@@ -1,0 +1,753 @@
+<script>
+$(document).ready(function(){
+//---- TOOLTIPS DEL ROL -----	
+	$(".topTool").tooltip({ placement: "right" });
+	
+	$(".topToolNom").tooltip({ placement: "bottom" });
+//----------------------------------------------
+	$("#selCuaderno").change(function(){
+		var dataHisCuaderno = $(this).val();
+		
+		historiaCausaCuaderno(dataHisCuaderno);
+	});	
+	
+});
+</script>
+<!--[if IE]>
+<style>
+    .panel-default {
+         margin-top: 30px;
+    }
+</style>
+<![endif]-->
+	<div class="modal-dialog modal-lg">
+      <!-- Modal content-->
+		<div class="modal-content">
+			<div class="modal-header">
+										<button type="button" class="close" data-dismiss="modal">&times;</button>
+							<h4 class="modal-title" style="color:#337ab7;">Detalle Causa Civil</h4>
+			</div>
+		
+			<div class="modal-body">
+			
+				<div class="panel with-nav-tabs">
+				
+					<div class="panel panel-default">
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td><strong>ROL:</strong> C-1234-2024 <span title="Causa LTE" class="label label-primary topTool"></span></td>
+									<td colspan="2"><strong>F. Ing.:</strong> 31/05/2024</td>
+									<td>PROMOTORA CMR FALABELLA  S</td>
+								</tr>
+								<tr>
+									<td>
+										<strong>Est. Adm.: </strong>
+										<span class="topTool"  data-toggle="tooltip">
+										  Sin archivar                  																					</span>
+									</td>
+									<td><strong>Proc.:</strong> Ejecutivo ObligaciÃ³n de Dar</td>
+									<td colspan="2"><strong>Ubicaci&oacute;n:</strong> Digital                       </td>
+								</tr>
+								<tr>
+									<td><strong>Estado Proc.:</strong> TramitaciÃ³n                   </td>
+									<td><strong>Etapa:</strong> 3 ContestaciÃ³n Excepciones                </td>
+									<td colspan="2"><strong>Tribunal:</strong> 2Âº Juzgado de Letras de Coquimbo                  </td>
+								</tr>
+								<input type="hidden" value="string(42) "3 Contestación Excepciones                "
+">
+							</tbody>
+						</table>
+								
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td>
+										<strong>Texto Demanda:</strong>
+										<form name="form" action="ADIR_871/civil/documentos/docu.php" method="get" target="txtD">
+											<input type='hidden' name='valorEncTxtDmda' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9QSFRpTyswcDJBMjlBWnByYXM0SWZtelpZVmZWaXg4UGQ1eng5MEhOMWJVXC9CT0xVS0R5aDIydXVLdGNwdUpsd0JxNXdxRUZRdVhQSU9zNFA1SVFVQU09In0.uwkoVX4DqrFrUZbwFiM9toa-2DdAJlsjbpV38zmabxg'>
+											<a href="#" onClick='$(this).closest("form").submit();' title="Archivo Texto Demanda" role="img">
+												<i title="Texto Demanda" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+											</a>
+										</form>
+									</td>
+									<td>
+										<strong>Anexos de la causa:</strong>
+										</br>
+										<a data-toggle="modal" href="#modalAnexoCausaCivil" title="Ver Anexos de la causa" role="img" onClick="anexoCausaCivil('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiQVwvZW5kaHA2ZXE0TWxEWmgxU1V2MHQ1XC9hUzNlTFVWZ1MwaU8rR1RJdGxHcXVlSnI1emEzb05RNXQzUldRNmF6In0.kMlXQkOTKL5VO61W3iO78V9XUB0jzZIELa98XBfb8hg');"><i class="fa fa-folder-open fa-lg" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+									</td>
+									
+									  
+									  <!-- Bloque boton Certificado -->
+									<td>
+										<strong>Certificado de Env&iacute;o:</strong>
+										<form name="certCivil" action="ADIR_871/civil/documentos/docCertificadoDemanda.php" method="get" target="cert">
+											<input type='hidden' name='dtaCert' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiYzlPZUIxa2NmTHpEaGN6TnRsY0NxM2dwM1d1ejVoTTd4bmdvMThQd2VWTT0ifQ._59qZBUrPIDAg18vOmr_ALa8rGQI5g4jPLSGsptH130'>
+											<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Certificado" role="img">
+												<i title="Descargar Certificado" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+											</a>
+											
+										</form>
+									</td>
+								<!-- Fin Bloque boton Certificado -->
+
+									<td id="boton">
+								<!-- Bloque boton ebook -->
+										<strong>Ebook:</strong>
+										<form name="form" action="ADIR_871/civil/documentos/newebookcivil.php" method="get" target="_blank">
+											<input type='hidden' name='dtaEbook' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiQVwvZW5kaHA2ZXE0TWxEWmgxU1V2MHVOek1XaTNxRFwvNGtOeHZSOXZwU2JcL0d1TmRrVktzMVRGa3A0MkgyTVdZUyJ9.XY1ryEx5Vp2h1HGohjgkwLREbPtkEg1vTo075EvVH4U'>
+											<a href="#"  onClick='$(this).closest("form").submit();' title="Descargar Ebook" role="img">
+											<i title="Descargar Ebook" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+											</a>
+										</form>
+									</td>
+								<!-- Fin Bloque boton ebook -->
+								</tr>
+							</tbody>
+						</table>
+						
+						<!-- Bloque Piezas Exhorto -->
+									<!-- Fin Bloque Piezas Exhorto -->
+								</tr>
+							</tbody>
+						</table>
+					</div>
+					
+					<div class="panel panel-default">
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td>
+										<strong>Historia Causa Cuaderno</strong><br>
+										<select id="selCuaderno" class="form-control form-control-sm">
+												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiM1JyOTlNcFlJdkNYZUFzZ2RIbzFNbkJkVU9CM3RSYmV0XC84VW1hYU4rQnZweDZSQ0dDN0NSczN4bUVoaEVHZDlaRExYQXA0SU11VXNGdnZIbWFtTHo0OCtIZWs3Q3RQRnQ3SWNieGdPMG9PSHlkTFFZMGdKbjUyM1wvRk9TZXV0b2EyZkRBNDVUV1RYbDduT0QwWFwvdnQ2OWVtMHlGTGMyanZqVWtOTVlQTHlnPSJ9.XFbBDugYie8m-T8otFvOQ_hmYUmHgYnCK1UBc4LmT3M" selected="selected">1 - Principal</option>
+												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiM1JyOTlNcFlJdkNYZUFzZ2RIbzFNbkJkVU9CM3RSYmV0XC84VW1hYU4rQnZweDZSQ0dDN0NSczN4bUVoaEVHZDlaRExYQXA0SU11VXNGdnZIbWFtTHpcL0ZFUUlURUZJcE13TGJKVm1YZVA2djZKV0kzeVwvR0MwNm5iakVaQk5nbFBwdjZEMUp5Q2J5SDQ5VUh5SGxraXdTTnJRRjFHZVwvVXNzMjJUWjdcL0orQzg9In0.zDHwedtq0mgjipVFkhcSldcAZ4Us9u5CXrQzOt2mtAk" >2 - Apremio Ejecutivo ObligaciÃ³n de Dar</option>
+												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiM1JyOTlNcFlJdkNYZUFzZ2RIbzFNbkJkVU9CM3RSYmV0XC84VW1hYU4rQnZweDZSQ0dDN0NSczN4bUVoaEVHZDlaRExYQXA0SU11VXNGdnZIbWFtTHoyMzZHWEZ1eTdQU0JMUDE4SW9tNHNNelVubkZFOVwvZkZxdkZFSnBqWW1iaWNQNjFZZlFkd0RYc3pWZ2VKZDErdFZJM3FGWVEzMGVEUGVBaHNKRWxoTnM9In0.EDZk-WDYQkMeex3qPqe7OiifGxl0S3PlUSafoMnHVII" >3 - Incidente Abandono del Proc.</option>
+	
+										</select>
+										<!--
+										44 31539374 43781190 101 1234 C 2024										-->
+									</td>
+									<td>
+										<strong>Informaci&oacute;n notificaciones receptor:</strong>
+										<br>
+										<a data-toggle="modal" href="#modalReceptorCivil" title="Ver Receptor" role="img" onClick="receptorCivil('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoic1dCRmw3Mm15TEtaeU5samZQc3FuVVdcL0tPZzN6YnVHbUFaMGREVHRGdFliNTQrM0RManFxZ29KVzhmQVJ0bXhuUlo3YlVuejhwRUV5amVxVzBHZFdRTzNqc2dcL1F0RGtrTlh5bXdIUHlaV3phRThXaU1qd2RIbTBQZ0pKZ1F6ZXBzOW15bTBcL0N2WGJrdldYT3JtTkQ5Vmwydk1TVDdub3l6YXUzR2VHYWYwQlZsK0h5ZlJjVERseDYyM2liWTZQIn0._3B6Gf1uXsBztkBVS4s67kMHROgrXeqN4u62aTwefDw');"><i class="fa fa-folder fa-2x" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+									</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+					
+					<div class="panel-heading">
+						<ul class="nav nav-tabs" style="display:inline-block">
+							<li class="active"><a data-toggle="tab" href="#historiaCiv">Historia</a></li>
+							<li><a data-toggle="tab" href="#litigantesCiv">Litigantes</a></li>
+							<li><a data-toggle="tab" href="#notificacionesCiv">Notificaciones</a></li>
+							<li><a data-toggle="tab" href="#escritosCiv">Escritos por Resolver</a></li>
+							<li><a data-toggle="tab" href="#exhortosCiv">Exhortos</a></li>
+						</ul>
+					</div>
+					
+					<div class="tab-content" id="loadHistCuadernoCiv">
+						
+						<div class="tab-pane fade in active" id="historiaCiv"> <!-- INICIO PANEL -->
+						
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+									
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Folio</th>
+												<th>Doc.</th>
+												<th>Anexo</th>
+												<th>Etapa</th>
+												<th>Tr&aacute;mite</th>
+												<th>Desc. Tr&aacute;mite</th>
+												<th>Fec. Tr&aacute;mite</th>
+												<th>Foja</th>
+												<th>Georref.</th>
+											</tr>												
+										</thead>
+										<tbody>
+											<tr>
+												<td>
+													15 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p1">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9NT29LblVJMzBRVExkOUJ4bW9uekd2TlZVeFhkSm5lUUxXUFFLM0F1UUxEU0l1UHhUb2xvdlI0XC9pTHl2bjQzQXVoZU5aT1hyd1NjcVlhalc5ZVVUR240MVN4UVhFQTdcL29tYUh1K2YzYmJMXC9MUGRXTVVaOHBFcENGcEJxZmNkSFE9PSJ9.gB3-zjFXYbd8BOxhYMvJo7HNfFxGNs7wlgzQjxLhAZY'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>ContestaciÃ³n Excepciones                </td>
+												<td>ResoluciÃ³n</td>
+												<!--<td><span title="Confiere Traslado de Incidente" class="topToolNom"></span></td>-->
+												<td>
+ Confiere Traslado de Incidente												</td>
+												<td>22/09/2025</td>
+												<td>9</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													14 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w2" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9EaTMzMVlQdFB0SlNcL3dVWEkwbjlLbGJYcUZYdGhrRFhRUTZtUm5zaWJhWG95a3NLMTFNajFRdnd3R1wvQnFFcGZIVkR1bzE0dWpFT0Fva1dnVFFxTUpXaGpmUzRZNklyaXZSSVA0WFFLNkxLIn0.zYVhRaozlWV1BNMnSNaoCG5nQpjPoiZnHviTF10n0Xw'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  																<form name="certCivil" action="ADIR_871/civil/documentos/docCertificadoEscrito.php" method="get" target="cert" style="display: inline-block;">
+																<input type='hidden' name='dtaCert' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTUZSZXhEOXd6UjA2cWJPSzlpcWFBWkU4eXNcL1lcL0hEMDR0Z1o3eVJcL1lpTT0ifQ.MFeZu9KrhopvqKluyyHPWYKGCSZ7icAyhSmGNzpAeBM'>
+																<a href="#" onClick='$(this).closest("form").submit();' title="Certificado de envio escrito" role="img" style="display: inline-block;">
+																	<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#2693FF; cursor:pointer; display: inline-block;" ></i>
+																</a>
+																</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>ContestaciÃ³n Excepciones                </td>
+												<td>Escrito</td>
+												<!--<td><span title="Abandono procedimiento" class="topToolNom"></span></td>-->
+												<td>
+ Abandono procedimiento												</td>
+												<td>19/09/2025</td>
+												<td>8</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													13 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p3">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9KTVE1dGptTmxsSWlwUTV4MDlKUXk5ekFqd3BZZzJvdTdWMk9BYVVaV1QzOE9XWTZTTXBCTXk5WnZyYytLZUNVQzBvSjhZRnF6MVZ6TnFxNjU3SnFjdkVXY01CeHhyY2o3RmV5eE1sMUYzYStrVWZKQUgxNHNZWUJneE15b3dZV0E9PSJ9.lpa5RWPZ4WLGuRUfad9Dbtbqr6kIZ5wZ7ctuY_re7vs'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Excepciones                             </td>
+												<td>ResoluciÃ³n</td>
+												<!--<td><span title="Opone excepciones-Traslado" class="topToolNom"></span></td>-->
+												<td>
+ Opone excepciones-Traslado												</td>
+												<td>23/10/2024</td>
+												<td>6</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													12 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p4">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9EbnNnNE9VbzVPaEc1aXRlck1vdCtGNXpDMENTS0hERkxNbzY5c0pDRVhHbzFtXC9FUWtSaFpxNEhFSlZ4Q2lrQzZDOXFUMFByOElVTm1nSW9rRFhoOFM1UDJOM3pHRmY0M3NpTkd0c1JsN20ifQ.d1ppMiVSsjpy5WKNFQaCiTGOFQX_adpCpYn8RYbpQYo'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Excepciones                             </td>
+												<td></td>
+												<!--<td><span title="Acredita Poder" class="topToolNom"></span></td>-->
+												<td>
+ Acredita Poder												</td>
+												<td>22/10/2024</td>
+												<td>0</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													11 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p5">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9CTWR0Q3hJUWYydUFSNTNscktyOHFoclFNbnVsWmxKSDRPdnhCK2tNeWJ1T2VYOE1kNnRTazF2d09qRlltSFF6Ym00VDdFWllXVFN3bGpPb2lNOWl5WDZUVHpLcEd5V3NVWFE4OXoyRU1HVytqd3JCZ0FuQ1ZTRUM4QjMzRXdSRmc9PSJ9.xHx-QNX6CrDLtpvZ_elWIsOXN2wYnnEaVzdRCQeeuco'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Excepciones                             </td>
+												<td>ResoluciÃ³n</td>
+												<!--<td><span title="Previo a proveer" class="topToolNom"></span></td>-->
+												<td>
+ Previo a proveer												</td>
+												<td>18/10/2024</td>
+												<td>5</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													10 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w6" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9LQXUzN3BFNjRyXC8zWlNFd3NuQ2pYenNWdFhzdUZna1gzaVBRdWYwNU9yRkVQbDJGZFFDTnIyN2tTUFwvcldGWXVyWDdZTWNYUlhzQTZiSVwvQnhvM2FZV1Q0Q1lBN1lET1FJY1hrOElqdFFBOCJ9.0pUl3cT71Nb0Eq1nAo0MH8Efd3UOC8oUijs37TbOo-A'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  																<form name="certCivil" action="ADIR_871/civil/documentos/docCertificadoEscrito.php" method="get" target="cert" style="display: inline-block;">
+																<input type='hidden' name='dtaCert' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTUZSZXhEOXd6UjA2cWJPSzlpcWFBU2REbm1NcE1reE1FTGZWY2RNeFBaND0ifQ.XC32ydIfG0Hu6zxeCfFXrZNVx1YcVISlrW-TVPAv7qg'>
+																<a href="#" onClick='$(this).closest("form").submit();' title="Certificado de envio escrito" role="img" style="display: inline-block;">
+																	<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#2693FF; cursor:pointer; display: inline-block;" ></i>
+																</a>
+																</form>
+														  													</td>
+												<td align="center">
+						
+													<a data-toggle="modal" href="#modalAnexoSolicitudCivil" title="Anexo solicitud" role="img" onClick="anexoSolicitudCivil('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiQVwvZW5kaHA2ZXE0TWxEWmgxU1V2MGdEQVUzcHJlOFV4WUh4MGxPV01oZWt1OHl6YkljbERGOFwvRnR5U0hPYjFJRzNwYXBcL0plVVhxYWo5Q011OWhQQVBRQnlFRkRLakFjQXVvUm5oUTd1Mnc9In0.NLh5EvXBpmQ2dVLliDF1ZaSg7gP3x6Xn78unVwbwbHU');"><i class="fa fa-folder-open fa-lg" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+	
+												</td>
+												<td>NotificaciÃ³n demanda y su proveÃ­do      </td>
+												<td>Escrito</td>
+												<!--<td><span title="Opone excepciones" class="topToolNom"></span></td>-->
+												<td>
+ Opone excepciones												</td>
+												<td>17/10/2024</td>
+												<td>4</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													9 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w7" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9PUFwvNlFZTE9JYjAycEdvR2lQK1JTd0hDUnVcL1M1cEt6bk5DcGVvd2crSDJqdWw5Z2dnNGtLM2V3ZWRFYjdmcHJxQWxTWGtcL3hGXC9FOGkzVk5vZElEc2xwOVlnZVJOektLOU15VWlmN2ZuajNPSWY3R1dYVHlsWENySGllYXJXeFhRPT0ifQ.ulYtNsv8vncGRII9XYHgpHYwjV8ThNCUp3b5OS3UK3U'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>NotificaciÃ³n demanda y su proveÃ­do      </td>
+												<td>ActuaciÃ³n Receptor</td>
+												<!--<td><span title="NOTIFICACIÃN DE DEMANDA (Exitosa) Diligencia:10/10/2024 12:55" class="topToolNom"></span></td>-->
+												<td>
+ NOTIFICACIÃN DE DEMANDA (Exitosa) Diligencia:10/10/2024 12:55												</td>
+												<td>11/10/2024 (10/10/2024)</td>
+												<td>0</td>
+												<td align="center">
+														<a data-toggle="modal" href="#modalGeoReferenciaCivil" title="Georreferencia" role="img" onClick="geoReferencia('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoibERBTFMxU01vcStrRHhVVjNiSFZmUTRvWUlpUTZyc0NIUWo3dkF5MllmND0ifQ.1gMyo115owRNw--RF4Apf0-ODKuR8KoQSMsXjz6Prbs');"><i class="fa fa-globe fa-lg" aria-hidden="true" style="cursor:pointer; color:#2FB083"></i></a>
+												</td>
+											</tr>
+											<tr>
+												<td>
+													8 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w8" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9NNGNcL3ZQeUp4MXV4cVc3T0lwWkJQUWlsa1kxN1wvNHZrZFB4azVwXC8yXC9kZlRxeUQ3dTZqR0h5dW1HWVc4bE12WHVXNVg4RkVcL2R6T0lVMmxtcjRSWlppMDJHdWpON2VwTDc5T3pMMEZrKzVVM1IyRHVNaFpaYjdQdjNTeEpWV3VWUT09In0.3dbzkBHLUvgbTto7w-G4VbVkeLcZpVwCk-deZwok0rc'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>NotificaciÃ³n demanda y su proveÃ­do      </td>
+												<td>ActuaciÃ³n Receptor</td>
+												<!--<td><span title="CERTIFICACIÃN BÃSQUEDAS (BÃºsqueda positiva) Diligencia:10/10/2024 12:55" class="topToolNom"></span></td>-->
+												<td>
+ CERTIFICACIÃN BÃSQUEDAS (BÃºsqueda positiva) Diligencia:10/10/2024 12:55												</td>
+												<td>11/10/2024 (10/10/2024)</td>
+												<td>0</td>
+												<td align="center">
+														<a data-toggle="modal" href="#modalGeoReferenciaCivil" title="Georreferencia" role="img" onClick="geoReferencia('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoibERBTFMxU01vcStrRHhVVjNiSFZmVzJId2R5RVNHY2RUeVJSNjczTjN6ND0ifQ.TkjWA-xfnatdL6C-QKk179SiBtpuThqEKBm_H2nWeFw');"><i class="fa fa-globe fa-lg" aria-hidden="true" style="cursor:pointer; color:#2FB083"></i></a>
+												</td>
+											</tr>
+											<tr>
+												<td>
+													7 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w9" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9JUjFqSVB1Wm5wTVFkWkF0M3JLU3lBQ1N6T0pqWGc2ckowMFJmOXNrWHRwSDU0b1N4bFhTcGJ4QU9reXlodjBUSGFmXC9WUjIxbExrbGRKVFE0dUxDcE8yYWRoVlVMbFNTbHRuNjYweEdXeGh6WEFKUUFMaUtYR2xDRTJjN1EwTlJBPT0ifQ.5mlPL5N7yGQng0A5qAJAnMUinsByttzPZvkNwTGrbMs'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>NotificaciÃ³n demanda y su proveÃ­do      </td>
+												<td>ActuaciÃ³n Receptor</td>
+												<!--<td><span title="CERTIFICACIÃN BÃSQUEDAS (BÃºsqueda positiva) Diligencia:09/10/2024 13:06" class="topToolNom"></span></td>-->
+												<td>
+ CERTIFICACIÃN BÃSQUEDAS (BÃºsqueda positiva) Diligencia:09/10/2024 13:06												</td>
+												<td>11/10/2024 (09/10/2024)</td>
+												<td>0</td>
+												<td align="center">
+														<a data-toggle="modal" href="#modalGeoReferenciaCivil" title="Georreferencia" role="img" onClick="geoReferencia('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoibERBTFMxU01vcStrRHhVVjNiSFZmVG90dUhpZldtbXFSRER4TEloOXhNcz0ifQ.hBbvmK-drznPQJziKJn46viYbFcHfd418OlhwSEmCUI');"><i class="fa fa-globe fa-lg" aria-hidden="true" style="cursor:pointer; color:#2FB083"></i></a>
+												</td>
+											</tr>
+											<tr>
+												<td>
+													6 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p10">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9DWWY3eFlCSTZyanBPXC8weXpwbHVyYlwvVHFiMnF2NW44WkhOZGRJYm95bVVDYmppamk5cStuc3RIOHphUjUrbmlnNkFFbUJiXC90U0NKS1ZwUWlTSWRRSDBmdEVhaVRIc1A2cW52YkNpNDF4RkU4eEE2NjF2aThLK1Y1NGFxaWhBV1E9PSJ9.Zt53kNpS_RLtImZe5oOxb4MaxwauEYbzKE8DpDCLZx4'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td>ResoluciÃ³n</td>
+												<!--<td><span title="Ordena despachar mandamiento" class="topToolNom"></span></td>-->
+												<td>
+ Ordena despachar mandamiento												</td>
+												<td>07/06/2024</td>
+												<td>3</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													5 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p11">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9KS1wvdGJCWWdOSjhldDlnMGxXMG5BS3d2ZllHOTFcL1dVVW9DUklhUlZcL0ozOGtJQkZLOUVVRE9LM0FiQndhMU0rc0JrZkIrZWVTZ0c3dGVZOER0aFFZclhzVFBadzZoMVZ4R3NKS1pjNGNWayJ9.MO6uPvkdfoCi5RwGpvOcIDQbp6YhElGFFNd6tDm8J5Q'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td></td>
+												<!--<td><span title="Acredita Poder" class="topToolNom"></span></td>-->
+												<td>
+ Acredita Poder												</td>
+												<td>06/06/2024</td>
+												<td>0</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													4 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p12">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9JMkNUZzM1RmRYb290VGFXRGdmcE4yN0NtQXBtQzlEVE5YZmRVcjhzbzhSSDYxdXJwblRkRmwzd0toUlp6QlNzdHUyZlZwME1PK3dvOWMrN1QxTXdhSzBYUkV0OHdHcHR2RXpOcmh5ajRpTCJ9.gHYg5bcvZjThUponzuNu7fL4VPh7wVxgxsbnzuvPefk'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td></td>
+												<!--<td><span title="Acredita Poder" class="topToolNom"></span></td>-->
+												<td>
+ Acredita Poder												</td>
+												<td>06/06/2024</td>
+												<td>0</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													3 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w13" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9LRm1NeXZKVkFySWV3SEZKTTF4U0htVFp6TGxoSGg0SmNiWjlJdlRDWTNvMHpZVFdKNlltNmpcL2pqRms0MDNPb2hmUk51V1ZlZmJ0eVVNM3BFVTR5ZDhodWJCY1A4WlwvNGFST1d0eHpTWHJOIn0.Yx6IFVI-V5GvLsIN-qONnouGeoHfi5TdI8bPBMhMvhk'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  																<form name="certCivil" action="ADIR_871/civil/documentos/docCertificadoEscrito.php" method="get" target="cert" style="display: inline-block;">
+																<input type='hidden' name='dtaCert' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTUZSZXhEOXd6UjA2cWJPSzlpcWFBWkx6RFNhZ0VQR2U1cEkrXC9Lc1RSdEk9In0.Od3wv5l0sNDtHOJ1mk4aJC8xabzm-ERR__xC2MFHo3I'>
+																<a href="#" onClick='$(this).closest("form").submit();' title="Certificado de envio escrito" role="img" style="display: inline-block;">
+																	<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#2693FF; cursor:pointer; display: inline-block;" ></i>
+																</a>
+																</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td>Escrito</td>
+												<!--<td><span title="AcompaÃ±a documentos" class="topToolNom"></span></td>-->
+												<td>
+ AcompaÃ±a documentos												</td>
+												<td>05/06/2024</td>
+												<td>2</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													2 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuS.php" method="get" target="p14">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9FY2Z1NkpITlFUV2Z4ZERaVEFTeExadUFuMEVEb1E2NWg4dzZJd2dPWmZzc2RJMnZWc0syVWV2RTZhb21yQjlwVGtLbW1xMk14bGkxZHlUcXhocGcwSjN3QWNTbklHdHBYOG9XaVVGYWVTeWlBZHFGbEZaNk5FZmFJOWZOckx3K2c9PSJ9.x_rh3-qs_dTRobtQX3VH_okWTj5DwGpHRZqR8CHtz1k'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+																<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+															</a>
+															
+														</form>
+													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td>ResoluciÃ³n</td>
+												<!--<td><span title="Apercibimiento poder y/o tÃ­tulo" class="topToolNom"></span></td>-->
+												<td>
+ Apercibimiento poder y/o tÃ­tulo												</td>
+												<td>03/06/2024</td>
+												<td>1</td>
+												<td align="center">
+												</td>
+											</tr>
+											<tr>
+												<td>
+													1 
+												</td>
+												<td align="left">
+														<form name="form" action="ADIR_871/civil/documentos/docuN.php" method="get" target="w15" style="display: inline-block;">
+															<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MjQ5OTM1MywiZXhwIjoxNzcyNTAyOTUzLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9BYUlsRHNGXC94SW14eEROcUlWV1BmclBORUlTN2hJSUlnWHNcL1c3OWo2SVFGTGw1R2RLQ25jUVg3TU5vb0RKejN3Q1YxWGJEdFc4M1Y1Z2JhTXgxaHE4T3p2ZUpwaEhaTFN0WnlFOTB5ZFZLIn0.dqPcoSvhQZ1TulTx093Lvcf-2QCvtsxQHLrpPpwQxhM'>
+															<a href="#" onClick='$(this).closest("form").submit();' title="Documento principal del escrito" role="img" style="display: inline-block;">
+																<i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;,  display: inline-block"></i>
+															</a>
+														</form>
+														  													</td>
+												<td align="center">
+	
+												</td>
+												<td>Inicio de la TramitaciÃ³n                </td>
+												<td>Escrito</td>
+												<!--<td><span title="Ingreso demanda" class="topToolNom"></span></td>-->
+												<td>
+ Ingreso demanda												</td>
+												<td>31/05/2024</td>
+												<td>1</td>
+												<td align="center">
+												</td>
+											</tr>
+										</tbody>
+									</table>
+
+								</div>
+							</div>
+
+						</div> <!-- FIN PANEL -->
+
+
+						<div class="tab-pane fade" id="litigantesCiv"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Participante</th>
+												<th>Rut</th>
+												<th>Persona</th>
+												<th>Nombre o Raz&oacute;n Social</th>
+											</tr>												
+										</thead>
+										<tbody>
+											<tr>
+												<td>DDO.  </td>
+												<td>7920613-K</td>
+												<td>NATURAL                       </td>
+												<td>ABRAHAM ENRIQUE VALDIVIA CARMONA </td>				
+											</tr>
+											<tr>
+												<td>AB.DTE</td>
+												<td>7010493-8</td>
+												<td>NATURAL                       </td>
+												<td>RODRIGO ARCADIO ZAPICO GUERRA (Poder Simple)</td>				
+											</tr>
+											<tr>
+												<td>AB.DDO</td>
+												<td>18495300-5</td>
+												<td>NATURAL                       </td>
+												<td>NATALIA ANDREA CARMONA HIDALGO (Poder Amplio)</td>				
+											</tr>
+											<tr>
+												<td>AP.DTE</td>
+												<td>15069890-1</td>
+												<td>NATURAL                       </td>
+												<td>NATALIA ISABEL CORTÃS PHILIPP (Poder Simple)</td>				
+											</tr>
+											<tr>
+												<td>DTE.  </td>
+												<td>90743000-6</td>
+												<td>JURIDICA                      </td>
+												<td>PROMOTORA CMR FALABELLA  S.A.   </td>				
+											</tr>
+										</tbody>
+									</table>
+										
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+
+
+						<div class="tab-pane fade" id="notificacionesCiv"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>ROL</th>
+												<th>Est. Notif.</th>
+												<th>Tipo Notif.</th>
+												<th>Fecha Tr&aacute;mite</th>
+												<th>Tipo Part.</th>
+												<th>Nombre</th>
+												<th>Tr&aacute;mite</th>
+												<th>Obs. Fallida</th>
+											</tr>												
+										</thead>
+										<tbody>
+											<tr>
+												<td nowrap>C-1234-2024</td>
+												<td>Realizada           </td>
+												<td>mail                          </td>
+												<td>07/06/2024</td>
+												<td>AB.DTE         </td>
+												<td nowrap>RODRIGO ARCADIO ZAPICO GUERRA</td>
+												<td>resoluciÃ³n                    </td>
+												<td></td>
+											</tr>
+											<tr>
+												<td nowrap>C-1234-2024</td>
+												<td>Realizada           </td>
+												<td>mail                          </td>
+												<td>23/10/2024</td>
+												<td>AB.DDO         </td>
+												<td nowrap>NATALIA ANDREA CARMONA HIDALGO</td>
+												<td>resoluciÃ³n                    </td>
+												<td></td>
+											</tr>
+										</tbody>
+									</table>
+										
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+
+
+						<div class="tab-pane fade" id="escritosCiv"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Doc.</th>
+												<th>Anexo</th>
+												<th>Fecha de Ingreso</th>
+												<th>Tipo Escrito</th>
+												<th>Solicitante</th>
+											</tr>												
+										</thead>
+										<tbody>
+										</tbody>
+									</table>
+												
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+						
+						
+						<div class="tab-pane fade" id="exhortosCiv"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Rol Origen</th>
+												<th>Tipo Exhorto</th>
+												<th>Rol Destino</th>
+												<th>Fecha Ordena Exhorto</th>
+												<th>Fecha Ingreso Exhorto</th>
+												<th>Tribunal Destino</th>
+												<th>Estado Exhorto</th>
+											</tr>												
+										</thead>
+										<tbody>
+										</tbody>
+									</table>
+										
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+						
+						
+					</div>
+					
+				</div>
+                
+
+			
+			</div>
+			
+        
+			<div class="modal-footer">
+							<button type="button" class="btn btn-default" data-dismiss="modal">Cerrar</button>
+						</div>
+			
+		</div>
+	</div>
