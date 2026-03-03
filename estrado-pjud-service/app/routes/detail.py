@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter
 
 from app.auth import verify_api_key
-from app.config import Settings
+from app.config import get_settings
 from app.models import (
     DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
 )
@@ -41,7 +41,7 @@ def _guess_competencia_from_jwt(jwt: str) -> str:
 
 @router.post("/detail", response_model=DetailResponse)
 async def case_detail(req: DetailRequest, _api_key: str = verify_api_key):
-    settings = Settings()
+    settings = get_settings()
     adapter = OJVHttpAdapter(settings)
     session = OJVSession(adapter)
 

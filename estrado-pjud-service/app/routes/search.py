@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter
 
 from app.auth import verify_api_key
-from app.config import Settings
+from app.config import get_settings
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.session import OJVSession
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 
 @router.post("/search", response_model=SearchResponse)
 async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
-    settings = Settings()
+    settings = get_settings()
     adapter = OJVHttpAdapter(settings)
     session = OJVSession(adapter)
 

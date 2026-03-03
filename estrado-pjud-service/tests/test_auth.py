@@ -16,6 +16,8 @@ async def protected(api_key: str = verify_api_key):
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("API_KEY", "test-secret")
+    from app.config import get_settings
+    get_settings.cache_clear()
     return TestClient(app)
 
 

@@ -2,12 +2,12 @@ import logging
 
 from fastapi import FastAPI
 
-from app.config import Settings
+from app.config import get_settings
 from app.routes import health, search, detail
 
 
 def create_app() -> FastAPI:
-    settings = Settings()
+    settings = get_settings()
 
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),

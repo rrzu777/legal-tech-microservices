@@ -28,6 +28,8 @@ def _load(name: str) -> str:
 def _env(monkeypatch):
     """Ensure API_KEY is set for every test."""
     monkeypatch.setenv("API_KEY", "test-key")
+    from app.config import get_settings
+    get_settings.cache_clear()
 
 
 @pytest.fixture
