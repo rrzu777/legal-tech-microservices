@@ -50,7 +50,8 @@ def _compute_priority(case_status: str, latest_date: str | None) -> int:
         return 2
     try:
         d = date.fromisoformat(latest_date)
-        days = (date.today() - d).days
+        today = datetime.now(_TZ).date()
+        days = (today - d).days
     except ValueError:
         return 2
     if days < 7:
@@ -200,7 +201,11 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
 
             # Get detail key
-            detail_key = case.get("external_case_key") or search_result["matches"][0]["key"]
+            detail_key = case.get("external_case_key") or search_result["matches"][0].get("key")
+            if not detail_key:
+                await self._finish_run(sync_run_id, started_at, "error", 0, "No detail key available")
+                self._metrics.record_error()
+                return {"success": False, "new_movements": 0}
 
             await self._pool.enforce_global_rate_limit()
 

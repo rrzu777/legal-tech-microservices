@@ -19,12 +19,15 @@ logger = logging.getLogger("worker")
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        return json.dumps({
+        entry = {
             "ts": self.formatTime(record),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
-        })
+        }
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
 
 
 def setup_logging(level: str):

@@ -35,14 +35,18 @@ class SessionPool:
                 await asyncio.sleep(1.5)  # stagger
 
     async def acquire(self) -> OJVSession:
+        """Acquire a session from the pool.
+
+        NOTE: Currently always returns the first session. This is correct for
+        POOL_SIZE=1. For POOL_SIZE>1, implement proper available/in-use tracking.
+        """
         await self._semaphore.acquire()
         for i, session in enumerate(self._pool):
             if session.age_seconds > self._config.SESSION_MAX_AGE_S:
                 logger.info("Refreshing expired session %d (age=%.0fs)", i, session.age_seconds)
                 await self._refresh_session(session)
-                return self._pool[i]  # Return the NEW session
-            return session
-        raise RuntimeError("No session available")
+                return self._pool[i]
+        return self._pool[0]
 
     def release(self, session: OJVSession):
         self._semaphore.release()

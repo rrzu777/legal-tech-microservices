@@ -18,7 +18,7 @@ class Metrics:
         self.cases_synced_total: int = 0
         self.cases_synced_today: int = 0
         self.errors_today: int = 0
-        self._current_day: int = datetime.now(_TZ).day
+        self._current_date = datetime.now(_TZ).date()
         self._task: asyncio.Task | None = None
 
     def record_sync(self):
@@ -31,11 +31,11 @@ class Metrics:
         self.errors_today += 1
 
     def _maybe_reset_daily(self):
-        today = datetime.now(_TZ).day
-        if today != self._current_day:
+        today = datetime.now(_TZ).date()
+        if today != self._current_date:
             self.cases_synced_today = 0
             self.errors_today = 0
-            self._current_day = today
+            self._current_date = today
 
     async def send_heartbeat(self):
         self._maybe_reset_daily()
