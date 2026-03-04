@@ -1,25 +1,22 @@
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-from worker.config import WorkerConfig
+from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 
 logger = logging.getLogger(__name__)
 
-_TZ = ZoneInfo("America/Santiago")
-
 
 def _is_office_hours(dt: datetime | None = None) -> bool:
-    now = dt or datetime.now(_TZ)
+    now = dt or datetime.now(TZ_SANTIAGO)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=_TZ)
+        now = now.replace(tzinfo=TZ_SANTIAGO)
     return now.weekday() < 5 and 8 <= now.hour < 18
 
 
 def _is_archived_window(dt: datetime | None = None) -> bool:
-    now = dt or datetime.now(_TZ)
+    now = dt or datetime.now(TZ_SANTIAGO)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=_TZ)
+        now = now.replace(tzinfo=TZ_SANTIAGO)
     return now.weekday() == 6 and (now.hour >= 22 or now.hour < 6)
 
 
@@ -29,7 +26,7 @@ class Scheduler:
         self._sb = supabase
 
     async def get_next_batch(self) -> list[dict]:
-        now_iso = datetime.now(_TZ).isoformat()
+        now_iso = datetime.now(TZ_SANTIAGO).isoformat()
 
         query = (
             self._sb.from_("cases")
@@ -43,10 +40,10 @@ class Scheduler:
             .limit(self._config.BATCH_SIZE)
         )
 
-        resp = query.execute()
+        resp = await run_query(query)
         cases = resp.data or []
 
-        now = datetime.now(_TZ)
+        now = datetime.now(TZ_SANTIAGO)
         if _is_office_hours(now):
             cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 2]
         elif not _is_archived_window(now):
@@ -56,11 +53,10 @@ class Scheduler:
             return []
 
         case_ids = [c["id"] for c in cases]
-        (
+        await run_query(
             self._sb.from_("cases")
             .update({"sync_worker_id": self._config.WORKER_ID})
             .in_("id", case_ids)
-            .execute()
         )
 
         logger.info("Claimed batch of %d cases", len(cases))
@@ -69,9 +65,8 @@ class Scheduler:
     async def release_batch(self, case_ids: list[str]):
         if not case_ids:
             return
-        (
+        await run_query(
             self._sb.from_("cases")
             .update({"sync_worker_id": None})
             .in_("id", case_ids)
-            .execute()
         )

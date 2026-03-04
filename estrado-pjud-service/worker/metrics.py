@@ -2,13 +2,10 @@
 import asyncio
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-from worker.config import WorkerConfig
+from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 
 logger = logging.getLogger(__name__)
-
-_TZ = ZoneInfo("America/Santiago")
 
 
 class Metrics:
@@ -18,7 +15,7 @@ class Metrics:
         self.cases_synced_total: int = 0
         self.cases_synced_today: int = 0
         self.errors_today: int = 0
-        self._current_date = datetime.now(_TZ).date()
+        self._current_date = datetime.now(TZ_SANTIAGO).date()
         self._task: asyncio.Task | None = None
 
     def record_sync(self):
@@ -31,7 +28,7 @@ class Metrics:
         self.errors_today += 1
 
     def _maybe_reset_daily(self):
-        today = datetime.now(_TZ).date()
+        today = datetime.now(TZ_SANTIAGO).date()
         if today != self._current_date:
             self.cases_synced_today = 0
             self.errors_today = 0
@@ -39,19 +36,21 @@ class Metrics:
 
     async def send_heartbeat(self):
         self._maybe_reset_daily()
-        now = datetime.now(_TZ).isoformat()
-        self._sb.from_("sync_worker_heartbeats").upsert(
-            {
-                "worker_id": self._config.WORKER_ID,
-                "status": "running",
-                "last_heartbeat_at": now,
-                "cases_synced_total": self.cases_synced_total,
-                "cases_synced_today": self.cases_synced_today,
-                "errors_today": self.errors_today,
-                "pool_size": self._config.POOL_SIZE,
-            },
-            on_conflict="worker_id",
-        ).execute()
+        now = datetime.now(TZ_SANTIAGO).isoformat()
+        await run_query(
+            self._sb.from_("sync_worker_heartbeats").upsert(
+                {
+                    "worker_id": self._config.WORKER_ID,
+                    "status": "running",
+                    "last_heartbeat_at": now,
+                    "cases_synced_total": self.cases_synced_total,
+                    "cases_synced_today": self.cases_synced_today,
+                    "errors_today": self.errors_today,
+                    "pool_size": self._config.POOL_SIZE,
+                },
+                on_conflict="worker_id",
+            )
+        )
         logger.debug("Heartbeat sent")
 
     async def _heartbeat_loop(self):
@@ -74,18 +73,20 @@ class Metrics:
                 pass
         # Final heartbeat with stopped status
         try:
-            now = datetime.now(_TZ).isoformat()
-            self._sb.from_("sync_worker_heartbeats").upsert(
-                {
-                    "worker_id": self._config.WORKER_ID,
-                    "status": "stopped",
-                    "last_heartbeat_at": now,
-                    "cases_synced_total": self.cases_synced_total,
-                    "cases_synced_today": self.cases_synced_today,
-                    "errors_today": self.errors_today,
-                    "pool_size": self._config.POOL_SIZE,
-                },
-                on_conflict="worker_id",
-            ).execute()
+            now = datetime.now(TZ_SANTIAGO).isoformat()
+            await run_query(
+                self._sb.from_("sync_worker_heartbeats").upsert(
+                    {
+                        "worker_id": self._config.WORKER_ID,
+                        "status": "stopped",
+                        "last_heartbeat_at": now,
+                        "cases_synced_total": self.cases_synced_total,
+                        "cases_synced_today": self.cases_synced_today,
+                        "errors_today": self.errors_today,
+                        "pool_size": self._config.POOL_SIZE,
+                    },
+                    on_conflict="worker_id",
+                )
+            )
         except Exception:
             logger.exception("Final heartbeat failed")

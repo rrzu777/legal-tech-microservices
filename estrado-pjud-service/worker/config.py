@@ -1,4 +1,14 @@
+import asyncio
+from zoneinfo import ZoneInfo
+
 from pydantic_settings import BaseSettings
+
+TZ_SANTIAGO = ZoneInfo("America/Santiago")
+
+
+async def run_query(query):
+    """Run a Supabase query chain in a thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(query.execute)
 
 
 class WorkerConfig(BaseSettings):
@@ -14,4 +24,4 @@ class WorkerConfig(BaseSettings):
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     LOG_LEVEL: str = "INFO"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

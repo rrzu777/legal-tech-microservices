@@ -2,16 +2,13 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
 
 from app.parsers.normalizer import parse_case_identifier
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
-from worker.config import WorkerConfig
+from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 
 logger = logging.getLogger(__name__)
-
-_TZ = ZoneInfo("America/Santiago")
 _BLOCK_DURATION_S = 3600  # 1 hour
 
 MATTER_TO_COMPETENCIA = {
@@ -50,7 +47,7 @@ def _compute_priority(case_status: str, latest_date: str | None) -> int:
         return 2
     try:
         d = date.fromisoformat(latest_date)
-        today = datetime.now(_TZ).date()
+        today = datetime.now(TZ_SANTIAGO).date()
         days = (today - d).days
     except ValueError:
         return 2
@@ -63,7 +60,7 @@ def _compute_priority(case_status: str, latest_date: str | None) -> int:
 
 def _compute_next_sync_at(priority: int) -> str:
     hours = SYNC_INTERVALS_HOURS.get(priority, 24)
-    return (datetime.now(_TZ) + timedelta(hours=hours)).isoformat()
+    return (datetime.now(TZ_SANTIAGO) + timedelta(hours=hours)).isoformat()
 
 
 def _get_latest_movement_date(movements: list[dict]) -> str | None:
@@ -119,12 +116,12 @@ class SyncEngine:
         self._config = config
 
     async def sync_case(self, case: dict) -> dict:
-        started_at = datetime.now(_TZ)
+        started_at = datetime.now(TZ_SANTIAGO)
 
         # Create sync run
         sync_run_id = None
         try:
-            resp = (
+            resp = await run_query(
                 self._sb.from_("case_sync_runs")
                 .insert({
                     "law_firm_id": case["law_firm_id"],
@@ -135,7 +132,6 @@ class SyncEngine:
                 })
                 .select("id")
                 .single()
-                .execute()
             )
             sync_run_id = resp.data.get("id") if resp.data else None
         except Exception:
@@ -231,22 +227,24 @@ class SyncEngine:
 
             canonical = f"{competencia}:{parsed['tipo']}:{parsed['numero']}:{parsed['anno']}"
 
-            self._sb.from_("cases").update({
-                "tracking_status": "active",
-                "last_sync_at": datetime.now(_TZ).isoformat(),
-                "last_sync_status": "success",
-                "last_sync_error": None,
-                "sync_attempts": (case.get("sync_attempts") or 0) + 1,
-                "canonical_identifier": canonical,
-                "external_case_key": case.get("external_case_key") or detail_key,
-                "external_payload": {
-                    "metadata": detail["metadata"],
-                    "litigantes": detail["litigantes"],
-                },
-                "sync_priority": priority,
-                "next_sync_at": next_sync,
-                "latest_movement_date": latest_date,
-            }).eq("id", case["id"]).execute()
+            await run_query(
+                self._sb.from_("cases").update({
+                    "tracking_status": "active",
+                    "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
+                    "last_sync_status": "success",
+                    "last_sync_error": None,
+                    "sync_attempts": (case.get("sync_attempts") or 0) + 1,
+                    "canonical_identifier": canonical,
+                    "external_case_key": case.get("external_case_key") or detail_key,
+                    "external_payload": {
+                        "metadata": detail["metadata"],
+                        "litigantes": detail["litigantes"],
+                    },
+                    "sync_priority": priority,
+                    "next_sync_at": next_sync,
+                    "latest_movement_date": latest_date,
+                }).eq("id", case["id"])
+            )
 
             # Finish sync run
             await self._finish_run(sync_run_id, started_at, "success", new_count)
@@ -309,27 +307,27 @@ class SyncEngine:
             })
 
         # Count before
-        before_resp = (
+        before_resp = await run_query(
             self._sb.from_("case_movements")
             .select("id", count="exact")
             .eq("case_id", case["id"])
-            .execute()
         )
         before_count = before_resp.count if before_resp.count is not None else 0
 
         # Upsert (ignore duplicates)
-        self._sb.from_("case_movements").upsert(
-            rows,
-            on_conflict="case_id,external_movement_key",
-            ignore_duplicates=True,
-        ).execute()
+        await run_query(
+            self._sb.from_("case_movements").upsert(
+                rows,
+                on_conflict="case_id,external_movement_key",
+                ignore_duplicates=True,
+            )
+        )
 
         # Count after
-        after_resp = (
+        after_resp = await run_query(
             self._sb.from_("case_movements")
             .select("id", count="exact")
             .eq("case_id", case["id"])
-            .execute()
         )
         after_count = after_resp.count if after_resp.count is not None else 0
 
@@ -338,31 +336,37 @@ class SyncEngine:
     async def _finish_run(self, run_id, started_at, status, new_movements, error=None):
         if not run_id:
             return
-        now = datetime.now(_TZ)
+        now = datetime.now(TZ_SANTIAGO)
         duration_ms = int((now - started_at).total_seconds() * 1000)
         try:
-            self._sb.from_("case_sync_runs").update({
-                "status": status,
-                "finished_at": now.isoformat(),
-                "duration_ms": duration_ms,
-                "new_movements_count": new_movements,
-                "error_message": error,
-            }).eq("id", run_id).execute()
+            await run_query(
+                self._sb.from_("case_sync_runs").update({
+                    "status": status,
+                    "finished_at": now.isoformat(),
+                    "duration_ms": duration_ms,
+                    "new_movements_count": new_movements,
+                    "error_message": error,
+                }).eq("id", run_id)
+            )
         except Exception:
             logger.exception("Failed to finish sync_run %s", run_id)
 
     async def _update_case_blocked(self, case_id: str):
-        blocked_until = (datetime.now(_TZ) + timedelta(seconds=_BLOCK_DURATION_S)).isoformat()
-        self._sb.from_("cases").update({
-            "tracking_status": "blocked",
-            "last_sync_status": "blocked",
-            "last_sync_error": "Acceso bloqueado por OJV",
-            "sync_blocked_until": blocked_until,
-        }).eq("id", case_id).execute()
+        blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_BLOCK_DURATION_S)).isoformat()
+        await run_query(
+            self._sb.from_("cases").update({
+                "tracking_status": "blocked",
+                "last_sync_status": "blocked",
+                "last_sync_error": "Acceso bloqueado por OJV",
+                "sync_blocked_until": blocked_until,
+            }).eq("id", case_id)
+        )
 
     async def _update_case_error(self, case_id: str, error: str):
-        self._sb.from_("cases").update({
-            "tracking_status": "error",
-            "last_sync_status": "error",
-            "last_sync_error": error,
-        }).eq("id", case_id).execute()
+        await run_query(
+            self._sb.from_("cases").update({
+                "tracking_status": "error",
+                "last_sync_status": "error",
+                "last_sync_error": error,
+            }).eq("id", case_id)
+        )
