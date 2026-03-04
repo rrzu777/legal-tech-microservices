@@ -16,12 +16,13 @@ _USER_AGENT = (
 
 
 class OJVHttpAdapter:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, proxy: str | None = None):
         self._settings = settings
         self._base = settings.OJV_BASE_URL.rstrip("/")
         self._rate_limit_s = settings.RATE_LIMIT_MS / 1000.0
         self._last_request_time: float = 0.0
         self._client = httpx.AsyncClient(
+            proxy=proxy,
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             headers={

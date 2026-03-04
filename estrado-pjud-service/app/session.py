@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 
 import httpx
 
@@ -40,6 +41,11 @@ class OJVSession:
     def __init__(self, adapter: OJVHttpAdapter):
         self._adapter = adapter
         self.csrf_token: str | None = None
+        self._created_at: float = time.monotonic()
+
+    @property
+    def age_seconds(self) -> float:
+        return time.monotonic() - self._created_at
 
     async def initialize(self):
         """Step 1+2: Load initial page for cookies + CSRF, then activate guest session."""
