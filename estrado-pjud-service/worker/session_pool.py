@@ -36,11 +36,11 @@ class SessionPool:
 
     async def acquire(self) -> OJVSession:
         await self._semaphore.acquire()
-        for session in self._pool:
+        for i, session in enumerate(self._pool):
             if session.age_seconds > self._config.SESSION_MAX_AGE_S:
-                logger.info("Refreshing expired session (age=%.0fs)", session.age_seconds)
+                logger.info("Refreshing expired session %d (age=%.0fs)", i, session.age_seconds)
                 await self._refresh_session(session)
-                return session
+                return self._pool[i]  # Return the NEW session
             return session
         raise RuntimeError("No session available")
 

@@ -161,8 +161,8 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detailPjudViaSession", new_callable=AsyncMock) as mock_detail:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
@@ -207,7 +207,7 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.return_value = _mock_search_response(blocked=True)
             result = await engine.sync_case(case)
 
@@ -265,7 +265,7 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.return_value = _mock_search_response(found=False, matches=[])
             result = await engine.sync_case(case)
 
@@ -280,8 +280,8 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detailPjudViaSession", new_callable=AsyncMock) as mock_detail:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response(blocked=True)
             result = await engine.sync_case(case)
@@ -297,7 +297,7 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.side_effect = TimeoutError("timed out")
             result = await engine.sync_case(case)
 
@@ -313,8 +313,8 @@ class TestSyncEngine:
 
         case = _make_case(external_case_key="eyJpreexisting_key")
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detailPjudViaSession", new_callable=AsyncMock) as mock_detail:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
@@ -382,8 +382,8 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detailPjudViaSession", new_callable=AsyncMock) as mock_detail:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
@@ -423,7 +423,7 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.side_effect = RuntimeError("unexpected crash")
             result = await engine.sync_case(case)
 
@@ -438,8 +438,8 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.searchPjudViaSession", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detailPjudViaSession", new_callable=AsyncMock) as mock_detail:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
@@ -545,14 +545,14 @@ class TestHelperFunctions:
 class TestSearchPjudViaSession:
     @pytest.mark.asyncio
     async def test_returns_matches_when_found(self):
-        from worker.engine import searchPjudViaSession
+        from worker.engine import search_pjud_via_session
 
         mock_session = AsyncMock()
         mock_session.search = AsyncMock(return_value="<html>result</html>")
 
         with patch("worker.engine.detect_blocked", return_value=False), \
              patch("worker.engine.parse_search_results", return_value=[{"key": "abc"}]):
-            result = await searchPjudViaSession(
+            result = await search_pjud_via_session(
                 mock_session, "civil", {"action": "search"}, 25.0
             )
 
@@ -562,13 +562,13 @@ class TestSearchPjudViaSession:
 
     @pytest.mark.asyncio
     async def test_returns_blocked_when_detected(self):
-        from worker.engine import searchPjudViaSession
+        from worker.engine import search_pjud_via_session
 
         mock_session = AsyncMock()
         mock_session.search = AsyncMock(return_value="<html>captcha</html>")
 
         with patch("worker.engine.detect_blocked", return_value=True):
-            result = await searchPjudViaSession(
+            result = await search_pjud_via_session(
                 mock_session, "civil", {"action": "search"}, 25.0
             )
 
@@ -577,14 +577,14 @@ class TestSearchPjudViaSession:
 
     @pytest.mark.asyncio
     async def test_returns_not_found_when_no_matches(self):
-        from worker.engine import searchPjudViaSession
+        from worker.engine import search_pjud_via_session
 
         mock_session = AsyncMock()
         mock_session.search = AsyncMock(return_value="<html>empty</html>")
 
         with patch("worker.engine.detect_blocked", return_value=False), \
              patch("worker.engine.parse_search_results", return_value=[]):
-            result = await searchPjudViaSession(
+            result = await search_pjud_via_session(
                 mock_session, "civil", {"action": "search"}, 25.0
             )
 
@@ -595,7 +595,7 @@ class TestSearchPjudViaSession:
 class TestDetailPjudViaSession:
     @pytest.mark.asyncio
     async def test_returns_parsed_detail_when_valid(self):
-        from worker.engine import detailPjudViaSession
+        from worker.engine import detail_pjud_via_session
 
         html = "<html>" + "x" * 200 + "</html>"
         mock_session = AsyncMock()
@@ -608,7 +608,7 @@ class TestDetailPjudViaSession:
         }
 
         with patch("worker.engine.parse_detail", return_value=mock_parsed):
-            result = await detailPjudViaSession(
+            result = await detail_pjud_via_session(
                 mock_session, "civil", "eyJkey", 25.0
             )
 
@@ -617,13 +617,13 @@ class TestDetailPjudViaSession:
 
     @pytest.mark.asyncio
     async def test_returns_blocked_on_short_response(self):
-        from worker.engine import detailPjudViaSession
+        from worker.engine import detail_pjud_via_session
 
         short_html = "<html>err</html>"  # definitely < 100 chars
         mock_session = AsyncMock()
         mock_session.detail = AsyncMock(return_value=short_html)
 
-        result = await detailPjudViaSession(
+        result = await detail_pjud_via_session(
             mock_session, "civil", "eyJkey", 25.0
         )
 

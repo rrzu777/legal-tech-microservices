@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
-from app.parsers.normalizer import parse_case_identifier, competencia_path
+from app.parsers.normalizer import parse_case_identifier
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from worker.config import WorkerConfig
@@ -77,7 +77,7 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
 
 
-async def searchPjudViaSession(session, competencia: str, form_data: dict, timeout: float) -> dict:
+async def search_pjud_via_session(session, competencia: str, form_data: dict, timeout: float) -> dict:
     """Call OJV search via session and parse results."""
     html = await asyncio.wait_for(
         session.search(competencia, form_data),
@@ -96,7 +96,7 @@ async def searchPjudViaSession(session, competencia: str, form_data: dict, timeo
     }
 
 
-async def detailPjudViaSession(session, competencia: str, detail_key: str, timeout: float) -> dict:
+async def detail_pjud_via_session(session, competencia: str, detail_key: str, timeout: float) -> dict:
     """Call OJV detail via session and parse results."""
     html = await asyncio.wait_for(
         session.detail(competencia, detail_key),
@@ -182,7 +182,7 @@ class SyncEngine:
             }
 
             # Search
-            search_result = await searchPjudViaSession(
+            search_result = await search_pjud_via_session(
                 session, competencia, form_data, self._config.OJV_TIMEOUT_S,
             )
 
@@ -205,7 +205,7 @@ class SyncEngine:
             await self._pool.enforce_global_rate_limit()
 
             # Detail
-            detail = await detailPjudViaSession(
+            detail = await detail_pjud_via_session(
                 session, competencia, detail_key, self._config.OJV_TIMEOUT_S,
             )
 
