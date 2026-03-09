@@ -1,6 +1,6 @@
 # Diferencias entre Competencias PJUD
 
-Generado: 2026-03-09T22:30:39.270685
+Generado: 2026-03-09T22:34:45.668282
 
 ---
 
@@ -10,29 +10,32 @@ Generado: 2026-03-09T22:30:39.270685
 
 - Búsqueda: ✗
 - Detalle: ✗
-- Errores: No se encontró detail key en búsqueda
+- Errores: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
+- ⚠️ **REDIRECT**: La OJV redirigió al index (ROL no existe o requiere sesión)
 
 ### APELACIONES
 
 - Búsqueda: ✗
 - Detalle: ✗
-- Errores: No se encontró detail key en búsqueda
+- Errores: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
+- ⚠️ **REDIRECT**: La OJV redirigió al index (ROL no existe o requiere sesión)
 
 ### PENAL
 
 - Búsqueda: ✗
 - Detalle: ✗
-- Errores: No se encontró detail key en búsqueda
+- Errores: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
+- ⚠️ **REDIRECT**: La OJV redirigió al index (ROL no existe o requiere sesión)
 
 ---
 
 ## Tabla Comparativa
 
-| Competencia | Captcha | Campos Únicos | Movimientos | Litigantes/Intervinientes |
-|-------------|---------|---------------|-------------|----------------------------|
-| Suprema | No | No | No | No |
-| Apelaciones | No | No | No | No |
-| Penal | No | No | No | No |
+| Competencia | Captcha | Campos Únicos | Redirect | Movimientos | Litigantes/Intervinientes |
+|-------------|---------|---------------|----------|-------------|----------------------------|
+| Suprema | No | No | ⚠️ Sí | No | No |
+| Apelaciones | No | No | ⚠️ Sí | No | No |
+| Penal | No | No | ⚠️ Sí | No | No |
 
 ---
 
@@ -48,14 +51,25 @@ Generado: 2026-03-09T22:30:39.270685
 
 ### Riesgos detectados:
 
-- **Suprema**: No se encontró detail key en búsqueda
-- **Apelaciones**: No se encontró detail key en búsqueda
-- **Penal**: No se encontró detail key en búsqueda
+⚠️ **ALGUNAS COMPETENCIAS REDIRIGEN AL INDEX**
+
+Esto puede deberse a:
+1. Los ROLs/RITs de prueba no existen
+2. La OJV requiere sesión autenticada
+3. La OJV detectó scraping y bloqueó la request
+
+**Próximo paso:** Encontrar ROLs/RITs válidos y reales para cada competencia.
+
+- **Suprema**: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
+- **Apelaciones**: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
+- **Penal**: OJV redirigió al index - ROL puede no existir, No se encontró detail key en búsqueda
 
 ### Próximos pasos:
 
-1. Revisar fixtures HTML generados
-2. Implementar Apelaciones primero (caso más complejo con filtro de corte)
-3. Implementar Suprema y Penal (copiar patrón)
-4. Agregar tests unitarios con los fixtures
-5. Verificar worker de sync (debería fluir automático)
+1. **URGENTE:** Encontrar ROLs/RITs válidos para cada competencia
+2. Re-ejecutar spike con casos reales existentes
+3. Revisar fixtures HTML generados
+4. Implementar Apelaciones primero (caso más complejo con filtro de corte)
+5. Implementar Suprema y Penal (copiar patrón)
+6. Agregar tests unitarios con los fixtures
+7. Verificar worker de sync (debería fluir automático)

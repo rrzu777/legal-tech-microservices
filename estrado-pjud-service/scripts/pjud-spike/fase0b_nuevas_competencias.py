@@ -18,35 +18,39 @@ OJV_BASE = "https://oficinajudicialvirtual.pjud.cl"
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Casos de prueba conocidos (ajustar según sea necesario)
+# Casos de prueba CONOCIDOS (basados en fixtures existentes)
+# NOTA: Estos son ejemplos - necesitamos encontrar ROLs reales para cada competencia
 TEST_CASES = {
     "suprema": {
         "search_params": {
             "competencia": "suprema",
             "case_type": "rol",
-            "case_number": "C-100-2025"  # Ajustar a un caso real existente
+            "case_number": "C-100-2024"  # Caso genérico - puede no existir
         },
         "search_endpoint": "/ADIR_871/suprema/consultaRitSuprema.php",
         "detail_endpoint": "/ADIR_871/suprema/modal/causaSuprema.php",
+        "detail_fn_pattern": r"detalleCausaSuprema\('([^']+)'\)",
     },
     "apelaciones": {
         "search_params": {
             "competencia": "apelaciones",
             "case_type": "rol",
-            "case_number": "Proteccion-4490-2025",
+            "case_number": "Proteccion-4490-2024",  # Caso de protección común
             "corte": 91  # C.A. de San Miguel
         },
         "search_endpoint": "/ADIR_871/apelaciones/consultaRitApelaciones.php",
         "detail_endpoint": "/ADIR_871/apelaciones/modal/causaApelaciones.php",
+        "detail_fn_pattern": r"detalleCausaApelaciones\('([^']+)'\)",
     },
     "penal": {
         "search_params": {
             "competencia": "penal",
             "case_type": "rit",
-            "case_number": "T-500-2024"  # Ajustar a un caso real existente
+            "case_number": "T-100-2024"  # RIT genérico
         },
         "search_endpoint": "/ADIR_871/penal/consultaRitPenal.php",
         "detail_endpoint": "/ADIR_871/penal/modal/causaPenal.php",
+        "detail_fn_pattern": r"detalleCausaPenal\('([^']+)'\)",
     },
 }
 
@@ -97,11 +101,12 @@ def analyze_html_structure(html: str, filename: str) -> dict:
     """Analiza la estructura del HTML para detectar campos únicos."""
     analysis = {
         'filename': filename,
-        'encoding': 'utf-8',  # Asumimos utf-8 por defecto
+        'encoding': 'utf-8',
         'captcha_fields': detect_captcha_fields(html),
         'unique_fields': [],
         'has_movements': 'movimiento' in html.lower() or 'actuacion' in html.lower(),
         'has_litigantes': 'litigante' in html.lower() or 'interviniente' in html.lower(),
+        'is_redirect': 'parent.window.open' in html or 'index.php' in html,
     }
     
     # Detectar campos específicos por competencia
@@ -153,6 +158,7 @@ async def spike_competencia(name: str, config: dict, client: httpx.AsyncClient):
             f"{OJV_BASE}{config['search_endpoint']}",
             data=config['search_params'],
             timeout=30.0,
+            follow_redirects=True,
         )
         
         # Guardar HTML y headers
@@ -161,6 +167,11 @@ async def spike_competencia(name: str, config: dict, client: httpx.AsyncClient):
         
         # Analizar estructura
         search_analysis = analyze_html_structure(search_response.text, f"{name}_search.html")
+        
+        # Verificar si es redirect
+        if search_analysis['is_redirect']:
+            print(f"⚠️ La OJV redirigió al index (ROL no existe o requiere sesión)")
+            results['errors'].append("OJV redirigió al index - ROL puede no existir")
         
         # Extraer detail key
         detail_fn_pattern = config.get('detail_fn_pattern', r"detalleCausa\w+\('([^']+)'\)")
@@ -179,6 +190,7 @@ async def spike_competencia(name: str, config: dict, client: httpx.AsyncClient):
             detail_response = await client.get(
                 f"{OJV_BASE}{config['detail_endpoint']}?key={detail_key}",
                 timeout=30.0,
+                follow_redirects=True,
             )
             
             # Guardar HTML y headers
@@ -235,14 +247,17 @@ def generate_diferencias_md(results: list[dict]):
                 
                 if detail and detail.get('unique_fields'):
                     f.write(f"- Campos únicos (detalle): {', '.join(detail['unique_fields'])}\n")
+                
+                if search.get('is_redirect'):
+                    f.write(f"- ⚠️ **REDIRECT**: La OJV redirigió al index (ROL no existe o requiere sesión)\n")
             
             f.write("\n")
         
         # Tabla comparativa
         f.write("---\n\n")
         f.write("## Tabla Comparativa\n\n")
-        f.write("| Competencia | Captcha | Campos Únicos | Movimientos | Litigantes/Intervinientes |\n")
-        f.write("|-------------|---------|---------------|-------------|----------------------------|\n")
+        f.write("| Competencia | Captcha | Campos Únicos | Redirect | Movimientos | Litigantes/Intervinientes |\n")
+        f.write("|-------------|---------|---------------|----------|-------------|----------------------------|\n")
         
         for result in results:
             name = result['name'].capitalize()
@@ -253,10 +268,11 @@ def generate_diferencias_md(results: list[dict]):
             captcha = ', '.join(search.get('captcha_fields', [])) or 'No'
             detail_fields = detail.get('unique_fields', []) if detail else []
             unique_fields = ', '.join(search.get('unique_fields', []) + detail_fields) or 'No'
+            is_redirect = '⚠️ Sí' if search.get('is_redirect') else 'No'
             has_movements = 'Sí' if search.get('has_movements') or (detail and detail.get('has_movements')) else 'No'
             has_litigantes = 'Sí' if search.get('has_litigantes') or (detail and detail.get('has_litigantes')) else 'No'
             
-            f.write(f"| {name} | {captcha} | {unique_fields} | {has_movements} | {has_litigantes} |\n")
+            f.write(f"| {name} | {captcha} | {unique_fields} | {is_redirect} | {has_movements} | {has_litigantes} |\n")
         
         # Recomendaciones
         f.write("\n---\n\n")
@@ -268,16 +284,27 @@ def generate_diferencias_md(results: list[dict]):
         f.write("3. **Suprema**: Verificar campos adicionales (Sala, Relator, Ministros).\n\n")
         
         f.write("### Riesgos detectados:\n\n")
+        has_redirects = any(r.get('analysis', {}).get('search', {}).get('is_redirect', False) for r in results)
+        if has_redirects:
+            f.write("⚠️ **ALGUNAS COMPETENCIAS REDIRIGEN AL INDEX**\n\n")
+            f.write("Esto puede deberse a:\n")
+            f.write("1. Los ROLs/RITs de prueba no existen\n")
+            f.write("2. La OJV requiere sesión autenticada\n")
+            f.write("3. La OJV detectó scraping y bloqueó la request\n\n")
+            f.write("**Próximo paso:** Encontrar ROLs/RITs válidos y reales para cada competencia.\n\n")
+        
         for result in results:
             if result['errors']:
                 f.write(f"- **{result['name'].capitalize()}**: {', '.join(result['errors'])}\n")
         
         f.write("\n### Próximos pasos:\n\n")
-        f.write("1. Revisar fixtures HTML generados\n")
-        f.write("2. Implementar Apelaciones primero (caso más complejo con filtro de corte)\n")
-        f.write("3. Implementar Suprema y Penal (copiar patrón)\n")
-        f.write("4. Agregar tests unitarios con los fixtures\n")
-        f.write("5. Verificar worker de sync (debería fluir automático)\n")
+        f.write("1. **URGENTE:** Encontrar ROLs/RITs válidos para cada competencia\n")
+        f.write("2. Re-ejecutar spike con casos reales existentes\n")
+        f.write("3. Revisar fixtures HTML generados\n")
+        f.write("4. Implementar Apelaciones primero (caso más complejo con filtro de corte)\n")
+        f.write("5. Implementar Suprema y Penal (copiar patrón)\n")
+        f.write("6. Agregar tests unitarios con los fixtures\n")
+        f.write("7. Verificar worker de sync (debería fluir automático)\n")
     
     print(f"\n✓ DIFERENCIAS.md generado: {filepath}")
     return filepath
@@ -290,6 +317,8 @@ async def main():
     print("="*60)
     print(f"Fixtures directory: {FIXTURES_DIR}")
     print(f"Timestamp: {datetime.now().isoformat()}")
+    print("\n⚠️ NOTA: Los ROLs usados pueden no existir. Si la OJV redirige al index,")
+    print("necesitamos encontrar ROLs/RITs válidos para cada competencia.\n")
     
     results = []
     
@@ -323,6 +352,14 @@ async def main():
     
     print(f"\nFixtures guardados en: {FIXTURES_DIR}")
     print(f"Listar: ls -la {FIXTURES_DIR}")
+    print("\n" + "="*60)
+    print("PRÓXIMOS PASOS:")
+    print("="*60)
+    print("1. Revisar si los fixtures muestran redirects")
+    print("2. Si hay redirects, encontrar ROLs/RITs válidos")
+    print("3. Re-ejecutar spike con casos reales")
+    print("4. Analizar HTML real para implementar parsers")
+    print("="*60)
 
 
 if __name__ == "__main__":
