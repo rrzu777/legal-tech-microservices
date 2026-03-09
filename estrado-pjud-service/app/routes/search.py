@@ -33,7 +33,7 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "g-recaptcha-response-rit": "",
             "action": "validate_captcha_rit",
             "competencia": str(comp_code),
-            "conCorte": "0",
+            "conCorte": str(req.corte) if req.competencia == "apelaciones" else "0",
             "conTribunal": "0",
             "conTipoBusApe": "0",
             "radio-groupPenal": "1",

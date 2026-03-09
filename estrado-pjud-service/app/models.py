@@ -1,10 +1,19 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class SearchRequest(BaseModel):
     case_type: str  # "rol" | "rit" | "ruc"
     case_number: str  # "X-NNNN-YYYY"
-    competencia: str  # "civil" | "laboral" | "cobranza"
+    competencia: str  # "suprema" | "apelaciones" | "civil" | "laboral" | "penal" | "cobranza"
+    corte: int | None = None  # only valid when competencia == "apelaciones"
+
+    @model_validator(mode="after")
+    def _validate_corte(self):
+        if self.corte is not None and self.competencia != "apelaciones":
+            raise ValueError("corte is only valid when competencia is 'apelaciones'")
+        if self.competencia == "apelaciones" and self.corte is None:
+            self.corte = 0
+        return self
 
 
 class CandidateMatch(BaseModel):

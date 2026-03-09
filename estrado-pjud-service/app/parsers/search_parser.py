@@ -119,6 +119,11 @@ _ROW_PARSERS = {
     "civil": _parse_civil_row,
     "laboral": _parse_laboral_row,
     "cobranza": _parse_cobranza_row,
+    # TODO(spike): Replace with dedicated parsers after reviewing HTML fixtures
+    # from scripts/pjud-spike/fase0b_nuevas_competencias.py
+    "suprema": _parse_civil_row,
+    "apelaciones": _parse_civil_row,
+    "penal": _parse_civil_row,
 }
 
 
@@ -130,7 +135,8 @@ def parse_search_results(html: str, competencia: str) -> list[dict]:
     html:
         Raw HTML string returned by the PJUD search endpoint.
     competencia:
-        One of ``"civil"``, ``"laboral"``, ``"cobranza"`` (case-insensitive).
+        One of ``"suprema"``, ``"apelaciones"``, ``"civil"``, ``"laboral"``,
+        ``"penal"``, ``"cobranza"`` (case-insensitive).
 
     Returns
     -------

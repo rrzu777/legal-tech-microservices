@@ -15,6 +15,9 @@ MATTER_TO_COMPETENCIA = {
     "civil": "civil",
     "laboral": "laboral",
     "cobranza": "cobranza",
+    "suprema": "suprema",
+    "apelaciones": "apelaciones",
+    "penal": "penal",
 }
 
 SYNC_INTERVALS_HOURS = {
@@ -165,6 +168,8 @@ class SyncEngine:
                 "conTipoCausa": parsed["tipo"],
                 "conRolCausa": parsed["numero"],
                 "conEraCausa": parsed["anno"],
+                # TODO(spike): For apelaciones, determine corte from case record
+                # (e.g. case["external_payload"]["corte"] or a new DB field)
                 "conCorte": "",
                 "conTribunal": "",
                 "conTipoBusApe": "",
