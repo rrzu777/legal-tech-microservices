@@ -1,13 +1,13 @@
 Status Code: 200
 Encoding: utf-8
 Content-Type: text/html; charset=UTF-8
-Set-Cookie: PHPSESSID=14a823b04395957be14187c46a50b786; path=/, TS01262d1d=01b485afe55f43c4b5f3d34062cd369b04501cb02396cc6f68d6aa2109ed078fe41fcf05eebd4009235b0498b14655a487dd2fb1ab34f3be8904b12412caa560c73e6b8f83; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
+Set-Cookie: PHPSESSID=7dc675b9c5fcac5fcdeb25a7d9b18334; path=/, TS01262d1d=01b485afe54af0127cef142930dc4517631ba92d65b59161aa80daf66949751a416a73425ce3b3c8de53fccc6e0d6f95979fc2e2b6323c132fdc0b37c46495d0f91eb14852; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
 
 All Headers:
-date: Mon, 09 Mar 2026 21:34:43 GMT
+date: Mon, 09 Mar 2026 21:54:00 GMT
 x-frame-options: SAMEORIGIN
 x-xss-protection: 1; mode=block
-set-cookie: PHPSESSID=14a823b04395957be14187c46a50b786; path=/, TS01262d1d=01b485afe55f43c4b5f3d34062cd369b04501cb02396cc6f68d6aa2109ed078fe41fcf05eebd4009235b0498b14655a487dd2fb1ab34f3be8904b12412caa560c73e6b8f83; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
+set-cookie: PHPSESSID=7dc675b9c5fcac5fcdeb25a7d9b18334; path=/, TS01262d1d=01b485afe54af0127cef142930dc4517631ba92d65b59161aa80daf66949751a416a73425ce3b3c8de53fccc6e0d6f95979fc2e2b6323c132fdc0b37c46495d0f91eb14852; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
 expires: Thu, 19 Nov 1981 08:52:00 GMT
 cache-control: no-store, no-cache, must-revalidate
 pragma: no-cache

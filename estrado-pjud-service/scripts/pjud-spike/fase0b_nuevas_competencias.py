@@ -18,14 +18,14 @@ OJV_BASE = "https://oficinajudicialvirtual.pjud.cl"
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Casos de prueba CONOCIDOS (basados en fixtures existentes)
-# NOTA: Estos son ejemplos - necesitamos encontrar ROLs reales para cada competencia
+# Casos de prueba REALES (encontrados en búsquedas públicas)
+# Fuentes: diarioconstitucional.cl, pjud.cl, bcn.cl, refworld.org
 TEST_CASES = {
     "suprema": {
         "search_params": {
             "competencia": "suprema",
             "case_type": "rol",
-            "case_number": "C-100-2024"  # Caso genérico - puede no existir
+            "case_number": "C-26903-2025"  # Caso real: Fundación Orden vs Municipalidad de Santiago
         },
         "search_endpoint": "/ADIR_871/suprema/consultaRitSuprema.php",
         "detail_endpoint": "/ADIR_871/suprema/modal/causaSuprema.php",
@@ -46,7 +46,7 @@ TEST_CASES = {
         "search_params": {
             "competencia": "penal",
             "case_type": "rit",
-            "case_number": "T-100-2024"  # RIT genérico
+            "case_number": "T-12141-2024"  # Caso real: RUC 2401510892-0 (Corte Suprema 2025)
         },
         "search_endpoint": "/ADIR_871/penal/consultaRitPenal.php",
         "detail_endpoint": "/ADIR_871/penal/modal/causaPenal.php",
