@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_MS: int = 2500
     LOG_LEVEL: str = "INFO"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 @lru_cache

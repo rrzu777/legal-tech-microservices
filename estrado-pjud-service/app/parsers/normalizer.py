@@ -4,8 +4,22 @@ _IDENTIFIER_RE = re.compile(r"^([A-Za-z])-(\d+)-(\d{4})$")
 _DATE_DMY_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_COMPETENCIA_CODES = {"civil": 3, "laboral": 4, "cobranza": 6}
-_COMPETENCIA_PATHS = {"civil": "civil", "laboral": "laboral", "cobranza": "cobranza"}
+_COMPETENCIA_CODES = {
+    "suprema": 1,
+    "apelaciones": 2,
+    "civil": 3,
+    "laboral": 4,
+    "penal": 5,
+    "cobranza": 6,
+}
+_COMPETENCIA_PATHS = {
+    "suprema": "suprema",
+    "apelaciones": "apelaciones",
+    "civil": "civil",
+    "laboral": "laboral",
+    "penal": "penal",
+    "cobranza": "cobranza",
+}
 
 
 def parse_case_identifier(raw: str) -> dict[str, str]:

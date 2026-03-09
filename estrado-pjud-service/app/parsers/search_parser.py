@@ -8,6 +8,22 @@ from bs4 import BeautifulSoup
 
 from app.parsers.normalizer import normalize_date
 
+
+class AuthenticationRequired(Exception):
+    """Raised when OJV requires authentication for a competencia."""
+    pass
+
+
+class NoResultsFound(Exception):
+    """Raised when OJV returns no results for a search."""
+    pass
+
+
+def detect_auth_redirect(html: str) -> bool:
+    """Detect if OJV redirected to index (auth required or ROL not found)."""
+    return 'parent.window.open' in html or 'index.php' in html
+
+
 # Matches detalleCausaCivil('eyJ...'), detalleCausaLaboral('eyJ...'), etc.
 _JWT_RE = re.compile(
     r"detalleCausa\w+\('(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)'\)"
@@ -139,6 +155,12 @@ def parse_search_results(html: str, competencia: str) -> list[dict]:
         ``caratulado``, ``fecha_ingreso``.
     """
     comp = competencia.lower()
+
+    if detect_auth_redirect(html):
+        raise AuthenticationRequired(
+            f"OJV requires authentication for competencia={competencia!r}"
+        )
+
     row_parser = _ROW_PARSERS.get(comp)
     if row_parser is None:
         raise ValueError(f"Unknown competencia: {competencia!r}")

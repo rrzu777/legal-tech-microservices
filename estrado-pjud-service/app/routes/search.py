@@ -8,7 +8,12 @@ from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.session import OJVSession
 from app.parsers.normalizer import parse_case_identifier, competencia_code, competencia_path
-from app.parsers.search_parser import parse_search_results, detect_blocked
+from app.parsers.search_parser import (
+    parse_search_results,
+    detect_blocked,
+    detect_auth_redirect,
+    AuthenticationRequired,
+)
 from app.routes.health import record_successful_request
 
 logger = logging.getLogger(__name__)
@@ -33,7 +38,7 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "g-recaptcha-response-rit": "",
             "action": "validate_captcha_rit",
             "competencia": str(comp_code),
-            "conCorte": "0",
+            "conCorte": str(req.corte) if req.competencia == "apelaciones" else "0",
             "conTribunal": "0",
             "conTipoBusApe": "0",
             "radio-groupPenal": "1",
@@ -54,6 +59,12 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
+            )
+
+        if detect_auth_redirect(html):
+            return SearchResponse(
+                found=False, match_count=0, matches=[], blocked=True,
+                error="Authentication required - OJV session expired",
             )
 
         raw_matches = parse_search_results(html, req.competencia)

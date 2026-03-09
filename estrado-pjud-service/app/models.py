@@ -4,7 +4,8 @@ from pydantic import BaseModel
 class SearchRequest(BaseModel):
     case_type: str  # "rol" | "rit" | "ruc"
     case_number: str  # "X-NNNN-YYYY"
-    competencia: str  # "civil" | "laboral" | "cobranza"
+    competencia: str  # "civil" | "laboral" | "cobranza" | "suprema" | "apelaciones" | "penal"
+    corte: int = 0  # codigo de corte para apelaciones (0 = todas las cortes)
 
 
 class CandidateMatch(BaseModel):
