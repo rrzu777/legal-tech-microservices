@@ -1,0 +1,21 @@
+Status Code: 200
+Encoding: utf-8
+Content-Type: text/html; charset=UTF-8
+Set-Cookie: PHPSESSID=5c28fc659d2333641294beb38092051e; path=/, TS01262d1d=01b485afe5e8d20a14d924559901f611b1eb12c6ca3b2dee750c9dc581afbdd707cb8b4951cba2afb5ad56cae35d16d150cf5225a325acf5c54f9f823155f5e81d6237e1a5; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
+
+All Headers:
+date: Mon, 09 Mar 2026 21:30:37 GMT
+x-frame-options: SAMEORIGIN
+x-xss-protection: 1; mode=block
+set-cookie: PHPSESSID=5c28fc659d2333641294beb38092051e; path=/, TS01262d1d=01b485afe5e8d20a14d924559901f611b1eb12c6ca3b2dee750c9dc581afbdd707cb8b4951cba2afb5ad56cae35d16d150cf5225a325acf5c54f9f823155f5e81d6237e1a5; Path=/; Domain=.oficinajudicialvirtual.pjud.cl
+expires: Thu, 19 Nov 1981 08:52:00 GMT
+cache-control: no-store, no-cache, must-revalidate
+pragma: no-cache
+content-security-policy: frame-ancestors *.pjud.cl causas.3ta.cl causas.1ta.cl;
+x-content-type-options: nosniff
+strict-transport-security: max-age=31536000
+referrer-policy: no-referrer-when-downgrade
+permissions-policy: geolocation=self
+content-length: 70
+connection: close
+content-type: text/html; charset=UTF-8

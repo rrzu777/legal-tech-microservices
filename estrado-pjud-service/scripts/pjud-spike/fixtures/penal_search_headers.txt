@@ -1,0 +1,20 @@
+Status Code: 200
+Encoding: utf-8
+Content-Type: text/html; charset=UTF-8
+Set-Cookie: N/A
+
+All Headers:
+date: Mon, 09 Mar 2026 21:30:39 GMT
+x-frame-options: SAMEORIGIN
+x-xss-protection: 1; mode=block
+expires: Thu, 19 Nov 1981 08:52:00 GMT
+cache-control: no-store, no-cache, must-revalidate
+pragma: no-cache
+content-security-policy: frame-ancestors *.pjud.cl causas.3ta.cl causas.1ta.cl;
+x-content-type-options: nosniff
+strict-transport-security: max-age=31536000
+referrer-policy: no-referrer-when-downgrade
+permissions-policy: geolocation=self
+content-length: 70
+connection: close
+content-type: text/html; charset=UTF-8
