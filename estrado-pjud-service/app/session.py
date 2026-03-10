@@ -31,7 +31,7 @@ def _decode(resp: httpx.Response) -> str:
 
 _AJAX_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://oficinajudicialvirtual.pjud.cl/indexN.php",
+    "Referer": "https://oficinajudicialvirtual.pjud.cl/consultaUnificada.php",
 }
 
 
