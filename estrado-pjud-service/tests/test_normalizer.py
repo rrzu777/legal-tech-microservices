@@ -29,6 +29,14 @@ class TestParseCaseIdentifier:
         with pytest.raises(ValueError, match="Invalid case identifier"):
             parse_case_identifier("C-1234")
 
+    def test_multi_char_tipo(self):
+        result = parse_case_identifier("Proteccion-4490-2025")
+        assert result == {"tipo": "PROTECCION", "numero": "4490", "anno": "2025"}
+
+    def test_number_only_suprema(self):
+        result = parse_case_identifier("100-2025")
+        assert result == {"tipo": "", "numero": "100", "anno": "2025"}
+
 
 class TestNormalizeDate:
     def test_dd_mm_yyyy(self):
@@ -57,9 +65,18 @@ class TestCompetenciaCodes:
     def test_cobranza(self):
         assert competencia_code("cobranza") == 6
 
+    def test_suprema(self):
+        assert competencia_code("suprema") == 1
+
+    def test_apelaciones(self):
+        assert competencia_code("apelaciones") == 2
+
+    def test_penal(self):
+        assert competencia_code("penal") == 5
+
     def test_unknown(self):
         with pytest.raises(ValueError):
-            competencia_code("penal")
+            competencia_code("familia")
 
 
 class TestCompetenciaPath:
@@ -71,3 +88,12 @@ class TestCompetenciaPath:
 
     def test_cobranza(self):
         assert competencia_path("cobranza") == "cobranza"
+
+    def test_suprema(self):
+        assert competencia_path("suprema") == "suprema"
+
+    def test_apelaciones(self):
+        assert competencia_path("apelaciones") == "apelaciones"
+
+    def test_penal(self):
+        assert competencia_path("penal") == "penal"

@@ -60,6 +60,96 @@ class TestParseDetailCivil:
         assert "nombre" in lig
 
 
+class TestParseDetailSuprema:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Suprema_100_2025.html")
+        return parse_detail(html)
+
+    def test_movements_found(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_has_fields(self, result):
+        mov = result["movements"][0]
+        assert "folio" in mov
+        assert "tramite" in mov
+        assert "fecha" in mov
+
+    def test_litigantes_found(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_litigante_has_fields(self, result):
+        lig = result["litigantes"][0]
+        assert "rut" in lig
+        assert "nombre" in lig
+
+    def test_metadata_has_rol(self, result):
+        assert result["metadata"]["rol"]
+
+    def test_metadata_has_estado_procesal(self, result):
+        assert result["metadata"]["estado_procesal"]
+
+
+class TestParseDetailApelaciones:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        return parse_detail(html)
+
+    def test_movements_found(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_has_tramite(self, result):
+        tramites = [m["tramite"] for m in result["movements"]]
+        assert any(t for t in tramites)  # at least one non-empty
+
+    def test_litigantes_found(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_metadata_has_rol(self, result):
+        assert result["metadata"]["rol"]
+
+    def test_metadata_has_estado_procesal(self, result):
+        assert result["metadata"]["estado_procesal"]
+
+    def test_metadata_has_tribunal(self, result):
+        assert result["metadata"]["tribunal"]
+
+
+class TestParseDetailPenal:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Penal_O_100_2025.html")
+        return parse_detail(html)
+
+    def test_metadata_has_rit(self, result):
+        assert "O-100-2025" in result["metadata"]["rol"]
+
+    def test_metadata_has_ruc(self, result):
+        assert result["metadata"]["ruc"]
+        assert "2500100001-5" in result["metadata"]["ruc"]
+
+    def test_movements_not_empty(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_fields(self, result):
+        for mov in result["movements"]:
+            assert "folio" in mov
+            assert "etapa" in mov
+            assert "tramite" in mov
+            assert "descripcion" in mov
+            assert "fecha" in mov
+
+    def test_intervinientes_not_empty(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_interviniente_fields(self, result):
+        for lig in result["litigantes"]:
+            assert "rol" in lig
+            assert "rut" in lig
+            assert "nombre" in lig
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")

@@ -33,11 +33,10 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "g-recaptcha-response-rit": "",
             "action": "validate_captcha_rit",
             "competencia": str(comp_code),
-            "conCorte": "0",
+            "conCorte": str(req.corte) if req.competencia == "apelaciones" else "0",
             "conTribunal": "0",
             "conTipoBusApe": "0",
             "radio-groupPenal": "1",
-            "conTipoCausa": parsed["tipo"],
             "radio-group": "1",
             "conRolCausa": parsed["numero"],
             "conEraCausa": parsed["anno"],
@@ -47,6 +46,17 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "rucPen2": "",
             "conCaratulado": "",
         }
+
+        if req.competencia == "suprema":
+            form_data["conTipoBus"] = "0"
+        elif req.competencia == "penal":
+            # Penal uses RIT/RUC instead of ROL.  radio-groupPenal=1 selects
+            # RIT mode (tipo + numero + anno).  RUC search would use
+            # radio-groupPenal=2 with rucPen1/rucPen2 fields instead.
+            form_data["radio-groupPenal"] = "1"  # RIT mode
+            form_data["conTipoCausa"] = parsed["tipo"]
+        else:
+            form_data["conTipoCausa"] = parsed["tipo"]
 
         html = await session.search(comp_path, form_data)
 

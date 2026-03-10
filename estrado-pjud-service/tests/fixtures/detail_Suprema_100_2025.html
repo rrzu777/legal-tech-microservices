@@ -1,0 +1,444 @@
+<script>
+$(document).ready(function(){
+//---- TOOLTIPS DEL ROL -----	
+	$(".topToolNom").tooltip({ placement: "bottom" });
+//----------------------------------------------
+});
+</script>
+
+<!--[if IE]>
+<style>
+    .panel-default {
+         margin-top: 30px;
+    }
+</style>
+<![endif]-->
+	<div class="modal-dialog modal-lg">
+      <!-- Modal content-->
+		<div class="modal-content">
+			<div class="modal-header">
+							<button type="button" class="close" data-dismiss="modal">&times;</button>
+							<h4 class="modal-title" style="color:#337ab7;">Detalle Causa Suprema</h4>
+			</div>
+		
+			<div class="modal-body">
+			
+				<div class="panel with-nav-tabs">
+				
+					<div class="panel-heading">
+						<ul class="nav nav-tabs" style="display:inline-block">
+							<li class="active"><a data-toggle="tab" href="#corteSuprema">Corte Suprema</a></li>
+							<li><a data-toggle="tab" href="#corteApelaciones">Expediente Corte Apelaciones</a></li>
+							<li><a data-toggle="tab" href="#primeraInstancia">Expediente Primera Instancia</a></li>
+						</ul>
+					</div>			
+				
+				
+					<div class="tab-content">
+				
+				
+						<div class="tab-pane fade in active" id="corteSuprema"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								<table class="table table-responsive table-titulos">
+									<tbody>
+										<tr>
+												<td><strong>Libro :</strong> Criminal / 100 - 2025</td>
+												<td><strong>Fecha :</strong> 02/01/2025</td>
+												<td colspan="2"><strong>Caratulado:</strong> PARDO AVILA CRISTOBAL/COMISIÓN DE LIBERTAD CONDICIONAL - DIRECCIÓN REGIONAL METROPOLITANA DE GENDARMERÍA DE CHILE</td>
+										</tr>
+										<tr>
+												<td><strong>Estado Procesal:</strong> Fallada</td>
+												<td><strong>Ubicaci&oacute;n:</strong> Fallado y devuelto Interconexion</td>
+												<td colspan="2"><strong>Tipo:</strong> (Crimen) Apelación Amparo</td>
+										</tr>
+									</tbody>
+								</table>
+										
+								<table class="table table-responsive table-titulos">
+									<tbody>
+										<tr>
+											<td>
+												<strong>Texto Recurso:</strong></br>
+												<a data-toggle="modal" href="#modalTextoSuprema" role="img" title="Texto Recurso" onClick="textoSuprema('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiMW50TDFGaUlxZ1hUaVhoc2dcL040ZFhscUJ6RHBqeTlHaklqY2RoaHorallOUzJMNzVVWHdLdVU5S3E4Nms3cUlUa3ZrVmRwR0hKRzZnekY5K1A5b1hPaEZhZnJHb3VjUFUraStNN3l2MTlnPSJ9.tL8i3ZSFri5EDYl3j2sKe5Jy9rrC97SdMukEEqLLOF0');"><i class="fa fa-folder fa-lg" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+											</td>
+											<td>
+												<strong>Tomo:</strong></br>
+												<a data-toggle="modal" href="#modalTomoSuprema" role="img" title="Tomo" onClick="tomoSuprema('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiMW50TDFGaUlxZ1hUaVhoc2dcL040ZFhscUJ6RHBqeTlHaklqY2RoaHorallOUzJMNzVVWHdLdVU5S3E4Nms3cUlcLytDeDdyT2FPOXc2M3p5MUthZFJxYW11d2FIXC92UXUwXC9hS1hpd1VYYTJjPSJ9.cEbNpQHR0pJd9LxrLLidJaLbUEkw8u-tHYlLd733j_k');"><i class="fa fa-folder fa-lg" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+											</td>
+											<td>
+												<strong>Documentos:</strong></br>
+												<a data-toggle="modal" href="#modalDocumentosSuprema" role="img" title="Documentos" onClick="documentosSuprema('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiMW50TDFGaUlxZ1hUaVhoc2dcL040ZFhscUJ6RHBqeTlHaklqY2RoaHorallOUzJMNzVVWHdLdVU5S3E4Nms3cUlcLytDeDdyT2FPOXc2M3p5MUthZFJxYW11d2FIXC92UXUwXC9hS1hpd1VYYTJjPSJ9.cEbNpQHR0pJd9LxrLLidJaLbUEkw8u-tHYlLd733j_k');"><i class="fa fa-folder fa-lg" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+											</td>
+											<td>
+											  <!-- Bloque boton Certificado -->
+						
+												<strong>Certificado de Env&iacute;o:</strong></br>
+												<i class="fa fa-ban fa-lg" aria-hidden="true" style="color:#660000; cursor:no-drop;"></i>
+								<!-- Fin Bloque boton Certificado -->
+											</td>
+											
+											<!-- INICIO EBOOK -->
+											<td id="contenedorEbook">
+																							<strong>Ebook:</strong>
+													<form name="form" action="ADIR_871/suprema/documentos/newebooksuprema.php" method="get" target="_blank">
+														<input type='hidden' name='dtaEbook' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiZDY5Y3BZZTRuXC9wNlRXVW5aU1BVMG1VT3pocUtiVWc5XC9QN2cxeXphTG13emM1OWo3eGYzVDM4d21wXC9iU3dkTXlzN3I4WjNRaUp4bFJRZHBKdkVadnZJSmwzSnN5TUFQZVdDNXE3UHFtcUk9In0.27vG-SsknrNdCge3LKVwh5i3LAAs3RBPMyVgDZgRUYs'>
+                            <a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Ebook">
+                              <i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+                            </a>
+													</form>
+												
+											</td>
+											<!-- FIN EBOOK -->
+											
+										</tr>
+									</tbody>
+								</table>
+							</div>
+								<div class="panel-heading">
+						<ul class="nav nav-tabs" style="display:inline-block">
+							<li class="active"><a data-toggle="tab" href="#movimientosSup">Movimientos</a></li>
+							<li><a data-toggle="tab" href="#litigantesSup">Litigantes</a></li>
+							<li><a data-toggle="tab" href="#agregadosSup">Agregados</a></li>
+							<li><a data-toggle="tab" href="#observacionSup">Observaci&oacute;n</a></li>
+						</ul>
+					</div>
+					
+					<div class="tab-content">
+						
+						<div class="tab-pane fade in active" id="movimientosSup"> <!-- INICIO PANEL -->
+						
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+									
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Folio</th>
+												<th>Doc.</th>
+												<th>Anexo</th>
+												<th>A&ntilde;o</th>
+												<th>Fecha Tr&aacute;mite</th>
+												<th>Tr&aacute;mite</th>
+												<th>Des. Tr&aacute;mite</th>
+                        <th>Correlativo</th>
+												<th>Salas</th>
+												<th>Estado</th>
+											</tr>												
+										</thead>
+										<tbody>
+												<tr>
+													<td>8</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf1">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSXlnYmNtOUx2eE0wVTE5XC96S3hqb3JKQ2xPVFZ6TVJTblVaWWRaZW1peUhLQnNSdlB1Z0hkdTV5dkFkRDN4eXVhYm10d1FMM0tCb1pYM0ZZWElPVXJra2N3alczRzVZRldmajFLcGE4R2FHeWJ4U1Q3R1JYYllPWkJRQ0V6Z0dDWHc9PSJ9.-FSkUAqotrp1tKOJmeLuevu2-PJkuT7VqZghECi5gxI'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>15/01/2025</td>
+													<td>Otro Tramite</td>
+													<td><span title="Nomenclaturas  :
+    1.CONSTANCIA DEVOLUCIÓN" class="topToolNom">CONSTANCIA DEVOLUCIÓN</span></td>
+                          <td>10474-2025</td>
+													<td>Unidad Ingreso</td>
+													<td>Bloqueado</td>
+												</tr>
+												<tr>
+													<td>7</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf2">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSThoQnVqbWcxOFwvS01VVDlzTnZ2Tk55SGluTUV3OXdXdHI5cG1SZnlqZFQxcEdHQ3I5cGpxTDJuenpUc1ArOXZBKzNwdmVcL2k0bSs4OVF2MG1PYWliU2JqSUNjdlhvRDZjbFZ4K3hLUUpIeXJBMExKeVY3WXNhYXlsaDUrc1VsZFVRPT0ifQ.haA7U7MO3wjqxouIFUXhzdgsq72oKOgG-rXX9T4b1VU'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>15/01/2025</td>
+													<td>Sentencia</td>
+													<td><span title="Nomenclaturas  :    1.CONFIRMA SENTENCIA APELADA" class="topToolNom">CONFIRMA SENTENCIA APELADA</span></td>
+                          <td>10008-2025</td>
+													<td>Segunda, PENAL</td>
+													<td>Bloqueado</td>
+												</tr>
+												<tr>
+													<td>6</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf3">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSTBQdXpraHVBUTYwM1JieDkrd0JvNTUzMW1GbUJhQ0Q5ZnZVS0F3ZFFEYW5NOUp2RnQrNG95Um5zTGNIUURDUDRlZjZ6OGpRcUIwYmlSQmw4RGg2ZWNXakR1YnFhSjMrc2owdkRlYlhGY1dQc3pValBXNDlXUDdYbEtXUmlSU28rZz09In0.c_Ra0NCu97a22jDjC2P6_7R4iZQCh_KunU-shNSzk_M'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>07/01/2025</td>
+													<td>Resolución</td>
+													<td><span title="Nomenclaturas  :    1.TÉNGASE PRESENTE" class="topToolNom">TÉNGASE PRESENTE AL DAR CUENTA.</span></td>
+                          <td>2586-2025</td>
+													<td>Cuenta (Secretaria)</td>
+													<td>Bloqueado</td>
+												</tr>
+												<tr>
+													<td>5</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf4">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSTNxOHgwS3BrcE12QXMwVWpvSElyYmo0bUxqSXAwYkNKVzYrUVlRUnlleWVLSkJVNXdoV1NEV0lrSktGM05zMXVxdld0UGg0c2FWRXUyeG5oNXRaWlRTbVA3eUtuUGppWUFyRUxWb1lFVzZHWjB0Ylg1RGd2NjVoWFwvZGRONmY2ZXc9PSJ9.0Btq0V-vQzl6t52Gx-jTIFDz6ZFIjHDAV_b_6Dv7vUA'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>06/01/2025</td>
+													<td>Escrito</td>
+													<td><span title="Abogado Recurrente" class="topToolNom">Se tenga presente</span></td>
+                          <td>1072-2025</td>
+													<td>Cuenta (Secretaria)</td>
+													<td>Proveído</td>
+												</tr>
+												<tr>
+													<td>4</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf5">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSTI5R09IclcwVjhOWEo1VmVFYW95WmhEYVZuS2VJREQ1Sm11WFlCN1owZTFURCtaZUhiVFNTenNYXC9hYVFlTGRIOXlaZnplZTM2UVNxV2RkcTFnQWZqY2k1NjdqSnFaZ0sweFh0U0k2XC8yelNKNnBcL3QwZFk5VjlZTjVZOWVEQ1piZz09In0.jX4hEhAm8r5yCvYqDKe4dMrZo4ZiH-a2RL9a3tMZqQw'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>03/01/2025</td>
+													<td>Resolución</td>
+													<td><span title="Nomenclaturas  :    1.DÉSE CUENTA APELACIÓN DE AMPARO" class="topToolNom">DÉSE CUENTA APELACIÓN DE AMPARO</span></td>
+                          <td>852-2025</td>
+													<td>Cuenta (Secretaria)</td>
+													<td>Bloqueado</td>
+												</tr>
+												<tr>
+													<td>2</td>
+													<td align="center">
+															<form name="frmPdf" action="ADIR_871/suprema/documentos/docCausaSuprema.php" method="get" target="pdf6">
+															
+															  <div>
+																<input type='hidden' id='valorFile' name='valorFile' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiSmMrWVhhN3RZS0E5ZHVNYnJMXC8rSTRybGcwZm9OV3JsTnN1RkVIZk1KcUliZ3hnWEZkUWdhWWlVdUtpV0d1aDNKYTJ4TEJtR3pPNHdVWk5OS1wvS0dRbVd6N2c1Wm53MDdybytQSUtrWENXMkRkRzJsYlZEZWFBSVFsXC9vc3pZdXg3aWdnTnEzTkxPUnorcU42dG8xb2ZnPT0ifQ.DEfoTOZrICyhUJo8WW4fOhtgcxvjDPyaCYUJCNtyTrU'>
+                                									<a href="#" onClick='$(this).closest("form").submit();' role="img" title="Descargar Documento"><i class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i></a>
+															  </div>
+															</form>
+													</td>													
+													<td align="center">
+													
+													</td>													
+													<td>2025</td>
+													<td>02/01/2025</td>
+													<td>Otro Tramite</td>
+													<td><span title="Nomenclaturas  :    1.CERTIFICACIÓN (EN EL MISMO EXPEDIENTE)" class="topToolNom">CERTIFICADO DE INGRESO</span></td>
+                          <td>529-2025</td>
+													<td>Unidad Ingreso</td>
+													<td>Bloqueado</td>
+												</tr>
+										 
+										</tbody>
+									</table>
+
+								</div>
+							</div>
+
+						</div> <!-- FIN PANEL -->
+
+
+						<div class="tab-pane fade" id="litigantesSup"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+							
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Sujeto</th>
+												<th>Rut</th>
+												<th>Persona</th>
+												<th>Nombre o Raz&oacute;n Social</th>
+											</tr>												
+										</thead>
+										<tbody>
+											<tr>			
+												<td>ABG. RECURRENTE</td>				
+												<td>17258810-7</td>
+												<td>Natural                       </td>
+												<td>ANDRÉS MATÍAS DELGADO GONZÁLEZ</td>				
+												
+											</tr>
+											<tr>			
+												<td>Ampdo.</td>				
+												<td>18116065-9</td>
+												<td>Natural                       </td>
+												<td>CRISTÓBAL ALEJANDRO PARDO ÁVILA</td>				
+												
+											</tr>
+											<tr>			
+												<td>RECURRENTE</td>				
+												<td>18116065-9</td>
+												<td>Natural                       </td>
+												<td>CRISTÓBAL ALEJANDRO PARDO ÁVILA</td>				
+												
+											</tr>
+											<tr>			
+												<td>RECURRIDO</td>				
+												<td>61004000-4</td>
+												<td>Jurídica                      </td>
+												<td>GENDARMERÍA DE CHILE, DIRECCIÓN NACIONAL  </td>				
+												
+											</tr>
+											<tr>			
+												<td>RECURRIDO</td>				
+												<td>0-0</td>
+												<td>Jurídica                      </td>
+												<td>COMISION LIBERTAD CONDICIONAL  </td>				
+												
+											</tr>
+										</tbody>
+									</table>
+										
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+
+						<div class="tab-pane fade" id="agregadosSup"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Doc.</th>
+												<th>Folio</th>
+												<th>A&ntilde;o</th>
+												<th>Rit Causa</th>
+												<th>Tribunal</th>
+												<th>Materia</th>
+												<th>Caratulado</th>
+											</tr>												
+										</thead>
+										<tbody>
+										</tbody>
+									</table>
+												
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+						
+						
+						<div class="tab-pane fade" id="observacionSup"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								<div class="container-fluid" style="background-color:#F9F9F9; padding:15px;">
+								
+									<div class="row">
+										<div class="col-sm-12">
+										<strong>Tomo Principal:</strong><br>
+										 Nº: 0001    -     Foja Inicial   : 0    -     Foja Final  : 0										</div>
+									</div>
+									<br>
+									<div class="row">
+										<div class="col-sm-12">
+											<strong>Naturaleza del Recurso:</strong><br>
+											 NATURALEZA: Comisión de Libertad Condicional<br>SALA      : Segunda, PENAL<br>MATERIA   : SIN MATERIA										</div>
+									</div>
+									<br>
+									<div class="row">
+										<div class="col-sm-6">
+											<strong>Tr&aacute;mites: </strong>5										</div>
+										<div class="col-sm-6">
+											<strong>Escritos: </strong>1										</div>
+									</div>
+									<br>
+									<div class="row">
+										<div class="col-md-10">
+											<strong>Abogado Suspendido: </strong><br>
+																					</div>
+									</div>
+									<br>
+									<div class="row">
+										<div class="col-sm-6">
+											<strong>Tabla: </strong>--										</div>
+										<div class="col-sm-6">
+											<strong>N&uacute;mero de Oficio: </strong>0-0										</div>
+									</div>
+									<div class="row">
+									</div>
+
+								</div>
+							</div>
+						</div> <!-- FIN PANEL -->
+
+					</div>
+					
+						</div> <!-- FIN PANEL -->
+					
+										
+						<div class="tab-pane fade" id="corteApelaciones"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								<center><div id="capelaMsj" style="display:none;" class="alert alert-danger" role="alert"><strong>No Existen Registros.</strong></div></center>
+								<table class="table table-responsive table-titulos">
+									<tbody>
+										<tr>
+											<td><strong>Corte: </strong> C.A. DE SANTIAGO              </td>
+											<td><strong>Libro: </strong> Amparo</td>
+										</tr>
+										<tr>
+											<td><strong>Rol Ing: </strong> 3416 - 2024																							<a data-toggle="modal" role="img" title="Detalle Causa" href="#modalDetalleApelaciones" onClick="detalleCausaApelaciones('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3MzEwNDE3MSwiZXhwIjoxNzczMTA3NzcxLCJkYXRhIjoiUkFyNVNOcmhoYjdMSFB0ZlZLT002RkFcLzlYeUw0UTJyY3Bxb2hzQmJ4VGVNblBNeWpzXC9DUVlYV1VIT2hnRlVJSTN1WHNheFQ2ODJWeXFKTjJrbkFxRmpVY0l5eHg4dVlcL29WbU1yT3QwdnhTWEF4aEc4OHRVYWVKM25qa25KYnMifQ.V1AUXhI8Suk3Aau_eWf-9YedTW6qkPljB659VyWSagM');"><i class="fa fa-search fa-lg" aria-hidden="true" style="cursor:pointer; color:#337ab7"></i></a>
+											</td>
+										
+											<td><strong>Recurso: </strong> (Crimen) Apelación Amparo</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+						</div> <!-- FIN PANEL -->
+					
+						<div class="tab-pane fade" id="primeraInstancia"> <!-- INICIO PANEL -->
+							<div class="panel panel-default">
+								<center><div id="primInstaMsj" style="display:none;" class="alert alert-danger" role="alert" title=""><strong>Expediente reservado</strong></div></center>
+															</div>
+						</div> <!-- FIN PANEL -->
+					
+					
+					</div>
+
+					
+				
+				</div>
+				
+			</div>
+			
+        
+			<div class="modal-footer">
+							<button type="button" class="btn btn-default" data-dismiss="modal">Cerrar</button>
+						</div>
+			
+		</div>
+	</div>

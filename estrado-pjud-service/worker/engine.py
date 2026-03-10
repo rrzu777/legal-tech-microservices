@@ -15,6 +15,9 @@ MATTER_TO_COMPETENCIA = {
     "civil": "civil",
     "laboral": "laboral",
     "cobranza": "cobranza",
+    "suprema": "suprema",
+    "apelaciones": "apelaciones",
+    "penal": "penal",
 }
 
 SYNC_INTERVALS_HOURS = {
@@ -159,13 +162,25 @@ class SyncEngine:
             await self._pool.enforce_global_rate_limit()
 
             # Build search form data (mirrors routes/search.py)
+            # For apelaciones, read corte from the case's external_payload.
+            # Falls back to empty string if not available (searches all cortes).
+            corte_value = ""
+            if competencia == "apelaciones":
+                corte_value = str(
+                    case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
+                )
+                if not corte_value:
+                    logger.warning(
+                        "No corte in external_payload for apelaciones case %s; searching all cortes",
+                        case.get("case_number", case["id"]),
+                    )
+
             form_data = {
                 "action": "search",
                 "competencia": competencia,
-                "conTipoCausa": parsed["tipo"],
                 "conRolCausa": parsed["numero"],
                 "conEraCausa": parsed["anno"],
-                "conCorte": "",
+                "conCorte": corte_value,
                 "conTribunal": "",
                 "conTipoBusApe": "",
                 "radio-groupPenal": "",
@@ -177,6 +192,11 @@ class SyncEngine:
                 "conCaratulado": "",
                 "g-recaptcha-response-rit": "",
             }
+
+            if competencia == "suprema":
+                form_data["conTipoBus"] = "0"
+            else:
+                form_data["conTipoCausa"] = parsed["tipo"]
 
             # Search
             search_result = await search_pjud_via_session(

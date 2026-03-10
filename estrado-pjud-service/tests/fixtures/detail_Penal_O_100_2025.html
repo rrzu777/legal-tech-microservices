@@ -1,0 +1,172 @@
+<script>
+$(document).ready(function(){
+	$(".topTool").tooltip({ placement: "right" });
+	$(".topToolNom").tooltip({ placement: "bottom" });
+});
+</script>
+	<div class="modal-dialog modal-lg">
+      <!-- Modal content-->
+		<div class="modal-content">
+			<div class="modal-header">
+				<button type="button" class="close" data-dismiss="modal">&times;</button>
+				<h4 class="modal-title" style="color:#337ab7;">Detalle Causa Penal</h4>
+			</div>
+
+			<div class="modal-body">
+
+				<div class="panel with-nav-tabs">
+
+					<div class="panel panel-default">
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td><strong>RIT:</strong> O-100-2025</td>
+									<td><strong>RUC:</strong> 2500100001-5</td>
+									<td colspan="2"><strong>F. Ing.:</strong> 15/01/2025</td>
+								</tr>
+								<tr>
+									<td><strong>Tribunal:</strong> 4&ordm; Juzgado de Garant&iacute;a de Santiago</td>
+									<td><strong>Estado Proc.:</strong> Vigente</td>
+									<td colspan="2"><strong>Proc.:</strong> Procedimiento Simplificado</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+
+					<div class="panel-heading">
+						<ul class="nav nav-tabs" style="display:inline-block">
+							<li class="active"><a data-toggle="tab" href="#historiaPen">Historia</a></li>
+							<li><a data-toggle="tab" href="#intervinientesPen">Intervinientes</a></li>
+						</ul>
+					</div>
+
+					<div class="tab-content">
+
+						<div class="tab-pane fade in active" id="historiaPen">
+
+							<div class="panel panel-default">
+
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Folio</th>
+												<th>Doc.</th>
+												<th>Anexo</th>
+												<th>Etapa</th>
+												<th>Tr&aacute;mite</th>
+												<th>Desc. Tr&aacute;mite</th>
+												<th>Fec. Tr&aacute;mite</th>
+												<th>Foja</th>
+												<th>Georref.</th>
+											</tr>
+										</thead>
+										<tbody>
+											<tr>
+												<td>3</td>
+												<td align="left">
+													<form name="form" action="ADIR_871/penal/documentos/docuS.php" method="get" target="p1">
+														<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRhIjoicGVuYWxfZG9jXzMifQ.test_sig'>
+														<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+															<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+														</a>
+													</form>
+												</td>
+												<td align="center"></td>
+												<td>Audiencia de Control de Detenci&oacute;n</td>
+												<td>Resoluci&oacute;n</td>
+												<td>Se decreta prisi&oacute;n preventiva</td>
+												<td>20/01/2025</td>
+												<td>3</td>
+												<td align="center"></td>
+											</tr>
+											<tr>
+												<td>2</td>
+												<td align="left">
+													<form name="form" action="ADIR_871/penal/documentos/docuS.php" method="get" target="p2">
+														<input type='hidden' name='dtaDoc' value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRhIjoicGVuYWxfZG9jXzIifQ.test_sig'>
+														<a href="#" onClick='$(this).closest("form").submit();' title="Descargar Documento" role="img">
+															<i title="Descargar Documento" class="fa fa-file-pdf-o fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;" ></i>
+														</a>
+													</form>
+												</td>
+												<td align="center"></td>
+												<td>Audiencia de Formalizaci&oacute;n</td>
+												<td>Resoluci&oacute;n</td>
+												<td>Se formaliza investigaci&oacute;n</td>
+												<td>18/01/2025</td>
+												<td>2</td>
+												<td align="center"></td>
+											</tr>
+											<tr>
+												<td>1</td>
+												<td align="left"></td>
+												<td align="center"></td>
+												<td>Ingreso</td>
+												<td>Escrito</td>
+												<td>Ingreso causa penal</td>
+												<td>15/01/2025</td>
+												<td>1</td>
+												<td align="center"></td>
+											</tr>
+										</tbody>
+									</table>
+
+								</div>
+							</div>
+
+						</div>
+
+						<div class="tab-pane fade" id="intervinientesPen">
+							<div class="panel panel-default">
+
+								<div class="table-responsive">
+
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Participante</th>
+												<th>Rut</th>
+												<th>Persona</th>
+												<th>Nombre o Raz&oacute;n Social</th>
+											</tr>
+										</thead>
+										<tbody>
+											<tr>
+												<td>IMPUTADO</td>
+												<td>12345678-9</td>
+												<td>NATURAL</td>
+												<td>GONZALEZ PEREZ JUAN CARLOS</td>
+											</tr>
+											<tr>
+												<td>FISCAL</td>
+												<td>98765432-1</td>
+												<td>NATURAL</td>
+												<td>RODRIGUEZ SILVA MARIA ELENA</td>
+											</tr>
+											<tr>
+												<td>DEFENSOR</td>
+												<td>11223344-5</td>
+												<td>NATURAL</td>
+												<td>MARTINEZ LOPEZ PEDRO ANTONIO</td>
+											</tr>
+										</tbody>
+									</table>
+
+								</div>
+							</div>
+						</div>
+
+					</div>
+
+				</div>
+
+			</div>
+
+			<div class="modal-footer">
+				<button type="button" class="btn btn-default" data-dismiss="modal">Cerrar</button>
+			</div>
+
+		</div>
+	</div>
