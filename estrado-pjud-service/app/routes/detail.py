@@ -16,24 +16,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["detail"])
 
 
-def _guess_competencia_from_jwt(jwt: str) -> str:
-    """Try to extract competencia from the JWT payload. Fallback to 'civil'."""
+_CODE_MAP = {1: "suprema", 2: "apelaciones", 3: "civil", 4: "laboral", 5: "penal", 6: "cobranza"}
+_VALID_COMPS = set(_CODE_MAP.values())
+
+
+def _guess_competencia_from_jwt(jwt: str) -> str | None:
+    """Try to extract competencia from the JWT payload. Returns None if not found."""
     try:
         payload = jwt.split(".")[1]
         # Add padding
         payload += "=" * (4 - len(payload) % 4)
         decoded = base64.urlsafe_b64decode(payload)
         data = json.loads(decoded)
-        comp = data.get("competencia", "").lower()
-        if comp in ("suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"):
+        logger.debug("JWT payload keys: %s", list(data.keys()))
+        comp = data.get("competencia", "").lower() if isinstance(data.get("competencia"), str) else ""
+        if comp in _VALID_COMPS:
             return comp
-        code = data.get("codCompetencia") or data.get("competencia")
-        code_map = {1: "suprema", 2: "apelaciones", 3: "civil", 4: "laboral", 5: "penal", 6: "cobranza"}
-        if isinstance(code, int) and code in code_map:
-            return code_map[code]
+        code = data.get("codCompetencia")
+        if isinstance(code, int) and code in _CODE_MAP:
+            return _CODE_MAP[code]
+        # Try numeric string
+        if isinstance(code, str) and code.isdigit() and int(code) in _CODE_MAP:
+            return _CODE_MAP[int(code)]
+        logger.warning("Could not extract competencia from JWT payload: %s", {k: v for k, v in data.items() if k in ("competencia", "codCompetencia", "codTipoCompetencia")})
     except Exception:
-        pass
-    return "civil"
+        logger.warning("Failed to decode JWT for competencia extraction")
+    return None
 
 
 @router.post("/detail", response_model=DetailResponse)
@@ -46,6 +54,14 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             comp = req.competencia
         else:
             comp = _guess_competencia_from_jwt(req.detail_key)
+            if comp:
+                logger.info("Inferred competencia=%s from JWT", comp)
+            else:
+                logger.error("competencia not provided and could not be inferred from JWT")
+                return DetailResponse(
+                    metadata={}, movements=[], litigantes=[], blocked=True,
+                    error="competencia is required (could not infer from JWT)",
+                )
 
         html = await session.detail(comp, req.detail_key)
 
