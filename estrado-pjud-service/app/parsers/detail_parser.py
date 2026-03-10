@@ -11,10 +11,10 @@ from app.parsers.normalizer import normalize_date
 _WS_RE = re.compile(r"\s+")
 
 # Div IDs for movements per competencia type
-_MOVEMENT_DIV_IDS = ["historiaCiv", "movimientosSup", "movimientosApe"]
+_MOVEMENT_DIV_IDS = ["historiaCiv", "movimientosSup", "movimientosApe", "historiaPen", "movimientosPen"]
 
-# Div IDs for litigantes per competencia type
-_LITIGANTE_DIV_IDS = ["litigantesCiv", "litigantesSup", "litigantesApe"]
+# Div IDs for litigantes/intervinientes per competencia type
+_LITIGANTE_DIV_IDS = ["litigantesCiv", "litigantesSup", "litigantesApe", "intervinientesPen", "litigantesPen"]
 
 
 def _clean(text: str | None) -> str:
@@ -75,8 +75,16 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
                 continue
 
             # ROL (civil/laboral/cobranza)
-            if td.find("strong", string=re.compile(r"ROL")):
+            if td.find("strong", string=re.compile(r"^ROL")):
                 metadata["rol"] = _extract_text_after_strong(td, "ROL:")
+
+            # RIT (penal) — maps to rol
+            if td.find("strong", string=re.compile(r"^RIT")):
+                metadata["rol"] = _extract_text_after_strong(td, "RIT:")
+
+            # RUC (penal)
+            if td.find("strong", string=re.compile(r"^RUC")):
+                metadata["ruc"] = _extract_text_after_strong(td, "RUC:")
 
             # Libro (suprema/apelaciones) — maps to rol
             if td.find("strong", string=re.compile(r"^Libro")):
@@ -268,6 +276,40 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
                     "descripcion": descripcion,
                     "fecha": fecha,
                     "foja": None,
+                    "documento_url": documento_url,
+                }
+            )
+
+        elif div_id in ("historiaPen", "movimientosPen"):
+            # Penal: Folio(0), Doc(1), Anexo(2), Etapa(3),
+            #        Tramite(4), Desc(5), Fecha(6), Foja(7)
+            # NOTE: This layout is inferred from civil patterns and may need
+            # adjustment once real penal HTML is available.
+            if len(tds) < 8:
+                continue
+            folio = _int_or_none(tds[0].get_text())
+            etapa = _clean(tds[3].get_text())
+            tramite = _clean(tds[4].get_text())
+            descripcion = _clean(tds[5].get_text())
+            fecha = _normalize_movement_date(_clean(tds[6].get_text()))
+            foja = _int_or_none(tds[7].get_text())
+
+            doc_form = tds[1].find("form")
+            documento_url = None
+            if doc_form:
+                action = doc_form.get("action", "")
+                if action:
+                    documento_url = action
+
+            movements.append(
+                {
+                    "folio": folio,
+                    "cuaderno": cuaderno,
+                    "etapa": etapa,
+                    "tramite": tramite,
+                    "descripcion": descripcion,
+                    "fecha": fecha,
+                    "foja": foja,
                     "documento_url": documento_url,
                 }
             )

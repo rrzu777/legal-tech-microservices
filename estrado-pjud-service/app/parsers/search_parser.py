@@ -179,14 +179,34 @@ def _parse_apelaciones_row(tr) -> dict | None:
 def _parse_penal_row(tr) -> dict | None:
     """Parse a Penal search-result row.
 
-    TODO(spike): Penal row parser not yet implemented.
-    - Penal uses RIT/RUC identifiers instead of ROL.
-    - The OJV penal search form uses `radio-groupPenal` and `rucPen1`/`rucPen2` fields.
-    - The column layout is expected to differ from civil (likely includes RIT, RUC,
-      tribunal, caratulado, fecha_ingreso, estado, but exact order is unknown).
-    - A real penal HTML fixture is needed to build this parser.
+    Column layout (7 <td>):
+        0: search icon with onClick="detalleCausaPenal('JWT')"
+        1: RIT (e.g. O-1234-2024)
+        2: tribunal
+        3: RUC (e.g. 2400100001-5)
+        4: caratulado
+        5: fecha_ingreso (DD/MM/YYYY)
+        6: estado
     """
-    raise NotImplementedError("Penal row parser not yet implemented — needs real HTML fixture")
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 7:
+        return None
+
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),  # RIT
+        "tribunal": _clean(tds[2].get_text()),
+        "caratulado": _clean(tds[4].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[5].get_text())),
+    }
 
 
 _ROW_PARSERS = {

@@ -116,6 +116,40 @@ class TestParseDetailApelaciones:
         assert result["metadata"]["tribunal"]
 
 
+class TestParseDetailPenal:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Penal_O_100_2025.html")
+        return parse_detail(html)
+
+    def test_metadata_has_rit(self, result):
+        assert "O-100-2025" in result["metadata"]["rol"]
+
+    def test_metadata_has_ruc(self, result):
+        assert result["metadata"]["ruc"]
+        assert "2500100001-5" in result["metadata"]["ruc"]
+
+    def test_movements_not_empty(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_fields(self, result):
+        for mov in result["movements"]:
+            assert "folio" in mov
+            assert "etapa" in mov
+            assert "tramite" in mov
+            assert "descripcion" in mov
+            assert "fecha" in mov
+
+    def test_intervinientes_not_empty(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_interviniente_fields(self, result):
+        for lig in result["litigantes"]:
+            assert "rol" in lig
+            assert "rut" in lig
+            assert "nombre" in lig
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")

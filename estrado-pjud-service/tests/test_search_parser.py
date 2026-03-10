@@ -111,10 +111,32 @@ class TestParseSearchApelaciones:
 
 
 class TestParseSearchPenal:
-    def test_penal_raises_not_implemented(self):
-        html = "<html><body><table><tr><td>data</td></tr></table></body></html>"
-        with pytest.raises(NotImplementedError, match="Penal row parser not yet implemented"):
-            parse_search_results(html, "penal")
+    @pytest.fixture
+    def html(self):
+        return _load("search_Penal_O_100_2025.html")
+
+    def test_returns_results(self, html):
+        results = parse_search_results(html, "penal")
+        assert isinstance(results, list)
+        assert len(results) == 1
+
+    def test_jwt_keys_present(self, html):
+        results = parse_search_results(html, "penal")
+        for m in results:
+            assert m["key"].startswith("eyJ")
+
+    def test_fields_present(self, html):
+        results = parse_search_results(html, "penal")
+        for m in results:
+            assert "key" in m and m["key"]
+            assert "rol" in m and m["rol"]
+            assert "tribunal" in m and m["tribunal"]
+            assert "caratulado" in m and m["caratulado"]
+            assert "fecha_ingreso" in m
+
+    def test_rol_is_rit(self, html):
+        results = parse_search_results(html, "penal")
+        assert results[0]["rol"] == "O-100-2025"
 
 
 class TestParseSearchNoResults:
