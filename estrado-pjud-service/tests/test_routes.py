@@ -188,6 +188,51 @@ class TestSearch:
         resp = client.post("/api/v1/search", json=payload, headers=bad_auth)
         assert resp.status_code == 401
 
+    def test_search_returns_blocked_on_timeout(self, client):
+        """Network timeout should return blocked=True so caller can retry."""
+        import httpx
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is True
+        assert body["error"] is not None
+
+    def test_search_returns_blocked_on_connect_error(self, client):
+        """Connection error should return blocked=True."""
+        import httpx
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is True
+
+    def test_search_non_network_error_not_blocked(self, client):
+        """Non-network exceptions should return blocked=False."""
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(side_effect=ValueError("parsing failed"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is False
+
 
 # ===================================================================
 # Detail
