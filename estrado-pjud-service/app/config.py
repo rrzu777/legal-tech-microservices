@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     SESSION_POOL_SIZE: int = 2
     SESSION_MAX_AGE_S: int = 1200
 
+    # Telegram alerts
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+    TELEGRAM_BLOCKED_RATE_THRESHOLD: float = 0.3
+    TELEGRAM_COOLDOWN_S: int = 300
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

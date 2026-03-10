@@ -127,7 +127,7 @@ class TestSearch:
         # Verify the mock was used correctly
         mock_pool.acquire.assert_awaited_once()
         mock_session.search.assert_awaited_once()
-        mock_pool.release.assert_awaited_once_with(mock_session)
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
 
     def test_search_laboral(self, client):
         """POST /api/v1/search with laboral competencia returns results."""
@@ -243,7 +243,7 @@ class TestDetail:
         # Verify mock usage
         mock_pool.acquire.assert_awaited_once()
         mock_session.detail.assert_awaited_once()
-        mock_pool.release.assert_awaited_once_with(mock_session)
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
 
     def test_detail_requires_auth(self, client):
         """POST /api/v1/detail without Authorization header returns 401."""
