@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 from bs4 import BeautifulSoup, Tag
 
@@ -283,9 +286,10 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
         elif div_id in ("historiaPen", "movimientosPen"):
             # Penal: Folio(0), Doc(1), Anexo(2), Etapa(3),
             #        Tramite(4), Desc(5), Fecha(6), Foja(7)
-            # NOTE: This layout is inferred from civil patterns and may need
-            # adjustment once real penal HTML is available.
+            # NOTE: column layout inferred from civil patterns — log warning if mismatch
             if len(tds) < 8:
+                if len(tds) >= 4:
+                    logger.warning("Penal movement row has %d cols (expected 8), skipping", len(tds))
                 continue
             folio = _int_or_none(tds[0].get_text())
             etapa = _clean(tds[3].get_text())

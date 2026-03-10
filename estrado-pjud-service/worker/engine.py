@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, date
 
+from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
@@ -163,7 +164,6 @@ class SyncEngine:
             session = await self._pool.acquire()
             await self._pool.enforce_global_rate_limit()
 
-            # Build search form data (mirrors routes/search.py)
             # For apelaciones, read corte from the case's external_payload.
             # Falls back to empty string if not available (searches all cortes).
             corte_value = ""
@@ -177,28 +177,13 @@ class SyncEngine:
                         case.get("case_number", case["id"]),
                     )
 
-            form_data = {
-                "action": "search",
-                "competencia": competencia,
-                "conRolCausa": parsed["numero"],
-                "conEraCausa": parsed["anno"],
-                "conCorte": corte_value,
-                "conTribunal": "",
-                "conTipoBusApe": "",
-                "radio-groupPenal": "",
-                "radio-group": "",
-                "ruc1": "",
-                "ruc2": "",
-                "rucPen1": "",
-                "rucPen2": "",
-                "conCaratulado": "",
-                "g-recaptcha-response-rit": "",
-            }
-
-            if competencia == "suprema":
-                form_data["conTipoBus"] = "0"
-            else:
-                form_data["conTipoCausa"] = parsed["tipo"]
+            form_data = build_search_form_data(
+                competencia=competencia,
+                tipo=parsed["tipo"],
+                numero=parsed["numero"],
+                anno=parsed["anno"],
+                corte=corte_value,
+            )
 
             # Search
             search_result = await search_pjud_via_session(

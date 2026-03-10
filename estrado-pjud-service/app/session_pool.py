@@ -8,10 +8,6 @@ from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
 
-# How long a session can be reused before being refreshed
-_SESSION_MAX_AGE_S = 300  # 5 minutes
-_POOL_MAX_SIZE = 2
-
 
 class APISessionPool:
     """Reusable session pool for API routes.
@@ -24,6 +20,8 @@ class APISessionPool:
         self._settings = settings
         self._pool: deque[OJVSession] = deque()
         self._lock = asyncio.Lock()
+        self._max_size = settings.SESSION_POOL_SIZE
+        self._max_age = settings.SESSION_MAX_AGE_S
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
@@ -31,23 +29,27 @@ class APISessionPool:
             # Try to get a valid session from the pool
             while self._pool:
                 session = self._pool.popleft()
-                if session.age_seconds < _SESSION_MAX_AGE_S:
+                if session.age_seconds < self._max_age:
                     return session
                 # Session expired, close it
                 logger.info("Closing expired API session (age=%.0fs)", session.age_seconds)
                 await session.close()
 
-            # No valid session available, create a new one
-            logger.info("Creating new API session")
-            adapter = OJVHttpAdapter(self._settings)
-            session = OJVSession(adapter)
+        # No valid session available — create outside the lock to avoid blocking
+        logger.info("Creating new API session")
+        adapter = OJVHttpAdapter(self._settings)
+        session = OJVSession(adapter)
+        try:
             await session.initialize()
-            return session
+        except Exception:
+            await session.close()
+            raise
+        return session
 
     async def release(self, session: OJVSession):
         """Return a session to the pool for reuse."""
         async with self._lock:
-            if len(self._pool) < _POOL_MAX_SIZE and session.age_seconds < _SESSION_MAX_AGE_S:
+            if len(self._pool) < self._max_size and session.age_seconds < self._max_age:
                 self._pool.append(session)
             else:
                 await session.close()

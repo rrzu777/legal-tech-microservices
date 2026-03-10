@@ -1,4 +1,8 @@
+from typing import Literal
+
 from pydantic import BaseModel, model_validator
+
+COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
 
 
 VALID_CORTE_CODES = {
@@ -26,7 +30,7 @@ VALID_CORTE_CODES = {
 class SearchRequest(BaseModel):
     case_type: str  # "rol" | "rit" | "ruc"
     case_number: str  # "X-NNNN-YYYY"
-    competencia: str  # "suprema" | "apelaciones" | "civil" | "laboral" | "penal" | "cobranza"
+    competencia: COMPETENCIA_TYPE
     corte: int | None = None  # only valid when competencia == "apelaciones"
 
     @model_validator(mode="after")
@@ -60,7 +64,7 @@ class SearchResponse(BaseModel):
 
 class DetailRequest(BaseModel):
     detail_key: str
-    competencia: str | None = None  # optional for backward compat
+    competencia: COMPETENCIA_TYPE | None = None
 
 
 class CaseMetadata(BaseModel):

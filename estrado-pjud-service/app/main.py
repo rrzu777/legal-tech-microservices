@@ -11,9 +11,12 @@ from app.session_pool import APISessionPool
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    app.state.session_pool = APISessionPool(settings)
-    yield
-    await app.state.session_pool.close_all()
+    pool = APISessionPool(settings)
+    app.state.session_pool = pool
+    try:
+        yield
+    finally:
+        await pool.close_all()
 
 
 def create_app() -> FastAPI:
