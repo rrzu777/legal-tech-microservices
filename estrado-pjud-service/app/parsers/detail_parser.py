@@ -14,10 +14,18 @@ from app.parsers.normalizer import normalize_date
 _WS_RE = re.compile(r"\s+")
 
 # Div IDs for movements per competencia type
-_MOVEMENT_DIV_IDS = ["historiaCiv", "movimientosSup", "movimientosApe", "historiaPen", "movimientosPen"]
+_MOVEMENT_DIV_IDS = [
+    "historiaCiv", "historiaLab", "historiaCob",
+    "movimientosSup", "movimientosApe",
+    "historiaPen", "movimientosPen",
+]
 
 # Div IDs for litigantes/intervinientes per competencia type
-_LITIGANTE_DIV_IDS = ["litigantesCiv", "litigantesSup", "litigantesApe", "intervinientesPen", "litigantesPen"]
+_LITIGANTE_DIV_IDS = [
+    "litigantesCiv", "litigantesLab", "litigantesCob",
+    "litigantesSup", "litigantesApe",
+    "intervinientesPen", "litigantesPen",
+]
 
 
 def _clean(text: str | None) -> str:
@@ -222,6 +230,7 @@ _MOVEMENT_COLUMN_MAP: dict[str, dict] = {
     },
 }
 
+# Default column mapping for civil, laboral, cobranza (and fallback)
 _CIVIL_COLS: dict = {
     "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
     "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
@@ -319,8 +328,16 @@ def parse_detail(html: str) -> dict:
     """
     soup = BeautifulSoup(html, "html.parser")
 
+    movements = _parse_movements(soup)
+    litigantes = _parse_litigantes(soup)
+
+    if not movements and not litigantes:
+        # Log all div IDs in the HTML to help discover the correct ones
+        all_divs = [div.get("id") for div in soup.find_all("div", id=True)]
+        logger.warning("Parser found 0 movements and 0 litigantes. Div IDs in HTML: %s", all_divs)
+
     return {
         "metadata": _parse_metadata(soup),
-        "movements": _parse_movements(soup),
-        "litigantes": _parse_litigantes(soup),
+        "movements": movements,
+        "litigantes": litigantes,
     }
