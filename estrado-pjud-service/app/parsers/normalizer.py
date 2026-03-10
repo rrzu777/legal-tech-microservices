@@ -6,7 +6,6 @@ _DATE_DMY_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _COMPETENCIA_CODES = {"suprema": 1, "apelaciones": 2, "civil": 3, "laboral": 4, "penal": 5, "cobranza": 6}
-_COMPETENCIA_PATHS = {"suprema": "suprema", "apelaciones": "apelaciones", "civil": "civil", "laboral": "laboral", "penal": "penal", "cobranza": "cobranza"}
 
 
 def parse_case_identifier(raw: str) -> dict[str, str]:
@@ -43,6 +42,6 @@ def competencia_code(competencia: str) -> int:
 
 def competencia_path(competencia: str) -> str:
     c = competencia.lower()
-    if c not in _COMPETENCIA_PATHS:
+    if c not in _COMPETENCIA_CODES:
         raise ValueError(f"Unknown competencia: {competencia!r}")
-    return _COMPETENCIA_PATHS[c]
+    return c

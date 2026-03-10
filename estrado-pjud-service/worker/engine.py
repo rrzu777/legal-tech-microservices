@@ -3,7 +3,8 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, date
 
-from app.parsers.normalizer import parse_case_identifier
+from app.parsers.form_builder import build_search_form_data
+from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
@@ -80,8 +81,9 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
 
 async def search_pjud_via_session(session, competencia: str, form_data: dict, timeout: float) -> dict:
     """Call OJV search via session and parse results."""
+    comp_path = competencia_path(competencia)
     html = await asyncio.wait_for(
-        session.search(competencia, form_data),
+        session.search(comp_path, form_data),
         timeout=timeout,
     )
     blocked = detect_blocked(html)
@@ -99,8 +101,9 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
 
 async def detail_pjud_via_session(session, competencia: str, detail_key: str, timeout: float) -> dict:
     """Call OJV detail via session and parse results."""
+    comp_path = competencia_path(competencia)
     html = await asyncio.wait_for(
-        session.detail(competencia, detail_key),
+        session.detail(comp_path, detail_key),
         timeout=timeout,
     )
     if len(html.strip()) < 100:
@@ -147,21 +150,20 @@ class SyncEngine:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                await self._update_case_error(case["id"], "Identificador invalido")
+                await self._update_case_error(case["id"], "Identificador invalido", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Unsupported matter")
-                await self._update_case_error(case["id"], "Materia no soportada")
+                await self._update_case_error(case["id"], "Materia no soportada", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
             session = await self._pool.acquire()
             await self._pool.enforce_global_rate_limit()
 
-            # Build search form data (mirrors routes/search.py)
             # For apelaciones, read corte from the case's external_payload.
             # Falls back to empty string if not available (searches all cortes).
             corte_value = ""
@@ -175,28 +177,13 @@ class SyncEngine:
                         case.get("case_number", case["id"]),
                     )
 
-            form_data = {
-                "action": "search",
-                "competencia": competencia,
-                "conRolCausa": parsed["numero"],
-                "conEraCausa": parsed["anno"],
-                "conCorte": corte_value,
-                "conTribunal": "",
-                "conTipoBusApe": "",
-                "radio-groupPenal": "",
-                "radio-group": "",
-                "ruc1": "",
-                "ruc2": "",
-                "rucPen1": "",
-                "rucPen2": "",
-                "conCaratulado": "",
-                "g-recaptcha-response-rit": "",
-            }
-
-            if competencia == "suprema":
-                form_data["conTipoBus"] = "0"
-            else:
-                form_data["conTipoCausa"] = parsed["tipo"]
+            form_data = build_search_form_data(
+                competencia=competencia,
+                tipo=parsed["tipo"],
+                numero=parsed["numero"],
+                anno=parsed["anno"],
+                corte=corte_value,
+            )
 
             # Search
             search_result = await search_pjud_via_session(
@@ -212,7 +199,7 @@ class SyncEngine:
 
             if not search_result["found"]:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Not found in OJV")
-                await self._update_case_error(case["id"], "No encontrada en OJV")
+                await self._update_case_error(case["id"], "No encontrada en OJV", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -282,7 +269,7 @@ class SyncEngine:
             msg = "Timeout al consultar OJV"
             logger.warning("Timeout syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg)
+            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -291,7 +278,7 @@ class SyncEngine:
             msg = str(e)
             logger.exception("Error syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg)
+            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -382,11 +369,41 @@ class SyncEngine:
             }).eq("id", case_id)
         )
 
-    async def _update_case_error(self, case_id: str, error: str):
+    async def _update_case_error(self, case_id: str, error: str, sync_attempts: int = 0):
+        """Update case with error status and escalating backoff.
+
+        Backoff schedule based on sync_attempts:
+          1st error: 5 minutes
+          2nd error: 30 minutes
+          3rd error: 2 hours
+          4th+: 6 hours
+          After 10 failures: suspended (irrecoverable)
+        """
+        _MAX_SYNC_ATTEMPTS = 10
+
+        if sync_attempts >= _MAX_SYNC_ATTEMPTS:
+            logger.warning("Case %s exceeded max sync attempts (%d), suspending", case_id, _MAX_SYNC_ATTEMPTS)
+            await run_query(
+                self._sb.from_("cases").update({
+                    "tracking_status": "suspended",
+                    "last_sync_status": "error",
+                    "last_sync_error": f"Suspended after {sync_attempts} failed attempts: {error}",
+                    "sync_attempts": sync_attempts + 1,
+                }).eq("id", case_id)
+            )
+            return
+
+        backoff_seconds = {0: 300, 1: 1800, 2: 7200}.get(
+            sync_attempts, 21600
+        )
+        blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=backoff_seconds)).isoformat()
+
         await run_query(
             self._sb.from_("cases").update({
                 "tracking_status": "error",
                 "last_sync_status": "error",
                 "last_sync_error": error,
+                "sync_blocked_until": blocked_until,
+                "sync_attempts": sync_attempts + 1,
             }).eq("id", case_id)
         )

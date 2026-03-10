@@ -251,7 +251,7 @@ class TestSyncEngine:
         """Cases with unsupported matter type should fail gracefully."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-        case = _make_case(matter="penal")
+        case = _make_case(matter="familia")
         result = await engine.sync_case(case)
 
         assert result["success"] is False
@@ -677,3 +677,111 @@ class TestDetailPjudViaSession:
         )
 
         assert result["blocked"] is True
+
+
+class TestSyncErrorBackoff:
+    @pytest.mark.asyncio
+    async def test_sync_error_sets_blocked_until(self):
+        """When a case fails with an error, the update should include sync_blocked_until."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(sync_attempts=0)
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+            mock_search.return_value = _mock_search_response(found=False, matches=[])
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+
+        # Find the update call that sets tracking_status to "error"
+        update_calls = mock_sb.from_.return_value.update.call_args_list
+        error_update = None
+        for call in update_calls:
+            args = call[0] if call[0] else ()
+            kwargs = call[1] if call[1] else {}
+            payload = args[0] if args else kwargs.get("data")
+            if payload and payload.get("tracking_status") == "error":
+                error_update = payload
+                break
+
+        assert error_update is not None, "Expected an update call with tracking_status='error'"
+        assert "sync_blocked_until" in error_update, "Error update should set sync_blocked_until"
+
+    @pytest.mark.asyncio
+    async def test_sync_error_suspended_after_max_attempts(self):
+        """After 10+ failed attempts, the case should be suspended instead of retried."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(sync_attempts=10)
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+            mock_search.return_value = _mock_search_response(found=False, matches=[])
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+
+        # Find the update call that sets tracking_status to "suspended"
+        update_calls = mock_sb.from_.return_value.update.call_args_list
+        suspended_update = None
+        for call in update_calls:
+            args = call[0] if call[0] else ()
+            payload = args[0] if args else {}
+            if payload and payload.get("tracking_status") == "suspended":
+                suspended_update = payload
+                break
+
+        assert suspended_update is not None, "Expected an update call with tracking_status='suspended'"
+        assert suspended_update["last_sync_status"] == "error"
+        assert "Suspended after 10 failed attempts" in suspended_update["last_sync_error"]
+        assert suspended_update["sync_attempts"] == 11
+        # Suspended cases should NOT have sync_blocked_until (they don't retry)
+        assert "sync_blocked_until" not in suspended_update
+
+    @pytest.mark.asyncio
+    async def test_sync_error_backoff_escalates(self):
+        """Higher sync_attempts should result in longer backoff durations."""
+        from worker.engine import SyncEngine, TZ_SANTIAGO
+        from datetime import datetime as dt
+
+        backoff_expected = {
+            0: 300,     # 5 minutes
+            1: 1800,    # 30 minutes
+            2: 7200,    # 2 hours
+            5: 21600,   # 6 hours (4th+)
+        }
+
+        for attempts, expected_seconds in backoff_expected.items():
+            engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+            case = _make_case(sync_attempts=attempts)
+
+            before = dt.now(TZ_SANTIAGO)
+
+            with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = _mock_search_response(found=False, matches=[])
+                await engine.sync_case(case)
+
+            after = dt.now(TZ_SANTIAGO)
+
+            # Find the error update payload
+            update_calls = mock_sb.from_.return_value.update.call_args_list
+            error_update = None
+            for call in update_calls:
+                args = call[0] if call[0] else ()
+                payload = args[0] if args else {}
+                if payload and payload.get("tracking_status") == "error":
+                    error_update = payload
+                    break
+
+            assert error_update is not None
+            blocked_until = dt.fromisoformat(error_update["sync_blocked_until"])
+            diff = (blocked_until - before).total_seconds()
+            # Allow a small tolerance window (2 seconds)
+            assert abs(diff - expected_seconds) < 2, (
+                f"For sync_attempts={attempts}, expected ~{expected_seconds}s backoff, got {diff:.1f}s"
+            )
+            # Verify sync_attempts is incremented in the error update
+            assert error_update.get("sync_attempts") == attempts + 1, (
+                f"For sync_attempts={attempts}, expected update to set sync_attempts={attempts + 1}, "
+                f"got {error_update.get('sync_attempts')}"
+            )

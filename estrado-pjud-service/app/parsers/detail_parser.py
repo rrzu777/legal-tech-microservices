@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 from bs4 import BeautifulSoup, Tag
 
@@ -120,14 +123,14 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
 
             # Ubicación (suprema/apelaciones) — maps to etapa
             if td.find("strong", string=re.compile(r"Ubicaci")):
-                metadata["ubicacion"] = _extract_text_after_strong(td, "Ubicaci")
-                # Strip the label remnant if present
-                val = metadata["ubicacion"]
-                if val.startswith("n:"):
-                    val = val[2:].strip()
-                elif val.startswith("\u00f3n:"):
-                    val = val[3:].strip()
-                metadata["ubicacion"] = val
+                strong_tag = td.find("strong", string=re.compile(r"Ubicaci"))
+                if strong_tag:
+                    strong_text = _clean(strong_tag.get_text())
+                    full_text = _clean(td.get_text())
+                    if full_text.startswith(strong_text):
+                        metadata["ubicacion"] = full_text[len(strong_text):].strip()
+                    else:
+                        metadata["ubicacion"] = full_text
 
             # Tribunal (civil)
             if td.find("strong", string=re.compile(r"Tribunal:")):
@@ -199,6 +202,32 @@ def _find_div(soup: BeautifulSoup, div_ids: list[str]) -> tuple[Tag | None, str]
     return None, ""
 
 
+# Column mapping per div_id: indices for each field, -1 means not present
+_MOVEMENT_COLUMN_MAP: dict[str, dict] = {
+    "movimientosSup": {
+        "min_cols": 10, "folio": 0, "doc": 1, "fecha": 4,
+        "tramite": 5, "descripcion": 6, "etapa": -1, "foja": -1,
+    },
+    "movimientosApe": {
+        "min_cols": 9, "folio": 0, "doc": 1, "fecha": 5,
+        "tramite": 3, "descripcion": 4, "etapa": -1, "foja": -1,
+    },
+    "historiaPen": {
+        "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+        "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+    },
+    "movimientosPen": {
+        "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+        "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+    },
+}
+
+_CIVIL_COLS: dict = {
+    "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+    "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+}
+
+
 def _parse_movements(soup: BeautifulSoup) -> list[dict]:
     """Extract movements from the Historia/Movimientos tab table."""
     movements: list[dict] = []
@@ -212,6 +241,7 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
         return movements
 
     cuaderno = _get_selected_cuaderno(soup)
+    cols = _MOVEMENT_COLUMN_MAP.get(div_id, _CIVIL_COLS)
 
     tbody = table.find("tbody")
     if not tbody:
@@ -219,132 +249,35 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
 
     for row in tbody.find_all("tr"):
         tds = row.find_all("td")
+        if len(tds) < cols["min_cols"]:
+            if div_id in ("historiaPen", "movimientosPen") and 4 <= len(tds) < cols["min_cols"]:
+                logger.warning("Penal movement row has %d cols (expected %d), skipping", len(tds), cols["min_cols"])
+            continue
 
-        if div_id == "movimientosSup":
-            # Suprema: Folio(0), Doc(1), Anexo(2), Año(3), Fecha(4), Tramite(5),
-            #          Desc(6), Correlativo(7), Salas(8), Estado(9)
-            if len(tds) < 10:
-                continue
-            folio = _int_or_none(tds[0].get_text())
-            tramite = _clean(tds[5].get_text())
-            descripcion = _clean(tds[6].get_text())
-            fecha = _normalize_movement_date(_clean(tds[4].get_text()))
+        folio = _int_or_none(tds[cols["folio"]].get_text())
+        tramite = _clean(tds[cols["tramite"]].get_text())
+        descripcion = _clean(tds[cols["descripcion"]].get_text())
+        fecha = _normalize_movement_date(_clean(tds[cols["fecha"]].get_text()))
+        etapa = _clean(tds[cols["etapa"]].get_text()) if cols["etapa"] >= 0 else ""
+        foja = _int_or_none(tds[cols["foja"]].get_text()) if cols["foja"] >= 0 else None
 
-            doc_form = tds[1].find("form")
-            documento_url = None
-            if doc_form:
-                action = doc_form.get("action", "")
-                if action:
-                    documento_url = action
+        doc_form = tds[cols["doc"]].find("form")
+        documento_url = None
+        if doc_form:
+            action = doc_form.get("action", "")
+            if action:
+                documento_url = action
 
-            movements.append(
-                {
-                    "folio": folio,
-                    "cuaderno": cuaderno,
-                    "etapa": "",
-                    "tramite": tramite,
-                    "descripcion": descripcion,
-                    "fecha": fecha,
-                    "foja": None,
-                    "documento_url": documento_url,
-                }
-            )
-
-        elif div_id == "movimientosApe":
-            # Apelaciones: Folio(0), Doc(1), Anexo(2), Tramite(3), Desc(4),
-            #              Fecha(5), Sala(6), Estado(7), Geo(8)
-            if len(tds) < 9:
-                continue
-            folio = _int_or_none(tds[0].get_text())
-            tramite = _clean(tds[3].get_text())
-            descripcion = _clean(tds[4].get_text())
-            fecha = _normalize_movement_date(_clean(tds[5].get_text()))
-
-            doc_form = tds[1].find("form")
-            documento_url = None
-            if doc_form:
-                action = doc_form.get("action", "")
-                if action:
-                    documento_url = action
-
-            movements.append(
-                {
-                    "folio": folio,
-                    "cuaderno": cuaderno,
-                    "etapa": "",
-                    "tramite": tramite,
-                    "descripcion": descripcion,
-                    "fecha": fecha,
-                    "foja": None,
-                    "documento_url": documento_url,
-                }
-            )
-
-        elif div_id in ("historiaPen", "movimientosPen"):
-            # Penal: Folio(0), Doc(1), Anexo(2), Etapa(3),
-            #        Tramite(4), Desc(5), Fecha(6), Foja(7)
-            # NOTE: This layout is inferred from civil patterns and may need
-            # adjustment once real penal HTML is available.
-            if len(tds) < 8:
-                continue
-            folio = _int_or_none(tds[0].get_text())
-            etapa = _clean(tds[3].get_text())
-            tramite = _clean(tds[4].get_text())
-            descripcion = _clean(tds[5].get_text())
-            fecha = _normalize_movement_date(_clean(tds[6].get_text()))
-            foja = _int_or_none(tds[7].get_text())
-
-            doc_form = tds[1].find("form")
-            documento_url = None
-            if doc_form:
-                action = doc_form.get("action", "")
-                if action:
-                    documento_url = action
-
-            movements.append(
-                {
-                    "folio": folio,
-                    "cuaderno": cuaderno,
-                    "etapa": etapa,
-                    "tramite": tramite,
-                    "descripcion": descripcion,
-                    "fecha": fecha,
-                    "foja": foja,
-                    "documento_url": documento_url,
-                }
-            )
-
-        else:
-            # Civil (historiaCiv): Folio(0), Doc(1), Anexo(2), Etapa(3),
-            #                      Tramite(4), Desc(5), Fecha(6), Foja(7)
-            if len(tds) < 8:
-                continue
-            folio = _int_or_none(tds[0].get_text())
-            etapa = _clean(tds[3].get_text())
-            tramite = _clean(tds[4].get_text())
-            descripcion = _clean(tds[5].get_text())
-            fecha = _normalize_movement_date(_clean(tds[6].get_text()))
-            foja = _int_or_none(tds[7].get_text())
-
-            doc_form = tds[1].find("form")
-            documento_url = None
-            if doc_form:
-                action = doc_form.get("action", "")
-                if action:
-                    documento_url = action
-
-            movements.append(
-                {
-                    "folio": folio,
-                    "cuaderno": cuaderno,
-                    "etapa": etapa,
-                    "tramite": tramite,
-                    "descripcion": descripcion,
-                    "fecha": fecha,
-                    "foja": foja,
-                    "documento_url": documento_url,
-                }
-            )
+        movements.append({
+            "folio": folio,
+            "cuaderno": cuaderno,
+            "etapa": etapa,
+            "tramite": tramite,
+            "descripcion": descripcion,
+            "fecha": fecha,
+            "foja": foja,
+            "documento_url": documento_url,
+        })
 
     return movements
 
