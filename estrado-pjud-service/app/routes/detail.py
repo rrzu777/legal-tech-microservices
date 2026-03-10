@@ -49,6 +49,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
     pool = request.app.state.session_pool
     session = await pool.acquire()
 
+    healthy = True
     try:
         if req.competencia:
             comp = req.competencia
@@ -66,6 +67,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         html = await session.detail(comp, req.detail_key)
 
         if not html or len(html.strip()) < 100:
+            healthy = False
             logger.warning(
                 "Detail blocked for comp=%s — response length=%d, body=%r",
                 comp, len(html) if html else 0, (html or "")[:500],
@@ -93,9 +95,10 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
 
     except Exception as e:
         logger.exception("Detail fetch failed")
+        healthy = False
         return DetailResponse(
             metadata={}, movements=[], litigantes=[], blocked=True,
             error=str(e),
         )
     finally:
-        await pool.release(session)
+        await pool.release(session, healthy=healthy)

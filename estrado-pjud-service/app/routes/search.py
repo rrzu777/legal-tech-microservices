@@ -1,5 +1,6 @@
 import logging
 
+import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
@@ -19,6 +20,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
     pool = request.app.state.session_pool
     session = await pool.acquire()
 
+    healthy = True
     try:
         parsed = parse_case_identifier(req.case_number)
         comp_path = competencia_path(req.competencia)
@@ -34,6 +36,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         html = await session.search(comp_path, form_data)
 
         if detect_blocked(html):
+            healthy = False
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
@@ -54,9 +57,10 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
     except Exception as e:
         logger.exception("Search failed")
+        healthy = False
         return SearchResponse(
-            found=False, match_count=0, matches=[], blocked=False,
+            found=False, match_count=0, matches=[], blocked=isinstance(e, (httpx.TimeoutException, httpx.ConnectError)),
             error=str(e),
         )
     finally:
-        await pool.release(session)
+        await pool.release(session, healthy=healthy)

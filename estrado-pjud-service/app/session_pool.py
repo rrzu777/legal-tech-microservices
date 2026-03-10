@@ -46,8 +46,13 @@ class APISessionPool:
             raise
         return session
 
-    async def release(self, session: OJVSession):
-        """Return a session to the pool for reuse."""
+    async def release(self, session: OJVSession, healthy: bool = True):
+        """Return a session to the pool for reuse.
+        If healthy=False the session is closed immediately and not recycled.
+        """
+        if not healthy:
+            await session.close()
+            return
         async with self._lock:
             if len(self._pool) < self._max_size and session.age_seconds < self._max_age:
                 self._pool.append(session)
