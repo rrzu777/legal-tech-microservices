@@ -100,6 +100,10 @@ class OJVSession:
                 "Origin": "https://oficinajudicialvirtual.pjud.cl",
             },
         )
+        logger.info(
+            "Detail response: comp=%s status=%d length=%d",
+            competencia_path, resp.status_code, len(resp.content),
+        )
         resp.raise_for_status()
         return _decode(resp)
 

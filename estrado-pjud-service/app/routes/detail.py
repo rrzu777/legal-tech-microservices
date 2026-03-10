@@ -50,6 +50,10 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         html = await session.detail(comp, req.detail_key)
 
         if not html or len(html.strip()) < 100:
+            logger.warning(
+                "Detail blocked for comp=%s — response length=%d, body=%r",
+                comp, len(html) if html else 0, (html or "")[:500],
+            )
             return DetailResponse(
                 metadata={}, movements=[], litigantes=[], blocked=True,
                 error="Empty or blocked response from OJV",
