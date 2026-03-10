@@ -317,3 +317,20 @@ class TestDetail:
         body = resp.json()
         assert body["blocked"] is True
         assert body["error"] is not None
+
+    def test_detail_logs_warning_on_competencia_extraction_failure(self, client, caplog):
+        """When JWT doesn't contain competencia, a warning should be logged."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(detail_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        # JWT with no competencia field
+        payload = {"detail_key": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJmb28iOiJiYXIifQ.fake"}
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="app.routes.detail"):
+            resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        assert any("competencia" in r.message.lower() for r in caplog.records)
