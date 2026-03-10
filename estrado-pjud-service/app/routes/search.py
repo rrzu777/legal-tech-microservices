@@ -1,12 +1,9 @@
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
-from app.config import get_settings
 from app.models import SearchRequest, SearchResponse, CandidateMatch
-from app.adapters.http_adapter import OJVHttpAdapter
-from app.session import OJVSession
 from app.parsers.normalizer import parse_case_identifier, competencia_code, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.routes.health import record_successful_request
@@ -17,14 +14,11 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 
 
 @router.post("/search", response_model=SearchResponse)
-async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
-    settings = get_settings()
-    adapter = OJVHttpAdapter(settings)
-    session = OJVSession(adapter)
+async def search_case(req: SearchRequest, request: Request, _api_key: str = verify_api_key):
+    pool = request.app.state.session_pool
+    session = await pool.acquire()
 
     try:
-        await session.initialize()
-
         parsed = parse_case_identifier(req.case_number)
         comp_code = competencia_code(req.competencia)
         comp_path = competencia_path(req.competencia)
@@ -86,4 +80,4 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             error=str(e),
         )
     finally:
-        await session.close()
+        await pool.release(session)

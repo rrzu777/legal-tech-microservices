@@ -1,9 +1,9 @@
 """Integration tests for all API routes.
 
-Uses FastAPI TestClient with mocked OJVSession / OJVHttpAdapter
-so that no real HTTP calls are made to PJUD.  The real HTML fixtures
-are fed through the mocked session so that parsers run against
-authentic HTML, giving us true end-to-end coverage minus the network.
+Uses FastAPI TestClient with a mocked APISessionPool so that no real HTTP
+calls are made to PJUD.  The real HTML fixtures are fed through the mocked
+session so that parsers run against authentic HTML, giving us true end-to-end
+coverage minus the network.
 """
 
 from pathlib import Path
@@ -63,7 +63,17 @@ def _make_mock_session(*, search_html: str | None = None, detail_html: str | Non
     mock_session.search = AsyncMock(return_value=search_html or "")
     mock_session.detail = AsyncMock(return_value=detail_html or "")
     mock_session.close = AsyncMock()
+    mock_session.age_seconds = 0  # always fresh
     return mock_session
+
+
+def _make_mock_pool(mock_session):
+    """Build a MagicMock that quacks like APISessionPool."""
+    mock_pool = MagicMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_session)
+    mock_pool.release = AsyncMock()
+    mock_pool.close_all = AsyncMock()
+    return mock_pool
 
 
 # ===================================================================
@@ -85,13 +95,12 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
-    @patch("app.routes.search.OJVHttpAdapter")
-    @patch("app.routes.search.OJVSession")
-    def test_search_returns_matches(self, MockSession, MockAdapter, client):
+    def test_search_returns_matches(self, client):
         """POST /api/v1/search returns found=True with parsed matches."""
         html = _load("search_Civil_C_1234_2024.html")
         mock_session = _make_mock_session(search_html=html)
-        MockSession.return_value = mock_session
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
 
         payload = {
             "case_type": "rol",
@@ -116,17 +125,16 @@ class TestSearch:
         assert "fecha_ingreso" in first
 
         # Verify the mock was used correctly
-        mock_session.initialize.assert_awaited_once()
+        mock_pool.acquire.assert_awaited_once()
         mock_session.search.assert_awaited_once()
-        mock_session.close.assert_awaited_once()
+        mock_pool.release.assert_awaited_once_with(mock_session)
 
-    @patch("app.routes.search.OJVHttpAdapter")
-    @patch("app.routes.search.OJVSession")
-    def test_search_laboral(self, MockSession, MockAdapter, client):
+    def test_search_laboral(self, client):
         """POST /api/v1/search with laboral competencia returns results."""
         html = _load("search_Laboral_T_500_2024.html")
         mock_session = _make_mock_session(search_html=html)
-        MockSession.return_value = mock_session
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
 
         payload = {
             "case_type": "rit",
@@ -140,13 +148,12 @@ class TestSearch:
         assert body["found"] is True
         assert body["match_count"] >= 1
 
-    @patch("app.routes.search.OJVHttpAdapter")
-    @patch("app.routes.search.OJVSession")
-    def test_search_cobranza(self, MockSession, MockAdapter, client):
+    def test_search_cobranza(self, client):
         """POST /api/v1/search with cobranza competencia returns results."""
         html = _load("search_Cobranza_C_1000_2024.html")
         mock_session = _make_mock_session(search_html=html)
-        MockSession.return_value = mock_session
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
 
         payload = {
             "case_type": "rol",
@@ -195,13 +202,12 @@ class TestDetail:
         ".fake_signature"
     )
 
-    @patch("app.routes.detail.OJVHttpAdapter")
-    @patch("app.routes.detail.OJVSession")
-    def test_detail_returns_data(self, MockSession, MockAdapter, client):
+    def test_detail_returns_data(self, client):
         """POST /api/v1/detail returns metadata, movements, and litigantes."""
         html = _load("detail_Civil_C_1234_2024.html")
         mock_session = _make_mock_session(detail_html=html)
-        MockSession.return_value = mock_session
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
 
         payload = {"detail_key": self._CIVIL_JWT}
         resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
@@ -235,9 +241,9 @@ class TestDetail:
         assert "nombre" in lig
 
         # Verify mock usage
-        mock_session.initialize.assert_awaited_once()
+        mock_pool.acquire.assert_awaited_once()
         mock_session.detail.assert_awaited_once()
-        mock_session.close.assert_awaited_once()
+        mock_pool.release.assert_awaited_once_with(mock_session)
 
     def test_detail_requires_auth(self, client):
         """POST /api/v1/detail without Authorization header returns 401."""
@@ -252,12 +258,57 @@ class TestDetail:
         resp = client.post("/api/v1/detail", json=payload, headers=bad_auth)
         assert resp.status_code == 401
 
-    @patch("app.routes.detail.OJVHttpAdapter")
-    @patch("app.routes.detail.OJVSession")
-    def test_detail_blocked_when_empty_response(self, MockSession, MockAdapter, client):
+    def test_detail_with_explicit_competencia(self, client):
+        """POST /api/v1/detail with competencia skips JWT guessing."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(detail_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": "opaque-encrypted-token", "competencia": "penal"}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        # The session.detail call should have received "penal" as competencia
+        mock_session.detail.assert_awaited_once_with("penal", "opaque-encrypted-token")
+
+    @pytest.mark.parametrize("competencia", [
+        "suprema", "apelaciones", "civil", "laboral", "penal", "cobranza",
+    ])
+    def test_detail_all_competencias(self, client, competencia):
+        """POST /api/v1/detail accepts all 6 competencias."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(detail_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": "opaque-token", "competencia": competencia}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is False
+        mock_session.detail.assert_awaited_once_with(competencia, "opaque-token")
+
+    def test_detail_without_competencia_falls_back_to_guess(self, client):
+        """POST /api/v1/detail without competencia still guesses from JWT."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(detail_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        # Should guess "civil" from the JWT payload
+        mock_session.detail.assert_awaited_once_with("civil", self._CIVIL_JWT)
+
+    def test_detail_blocked_when_empty_response(self, client):
         """POST /api/v1/detail with empty HTML returns blocked=True."""
         mock_session = _make_mock_session(detail_html="")
-        MockSession.return_value = mock_session
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
 
         payload = {"detail_key": self._CIVIL_JWT}
         resp = client.post("/api/v1/detail", json=payload, headers=AUTH)

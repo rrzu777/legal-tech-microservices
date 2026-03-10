@@ -60,6 +60,7 @@ class SearchResponse(BaseModel):
 
 class DetailRequest(BaseModel):
     detail_key: str
+    competencia: str | None = None  # optional for backward compat
 
 
 class CaseMetadata(BaseModel):

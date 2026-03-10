@@ -147,14 +147,14 @@ class SyncEngine:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                await self._update_case_error(case["id"], "Identificador invalido")
+                await self._update_case_error(case["id"], "Identificador invalido", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Unsupported matter")
-                await self._update_case_error(case["id"], "Materia no soportada")
+                await self._update_case_error(case["id"], "Materia no soportada", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -212,7 +212,7 @@ class SyncEngine:
 
             if not search_result["found"]:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Not found in OJV")
-                await self._update_case_error(case["id"], "No encontrada en OJV")
+                await self._update_case_error(case["id"], "No encontrada en OJV", case.get("sync_attempts", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -282,7 +282,7 @@ class SyncEngine:
             msg = "Timeout al consultar OJV"
             logger.warning("Timeout syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg)
+            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -291,7 +291,7 @@ class SyncEngine:
             msg = str(e)
             logger.exception("Error syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg)
+            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -382,11 +382,25 @@ class SyncEngine:
             }).eq("id", case_id)
         )
 
-    async def _update_case_error(self, case_id: str, error: str):
+    async def _update_case_error(self, case_id: str, error: str, sync_attempts: int = 0):
+        """Update case with error status and escalating backoff.
+
+        Backoff schedule based on sync_attempts:
+          1st error: 5 minutes
+          2nd error: 30 minutes
+          3rd error: 2 hours
+          4th+: 6 hours
+        """
+        backoff_seconds = {0: 300, 1: 1800, 2: 7200}.get(
+            sync_attempts, 21600
+        )
+        blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=backoff_seconds)).isoformat()
+
         await run_query(
             self._sb.from_("cases").update({
                 "tracking_status": "error",
                 "last_sync_status": "error",
                 "last_sync_error": error,
+                "sync_blocked_until": blocked_until,
             }).eq("id", case_id)
         )
