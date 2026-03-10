@@ -21,8 +21,10 @@ def test_config_defaults(monkeypatch):
     monkeypatch.setenv("API_KEY", "key")
 
     from app.config import Settings
-    s = Settings()
+    s = Settings(_env_file=None)
 
     assert s.OJV_BASE_URL == "https://oficinajudicialvirtual.pjud.cl"
     assert s.RATE_LIMIT_MS == 2500
     assert s.LOG_LEVEL == "INFO"
+    assert s.SESSION_POOL_SIZE == 2
+    assert s.SESSION_MAX_AGE_S == 1200

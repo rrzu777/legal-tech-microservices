@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_MS: int = 2500
     LOG_LEVEL: str = "INFO"
     SESSION_POOL_SIZE: int = 2
-    SESSION_MAX_AGE_S: int = 300
+    SESSION_MAX_AGE_S: int = 1200
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
