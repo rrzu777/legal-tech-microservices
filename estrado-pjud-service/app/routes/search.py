@@ -4,6 +4,7 @@ import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
+from app.rate_limit import limiter
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 
 
 @router.post("/search", response_model=SearchResponse)
+@limiter.limit("5/minute")
 async def search_case(req: SearchRequest, request: Request, _api_key: str = verify_api_key):
     pool = request.app.state.session_pool
     session = await pool.acquire()

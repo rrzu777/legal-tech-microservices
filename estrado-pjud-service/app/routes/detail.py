@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
+from app.rate_limit import limiter
 from app.models import (
     DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
 )
@@ -45,6 +46,7 @@ def _guess_competencia_from_jwt(jwt: str) -> str | None:
 
 
 @router.post("/detail", response_model=DetailResponse)
+@limiter.limit("5/minute")
 async def case_detail(req: DetailRequest, request: Request, _api_key: str = verify_api_key):
     pool = request.app.state.session_pool
     session = await pool.acquire()
