@@ -162,14 +162,25 @@ class SyncEngine:
             await self._pool.enforce_global_rate_limit()
 
             # Build search form data (mirrors routes/search.py)
+            # For apelaciones, read corte from the case's external_payload.
+            # Falls back to empty string if not available (searches all cortes).
+            corte_value = ""
+            if competencia == "apelaciones":
+                corte_value = str(
+                    case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
+                )
+                if not corte_value:
+                    logger.warning(
+                        "No corte in external_payload for apelaciones case %s; searching all cortes",
+                        case.get("case_number", case["id"]),
+                    )
+
             form_data = {
                 "action": "search",
                 "competencia": competencia,
                 "conRolCausa": parsed["numero"],
                 "conEraCausa": parsed["anno"],
-                # TODO(spike): For apelaciones, determine corte from case record
-                # (e.g. case["external_payload"]["corte"] or a new DB field)
-                "conCorte": "",
+                "conCorte": corte_value,
                 "conTribunal": "",
                 "conTipoBusApe": "",
                 "radio-groupPenal": "",

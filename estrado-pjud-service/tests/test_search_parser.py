@@ -110,6 +110,13 @@ class TestParseSearchApelaciones:
             assert m["caratulado"]
 
 
+class TestParseSearchPenal:
+    def test_penal_raises_not_implemented(self):
+        html = "<html><body><table><tr><td>data</td></tr></table></body></html>"
+        with pytest.raises(NotImplementedError, match="Penal row parser not yet implemented"):
+            parse_search_results(html, "penal")
+
+
 class TestParseSearchNoResults:
     def test_empty_html_returns_empty(self):
         results = parse_search_results("<html><body></body></html>", "civil")

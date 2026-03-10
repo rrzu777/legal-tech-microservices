@@ -49,6 +49,14 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
 
         if req.competencia == "suprema":
             form_data["conTipoBus"] = "0"
+        elif req.competencia == "penal":
+            # TODO(spike): Penal uses RIT/RUC instead of ROL.  The OJV form
+            # uses radio-groupPenal to select RIT vs RUC mode, and rucPen1/rucPen2
+            # for RUC-based searches.  Until we have a real penal fixture the
+            # parser will raise NotImplementedError, but we set the form fields
+            # so the HTTP request is at least structurally correct.
+            form_data["radio-groupPenal"] = "1"  # RIT mode
+            form_data["conTipoCausa"] = parsed["tipo"]
         else:
             form_data["conTipoCausa"] = parsed["tipo"]
 

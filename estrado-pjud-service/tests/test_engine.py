@@ -432,6 +432,55 @@ class TestSyncEngine:
         mock_pool.release.assert_called_once_with(mock_session)
 
     @pytest.mark.asyncio
+    async def test_sync_apelaciones_uses_corte_from_external_payload(self):
+        """For apelaciones cases, corte should be read from external_payload."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(
+            case_number="Proteccion-4490-2025",
+            matter="apelaciones",
+            external_case_key=None,
+            external_payload={"corte": 17},
+        )
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response()
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+        # Verify that search was called with corte=17 in form_data
+        call_args = mock_search.call_args
+        form_data = call_args[0][2]  # third positional arg is form_data
+        assert form_data["conCorte"] == "17"
+
+    @pytest.mark.asyncio
+    async def test_sync_apelaciones_warns_when_no_corte(self):
+        """For apelaciones cases without corte, a warning should be logged."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(
+            case_number="Proteccion-4490-2025",
+            matter="apelaciones",
+            external_case_key=None,
+            external_payload={},
+        )
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
+             patch("worker.engine.logger") as mock_logger:
+            mock_search.return_value = _mock_search_response()
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+        mock_logger.warning.assert_any_call(
+            "No corte in external_payload for apelaciones case %s; searching all cortes",
+            "Proteccion-4490-2025",
+        )
+
+    @pytest.mark.asyncio
     async def test_sync_records_sync_on_success(self):
         """metrics.record_sync() should be called on success."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()

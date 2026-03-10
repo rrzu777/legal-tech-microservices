@@ -176,14 +176,26 @@ def _parse_apelaciones_row(tr) -> dict | None:
     }
 
 
+def _parse_penal_row(tr) -> dict | None:
+    """Parse a Penal search-result row.
+
+    TODO(spike): Penal row parser not yet implemented.
+    - Penal uses RIT/RUC identifiers instead of ROL.
+    - The OJV penal search form uses `radio-groupPenal` and `rucPen1`/`rucPen2` fields.
+    - The column layout is expected to differ from civil (likely includes RIT, RUC,
+      tribunal, caratulado, fecha_ingreso, estado, but exact order is unknown).
+    - A real penal HTML fixture is needed to build this parser.
+    """
+    raise NotImplementedError("Penal row parser not yet implemented — needs real HTML fixture")
+
+
 _ROW_PARSERS = {
     "civil": _parse_civil_row,
     "laboral": _parse_laboral_row,
     "cobranza": _parse_cobranza_row,
     "suprema": _parse_suprema_row,
     "apelaciones": _parse_apelaciones_row,
-    # TODO(spike): Replace with dedicated parser after reviewing HTML fixtures
-    "penal": _parse_civil_row,
+    "penal": _parse_penal_row,
 }
 
 
