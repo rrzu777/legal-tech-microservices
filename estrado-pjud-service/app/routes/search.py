@@ -1,4 +1,5 @@
 import logging
+import re
 
 import httpx
 from fastapi import APIRouter, Request
@@ -12,6 +13,17 @@ from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 
 logger = logging.getLogger(__name__)
+
+_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|\w+\.php")
+
+
+def _safe_error(e: Exception) -> str:
+    """Return a user-safe error message without internal URLs or paths."""
+    msg = str(e)
+    if _INTERNAL_PATTERN.search(msg):
+        return f"Internal error: {type(e).__name__}"
+    return msg
+
 
 router = APIRouter(prefix="/api/v1", tags=["search"])
 
@@ -73,7 +85,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 await alerter.check_and_alert()
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=blocked,
-            error=str(e),
+            error=_safe_error(e),
         )
     finally:
         await pool.release(session, healthy=healthy)

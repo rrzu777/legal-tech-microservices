@@ -233,6 +233,36 @@ class TestSearch:
         body = resp.json()
         assert body["blocked"] is False
 
+    def test_search_error_does_not_expose_internals(self, client):
+        """Error messages should not contain internal paths or URLs."""
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(
+            side_effect=Exception("Connection to https://oficinajudicialvirtual.pjud.cl/ADIR_871/civil/foo.php failed")
+        )
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+        body = resp.json()
+
+        assert "oficinajudicialvirtual" not in body["error"]
+        assert ".php" not in body["error"]
+        assert "ADIR_871" not in body["error"]
+
+    def test_search_non_internal_error_preserved(self, client):
+        """Non-internal error messages should be preserved."""
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(side_effect=ValueError("Invalid case number format"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+        body = resp.json()
+
+        assert body["error"] == "Invalid case number format"
+
 
 # ===================================================================
 # Detail
@@ -379,3 +409,19 @@ class TestDetail:
 
         assert resp.status_code == 200
         assert any("competencia" in r.message.lower() for r in caplog.records)
+
+    def test_detail_error_does_not_expose_internals(self, client):
+        """Error messages should not contain internal paths or URLs."""
+        mock_session = _make_mock_session()
+        mock_session.detail = AsyncMock(
+            side_effect=Exception("Connection to https://oficinajudicialvirtual.pjud.cl/ADIR_871/civil/modal/causaCivil.php failed")
+        )
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+        body = resp.json()
+
+        assert "oficinajudicialvirtual" not in body["error"]
+        assert ".php" not in body["error"]

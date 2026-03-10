@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import re
 
 from fastapi import APIRouter, Request
 
@@ -13,6 +14,17 @@ from app.parsers.detail_parser import parse_detail
 from app.metrics import api_metrics
 
 logger = logging.getLogger(__name__)
+
+_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|\w+\.php")
+
+
+def _safe_error(e: Exception) -> str:
+    """Return a user-safe error message without internal URLs or paths."""
+    msg = str(e)
+    if _INTERNAL_PATTERN.search(msg):
+        return f"Internal error: {type(e).__name__}"
+    return msg
+
 
 router = APIRouter(prefix="/api/v1", tags=["detail"])
 
@@ -111,7 +123,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             await alerter.check_and_alert()
         return DetailResponse(
             metadata={}, movements=[], litigantes=[], blocked=True,
-            error=str(e),
+            error=_safe_error(e),
         )
     finally:
         await pool.release(session, healthy=healthy)
