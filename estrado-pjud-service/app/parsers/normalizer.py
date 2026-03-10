@@ -1,6 +1,7 @@
 import re
 
 _IDENTIFIER_RE = re.compile(r"^([A-Za-z]+)-(\d+)-(\d{4})$")
+_IDENTIFIER_NUM_RE = re.compile(r"^(\d+)-(\d{4})$")
 _DATE_DMY_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -9,10 +10,14 @@ _COMPETENCIA_PATHS = {"suprema": "suprema", "apelaciones": "apelaciones", "civil
 
 
 def parse_case_identifier(raw: str) -> dict[str, str]:
-    m = _IDENTIFIER_RE.match(raw.strip())
-    if not m:
-        raise ValueError(f"Invalid case identifier: {raw!r}")
-    return {"tipo": m.group(1).upper(), "numero": m.group(2), "anno": m.group(3)}
+    raw = raw.strip()
+    m = _IDENTIFIER_RE.match(raw)
+    if m:
+        return {"tipo": m.group(1).upper(), "numero": m.group(2), "anno": m.group(3)}
+    m = _IDENTIFIER_NUM_RE.match(raw)
+    if m:
+        return {"tipo": "", "numero": m.group(1), "anno": m.group(2)}
+    raise ValueError(f"Invalid case identifier: {raw!r}")
 
 
 def normalize_date(raw: str | None) -> str | None:

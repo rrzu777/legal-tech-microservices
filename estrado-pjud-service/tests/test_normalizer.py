@@ -33,6 +33,10 @@ class TestParseCaseIdentifier:
         result = parse_case_identifier("Proteccion-4490-2025")
         assert result == {"tipo": "PROTECCION", "numero": "4490", "anno": "2025"}
 
+    def test_number_only_suprema(self):
+        result = parse_case_identifier("100-2025")
+        assert result == {"tipo": "", "numero": "100", "anno": "2025"}
+
 
 class TestNormalizeDate:
     def test_dd_mm_yyyy(self):

@@ -60,6 +60,62 @@ class TestParseDetailCivil:
         assert "nombre" in lig
 
 
+class TestParseDetailSuprema:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Suprema_100_2025.html")
+        return parse_detail(html)
+
+    def test_movements_found(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_has_fields(self, result):
+        mov = result["movements"][0]
+        assert "folio" in mov
+        assert "tramite" in mov
+        assert "fecha" in mov
+
+    def test_litigantes_found(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_litigante_has_fields(self, result):
+        lig = result["litigantes"][0]
+        assert "rut" in lig
+        assert "nombre" in lig
+
+    def test_metadata_has_rol(self, result):
+        assert result["metadata"]["rol"]
+
+    def test_metadata_has_estado_procesal(self, result):
+        assert result["metadata"]["estado_procesal"]
+
+
+class TestParseDetailApelaciones:
+    @pytest.fixture
+    def result(self):
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        return parse_detail(html)
+
+    def test_movements_found(self, result):
+        assert len(result["movements"]) >= 1
+
+    def test_movement_has_tramite(self, result):
+        tramites = [m["tramite"] for m in result["movements"]]
+        assert any(t for t in tramites)  # at least one non-empty
+
+    def test_litigantes_found(self, result):
+        assert len(result["litigantes"]) >= 1
+
+    def test_metadata_has_rol(self, result):
+        assert result["metadata"]["rol"]
+
+    def test_metadata_has_estado_procesal(self, result):
+        assert result["metadata"]["estado_procesal"]
+
+    def test_metadata_has_tribunal(self, result):
+        assert result["metadata"]["tribunal"]
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")

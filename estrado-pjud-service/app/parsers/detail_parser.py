@@ -10,6 +10,12 @@ from app.parsers.normalizer import normalize_date
 
 _WS_RE = re.compile(r"\s+")
 
+# Div IDs for movements per competencia type
+_MOVEMENT_DIV_IDS = ["historiaCiv", "movimientosSup", "movimientosApe"]
+
+# Div IDs for litigantes per competencia type
+_LITIGANTE_DIV_IDS = ["litigantesCiv", "litigantesSup", "litigantesApe"]
+
 
 def _clean(text: str | None) -> str:
     """Strip and collapse whitespace."""
@@ -50,7 +56,7 @@ def _extract_text_after_strong(td: Tag, label: str) -> str:
 
 
 def _parse_metadata(soup: BeautifulSoup) -> dict:
-    """Extract the 6 metadata fields from the first table-titulos."""
+    """Extract metadata fields from the first table-titulos."""
     metadata: dict[str, str] = {}
 
     tables = soup.find_all("table", class_="table-titulos")
@@ -68,17 +74,24 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
             if not text:
                 continue
 
-            # ROL
+            # ROL (civil/laboral/cobranza)
             if td.find("strong", string=re.compile(r"ROL")):
                 metadata["rol"] = _extract_text_after_strong(td, "ROL:")
 
-            # Estado Administrativo
+            # Libro (suprema/apelaciones) — maps to rol
+            if td.find("strong", string=re.compile(r"^Libro")):
+                metadata["rol"] = _extract_text_after_strong(td, "Libro :")
+
+            # Estado Administrativo (civil)
             if td.find("strong", string=re.compile(r"Est\. Adm\.")):
                 metadata["estado_administrativo"] = _extract_text_after_strong(td, "Est. Adm.")
 
-            # Procedimiento
+            # Estado Recurso (apelaciones) — maps to estado_administrativo
+            if td.find("strong", string=re.compile(r"Estado Recurso")):
+                metadata["estado_administrativo"] = _extract_text_after_strong(td, "Estado Recurso:")
+
+            # Procedimiento (civil)
             if td.find("strong", string=re.compile(r"Proc\.:")) and "Estado" not in text.split("Proc")[0]:
-                # Make sure this is "Proc.:" and not "Estado Proc.:"
                 strong_tag = td.find("strong", string=re.compile(r"Proc\.:"))
                 if strong_tag:
                     strong_text = _clean(strong_tag.get_text())
@@ -86,16 +99,51 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
                         metadata["procedimiento"] = _extract_text_after_strong(td, "Proc.:")
 
             # Estado Procesal
-            if td.find("strong", string=re.compile(r"Estado Proc\.")):
-                metadata["estado_procesal"] = _extract_text_after_strong(td, "Estado Proc.:")
+            if td.find("strong", string=re.compile(r"Estado Proc")):
+                # Handle both "Estado Proc.:" (civil) and "Estado Procesal:" (suprema/apelaciones)
+                strong_tag = td.find("strong", string=re.compile(r"Estado Proc"))
+                if strong_tag:
+                    strong_text = _clean(strong_tag.get_text())
+                    metadata["estado_procesal"] = _extract_text_after_strong(td, strong_text)
 
-            # Etapa
+            # Etapa (civil)
             if td.find("strong", string=re.compile(r"^Etapa:")):
                 metadata["etapa"] = _extract_text_after_strong(td, "Etapa:")
 
-            # Tribunal
+            # Ubicación (suprema/apelaciones) — maps to etapa
+            if td.find("strong", string=re.compile(r"Ubicaci")):
+                metadata["ubicacion"] = _extract_text_after_strong(td, "Ubicaci")
+                # Strip the label remnant if present
+                val = metadata["ubicacion"]
+                if val.startswith("n:"):
+                    val = val[2:].strip()
+                elif val.startswith("\u00f3n:"):
+                    val = val[3:].strip()
+                metadata["ubicacion"] = val
+
+            # Tribunal (civil)
             if td.find("strong", string=re.compile(r"Tribunal:")):
                 metadata["tribunal"] = _extract_text_after_strong(td, "Tribunal:")
+
+            # Corte (apelaciones) — maps to tribunal
+            if td.find("strong", string=re.compile(r"^Corte:")):
+                metadata["tribunal"] = _extract_text_after_strong(td, "Corte:")
+
+            # Fecha (suprema/apelaciones)
+            if td.find("strong", string=re.compile(r"^Fecha :")):
+                metadata["fecha"] = _extract_text_after_strong(td, "Fecha :")
+
+            # Caratulado (suprema)
+            if td.find("strong", string=re.compile(r"Caratulado")):
+                metadata["caratulado"] = _extract_text_after_strong(td, "Caratulado:")
+
+            # Tipo (suprema)
+            if td.find("strong", string=re.compile(r"^Tipo:")):
+                metadata["tipo"] = _extract_text_after_strong(td, "Tipo:")
+
+            # Recurso (apelaciones)
+            if td.find("strong", string=re.compile(r"^Recurso:")):
+                metadata["recurso"] = _extract_text_after_strong(td, "Recurso:")
 
     return metadata
 
@@ -131,15 +179,27 @@ def _get_selected_cuaderno(soup: BeautifulSoup) -> str:
     return text
 
 
+def _find_div(soup: BeautifulSoup, div_ids: list[str]) -> tuple[Tag | None, str]:
+    """Find the first existing div from a list of candidate IDs.
+
+    Returns (div_tag, div_id) or (None, "") if none found.
+    """
+    for div_id in div_ids:
+        div = soup.find("div", id=div_id)
+        if div:
+            return div, div_id
+    return None, ""
+
+
 def _parse_movements(soup: BeautifulSoup) -> list[dict]:
-    """Extract movements from the Historia tab table."""
+    """Extract movements from the Historia/Movimientos tab table."""
     movements: list[dict] = []
 
-    historia_div = soup.find("div", id="historiaCiv")
-    if not historia_div:
+    mov_div, div_id = _find_div(soup, _MOVEMENT_DIV_IDS)
+    if not mov_div:
         return movements
 
-    table = historia_div.find("table", class_="table-bordered")
+    table = mov_div.find("table", class_="table-bordered")
     if not table:
         return movements
 
@@ -151,39 +211,98 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
 
     for row in tbody.find_all("tr"):
         tds = row.find_all("td")
-        if len(tds) < 8:
-            continue
 
-        # Column indices: 0=Folio, 1=Doc, 2=Anexo, 3=Etapa, 4=Tramite,
-        #                 5=Desc Tramite, 6=Fec Tramite, 7=Foja, 8=Georref
+        if div_id == "movimientosSup":
+            # Suprema: Folio(0), Doc(1), Anexo(2), Año(3), Fecha(4), Tramite(5),
+            #          Desc(6), Correlativo(7), Salas(8), Estado(9)
+            if len(tds) < 10:
+                continue
+            folio = _int_or_none(tds[0].get_text())
+            tramite = _clean(tds[5].get_text())
+            descripcion = _clean(tds[6].get_text())
+            fecha = _normalize_movement_date(_clean(tds[4].get_text()))
 
-        folio = _int_or_none(tds[0].get_text())
-        etapa = _clean(tds[3].get_text())
-        tramite = _clean(tds[4].get_text())
-        descripcion = _clean(tds[5].get_text())
-        fecha = _normalize_movement_date(_clean(tds[6].get_text()))
-        foja = _int_or_none(tds[7].get_text())
+            doc_form = tds[1].find("form")
+            documento_url = None
+            if doc_form:
+                action = doc_form.get("action", "")
+                if action:
+                    documento_url = action
 
-        # Check for document URL in the Doc column
-        doc_form = tds[1].find("form")
-        documento_url = None
-        if doc_form:
-            action = doc_form.get("action", "")
-            if action:
-                documento_url = action
+            movements.append(
+                {
+                    "folio": folio,
+                    "cuaderno": cuaderno,
+                    "etapa": "",
+                    "tramite": tramite,
+                    "descripcion": descripcion,
+                    "fecha": fecha,
+                    "foja": None,
+                    "documento_url": documento_url,
+                }
+            )
 
-        movements.append(
-            {
-                "folio": folio,
-                "cuaderno": cuaderno,
-                "etapa": etapa,
-                "tramite": tramite,
-                "descripcion": descripcion,
-                "fecha": fecha,
-                "foja": foja,
-                "documento_url": documento_url,
-            }
-        )
+        elif div_id == "movimientosApe":
+            # Apelaciones: Folio(0), Doc(1), Anexo(2), Tramite(3), Desc(4),
+            #              Fecha(5), Sala(6), Estado(7), Geo(8)
+            if len(tds) < 9:
+                continue
+            folio = _int_or_none(tds[0].get_text())
+            tramite = _clean(tds[3].get_text())
+            descripcion = _clean(tds[4].get_text())
+            fecha = _normalize_movement_date(_clean(tds[5].get_text()))
+
+            doc_form = tds[1].find("form")
+            documento_url = None
+            if doc_form:
+                action = doc_form.get("action", "")
+                if action:
+                    documento_url = action
+
+            movements.append(
+                {
+                    "folio": folio,
+                    "cuaderno": cuaderno,
+                    "etapa": "",
+                    "tramite": tramite,
+                    "descripcion": descripcion,
+                    "fecha": fecha,
+                    "foja": None,
+                    "documento_url": documento_url,
+                }
+            )
+
+        else:
+            # Civil (historiaCiv): Folio(0), Doc(1), Anexo(2), Etapa(3),
+            #                      Tramite(4), Desc(5), Fecha(6), Foja(7)
+            if len(tds) < 8:
+                continue
+            folio = _int_or_none(tds[0].get_text())
+            etapa = _clean(tds[3].get_text())
+            tramite = _clean(tds[4].get_text())
+            descripcion = _clean(tds[5].get_text())
+            fecha = _normalize_movement_date(_clean(tds[6].get_text()))
+            foja = _int_or_none(tds[7].get_text())
+
+            doc_form = tds[1].find("form")
+            documento_url = None
+            if doc_form:
+                action = doc_form.get("action", "")
+                if action:
+                    documento_url = action
+
+            movements.append(
+                {
+                    "folio": folio,
+                    "cuaderno": cuaderno,
+                    "etapa": etapa,
+                    "tramite": tramite,
+                    "descripcion": descripcion,
+                    "fecha": fecha,
+                    "foja": foja,
+                    "documento_url": documento_url,
+                }
+            )
 
     return movements
 
@@ -192,7 +311,7 @@ def _parse_litigantes(soup: BeautifulSoup) -> list[dict]:
     """Extract litigantes from the Litigantes tab table."""
     litigantes: list[dict] = []
 
-    lit_div = soup.find("div", id="litigantesCiv")
+    lit_div, _ = _find_div(soup, _LITIGANTE_DIV_IDS)
     if not lit_div:
         return litigantes
 
