@@ -66,6 +66,68 @@ def _parse_civil_row(tr) -> dict | None:
     }
 
 
+def _parse_suprema_row(tr) -> dict | None:
+    """Parse a Suprema search-result row.
+
+    Column layout (5 <td>):
+        0: search icon with onClick="detalleCausaSuprema('JWT')"
+        1: ROL  (e.g. C-26903-2025)
+        2: fecha_ingreso  (DD/MM/YYYY)
+        3: caratulado
+        4: tribunal
+    """
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 5:
+        return None
+
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[2].get_text())),
+        "caratulado": _clean(tds[3].get_text()),
+        "tribunal": _clean(tds[4].get_text()),
+    }
+
+
+def _parse_apelaciones_row(tr) -> dict | None:
+    """Parse an Apelaciones search-result row.
+
+    Column layout (5 <td>):
+        0: search icon with onClick="detalleCausaApelaciones('JWT')"
+        1: ROL  (e.g. Proteccion-4490-2024)
+        2: fecha_ingreso  (DD/MM/YYYY)
+        3: caratulado
+        4: tribunal
+    """
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 5:
+        return None
+
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[2].get_text())),
+        "caratulado": _clean(tds[3].get_text()),
+        "tribunal": _clean(tds[4].get_text()),
+    }
+
+
 def _parse_laboral_row(tr) -> dict | None:
     """Parse a Laboral search-result row.
 
@@ -131,9 +193,45 @@ def _parse_cobranza_row(tr) -> dict | None:
     }
 
 
+def _parse_penal_row(tr) -> dict | None:
+    """Parse a Penal search-result row.
+
+    Column layout (6 <td>):
+        0: search icon with onClick="detalleCausaPenal('JWT')"
+        1: RIT  (e.g. O-1234-2024)
+        2: RUC  (e.g. 2401510892-0)
+        3: tribunal
+        4: caratulado
+        5: fecha_ingreso  (DD/MM/YYYY)
+    """
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 6:
+        return None
+
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),
+        "ruc": _clean(tds[2].get_text()),
+        "tribunal": _clean(tds[3].get_text()),
+        "caratulado": _clean(tds[4].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[5].get_text())),
+    }
+
+
 _ROW_PARSERS = {
+    "suprema": _parse_suprema_row,
+    "apelaciones": _parse_apelaciones_row,
     "civil": _parse_civil_row,
     "laboral": _parse_laboral_row,
+    "penal": _parse_penal_row,
     "cobranza": _parse_cobranza_row,
 }
 
