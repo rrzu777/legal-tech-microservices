@@ -70,6 +70,13 @@ class CaseMetadata(BaseModel):
     procedimiento: str = ""
     estado_procesal: str = ""
     etapa: str = ""
+    # Competencia-specific fields
+    ruc: str = ""           # penal
+    ubicacion: str = ""     # suprema, apelaciones
+    fecha: str = ""         # suprema, apelaciones
+    caratulado: str = ""    # suprema
+    tipo: str = ""          # suprema
+    recurso: str = ""       # apelaciones
 
 
 class Movement(BaseModel):

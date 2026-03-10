@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, date
 
-from app.parsers.normalizer import parse_case_identifier
+from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
@@ -80,8 +80,9 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
 
 async def search_pjud_via_session(session, competencia: str, form_data: dict, timeout: float) -> dict:
     """Call OJV search via session and parse results."""
+    comp_path = competencia_path(competencia)
     html = await asyncio.wait_for(
-        session.search(competencia, form_data),
+        session.search(comp_path, form_data),
         timeout=timeout,
     )
     blocked = detect_blocked(html)
@@ -99,8 +100,9 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
 
 async def detail_pjud_via_session(session, competencia: str, detail_key: str, timeout: float) -> dict:
     """Call OJV detail via session and parse results."""
+    comp_path = competencia_path(competencia)
     html = await asyncio.wait_for(
-        session.detail(competencia, detail_key),
+        session.detail(comp_path, detail_key),
         timeout=timeout,
     )
     if len(html.strip()) < 100:
@@ -402,5 +404,6 @@ class SyncEngine:
                 "last_sync_status": "error",
                 "last_sync_error": error,
                 "sync_blocked_until": blocked_until,
+                "sync_attempts": sync_attempts + 1,
             }).eq("id", case_id)
         )

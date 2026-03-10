@@ -251,7 +251,7 @@ class TestSyncEngine:
         """Cases with unsupported matter type should fail gracefully."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-        case = _make_case(matter="penal")
+        case = _make_case(matter="familia")
         result = await engine.sync_case(case)
 
         assert result["success"] is False
@@ -749,4 +749,9 @@ class TestSyncErrorBackoff:
             # Allow a small tolerance window (2 seconds)
             assert abs(diff - expected_seconds) < 2, (
                 f"For sync_attempts={attempts}, expected ~{expected_seconds}s backoff, got {diff:.1f}s"
+            )
+            # Verify sync_attempts is incremented in the error update
+            assert error_update.get("sync_attempts") == attempts + 1, (
+                f"For sync_attempts={attempts}, expected update to set sync_attempts={attempts + 1}, "
+                f"got {error_update.get('sync_attempts')}"
             )
