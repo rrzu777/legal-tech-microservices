@@ -37,7 +37,6 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "conTribunal": "0",
             "conTipoBusApe": "0",
             "radio-groupPenal": "1",
-            "conTipoCausa": parsed["tipo"],
             "radio-group": "1",
             "conRolCausa": parsed["numero"],
             "conEraCausa": parsed["anno"],
@@ -47,6 +46,11 @@ async def search_case(req: SearchRequest, _api_key: str = verify_api_key):
             "rucPen2": "",
             "conCaratulado": "",
         }
+
+        if req.competencia == "suprema":
+            form_data["conTipoBus"] = "0"
+        else:
+            form_data["conTipoCausa"] = parsed["tipo"]
 
         html = await session.search(comp_path, form_data)
 

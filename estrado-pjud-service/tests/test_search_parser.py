@@ -64,6 +64,52 @@ class TestParseSearchCobranza:
         assert len(results) >= 1
 
 
+class TestParseSearchSuprema:
+    @pytest.fixture
+    def html(self):
+        return _load("search_Suprema_100_2025.html")
+
+    def test_returns_results(self, html):
+        results = parse_search_results(html, "suprema")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+
+    def test_jwt_keys_present(self, html):
+        results = parse_search_results(html, "suprema")
+        for m in results:
+            assert m["key"].startswith("eyJ")
+
+    def test_fields_present(self, html):
+        results = parse_search_results(html, "suprema")
+        for m in results:
+            assert m["rol"]
+            assert m["tribunal"]
+            assert m["caratulado"]
+
+
+class TestParseSearchApelaciones:
+    @pytest.fixture
+    def html(self):
+        return _load("search_Apelaciones_Proteccion_4490_2025.html")
+
+    def test_returns_results(self, html):
+        results = parse_search_results(html, "apelaciones")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+
+    def test_jwt_keys_present(self, html):
+        results = parse_search_results(html, "apelaciones")
+        for m in results:
+            assert m["key"].startswith("eyJ")
+
+    def test_fields_present(self, html):
+        results = parse_search_results(html, "apelaciones")
+        for m in results:
+            assert m["rol"]
+            assert m["tribunal"]
+            assert m["caratulado"]
+
+
 class TestParseSearchNoResults:
     def test_empty_html_returns_empty(self):
         results = parse_search_results("<html><body></body></html>", "civil")

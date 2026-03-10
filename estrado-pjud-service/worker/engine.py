@@ -165,7 +165,6 @@ class SyncEngine:
             form_data = {
                 "action": "search",
                 "competencia": competencia,
-                "conTipoCausa": parsed["tipo"],
                 "conRolCausa": parsed["numero"],
                 "conEraCausa": parsed["anno"],
                 # TODO(spike): For apelaciones, determine corte from case record
@@ -182,6 +181,11 @@ class SyncEngine:
                 "conCaratulado": "",
                 "g-recaptcha-response-rit": "",
             }
+
+            if competencia == "suprema":
+                form_data["conTipoBus"] = "0"
+            else:
+                form_data["conTipoCausa"] = parsed["tipo"]
 
             # Search
             search_result = await search_pjud_via_session(

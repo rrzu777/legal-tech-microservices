@@ -115,14 +115,74 @@ def _parse_cobranza_row(tr) -> dict | None:
     }
 
 
+def _parse_suprema_row(tr) -> dict | None:
+    """Parse a Suprema search-result row.
+
+    Column layout (7 <td>):
+        0: search icon with onClick="detalleCausaSuprema('JWT')"
+        1: ROL (e.g. 100-2025, no letter prefix)
+        2: tipo_recurso (e.g. "(Crimen) Apelación Amparo")
+        3: caratulado
+        4: fecha_ingreso (DD/MM/YYYY)
+        5: estado
+        6: tribunal
+    """
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 7:
+        return None
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),
+        "tribunal": _clean(tds[6].get_text()),
+        "caratulado": _clean(tds[3].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[4].get_text())),
+    }
+
+
+def _parse_apelaciones_row(tr) -> dict | None:
+    """Parse an Apelaciones search-result row.
+
+    Column layout (8 <td>):
+        0: search icon with onClick="detalleCausaApelaciones('JWT')"
+        1: ROL (e.g. Protección-4490-2025)
+        2: corte (e.g. C.A. de San Miguel)
+        3: caratulado
+        4: fecha_ingreso (DD/MM/YYYY)
+        5: estado
+        6: fecha (DD/MM/YYYY)
+        7: tribunal
+    """
+    tds = tr.find_all("td", recursive=False)
+    if len(tds) < 8:
+        return None
+    a_tag = tds[0].find("a", onclick=True)
+    if not a_tag:
+        return None
+    m = _JWT_RE.search(a_tag["onclick"])
+    if not m:
+        return None
+    return {
+        "key": m.group(1),
+        "rol": _clean(tds[1].get_text()),
+        "tribunal": _clean(tds[7].get_text()),
+        "caratulado": _clean(tds[3].get_text()),
+        "fecha_ingreso": normalize_date(_clean(tds[4].get_text())),
+    }
+
+
 _ROW_PARSERS = {
     "civil": _parse_civil_row,
     "laboral": _parse_laboral_row,
     "cobranza": _parse_cobranza_row,
-    # TODO(spike): Replace with dedicated parsers after reviewing HTML fixtures
-    # from scripts/pjud-spike/fase0b_nuevas_competencias.py
-    "suprema": _parse_civil_row,
-    "apelaciones": _parse_civil_row,
+    "suprema": _parse_suprema_row,
+    "apelaciones": _parse_apelaciones_row,
+    # TODO(spike): Replace with dedicated parser after reviewing HTML fixtures
     "penal": _parse_civil_row,
 }
 
