@@ -31,7 +31,7 @@ def _decode(resp: httpx.Response) -> str:
 
 _AJAX_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://oficinajudicialvirtual.pjud.cl/indexN.php",
+    "Referer": "https://oficinajudicialvirtual.pjud.cl/consultaUnificada.php",
 }
 
 
@@ -50,7 +50,9 @@ class OJVSession:
     async def initialize(self):
         """Step 1+2: Load initial page for cookies + CSRF, then activate guest session."""
         # Step 1: GET main page to get cookies + CSRF
-        resp = await self._adapter.get("/indexN.php")
+        # Must use consultaUnificada.php (not indexN.php) because only
+        # this page contains the CSRF token needed for detail requests.
+        resp = await self._adapter.get("/consultaUnificada.php")
         resp.raise_for_status()
         html = _decode(resp)
 
