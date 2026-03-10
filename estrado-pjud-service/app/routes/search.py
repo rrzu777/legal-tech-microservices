@@ -41,6 +41,9 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if detect_blocked(html):
             healthy = False
             api_metrics.record_blocked("search")
+            alerter = getattr(request.app.state, "alerter", None)
+            if alerter:
+                await alerter.check_and_alert()
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
@@ -63,8 +66,13 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         logger.exception("Search failed")
         healthy = False
         api_metrics.record_error("search")
+        blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
+        if blocked:
+            alerter = getattr(request.app.state, "alerter", None)
+            if alerter:
+                await alerter.check_and_alert()
         return SearchResponse(
-            found=False, match_count=0, matches=[], blocked=isinstance(e, (httpx.TimeoutException, httpx.ConnectError)),
+            found=False, match_count=0, matches=[], blocked=blocked,
             error=str(e),
         )
     finally:

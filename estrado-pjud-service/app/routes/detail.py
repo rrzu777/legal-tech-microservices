@@ -74,6 +74,9 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         if not html or len(html.strip()) < 100:
             healthy = False
             api_metrics.record_blocked("detail")
+            alerter = getattr(request.app.state, "alerter", None)
+            if alerter:
+                await alerter.check_and_alert()
             logger.warning(
                 "Detail blocked for comp=%s — response length=%d, body=%r",
                 comp, len(html) if html else 0, (html or "")[:500],
@@ -103,6 +106,9 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         logger.exception("Detail fetch failed")
         healthy = False
         api_metrics.record_error("detail")
+        alerter = getattr(request.app.state, "alerter", None)
+        if alerter:
+            await alerter.check_and_alert()
         return DetailResponse(
             metadata={}, movements=[], litigantes=[], blocked=True,
             error=str(e),

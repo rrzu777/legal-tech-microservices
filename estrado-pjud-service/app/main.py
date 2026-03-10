@@ -17,6 +17,18 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     pool = APISessionPool(settings)
     app.state.session_pool = pool
+
+    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        from app.alerting import TelegramAlerter
+        app.state.alerter = TelegramAlerter(
+            bot_token=settings.TELEGRAM_BOT_TOKEN,
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            blocked_rate_threshold=settings.TELEGRAM_BLOCKED_RATE_THRESHOLD,
+            cooldown_seconds=settings.TELEGRAM_COOLDOWN_S,
+        )
+    else:
+        app.state.alerter = None
+
     try:
         yield
     finally:
