@@ -377,7 +377,22 @@ class SyncEngine:
           2nd error: 30 minutes
           3rd error: 2 hours
           4th+: 6 hours
+          After 10 failures: suspended (irrecoverable)
         """
+        _MAX_SYNC_ATTEMPTS = 10
+
+        if sync_attempts >= _MAX_SYNC_ATTEMPTS:
+            logger.warning("Case %s exceeded max sync attempts (%d), suspending", case_id, _MAX_SYNC_ATTEMPTS)
+            await run_query(
+                self._sb.from_("cases").update({
+                    "tracking_status": "suspended",
+                    "last_sync_status": "error",
+                    "last_sync_error": f"Suspended after {sync_attempts} failed attempts: {error}",
+                    "sync_attempts": sync_attempts + 1,
+                }).eq("id", case_id)
+            )
+            return
+
         backoff_seconds = {0: 300, 1: 1800, 2: 7200}.get(
             sync_attempts, 21600
         )

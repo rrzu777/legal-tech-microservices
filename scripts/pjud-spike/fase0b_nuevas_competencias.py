@@ -154,7 +154,7 @@ class SpikeSession:
         """GET main page for cookies + CSRF, then activate guest session."""
         await self._rate_limit()
         log.info("Initializing session...")
-        resp = await self.client.get(f"{OJV_BASE}/consultaUnificada.php")
+        resp = await self.client.get(f"{OJV_BASE}/indexN.php")
         resp.raise_for_status()
         html = decode_response(resp)
 
