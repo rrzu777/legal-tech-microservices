@@ -5,21 +5,21 @@ VALID_CORTE_CODES = {
     0,   # Todas (all courts)
     10,  # C.A. de Arica
     11,  # C.A. de Iquique
-    12,  # C.A. de Antofagasta
-    13,  # C.A. de Copiapó
-    14,  # C.A. de La Serena
-    15,  # C.A. de Valparaíso
-    16,  # C.A. de Santiago
-    17,  # C.A. de San Miguel
-    18,  # C.A. de Rancagua
-    19,  # C.A. de Talca
-    20,  # C.A. de Chillán
-    21,  # C.A. de Concepción
-    22,  # C.A. de Temuco
-    23,  # C.A. de Valdivia
-    24,  # C.A. de Puerto Montt
-    25,  # C.A. de Coyhaique
-    26,  # C.A. de Punta Arenas
+    15,  # C.A. de Antofagasta
+    20,  # C.A. de Copiapó
+    25,  # C.A. de La Serena
+    30,  # C.A. de Valparaíso
+    35,  # C.A. de Rancagua
+    40,  # C.A. de Talca
+    45,  # C.A. de Chillán
+    46,  # C.A. de Concepción
+    50,  # C.A. de Temuco
+    55,  # C.A. de Valdivia
+    56,  # C.A. de Puerto Montt
+    60,  # C.A. de Coyhaique
+    61,  # C.A. de Punta Arenas
+    90,  # C.A. de Santiago
+    91,  # C.A. de San Miguel
 }
 
 

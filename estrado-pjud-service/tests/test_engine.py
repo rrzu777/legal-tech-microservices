@@ -440,7 +440,7 @@ class TestSyncEngine:
             case_number="Proteccion-4490-2025",
             matter="apelaciones",
             external_case_key=None,
-            external_payload={"corte": 17},
+            external_payload={"corte": 91},
         )
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
@@ -450,10 +450,10 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is True
-        # Verify that search was called with corte=17 in form_data
+        # Verify that search was called with corte=91 in form_data
         call_args = mock_search.call_args
         form_data = call_args[0][2]  # third positional arg is form_data
-        assert form_data["conCorte"] == "17"
+        assert form_data["conCorte"] == "91"
 
     @pytest.mark.asyncio
     async def test_sync_apelaciones_warns_when_no_corte(self):
