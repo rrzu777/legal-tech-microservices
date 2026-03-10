@@ -10,7 +10,7 @@ from app.models import (
     DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
 )
 from app.parsers.detail_parser import parse_detail
-from app.routes.health import record_successful_request
+from app.metrics import api_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -61,15 +61,19 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
                 logger.info("Inferred competencia=%s from JWT", comp)
             else:
                 logger.error("competencia not provided and could not be inferred from JWT")
+                api_metrics.record_request("detail")
+                api_metrics.record_error("detail")
                 return DetailResponse(
                     metadata={}, movements=[], litigantes=[], blocked=True,
                     error="competencia is required (could not infer from JWT)",
                 )
 
         html = await session.detail(comp, req.detail_key)
+        api_metrics.record_request("detail")
 
         if not html or len(html.strip()) < 100:
             healthy = False
+            api_metrics.record_blocked("detail")
             logger.warning(
                 "Detail blocked for comp=%s — response length=%d, body=%r",
                 comp, len(html) if html else 0, (html or "")[:500],
@@ -85,7 +89,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         movements = [Movement(**m) for m in parsed["movements"]]
         litigantes = [Litigante(**l) for l in parsed["litigantes"]]
 
-        record_successful_request()
+        api_metrics.record_success("detail")
 
         return DetailResponse(
             metadata=metadata,
@@ -98,6 +102,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
     except Exception as e:
         logger.exception("Detail fetch failed")
         healthy = False
+        api_metrics.record_error("detail")
         return DetailResponse(
             metadata={}, movements=[], litigantes=[], blocked=True,
             error=str(e),

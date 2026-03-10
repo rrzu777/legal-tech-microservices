@@ -9,7 +9,7 @@ from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
-from app.routes.health import record_successful_request
+from app.metrics import api_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,11 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         )
 
         html = await session.search(comp_path, form_data)
+        api_metrics.record_request("search")
 
         if detect_blocked(html):
             healthy = False
+            api_metrics.record_blocked("search")
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
@@ -47,7 +49,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         raw_matches = parse_search_results(html, req.competencia)
         matches = [CandidateMatch(**m) for m in raw_matches]
 
-        record_successful_request()
+        api_metrics.record_success("search")
 
         return SearchResponse(
             found=len(matches) > 0,
@@ -60,6 +62,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
     except Exception as e:
         logger.exception("Search failed")
         healthy = False
+        api_metrics.record_error("search")
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=isinstance(e, (httpx.TimeoutException, httpx.ConnectError)),
             error=str(e),

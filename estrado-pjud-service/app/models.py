@@ -112,3 +112,9 @@ class HealthResponse(BaseModel):
     status: str
     last_successful_request: str | None
     uptime_seconds: int
+    total_requests: int = 0
+    search_requests: int = 0
+    detail_requests: int = 0
+    total_errors: int = 0
+    total_blocked: int = 0
+    blocked_rate: float = 0.0
