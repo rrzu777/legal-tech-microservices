@@ -72,11 +72,16 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
 
     tables = soup.find_all("table", class_="table-titulos")
     if not tables:
+        logger.warning("No table.table-titulos found for metadata")
         return metadata
 
     # Metadata lives in the first table-titulos
     table = tables[0]
     rows = table.find_all("tr")
+
+    # Log all strong labels for diagnostics
+    all_labels = [_clean(s.get_text()) for s in table.find_all("strong")]
+    logger.info("Metadata strong labels: %s", all_labels)
 
     for row in rows:
         tds = row.find_all("td")
@@ -85,8 +90,8 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
             if not text:
                 continue
 
-            # ROL (civil/laboral/cobranza)
-            if td.find("strong", string=re.compile(r"^ROL")):
+            # ROL (civil/laboral/cobranza) — case-insensitive
+            if td.find("strong", string=re.compile(r"^ROL", re.IGNORECASE)):
                 metadata["rol"] = _extract_text_after_strong(td, "ROL:")
 
             # RIT (penal) — maps to rol
