@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-from app.models import SearchRequest
+from app.models import SearchRequest, SearchResponse
 
 
 class TestSearchRequestCorte:
@@ -35,3 +35,32 @@ class TestSearchRequestCorte:
     def test_corte_none_for_non_apelaciones(self):
         req = SearchRequest(case_type="rol", case_number="C-1234-2024", competencia="civil")
         assert req.corte is None
+
+
+class TestSearchRequestLibro:
+    def test_libro_optional_defaults_none(self):
+        req = SearchRequest(case_type="rol", case_number="C-1234-2024", competencia="civil")
+        assert req.libro is None
+
+    def test_libro_accepted_when_provided(self):
+        req = SearchRequest(case_type="rol", case_number="C-1234-2024", competencia="civil", libro="V")
+        assert req.libro == "V"
+
+    def test_libro_accepted_for_laboral(self):
+        req = SearchRequest(case_type="rit", case_number="T-500-2024", competencia="laboral", libro="T")
+        assert req.libro == "T"
+
+    def test_libro_accepted_for_suprema(self):
+        """Libro is accepted in the model even for suprema (ignored at form-builder level)."""
+        req = SearchRequest(case_type="rol", case_number="100-2025", competencia="suprema", libro="X")
+        assert req.libro == "X"
+
+
+class TestSearchResponseLibroUsed:
+    def test_libro_used_optional_defaults_none(self):
+        resp = SearchResponse(found=False, match_count=0, matches=[], blocked=False, error=None)
+        assert resp.libro_used is None
+
+    def test_libro_used_accepted_when_provided(self):
+        resp = SearchResponse(found=True, match_count=1, matches=[], blocked=False, error=None, libro_used="V")
+        assert resp.libro_used == "V"

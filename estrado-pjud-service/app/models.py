@@ -32,6 +32,7 @@ class SearchRequest(BaseModel):
     case_number: str  # "X-NNNN-YYYY"
     competencia: COMPETENCIA_TYPE
     corte: int | None = None  # only valid when competencia == "apelaciones"
+    libro: str | None = None
 
     @model_validator(mode="after")
     def _validate_corte(self):
@@ -60,6 +61,7 @@ class SearchResponse(BaseModel):
     matches: list[CandidateMatch]
     blocked: bool
     error: str | None
+    libro_used: str | None = None
 
 
 class DetailRequest(BaseModel):
