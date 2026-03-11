@@ -253,6 +253,49 @@ class TestSearch:
         assert "[redacted]" in body["error"]
         assert "Connection to" in body["error"]
 
+    def test_search_with_libro_passes_to_form_data(self, client):
+        """libro field is threaded through to build_search_form_data."""
+        html = _load("search_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(search_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {
+            "case_type": "rol",
+            "case_number": "C-1234-2024",
+            "competencia": "civil",
+            "libro": "V",
+        }
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["found"] is True
+        assert body["libro_used"] == "V"
+
+        # Verify the form data sent to PJUD contained libro override
+        call_args = mock_session.search.call_args
+        form_data = call_args[0][1]  # second positional arg
+        assert form_data["conTipoCausa"] == "V"
+
+    def test_search_without_libro_echoes_tipo(self, client):
+        """Without libro, libro_used echoes the tipo extracted from case_number."""
+        html = _load("search_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(search_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {
+            "case_type": "rol",
+            "case_number": "C-1234-2024",
+            "competencia": "civil",
+        }
+        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["libro_used"] == "C"
+
     def test_search_non_internal_error_preserved(self, client):
         """Non-internal error messages should be preserved."""
         mock_session = _make_mock_session()

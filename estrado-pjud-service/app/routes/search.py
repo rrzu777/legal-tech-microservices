@@ -7,7 +7,7 @@ from app.auth import verify_api_key
 from app.rate_limit import limiter
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
-from app.parsers.normalizer import parse_case_identifier, competencia_path
+from app.parsers.normalizer import parse_case_identifier, competencia_path, resolve_libro
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
@@ -37,7 +37,10 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             numero=parsed["numero"],
             anno=parsed["anno"],
             corte=req.corte if req.competencia == "apelaciones" else 0,
+            libro=req.libro,
         )
+
+        libro_used = resolve_libro(req.competencia, parsed["tipo"], req.libro) or None
 
         html = await session.search(comp_path, form_data)
 
@@ -48,6 +51,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
+                libro_used=None,
             )
 
         raw_matches = parse_search_results(html, req.competencia)
@@ -61,6 +65,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             matches=matches,
             blocked=False,
             error=None,
+            libro_used=libro_used,
         )
 
     except Exception as e:
@@ -74,6 +79,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=blocked,
             error=safe_error(e),
+            libro_used=None,
         )
     finally:
         await pool.release(session, healthy=healthy)
