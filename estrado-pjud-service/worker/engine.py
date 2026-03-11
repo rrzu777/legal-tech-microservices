@@ -177,12 +177,18 @@ class SyncEngine:
                         case.get("case_number", case["id"]),
                     )
 
+            # Read libro from external_payload (same pattern as corte)
+            libro_value = None
+            if case.get("external_payload"):
+                libro_value = case["external_payload"].get("libro") or None
+
             form_data = build_search_form_data(
                 competencia=competencia,
                 tipo=parsed["tipo"],
                 numero=parsed["numero"],
                 anno=parsed["anno"],
                 corte=corte_value,
+                libro=libro_value,
             )
 
             # Search
