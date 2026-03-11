@@ -76,6 +76,7 @@ class CaseMetadata(BaseModel):
     procedimiento: str = ""
     estado_procesal: str = ""
     etapa: str = ""
+    libro: str = ""  # extracted from ROL/RIT prefix or Libro label
     # Competencia-specific fields
     ruc: str = ""           # penal
     ubicacion: str = ""     # suprema, apelaciones
@@ -106,6 +107,7 @@ class DetailResponse(BaseModel):
     metadata: CaseMetadata | dict
     movements: list[Movement] | list[dict]
     litigantes: list[Litigante] | list[dict]
+    libro: str | None = None  # top-level convenience field
     blocked: bool
     error: str | None
 

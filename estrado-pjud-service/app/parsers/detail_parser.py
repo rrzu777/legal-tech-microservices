@@ -93,11 +93,18 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
             # ROL (civil) — case-insensitive
             if td.find("strong", string=re.compile(r"^ROL", re.IGNORECASE)):
                 metadata["rol"] = _extract_text_after_strong(td, "ROL:")
+                # Extract libro prefix from ROL: "C-1234-2024" → "C"
+                rol_val = metadata.get("rol", "")
+                if "-" in rol_val:
+                    metadata.setdefault("libro", rol_val.split("-")[0].strip())
 
             # RIT (laboral/cobranza/penal) — maps to rol; handles "RIT :" and "RIT:"
             if td.find("strong", string=re.compile(r"^RIT\s*:")):
                 strong_tag = td.find("strong", string=re.compile(r"^RIT\s*:"))
                 metadata["rol"] = _extract_text_after_strong(td, _clean(strong_tag.get_text()))
+                rit_val = metadata.get("rol", "")
+                if "-" in rit_val:
+                    metadata.setdefault("libro", rit_val.split("-")[0].strip())
 
             # RUC (cobranza/penal) — handles "RUC :" and "RUC:"
             if td.find("strong", string=re.compile(r"^RUC\s*:")):
@@ -107,6 +114,7 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
             # Libro (suprema/apelaciones) — maps to rol
             if td.find("strong", string=re.compile(r"^Libro")):
                 metadata["rol"] = _extract_text_after_strong(td, "Libro :")
+                metadata["libro"] = _extract_text_after_strong(td, "Libro :")
 
             # Estado Administrativo (civil)
             if td.find("strong", string=re.compile(r"Est\. Adm\.")):

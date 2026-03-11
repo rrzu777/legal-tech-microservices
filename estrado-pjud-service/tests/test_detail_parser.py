@@ -31,6 +31,10 @@ class TestParseDetailCivil:
         assert "Coquimbo" in md["tribunal"]
         assert md["estado_administrativo"] == "Sin archivar"
 
+    def test_libro_extracted_from_rol_prefix(self, result):
+        """Libro is extracted from the ROL prefix (e.g. 'C' from 'C-1234-2024')."""
+        assert result["metadata"]["libro"] == "C"
+
     def test_movements_is_list(self, result):
         assert isinstance(result["movements"], list)
         assert len(result["movements"]) >= 1
@@ -88,6 +92,10 @@ class TestParseDetailSuprema:
 
     def test_metadata_has_estado_procesal(self, result):
         assert result["metadata"]["estado_procesal"]
+
+    def test_libro_extracted_from_libro_label(self, result):
+        """Suprema libro is extracted from the 'Libro :' label."""
+        assert result["metadata"].get("libro")
 
 
 class TestParseDetailApelaciones:

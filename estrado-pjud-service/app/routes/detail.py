@@ -58,7 +58,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         if not comp:
             logger.error("competencia not provided and could not be inferred from JWT")
             return DetailResponse(
-                metadata={}, movements=[], litigantes=[], blocked=True,
+                metadata={}, movements=[], litigantes=[], libro=None, blocked=True,
                 error="competencia is required (could not infer from JWT)",
             )
         logger.info("Inferred competencia=%s from JWT", comp)
@@ -81,7 +81,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
                 comp, len(html) if html else 0, (html or "")[:500],
             )
             return DetailResponse(
-                metadata={}, movements=[], litigantes=[], blocked=True,
+                metadata={}, movements=[], litigantes=[], libro=None, blocked=True,
                 error="Empty or blocked response from OJV",
             )
 
@@ -97,6 +97,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             metadata=metadata,
             movements=movements,
             litigantes=litigantes,
+            libro=metadata.libro or None,
             blocked=False,
             error=None,
         )
@@ -110,7 +111,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             api_metrics.record_blocked("detail")
             await maybe_alert(request)
         return DetailResponse(
-            metadata={}, movements=[], litigantes=[], blocked=blocked,
+            metadata={}, movements=[], litigantes=[], libro=None, blocked=blocked,
             error=safe_error(e),
         )
     finally:

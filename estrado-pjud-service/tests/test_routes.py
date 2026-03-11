@@ -522,3 +522,18 @@ class TestDetail:
         assert resp.status_code == 200
         body = resp.json()
         assert body["blocked"] is False
+
+    def test_detail_includes_libro_field(self, client):
+        """DetailResponse includes libro extracted from metadata."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        mock_session = _make_mock_session(detail_html=html)
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["libro"] == "C"  # extracted from ROL "C-1234-2024"
+        assert body["metadata"]["libro"] == "C"
