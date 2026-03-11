@@ -243,10 +243,15 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
 
     mov_div, div_id = _find_div(soup, _MOVEMENT_DIV_IDS)
     if not mov_div:
+        all_divs = [d.get("id") for d in soup.find_all("div", id=True)]
+        logger.warning("No movement div found. Known IDs: %s. All div IDs in HTML: %s", _MOVEMENT_DIV_IDS, all_divs)
         return movements
+
+    logger.info("Movement div found: id=%s", div_id)
 
     table = mov_div.find("table", class_="table-bordered")
     if not table:
+        logger.warning("No table.table-bordered inside div#%s", div_id)
         return movements
 
     cuaderno = _get_selected_cuaderno(soup)
@@ -254,13 +259,19 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
 
     tbody = table.find("tbody")
     if not tbody:
+        logger.warning("No tbody inside table in div#%s", div_id)
         return movements
 
-    for row in tbody.find_all("tr"):
+    rows = tbody.find_all("tr")
+    logger.info("div#%s: found %d rows, expecting min_cols=%d", div_id, len(rows), cols["min_cols"])
+
+    for row in rows:
         tds = row.find_all("td")
         if len(tds) < cols["min_cols"]:
-            if div_id in ("historiaPen", "movimientosPen") and 4 <= len(tds) < cols["min_cols"]:
-                logger.warning("Penal movement row has %d cols (expected %d), skipping", len(tds), cols["min_cols"])
+            if len(rows) <= 5 or rows.index(row) == 0:
+                logger.warning("Row has %d cols (expected %d), skipping. First cells: %s",
+                    len(tds), cols["min_cols"],
+                    [_clean(td.get_text())[:30] for td in tds[:4]])
             continue
 
         folio = _int_or_none(tds[cols["folio"]].get_text())
