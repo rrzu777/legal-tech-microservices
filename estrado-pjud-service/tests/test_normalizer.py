@@ -5,6 +5,9 @@ from app.parsers.normalizer import (
     normalize_date,
     competencia_code,
     competencia_path,
+    VALID_LIBROS,
+    LIBRO_DEFAULTS,
+    resolve_libro,
 )
 
 
@@ -97,3 +100,43 @@ class TestCompetenciaPath:
 
     def test_penal(self):
         assert competencia_path("penal") == "penal"
+
+
+class TestResolveLibro:
+    """Test the 3-tier libro fallback: libro -> tipo -> competencia default."""
+
+    @pytest.mark.parametrize("competencia,libro,tipo,expected", [
+        # Tier 1: explicit libro wins
+        ("civil", "V", "C", "V"),
+        ("laboral", "T", "O", "T"),
+        ("cobranza", "J", "C", "J"),
+        # Tier 2: fallback to tipo extraction
+        ("civil", None, "C", "C"),
+        ("laboral", None, "T", "T"),
+        ("cobranza", None, "A", "A"),
+        # Tier 3: fallback to competencia default
+        ("civil", None, "", "C"),
+        ("laboral", None, "", "O"),
+        ("cobranza", None, "", "C"),
+        # Suprema and others: no conTipoCausa needed, returns ""
+        ("suprema", None, "", ""),
+        ("suprema", "X", "", ""),
+        ("penal", None, "O", "O"),
+        ("penal", None, "", ""),
+        # Apelaciones: uses tipo/libro like civil
+        ("apelaciones", "PROTECCION", "", "PROTECCION"),
+        ("apelaciones", None, "PROTECCION", "PROTECCION"),
+    ])
+    def test_resolve_libro(self, competencia, libro, tipo, expected):
+        assert resolve_libro(competencia, tipo, libro) == expected
+
+
+class TestLibroConstants:
+    def test_valid_libros_has_known_competencias(self):
+        assert "civil" in VALID_LIBROS
+        assert "laboral" in VALID_LIBROS
+        assert "cobranza" in VALID_LIBROS
+
+    def test_defaults_are_subset_of_valid(self):
+        for comp, default in LIBRO_DEFAULTS.items():
+            assert default in VALID_LIBROS[comp], f"Default {default!r} not in VALID_LIBROS[{comp!r}]"

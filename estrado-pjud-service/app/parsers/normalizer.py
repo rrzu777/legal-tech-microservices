@@ -7,6 +7,33 @@ _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _COMPETENCIA_CODES = {"suprema": 1, "apelaciones": 2, "civil": 3, "laboral": 4, "penal": 5, "cobranza": 6}
 
+VALID_LIBROS: dict[str, set[str]] = {
+    "civil": {"C", "V", "E", "A", "I"},
+    "laboral": {"O", "T", "M", "E", "I", "S"},
+    "cobranza": {"A", "C", "D", "E", "J", "P", "R"},
+}
+
+LIBRO_DEFAULTS: dict[str, str] = {
+    "civil": "C",
+    "laboral": "O",
+    "cobranza": "C",
+}
+
+
+def resolve_libro(competencia: str, tipo: str, libro: str | None = None) -> str:
+    """Resolve the effective libro (conTipoCausa) value.
+
+    Fallback chain: explicit libro -> extracted tipo -> competencia default.
+    Returns "" for suprema (uses conTipoBus instead).
+    """
+    if competencia == "suprema":
+        return ""
+    if libro:
+        return libro
+    if tipo:
+        return tipo
+    return LIBRO_DEFAULTS.get(competencia, "")
+
 
 def parse_case_identifier(raw: str) -> dict[str, str]:
     raw = raw.strip()
