@@ -28,3 +28,14 @@ def test_config_defaults(monkeypatch):
     assert s.LOG_LEVEL == "INFO"
     assert s.SESSION_POOL_SIZE == 2
     assert s.SESSION_MAX_AGE_S == 1200
+
+
+def test_telegram_config_defaults(monkeypatch):
+    monkeypatch.setenv("API_KEY", "test-key")
+    from app.config import get_settings, Settings
+    get_settings.cache_clear()
+    settings = Settings(API_KEY="test", _env_file=None)
+    assert settings.TELEGRAM_BOT_TOKEN == ""
+    assert settings.TELEGRAM_CHAT_ID == ""
+    assert settings.TELEGRAM_BLOCKED_RATE_THRESHOLD == 0.3
+    assert settings.TELEGRAM_COOLDOWN_S == 300

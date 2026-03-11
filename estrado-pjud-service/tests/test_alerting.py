@@ -1,7 +1,8 @@
 """Tests for Telegram alerting."""
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
+from starlette.datastructures import State
 
 
 @pytest.fixture(autouse=True)
@@ -95,3 +96,14 @@ class TestTelegramAlerter:
         with patch.object(alerter, "_send", new_callable=AsyncMock) as mock_send:
             await alerter.check_and_alert()
             mock_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_alerter_close_cleans_up_client(self):
+        from app.alerting import TelegramAlerter
+        alerter = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+        )
+        assert alerter._client is not None
+        await alerter.close()
+        assert alerter._client.is_closed

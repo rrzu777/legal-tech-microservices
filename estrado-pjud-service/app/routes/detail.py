@@ -13,6 +13,7 @@ from app.models import (
 from app.parsers.detail_parser import parse_detail
 from app.metrics import api_metrics
 from app.errors import safe_error
+from app.alerting import maybe_alert
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         if not html or len(html.strip()) < 100:
             healthy = False
             api_metrics.record_blocked("detail")
-            alerter = getattr(request.app.state, "alerter", None)
-            if alerter:
-                await alerter.check_and_alert()
+            await maybe_alert(request)
             logger.warning(
                 "Detail blocked for comp=%s — response length=%d, body=%r",
                 comp, len(html) if html else 0, (html or "")[:500],
@@ -109,9 +108,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
         if blocked:
             api_metrics.record_blocked("detail")
-            alerter = getattr(request.app.state, "alerter", None)
-            if alerter:
-                await alerter.check_and_alert()
+            await maybe_alert(request)
         return DetailResponse(
             metadata={}, movements=[], litigantes=[], blocked=blocked,
             error=safe_error(e),

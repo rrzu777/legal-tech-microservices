@@ -2,6 +2,7 @@ import logging
 import time
 
 import httpx
+from fastapi import Request
 
 from app.metrics import api_metrics
 
@@ -23,22 +24,17 @@ class TelegramAlerter:
         self._threshold = blocked_rate_threshold
         self._cooldown = cooldown_seconds
         self._last_alert_time: float = 0.0
-        self._client: httpx.AsyncClient | None = None
-
-    def _get_client(self) -> httpx.AsyncClient:
-        """Lazily create the shared HTTP client."""
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=10.0)
-        return self._client
+        self._client = httpx.AsyncClient(timeout=10.0)
 
     async def check_and_alert(self):
         """Check metrics and send alert if blocked rate exceeds threshold."""
         snapshot = api_metrics.snapshot()
+        windowed_rate = api_metrics.windowed_blocked_rate()
 
         if snapshot["total_requests"] == 0:
             return
 
-        if snapshot["blocked_rate"] < self._threshold:
+        if windowed_rate < self._threshold:
             return
 
         now = time.monotonic()
@@ -53,7 +49,7 @@ class TelegramAlerter:
             "Errors: {}\n"
             "Uptime: {}s"
         ).format(
-            snapshot["blocked_rate"],
+            windowed_rate,
             snapshot["total_blocked"],
             snapshot["total_requests"],
             snapshot["total_errors"],
@@ -65,8 +61,7 @@ class TelegramAlerter:
         """Send message via Telegram Bot API."""
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         try:
-            client = self._get_client()
-            resp = await client.post(url, json={
+            resp = await self._client.post(url, json={
                 "chat_id": self._chat_id,
                 "text": text,
             })
@@ -79,3 +74,10 @@ class TelegramAlerter:
         """Close the underlying HTTP client."""
         if self._client is not None:
             await self._client.aclose()
+
+
+async def maybe_alert(request: Request):
+    """Trigger alert check if alerter is configured."""
+    alerter = getattr(request.app.state, "alerter", None)
+    if alerter:
+        await alerter.check_and_alert()

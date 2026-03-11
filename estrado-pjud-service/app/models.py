@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
 
@@ -117,4 +117,4 @@ class HealthResponse(BaseModel):
     detail_requests: int = 0
     total_errors: int = 0
     total_blocked: int = 0
-    blocked_rate: float = 0.0
+    blocked_rate: float = Field(default=0.0, ge=0.0, le=1.0)

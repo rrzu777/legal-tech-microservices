@@ -11,6 +11,7 @@ from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
+from app.alerting import maybe_alert
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +44,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if detect_blocked(html):
             healthy = False
             api_metrics.record_blocked("search")
-            alerter = getattr(request.app.state, "alerter", None)
-            if alerter:
-                await alerter.check_and_alert()
+            await maybe_alert(request)
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
@@ -71,9 +70,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
         if blocked:
             api_metrics.record_blocked("search")
-            alerter = getattr(request.app.state, "alerter", None)
-            if alerter:
-                await alerter.check_and_alert()
+            await maybe_alert(request)
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=blocked,
             error=safe_error(e),

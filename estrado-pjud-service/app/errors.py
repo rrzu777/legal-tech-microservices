@@ -1,6 +1,6 @@
 import re
 
-_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|\w+\.php")
+_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|(?:causa|consulta|sesion|modal)\w*\.php")
 
 
 def safe_error(e: Exception) -> str:

@@ -55,3 +55,20 @@ class TestAPIMetrics:
 
         snapshot = api_metrics.snapshot()
         assert snapshot["blocked_rate"] == 0.0
+
+    def test_windowed_blocked_rate(self):
+        from app.metrics import api_metrics
+        api_metrics.reset()
+
+        for _ in range(10):
+            api_metrics.record_request("search")
+        for _ in range(3):
+            api_metrics.record_blocked("search")
+
+        rate = api_metrics.windowed_blocked_rate()
+        assert rate == pytest.approx(0.3, abs=0.01)  # 3 blocked / 10 requests
+
+    def test_windowed_rate_zero_when_empty(self):
+        from app.metrics import api_metrics
+        api_metrics.reset()
+        assert api_metrics.windowed_blocked_rate() == 0.0
