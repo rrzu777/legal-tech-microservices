@@ -15,7 +15,7 @@ _WS_RE = re.compile(r"\s+")
 
 # Div IDs for movements per competencia type
 _MOVEMENT_DIV_IDS = [
-    "historiaCiv", "historiaLab", "historiaCob",
+    "historiaCiv", "movimientoLab", "historiaCob",
     "movimientosSup", "movimientosApe",
     "historiaPen", "movimientosPen",
 ]
