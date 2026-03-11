@@ -90,17 +90,19 @@ def _parse_metadata(soup: BeautifulSoup) -> dict:
             if not text:
                 continue
 
-            # ROL (civil/laboral/cobranza) — case-insensitive
+            # ROL (civil) — case-insensitive
             if td.find("strong", string=re.compile(r"^ROL", re.IGNORECASE)):
                 metadata["rol"] = _extract_text_after_strong(td, "ROL:")
 
-            # RIT (penal) — maps to rol
-            if td.find("strong", string=re.compile(r"^RIT")):
-                metadata["rol"] = _extract_text_after_strong(td, "RIT:")
+            # RIT (laboral/cobranza/penal) — maps to rol; handles "RIT :" and "RIT:"
+            if td.find("strong", string=re.compile(r"^RIT\s*:")):
+                strong_tag = td.find("strong", string=re.compile(r"^RIT\s*:"))
+                metadata["rol"] = _extract_text_after_strong(td, _clean(strong_tag.get_text()))
 
-            # RUC (penal)
-            if td.find("strong", string=re.compile(r"^RUC")):
-                metadata["ruc"] = _extract_text_after_strong(td, "RUC:")
+            # RUC (cobranza/penal) — handles "RUC :" and "RUC:"
+            if td.find("strong", string=re.compile(r"^RUC\s*:")):
+                strong_tag = td.find("strong", string=re.compile(r"^RUC\s*:"))
+                metadata["ruc"] = _extract_text_after_strong(td, _clean(strong_tag.get_text()))
 
             # Libro (suprema/apelaciones) — maps to rol
             if td.find("strong", string=re.compile(r"^Libro")):
