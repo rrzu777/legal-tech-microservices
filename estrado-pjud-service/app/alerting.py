@@ -23,6 +23,13 @@ class TelegramAlerter:
         self._threshold = blocked_rate_threshold
         self._cooldown = cooldown_seconds
         self._last_alert_time: float = 0.0
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazily create the shared HTTP client."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=10.0)
+        return self._client
 
     async def check_and_alert(self):
         """Check metrics and send alert if blocked rate exceeds threshold."""
@@ -58,12 +65,17 @@ class TelegramAlerter:
         """Send message via Telegram Bot API."""
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json={
-                    "chat_id": self._chat_id,
-                    "text": text,
-                })
-                if resp.status_code != 200:
-                    logger.warning("Telegram alert failed: %s", resp.text)
+            client = self._get_client()
+            resp = await client.post(url, json={
+                "chat_id": self._chat_id,
+                "text": text,
+            })
+            if resp.status_code != 200:
+                logger.warning("Telegram alert failed: %s", resp.text)
         except Exception:
             logger.exception("Failed to send Telegram alert")
+
+    async def close(self):
+        """Close the underlying HTTP client."""
+        if self._client is not None:
+            await self._client.aclose()

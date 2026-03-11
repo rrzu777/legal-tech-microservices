@@ -1,8 +1,8 @@
 import base64
 import json
 import logging
-import re
 
+import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
@@ -12,19 +12,9 @@ from app.models import (
 )
 from app.parsers.detail_parser import parse_detail
 from app.metrics import api_metrics
+from app.errors import safe_error
 
 logger = logging.getLogger(__name__)
-
-_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|\w+\.php")
-
-
-def _safe_error(e: Exception) -> str:
-    """Return a user-safe error message without internal URLs or paths."""
-    msg = str(e)
-    if _INTERNAL_PATTERN.search(msg):
-        return f"Internal error: {type(e).__name__}"
-    return msg
-
 
 router = APIRouter(prefix="/api/v1", tags=["detail"])
 
@@ -60,28 +50,26 @@ def _guess_competencia_from_jwt(jwt: str) -> str | None:
 @router.post("/detail", response_model=DetailResponse)
 @limiter.limit("5/minute")
 async def case_detail(req: DetailRequest, request: Request, _api_key: str = verify_api_key):
+    if req.competencia:
+        comp = req.competencia
+    else:
+        comp = _guess_competencia_from_jwt(req.detail_key)
+        if not comp:
+            logger.error("competencia not provided and could not be inferred from JWT")
+            return DetailResponse(
+                metadata={}, movements=[], litigantes=[], blocked=True,
+                error="competencia is required (could not infer from JWT)",
+            )
+        logger.info("Inferred competencia=%s from JWT", comp)
+
     pool = request.app.state.session_pool
     session = await pool.acquire()
 
     healthy = True
     try:
-        if req.competencia:
-            comp = req.competencia
-        else:
-            comp = _guess_competencia_from_jwt(req.detail_key)
-            if comp:
-                logger.info("Inferred competencia=%s from JWT", comp)
-            else:
-                logger.error("competencia not provided and could not be inferred from JWT")
-                api_metrics.record_request("detail")
-                api_metrics.record_error("detail")
-                return DetailResponse(
-                    metadata={}, movements=[], litigantes=[], blocked=True,
-                    error="competencia is required (could not infer from JWT)",
-                )
+        api_metrics.record_request("detail")
 
         html = await session.detail(comp, req.detail_key)
-        api_metrics.record_request("detail")
 
         if not html or len(html.strip()) < 100:
             healthy = False
@@ -118,12 +106,15 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         logger.exception("Detail fetch failed")
         healthy = False
         api_metrics.record_error("detail")
-        alerter = getattr(request.app.state, "alerter", None)
-        if alerter:
-            await alerter.check_and_alert()
+        blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
+        if blocked:
+            api_metrics.record_blocked("detail")
+            alerter = getattr(request.app.state, "alerter", None)
+            if alerter:
+                await alerter.check_and_alert()
         return DetailResponse(
-            metadata={}, movements=[], litigantes=[], blocked=True,
-            error=_safe_error(e),
+            metadata={}, movements=[], litigantes=[], blocked=blocked,
+            error=safe_error(e),
         )
     finally:
         await pool.release(session, healthy=healthy)

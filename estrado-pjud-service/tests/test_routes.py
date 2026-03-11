@@ -249,6 +249,9 @@ class TestSearch:
         assert "oficinajudicialvirtual" not in body["error"]
         assert ".php" not in body["error"]
         assert "ADIR_871" not in body["error"]
+        # Redacted portions replaced but surrounding text preserved
+        assert "[redacted]" in body["error"]
+        assert "Connection to" in body["error"]
 
     def test_search_non_internal_error_preserved(self, client):
         """Non-internal error messages should be preserved."""
@@ -394,9 +397,8 @@ class TestDetail:
         assert body["error"] is not None
 
     def test_detail_logs_warning_on_competencia_extraction_failure(self, client, caplog):
-        """When JWT doesn't contain competencia, a warning should be logged."""
-        html = _load("detail_Civil_C_1234_2024.html")
-        mock_session = _make_mock_session(detail_html=html)
+        """When JWT doesn't contain competencia, an error should be logged and blocked=True returned."""
+        mock_session = _make_mock_session()
         mock_pool = _make_mock_pool(mock_session)
         client.app.state.session_pool = mock_pool
 
@@ -408,7 +410,11 @@ class TestDetail:
             resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
 
         assert resp.status_code == 200
-        assert any("competencia" in r.message.lower() for r in caplog.records)
+        body = resp.json()
+        assert body["blocked"] is True
+        assert "competencia" in body["error"]
+        # Session should NOT have been acquired since competencia failed before pool.acquire()
+        mock_pool.acquire.assert_not_awaited()
 
     def test_detail_error_does_not_expose_internals(self, client):
         """Error messages should not contain internal paths or URLs."""
@@ -425,3 +431,51 @@ class TestDetail:
 
         assert "oficinajudicialvirtual" not in body["error"]
         assert ".php" not in body["error"]
+        # Redacted portions replaced but surrounding text preserved
+        assert "[redacted]" in body["error"]
+        assert "Connection to" in body["error"]
+
+    def test_detail_returns_blocked_on_timeout(self, client):
+        """Network timeout should return blocked=True so caller can retry."""
+        import httpx
+        mock_session = _make_mock_session()
+        mock_session.detail = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is True
+        assert body["error"] is not None
+
+    def test_detail_returns_blocked_on_connect_error(self, client):
+        """Connection error should return blocked=True."""
+        import httpx
+        mock_session = _make_mock_session()
+        mock_session.detail = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is True
+
+    def test_detail_non_network_error_not_blocked(self, client):
+        """Non-network exceptions should return blocked=False."""
+        mock_session = _make_mock_session()
+        mock_session.detail = AsyncMock(side_effect=ValueError("parsing failed"))
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["blocked"] is False

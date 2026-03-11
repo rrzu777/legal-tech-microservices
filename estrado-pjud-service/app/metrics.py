@@ -37,7 +37,8 @@ class APIMetrics:
 
     @property
     def last_successful_request(self) -> float | None:
-        return self._last_successful_request
+        with self._lock:
+            return self._last_successful_request
 
     def snapshot(self) -> dict:
         with self._lock:

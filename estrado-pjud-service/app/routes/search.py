@@ -1,5 +1,4 @@
 import logging
-import re
 
 import httpx
 from fastapi import APIRouter, Request
@@ -11,19 +10,9 @@ from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
+from app.errors import safe_error
 
 logger = logging.getLogger(__name__)
-
-_INTERNAL_PATTERN = re.compile(r"https?://\S+|/ADIR_\w+\S*|\w+\.php")
-
-
-def _safe_error(e: Exception) -> str:
-    """Return a user-safe error message without internal URLs or paths."""
-    msg = str(e)
-    if _INTERNAL_PATTERN.search(msg):
-        return f"Internal error: {type(e).__name__}"
-    return msg
-
 
 router = APIRouter(prefix="/api/v1", tags=["search"])
 
@@ -36,6 +25,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
     healthy = True
     try:
+        api_metrics.record_request("search")
+
         parsed = parse_case_identifier(req.case_number)
         comp_path = competencia_path(req.competencia)
 
@@ -48,7 +39,6 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         )
 
         html = await session.search(comp_path, form_data)
-        api_metrics.record_request("search")
 
         if detect_blocked(html):
             healthy = False
@@ -80,12 +70,13 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         api_metrics.record_error("search")
         blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
         if blocked:
+            api_metrics.record_blocked("search")
             alerter = getattr(request.app.state, "alerter", None)
             if alerter:
                 await alerter.check_and_alert()
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=blocked,
-            error=_safe_error(e),
+            error=safe_error(e),
         )
     finally:
         await pool.release(session, healthy=healthy)

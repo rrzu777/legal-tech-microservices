@@ -33,6 +33,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await pool.close_all()
+        if hasattr(app.state, 'alerter') and app.state.alerter:
+            await app.state.alerter.close()
 
 
 def create_app() -> FastAPI:
