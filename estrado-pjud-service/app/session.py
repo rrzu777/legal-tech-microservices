@@ -107,5 +107,14 @@ class OJVSession:
         resp.raise_for_status()
         return _decode(resp)
 
+    async def download_document(self, path: str, dta_doc: str) -> httpx.Response:
+        """Download a document from PJUD using the form action path + dtaDoc token."""
+        resp = await self._adapter.get(
+            f"/{path}",
+            params={"dtaDoc": dta_doc},
+        )
+        resp.raise_for_status()
+        return resp
+
     async def close(self):
         await self._adapter.close()
