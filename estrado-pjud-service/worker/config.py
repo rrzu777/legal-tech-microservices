@@ -24,4 +24,11 @@ class WorkerConfig(BaseSettings):
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     LOG_LEVEL: str = "INFO"
 
+    # R2 document storage
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_ENDPOINT: str = ""
+    R2_BUCKET: str = "estrado-documents"
+    R2_ENABLED: bool = False
+
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}
