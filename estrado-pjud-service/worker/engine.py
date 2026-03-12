@@ -3,10 +3,12 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, date
 
+from app.document_downloader import download_documents
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
+from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,14 @@ class SyncEngine:
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._r2 = None
+        if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
+            self._r2 = R2Client(
+                access_key_id=config.R2_ACCESS_KEY_ID,
+                secret_access_key=config.R2_SECRET_ACCESS_KEY,
+                endpoint=config.R2_ENDPOINT,
+                bucket=config.R2_BUCKET,
+            )
 
     async def sync_case(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
@@ -233,6 +243,10 @@ class SyncEngine:
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
 
+            # Download and store documents
+            if self._r2 and detail.get("movements"):
+                await self._download_and_store_documents(case, detail, session)
+
             # Update case
             latest_date = _get_latest_movement_date(detail["movements"])
             priority = _compute_priority(case.get("status", "active"), latest_date)
@@ -345,6 +359,49 @@ class SyncEngine:
         after_count = after_resp.count if after_resp.count is not None else 0
 
         return after_count - before_count
+
+    async def _download_and_store_documents(self, case: dict, detail: dict, session) -> None:
+        """Download PJUD documents and upload to R2."""
+        movements = detail.get("movements", [])
+        if not movements:
+            return
+
+        try:
+            docs = await download_documents(session, movements)
+            if not docs:
+                return
+
+            for doc in docs:
+                mov = movements[doc.index]
+                ext_key = _build_external_movement_key(
+                    case["case_number"],
+                    mov.get("cuaderno", ""),
+                    mov.get("folio", ""),
+                )
+                r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
+
+                if self._r2.exists(r2_key):
+                    continue
+
+                try:
+                    self._r2.upload(r2_key, doc.data, doc.content_type)
+
+                    await run_query(
+                        self._sb.from_("case_movements")
+                        .update({
+                            "document_storage_key": r2_key,
+                            "document_content_type": doc.content_type,
+                        })
+                        .eq("case_id", case["id"])
+                        .eq("external_movement_key", ext_key)
+                    )
+                except Exception:
+                    logger.warning("Failed to upload document %s", r2_key, exc_info=True)
+
+            logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
+
+        except Exception:
+            logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
 
     async def _finish_run(self, run_id, started_at, status, new_movements, error=None):
         if not run_id:
