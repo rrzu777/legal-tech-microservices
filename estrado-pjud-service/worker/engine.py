@@ -327,12 +327,12 @@ class SyncEngine:
         )
         before_count = before_resp.count if before_resp.count is not None else 0
 
-        # Upsert (ignore duplicates)
+        # Upsert (update on conflict)
         await run_query(
             self._sb.from_("case_movements").upsert(
                 rows,
                 on_conflict="case_id,external_movement_key",
-                ignore_duplicates=True,
+                ignore_duplicates=False,
             )
         )
 
