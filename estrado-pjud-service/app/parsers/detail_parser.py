@@ -298,10 +298,14 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
 
         doc_form = tds[cols["doc"]].find("form")
         documento_url = None
+        documento_token = None
         if doc_form:
             action = doc_form.get("action", "")
             if action:
                 documento_url = action
+            token_input = doc_form.find("input", {"name": "dtaDoc"})
+            if token_input:
+                documento_token = token_input.get("value")
 
         movements.append({
             "folio": folio,
@@ -312,6 +316,7 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
             "fecha": fecha,
             "foja": foja,
             "documento_url": documento_url,
+            "documento_token": documento_token,
         })
 
     return movements

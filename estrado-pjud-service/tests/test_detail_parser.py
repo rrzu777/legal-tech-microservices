@@ -158,6 +158,26 @@ class TestParseDetailPenal:
             assert "nombre" in lig
 
 
+class TestDocumentoToken:
+    def test_extracts_documento_token_from_form(self):
+        """Movements with document forms should include the dtaDoc JWT."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        docs_with_token = [m for m in result["movements"] if m.get("documento_token")]
+        assert len(docs_with_token) > 0, "Should extract at least one documento_token"
+        for m in docs_with_token:
+            assert m["documento_token"].startswith("eyJ"), "Token should be a JWT (starts with eyJ)"
+            assert m["documento_url"] is not None, "Should also have documento_url"
+
+    def test_movement_without_document_has_none_token(self):
+        """Movements without a document form should have None token."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        docs_without = [m for m in result["movements"] if m.get("documento_url") is None]
+        for m in docs_without:
+            assert m.get("documento_token") is None
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")

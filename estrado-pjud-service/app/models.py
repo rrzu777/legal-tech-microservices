@@ -95,6 +95,7 @@ class Movement(BaseModel):
     fecha: str | None
     foja: int | None
     documento_url: str | None
+    documento_token: str | None = None  # dtaDoc JWT for document download
 
 
 class Litigante(BaseModel):
