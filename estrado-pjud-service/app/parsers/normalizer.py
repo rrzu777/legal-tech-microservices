@@ -1,6 +1,6 @@
 import re
 
-_IDENTIFIER_RE = re.compile(r"^([A-Za-z]+)-(\d+)-(\d{4})$")
+_IDENTIFIER_RE = re.compile(r"^(.+)-(\d+)-(\d{4})$")
 _IDENTIFIER_NUM_RE = re.compile(r"^(\d+)-(\d{4})$")
 _DATE_DMY_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
