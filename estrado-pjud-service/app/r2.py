@@ -1,5 +1,6 @@
 """Cloudflare R2 document storage (S3-compatible)."""
 
+import asyncio
 import logging
 from typing import NamedTuple
 
@@ -33,12 +34,16 @@ class R2Client:
             ),
         )
 
-    def upload(self, key: str, data: bytes, content_type: str) -> UploadResult:
-        """Upload document bytes to R2. Returns the storage key."""
+    async def upload(self, key: str, data: bytes, content_type: str) -> UploadResult:
+        """Upload document bytes to R2. Returns the storage key.
+
+        Runs boto3 sync call in a thread to avoid blocking the async event loop.
+        """
         if len(data) > MAX_DOC_SIZE:
             raise ValueError(f"Document too large: {len(data)} bytes (max {MAX_DOC_SIZE})")
 
-        self._s3.put_object(
+        await asyncio.to_thread(
+            self._s3.put_object,
             Bucket=self._bucket,
             Key=key,
             Body=data,
@@ -47,10 +52,13 @@ class R2Client:
         logger.info("Uploaded %s (%s, %d bytes)", key, content_type, len(data))
         return UploadResult(key=key, content_type=content_type)
 
-    def exists(self, key: str) -> bool:
-        """Check if a document already exists in R2."""
+    async def exists(self, key: str) -> bool:
+        """Check if a document already exists in R2.
+
+        Runs boto3 sync call in a thread to avoid blocking the async event loop.
+        """
         try:
-            self._s3.head_object(Bucket=self._bucket, Key=key)
+            await asyncio.to_thread(self._s3.head_object, Bucket=self._bucket, Key=key)
             return True
         except self._s3.exceptions.ClientError:
             return False

@@ -380,11 +380,11 @@ class SyncEngine:
                 )
                 r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
 
-                if self._r2.exists(r2_key):
+                if await self._r2.exists(r2_key):
                     continue
 
                 try:
-                    self._r2.upload(r2_key, doc.data, doc.content_type)
+                    await self._r2.upload(r2_key, doc.data, doc.content_type)
 
                     await run_query(
                         self._sb.from_("case_movements")
