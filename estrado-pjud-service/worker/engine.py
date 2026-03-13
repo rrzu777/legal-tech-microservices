@@ -1,6 +1,7 @@
 # worker/engine.py
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta, date
 
 from app.document_downloader import download_documents
@@ -135,23 +136,22 @@ class SyncEngine:
         started_at = datetime.now(TZ_SANTIAGO)
 
         # Create sync run
-        sync_run_id = None
+        sync_run_id = str(uuid.uuid4())
         try:
-            resp = await run_query(
+            await run_query(
                 self._sb.from_("case_sync_runs")
                 .insert({
+                    "id": sync_run_id,
                     "law_firm_id": case["law_firm_id"],
                     "case_id": case["id"],
                     "status": "running",
                     "trigger": "scheduled_sync",
                     "started_at": started_at.isoformat(),
                 })
-                .select("id")
-                .single()
             )
-            sync_run_id = resp.data.get("id") if resp.data else None
         except Exception:
             logger.exception("Failed to create sync_run")
+            sync_run_id = None
 
         session = None
         try:

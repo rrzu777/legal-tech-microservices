@@ -45,7 +45,7 @@ class Scheduler:
 
         now = datetime.now(TZ_SANTIAGO)
         if _is_office_hours(now):
-            cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 2]
+            cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 3]
         elif not _is_archived_window(now):
             cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 3]
 
