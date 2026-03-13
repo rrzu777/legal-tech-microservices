@@ -107,11 +107,11 @@ class OJVSession:
         resp.raise_for_status()
         return _decode(resp)
 
-    async def download_document(self, path: str, dta_doc: str) -> httpx.Response:
-        """Download a document from PJUD using the form action path + dtaDoc token."""
+    async def download_document(self, path: str, token: str, param_name: str = "dtaDoc") -> httpx.Response:
+        """Download a document from PJUD using the form action path + token."""
         resp = await self._adapter.get(
             f"/{path}",
-            params={"dtaDoc": dta_doc},
+            params={param_name: token},
         )
         resp.raise_for_status()
         return resp

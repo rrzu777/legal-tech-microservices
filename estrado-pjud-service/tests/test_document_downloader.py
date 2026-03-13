@@ -28,7 +28,7 @@ async def test_downloads_document_with_token():
     assert results[0].content_type == "application/pdf"
     assert results[0].extension == "pdf"
     session.download_document.assert_called_once_with(
-        "ADIR/civil/docuS.php", "eyJhbGciOiJ...",
+        "ADIR/civil/docuS.php", "eyJhbGciOiJ...", "dtaDoc",
     )
 
 

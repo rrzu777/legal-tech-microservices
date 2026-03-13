@@ -48,13 +48,14 @@ async def download_documents(
     async def _download_one(idx: int, mov: dict) -> DownloadedDoc | None:
         url = mov.get("documento_url")
         token = mov.get("documento_token")
+        param_name = mov.get("documento_param", "dtaDoc")
         if not url or not token:
             return None
 
         async with sem:
             await asyncio.sleep(DOWNLOAD_DELAY_S)
             try:
-                resp = await session.download_document(url, token)
+                resp = await session.download_document(url, token, param_name)
 
                 content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
                 ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
