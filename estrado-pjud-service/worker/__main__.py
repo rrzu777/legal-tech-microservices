@@ -92,6 +92,7 @@ async def main():
 
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
+                await metrics.send_heartbeat()
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -108,6 +109,7 @@ async def main():
                 await engine.sync_case(case)
 
             await scheduler.release_batch(case_ids)
+            await metrics.send_heartbeat()
 
     finally:
         logger.info("Shutting down...")

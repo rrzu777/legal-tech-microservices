@@ -307,22 +307,22 @@ class TestSyncEngine:
         mock_metrics.record_error.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_sync_uses_external_case_key_when_present(self):
-        """When external_case_key is set, it should be used as the detail key."""
+    async def test_sync_prefers_fresh_search_key_over_stored(self):
+        """Fresh search key should be preferred over stored external_case_key (JWT may expire)."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
         case = _make_case(external_case_key="eyJpreexisting_key")
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
              patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
-            mock_search.return_value = _mock_search_response()
+            mock_search.return_value = _mock_search_response()  # returns "eyJdetailkey"
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
 
         assert result["success"] is True
-        # The detail should have been called with the pre-existing key
+        # Should use fresh key from search, not the stored (potentially expired) key
         call_args = mock_detail.call_args
-        assert call_args[0][2] == "eyJpreexisting_key"
+        assert call_args[0][2] == "eyJdetailkey"
 
     @pytest.mark.asyncio
     async def test_sync_notifier_called_when_new_movements(self):

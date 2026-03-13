@@ -219,8 +219,8 @@ class SyncEngine:
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
-            # Get detail key
-            detail_key = case.get("external_case_key") or search_result["matches"][0].get("key")
+            # Get detail key — prefer fresh key from search (stored key may have expired JWT)
+            detail_key = search_result["matches"][0].get("key") or case.get("external_case_key")
             if not detail_key:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "No detail key available")
                 self._metrics.record_error()
