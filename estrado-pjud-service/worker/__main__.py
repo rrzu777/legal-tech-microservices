@@ -13,6 +13,7 @@ from worker.engine import SyncEngine
 from worker.notifier import Notifier
 from worker.metrics import Metrics
 from worker.backoff import CircuitBreaker
+from worker.sd_notify import notify_ready, notify_watchdog, notify_stopping
 
 logger = logging.getLogger("worker")
 
@@ -76,6 +77,7 @@ async def main():
     )
 
     logger.info("Worker ready, entering main loop")
+    notify_ready()
 
     try:
         while not shutdown_event.is_set():
@@ -112,6 +114,7 @@ async def main():
             await metrics.send_heartbeat()
 
     finally:
+        notify_stopping()
         logger.info("Shutting down...")
         await metrics.stop()
         await pool.close_all()

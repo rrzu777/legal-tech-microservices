@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
+from worker.sd_notify import notify_watchdog
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class Metrics:
                 on_conflict="worker_id",
             )
         )
+        notify_watchdog()
         logger.debug("Heartbeat sent")
 
     async def _heartbeat_loop(self):
