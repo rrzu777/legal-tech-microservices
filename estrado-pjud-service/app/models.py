@@ -67,6 +67,12 @@ class SearchResponse(BaseModel):
 class DetailRequest(BaseModel):
     detail_key: str
     competencia: COMPETENCIA_TYPE | None = None
+    # Optional search params: when provided, the detail endpoint performs a search
+    # on the SAME session before fetching the detail, ensuring JWT + CSRF affinity.
+    # This prevents cross-case contamination when session pooling reuses sessions.
+    case_number: str | None = None
+    corte: int | None = None
+    libro: str | None = None
 
 
 class CaseMetadata(BaseModel):
