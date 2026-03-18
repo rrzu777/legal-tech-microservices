@@ -476,7 +476,7 @@ class TestSyncEngine:
 
         assert result["success"] is True
         mock_logger.warning.assert_any_call(
-            "No corte in external_payload for apelaciones case %s; searching all cortes",
+            "No court_code for apelaciones case %s; searching all cortes",
             "Proteccion-4490-2025",
         )
 

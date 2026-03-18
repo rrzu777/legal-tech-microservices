@@ -174,22 +174,25 @@ class SyncEngine:
             session = await self._pool.acquire()
             await self._pool.enforce_global_rate_limit()
 
-            # For apelaciones, read corte from the case's external_payload.
-            # Falls back to empty string if not available (searches all cortes).
+            # For apelaciones, read corte from the case's court_code column (primary)
+            # or external_payload.corte (legacy fallback).
             corte_value = ""
             if competencia == "apelaciones":
-                corte_value = str(
-                    case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
-                )
+                corte_value = str(case.get("court_code") or "")
+                if not corte_value:
+                    # Legacy fallback: some cases might have corte in external_payload
+                    corte_value = str(
+                        case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
+                    )
                 if not corte_value:
                     logger.warning(
-                        "No corte in external_payload for apelaciones case %s; searching all cortes",
+                        "No court_code for apelaciones case %s; searching all cortes",
                         case.get("case_number", case["id"]),
                     )
 
-            # Read libro from external_payload (same pattern as corte)
-            libro_value = None
-            if case.get("external_payload"):
+            # Read libro from the case's libro column (primary) or external_payload (fallback)
+            libro_value = case.get("libro") or None
+            if not libro_value and case.get("external_payload"):
                 libro_value = case["external_payload"].get("libro") or None
 
             form_data = build_search_form_data(
