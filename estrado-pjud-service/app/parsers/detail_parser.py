@@ -13,6 +13,11 @@ from app.parsers.normalizer import normalize_date
 
 _WS_RE = re.compile(r"\s+")
 
+# Regex to extract JWT from anexo onclick handlers like:
+#   anexoEscritoApelaciones('eyJ...')
+#   anexoSolicitudCivil('eyJ...')
+_ANEXO_JWT_RE = re.compile(r"anexo\w+\(\s*'(eyJ[^']+)'\s*\)")
+
 # Div IDs for movements per competencia type
 _MOVEMENT_DIV_IDS = [
     "historiaCiv", "movimientoLab", "historiaCob",
@@ -228,26 +233,26 @@ def _find_div(soup: BeautifulSoup, div_ids: list[str]) -> tuple[Tag | None, str]
 # Column mapping per div_id: indices for each field, -1 means not present
 _MOVEMENT_COLUMN_MAP: dict[str, dict] = {
     "movimientosSup": {
-        "min_cols": 10, "folio": 0, "doc": 1, "fecha": 4,
+        "min_cols": 10, "folio": 0, "doc": 1, "anexo": 2, "fecha": 4,
         "tramite": 5, "descripcion": 6, "etapa": -1, "foja": -1,
     },
     "movimientosApe": {
-        "min_cols": 9, "folio": 0, "doc": 1, "fecha": 5,
+        "min_cols": 9, "folio": 0, "doc": 1, "anexo": 2, "fecha": 5,
         "tramite": 3, "descripcion": 4, "etapa": -1, "foja": -1,
     },
     "historiaPen": {
-        "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+        "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
         "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
     },
     "movimientosPen": {
-        "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+        "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
         "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
     },
 }
 
 # Default column mapping for civil, laboral, cobranza (and fallback)
 _CIVIL_COLS: dict = {
-    "min_cols": 8, "folio": 0, "doc": 1, "fecha": 6,
+    "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
     "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
 }
 
@@ -296,20 +301,62 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
         etapa = _clean(tds[cols["etapa"]].get_text()) if cols["etapa"] >= 0 else ""
         foja = _int_or_none(tds[cols["foja"]].get_text()) if cols["foja"] >= 0 else None
 
-        doc_form = tds[cols["doc"]].find("form")
+        # --- Doc column: extract ALL forms (main doc + certificate, etc.) ---
+        doc_td = tds[cols["doc"]]
+        all_forms = doc_td.find_all("form")
         documento_url = None
         documento_token = None
         documento_param = None
-        if doc_form:
-            action = doc_form.get("action", "")
-            if action:
-                documento_url = action
-            for param_name in ("dtaDoc", "valorDoc"):
-                token_input = doc_form.find("input", {"name": param_name})
-                if token_input:
-                    documento_token = token_input.get("value")
-                    documento_param = param_name
+        documentos_adicionales: list[dict] = []
+
+        # Known main-document param names (first match wins as primary doc)
+        _MAIN_PARAMS = ("dtaDoc", "valorDoc", "valorFile")
+        # Known additional-document param names
+        _EXTRA_PARAMS = ("dtaCert",)
+
+        for form in all_forms:
+            action = form.get("action", "")
+            if not action:
+                continue
+
+            # Try to find a token input in this form
+            form_token = None
+            form_param = None
+            for pname in (*_MAIN_PARAMS, *_EXTRA_PARAMS):
+                inp = form.find("input", {"name": pname})
+                if inp:
+                    form_token = inp.get("value")
+                    form_param = pname
                     break
+
+            if not form_token:
+                continue
+
+            if form_param in _MAIN_PARAMS and documento_url is None:
+                # First main-document form → primary
+                documento_url = action
+                documento_token = form_token
+                documento_param = form_param
+            else:
+                # Additional document (certificate or subsequent main forms)
+                documentos_adicionales.append({
+                    "url": action,
+                    "token": form_token,
+                    "param": form_param,
+                })
+
+        # --- Anexo column: extract JWT from onclick handler ---
+        anexo_token = None
+        anexo_idx = cols.get("anexo", -1)
+        if anexo_idx >= 0 and anexo_idx < len(tds):
+            anexo_td = tds[anexo_idx]
+            # Look for an <a> tag with an onclick that calls an anexo function
+            anexo_link = anexo_td.find("a", onclick=_ANEXO_JWT_RE)
+            if anexo_link:
+                onclick_val = anexo_link.get("onclick", "")
+                m = _ANEXO_JWT_RE.search(onclick_val)
+                if m:
+                    anexo_token = m.group(1)
 
         movements.append({
             "folio": folio,
@@ -322,6 +369,8 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
             "documento_url": documento_url,
             "documento_token": documento_token,
             "documento_param": documento_param,
+            "documentos_adicionales": documentos_adicionales,
+            "anexo_token": anexo_token,
         })
 
     return movements

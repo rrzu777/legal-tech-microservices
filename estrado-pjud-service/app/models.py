@@ -92,6 +92,13 @@ class CaseMetadata(BaseModel):
     recurso: str = ""       # apelaciones
 
 
+class DocumentoAdicional(BaseModel):
+    """Additional document form found in the Doc column (e.g. certificate)."""
+    url: str  # form action URL
+    token: str  # JWT token value
+    param: str  # form param name (e.g. dtaCert)
+
+
 class Movement(BaseModel):
     folio: int | None
     cuaderno: str
@@ -103,6 +110,10 @@ class Movement(BaseModel):
     documento_url: str | None
     documento_token: str | None = None  # JWT for document download
     documento_param: str | None = None  # form param name (dtaDoc or valorDoc)
+    # Additional documents in the Doc column (certificates, etc.)
+    documentos_adicionales: list[DocumentoAdicional] = []
+    # Anexo JWT token extracted from the Anexo column's modal link
+    anexo_token: str | None = None
 
 
 class Litigante(BaseModel):

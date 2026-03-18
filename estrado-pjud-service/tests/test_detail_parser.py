@@ -178,6 +178,162 @@ class TestDocumentoToken:
             assert m.get("documento_token") is None
 
 
+class TestDocumentosAdicionales:
+    """Tests for additional document extraction (certificates) from the Doc column."""
+
+    def test_civil_folio_14_has_certificate(self):
+        """Civil folio 14 has main doc (docuN.php/dtaDoc) + certificate (docCertificadoEscrito.php/dtaCert)."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        folio_14 = [m for m in result["movements"] if m["folio"] == 14]
+        assert len(folio_14) == 1
+        mov = folio_14[0]
+        # Primary document should be the main doc
+        assert mov["documento_url"] is not None
+        assert "docuN.php" in mov["documento_url"]
+        assert mov["documento_param"] == "dtaDoc"
+        # Should have one additional document (certificate)
+        assert len(mov["documentos_adicionales"]) == 1
+        cert = mov["documentos_adicionales"][0]
+        assert "docCertificadoEscrito.php" in cert["url"]
+        assert cert["param"] == "dtaCert"
+        assert cert["token"].startswith("eyJ")
+
+    def test_civil_folio_15_no_additional_docs(self):
+        """Civil folio 15 has only one form (docuS.php), no additional docs."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        folio_15 = [m for m in result["movements"] if m["folio"] == 15]
+        assert len(folio_15) == 1
+        assert folio_15[0]["documentos_adicionales"] == []
+
+    def test_apelaciones_folio_8_has_certificate(self):
+        """Apelaciones folio 8 has main doc + certificate form."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_8 = [m for m in result["movements"] if m["folio"] == 8]
+        assert len(folio_8) == 1
+        mov = folio_8[0]
+        assert mov["documento_url"] is not None
+        assert mov["documento_param"] == "valorDoc"
+        assert len(mov["documentos_adicionales"]) == 1
+        cert = mov["documentos_adicionales"][0]
+        assert "docCertificadoEscrito.php" in cert["url"]
+        assert cert["param"] == "dtaCert"
+
+    def test_apelaciones_folio_6_has_certificate(self):
+        """Apelaciones folio 6 also has main doc + certificate form."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_6 = [m for m in result["movements"] if m["folio"] == 6]
+        assert len(folio_6) == 1
+        mov = folio_6[0]
+        assert len(mov["documentos_adicionales"]) == 1
+
+
+class TestAnexoToken:
+    """Tests for anexo JWT token extraction from the Anexo column."""
+
+    def test_apelaciones_folio_8_has_anexo(self):
+        """Apelaciones folio 8 has an anexo link with JWT token."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_8 = [m for m in result["movements"] if m["folio"] == 8]
+        assert len(folio_8) == 1
+        assert folio_8[0]["anexo_token"] is not None
+        assert folio_8[0]["anexo_token"].startswith("eyJ")
+
+    def test_apelaciones_folio_6_has_anexo(self):
+        """Apelaciones folio 6 has an anexo link with JWT token."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_6 = [m for m in result["movements"] if m["folio"] == 6]
+        assert len(folio_6) == 1
+        assert folio_6[0]["anexo_token"] is not None
+        assert folio_6[0]["anexo_token"].startswith("eyJ")
+
+    def test_apelaciones_folio_11_no_anexo(self):
+        """Apelaciones folio 11 has no anexo (empty td)."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_11 = [m for m in result["movements"] if m["folio"] == 11]
+        assert len(folio_11) == 1
+        assert folio_11[0]["anexo_token"] is None
+
+    def test_civil_folio_10_has_anexo(self):
+        """Civil folio 10 has an anexo solicitud link."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        folio_10 = [m for m in result["movements"] if m["folio"] == 10]
+        assert len(folio_10) == 1
+        assert folio_10[0]["anexo_token"] is not None
+        assert folio_10[0]["anexo_token"].startswith("eyJ")
+
+    def test_civil_folio_15_no_anexo(self):
+        """Civil folio 15 has no anexo."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        folio_15 = [m for m in result["movements"] if m["folio"] == 15]
+        assert len(folio_15) == 1
+        assert folio_15[0]["anexo_token"] is None
+
+    def test_suprema_no_anexos(self):
+        """Suprema fixture has no anexo links in movements."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        for mov in result["movements"]:
+            assert mov["anexo_token"] is None
+
+    def test_penal_no_anexos(self):
+        """Penal fixture has no anexo links in movements."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        for mov in result["movements"]:
+            assert mov["anexo_token"] is None
+
+
+class TestBackwardCompatibility:
+    """Ensure new fields don't break existing behavior."""
+
+    def test_all_movements_have_new_fields(self):
+        """Every movement dict should include documentos_adicionales and anexo_token."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        for mov in result["movements"]:
+            assert "documentos_adicionales" in mov
+            assert "anexo_token" in mov
+            assert isinstance(mov["documentos_adicionales"], list)
+
+    def test_primary_doc_unchanged_civil(self):
+        """Primary document extraction still works the same for civil."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        docs_with_token = [m for m in result["movements"] if m.get("documento_token")]
+        assert len(docs_with_token) > 0
+        for m in docs_with_token:
+            assert m["documento_token"].startswith("eyJ")
+            assert m["documento_url"] is not None
+            assert m["documento_param"] in ("dtaDoc", "valorDoc", "valorFile")
+
+    def test_primary_doc_unchanged_apelaciones(self):
+        """Primary document extraction still works for apelaciones (valorDoc param)."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        docs_with_token = [m for m in result["movements"] if m.get("documento_token")]
+        assert len(docs_with_token) > 0
+        for m in docs_with_token:
+            assert m["documento_param"] == "valorDoc"
+
+    def test_primary_doc_unchanged_suprema(self):
+        """Primary document extraction works for suprema (valorFile param)."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        docs_with_token = [m for m in result["movements"] if m.get("documento_token")]
+        assert len(docs_with_token) > 0
+        for m in docs_with_token:
+            assert m["documento_param"] == "valorFile"
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")
