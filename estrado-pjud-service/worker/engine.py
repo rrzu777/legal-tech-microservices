@@ -4,7 +4,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, date
 
-from app.document_downloader import download_documents
+from app.document_downloader import download_documents, download_single_document
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
@@ -402,6 +402,39 @@ class SyncEngine:
                     logger.warning("Failed to upload document %s", r2_key, exc_info=True)
 
             logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
+
+            # --- Certificados ---
+            for doc_result in docs:
+                mov = movements[doc_result.index]
+                extras = mov.get("documentos_adicionales", [])
+                if not extras:
+                    continue
+
+                ext_key = _build_external_movement_key(
+                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
+                )
+
+                for cert_i, cert in enumerate(extras):
+                    cert_url = cert.get("url", "")
+                    cert_token = cert.get("token", "")
+                    cert_param = cert.get("param", "dtaCert")
+                    if not cert_url or not cert_token:
+                        continue
+
+                    try:
+                        cert_doc = await download_single_document(session, cert_url, cert_token, cert_param)
+                        if not cert_doc:
+                            continue
+
+                        suffix = f"-cert" if len(extras) == 1 else f"-cert-{cert_i}"
+                        r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}{suffix}.{cert_doc.extension}"
+
+                        # Always overwrite certs (no r2.exists check — avoids stale cache)
+                        await self._r2.upload(r2_key, cert_doc.data, cert_doc.content_type)
+                        logger.info("Uploaded cert %s (%d bytes)", r2_key, len(cert_doc.data))
+                    except Exception:
+                        logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
+                        # Cert failure must NOT block primary or anexos
 
         except Exception:
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)

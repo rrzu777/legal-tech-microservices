@@ -81,3 +81,26 @@ async def download_documents(
 
     logger.info("Downloaded %d/%d documents", len(results), sum(1 for m in movements if m.get("documento_url")))
     return results
+
+
+async def download_single_document(
+    session: "OJVSession",
+    url: str,
+    token: str,
+    param: str = "dtaDoc",
+) -> DownloadedDoc | None:
+    """Download a single document by URL + token. Returns None on failure."""
+    try:
+        resp = await session.download_document(url, token, param)
+        content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+        ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
+        if len(resp.content) > MAX_DOC_SIZE:
+            logger.warning("Document too large (%d bytes), skipping", len(resp.content))
+            return None
+        if len(resp.content) < 100:
+            logger.warning("Document suspiciously small (%d bytes), skipping", len(resp.content))
+            return None
+        return DownloadedDoc(index=0, data=resp.content, content_type=content_type, extension=ext)
+    except Exception:
+        logger.warning("Failed to download document from %s", url, exc_info=True)
+        return None
