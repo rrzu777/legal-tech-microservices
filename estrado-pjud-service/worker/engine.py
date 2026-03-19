@@ -366,16 +366,25 @@ class SyncEngine:
         return after_count - before_count
 
     async def _download_and_store_documents(self, case: dict, detail: dict, session) -> None:
-        """Download PJUD documents and upload to R2."""
+        """Download PJUD documents and upload to R2.
+
+        Builds a per-movement ``documents`` JSONB array and writes it
+        atomically alongside ``document_storage_key`` so the two columns
+        never go out of sync.
+        """
         movements = detail.get("movements", [])
         if not movements:
             return
+
+        # Track all uploaded docs per movement for one atomic DB update each
+        per_movement_docs: dict[str, list[dict]] = {}  # ext_key -> list of doc entries
 
         try:
             docs = await download_documents(session, movements)
             if not docs:
                 return
 
+            # --- Primary documents ---
             for doc in docs:
                 mov = movements[doc.index]
                 ext_key = _build_external_movement_key(
@@ -386,20 +395,23 @@ class SyncEngine:
                 r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
 
                 if await self._r2.exists(r2_key):
+                    # Already in R2 — still track it so the documents array is complete
+                    per_movement_docs.setdefault(ext_key, []).append({
+                        "type": "principal",
+                        "storage_key": r2_key,
+                        "content_type": doc.content_type,
+                        "label": "Documento",
+                    })
                     continue
 
                 try:
                     await self._r2.upload(r2_key, doc.data, doc.content_type)
-
-                    await run_query(
-                        self._sb.from_("case_movements")
-                        .update({
-                            "document_storage_key": r2_key,
-                            "document_content_type": doc.content_type,
-                        })
-                        .eq("case_id", case["id"])
-                        .eq("external_movement_key", ext_key)
-                    )
+                    per_movement_docs.setdefault(ext_key, []).append({
+                        "type": "principal",
+                        "storage_key": r2_key,
+                        "content_type": doc.content_type,
+                        "label": "Documento",
+                    })
                 except Exception:
                     logger.warning("Failed to upload document %s", r2_key, exc_info=True)
 
@@ -433,6 +445,12 @@ class SyncEngine:
 
                         # Always overwrite certs (no r2.exists check — avoids stale cache)
                         await self._r2.upload(r2_key, cert_doc.data, cert_doc.content_type)
+                        per_movement_docs.setdefault(ext_key, []).append({
+                            "type": "certificado",
+                            "storage_key": r2_key,
+                            "content_type": cert_doc.content_type,
+                            "label": "Certificado",
+                        })
                         logger.info("Uploaded cert %s (%d bytes)", r2_key, len(cert_doc.data))
                     except Exception:
                         logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
@@ -478,6 +496,13 @@ class SyncEngine:
                             r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}-anexo-{anexo_i}.{anexo_doc.extension}"
                             # Always overwrite (no r2.exists check)
                             await self._r2.upload(r2_key, anexo_doc.data, anexo_doc.content_type)
+                            per_movement_docs.setdefault(ext_key, []).append({
+                                "type": "anexo",
+                                "storage_key": r2_key,
+                                "content_type": anexo_doc.content_type,
+                                "label": anexo_file.get("label", "Anexo"),
+                                "codigo": anexo_file.get("codigo"),
+                            })
                             logger.info("Uploaded anexo %s (%d bytes)", r2_key, len(anexo_doc.data))
                         except Exception:
                             logger.warning("Failed to download/upload anexo %d for %s", anexo_i, ext_key, exc_info=True)
@@ -485,6 +510,25 @@ class SyncEngine:
                 except Exception:
                     logger.warning("Failed to resolve anexo list for %s (func=%s)", ext_key, anexo_func, exc_info=True)
                     # Anexo failure must NOT block primary or certs
+
+            # --- Atomic DB update: write documents + document_storage_key together ---
+            for ext_key, doc_list in per_movement_docs.items():
+                update_data: dict = {"documents": doc_list}
+                # Primary doc is always first in the list (if it exists)
+                primary = next((d for d in doc_list if d["type"] == "principal"), None)
+                if primary:
+                    update_data["document_storage_key"] = primary["storage_key"]
+                    update_data["document_content_type"] = primary["content_type"]
+
+                try:
+                    await run_query(
+                        self._sb.from_("case_movements")
+                        .update(update_data)
+                        .eq("case_id", case["id"])
+                        .eq("external_movement_key", ext_key)
+                    )
+                except Exception:
+                    logger.warning("Failed to update documents for %s", ext_key, exc_info=True)
 
         except Exception:
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
