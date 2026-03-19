@@ -107,6 +107,19 @@ class OJVSession:
         resp.raise_for_status()
         return _decode(resp)
 
+    async def fetch_anexo_list(self, endpoint: str, param: str, jwt: str) -> str:
+        """POST to an anexo modal endpoint. Returns HTML with document table.
+
+        No CSRF needed — PJUD's JS sends only the JWT param.
+        """
+        resp = await self._adapter.post(
+            f"/ADIR_871/{endpoint}",
+            data={param: jwt},
+            headers=_AJAX_HEADERS,
+        )
+        resp.raise_for_status()
+        return _decode(resp)
+
     async def download_document(self, path: str, token: str, param_name: str = "dtaDoc") -> httpx.Response:
         """Download a document from PJUD using the form action path + token."""
         resp = await self._adapter.get(
