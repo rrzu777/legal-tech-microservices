@@ -417,9 +417,8 @@ class SyncEngine:
 
             logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
 
-            # --- Certificados ---
-            for doc_result in docs:
-                mov = movements[doc_result.index]
+            # --- Certificados (iterate ALL movements, not just downloaded docs) ---
+            for mov in movements:
                 extras = mov.get("documentos_adicionales", [])
                 if not extras:
                     continue
@@ -456,9 +455,8 @@ class SyncEngine:
                         logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
                         # Cert failure must NOT block primary or anexos
 
-            # --- Anexos ---
-            for doc_result in docs:
-                mov = movements[doc_result.index]
+            # --- Anexos (iterate ALL movements, not just downloaded docs) ---
+            for mov in movements:
                 anexo_func = mov.get("anexo_func")
                 anexo_token = mov.get("anexo_token")
                 if not anexo_func or not anexo_token:
