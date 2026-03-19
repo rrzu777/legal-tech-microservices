@@ -114,6 +114,7 @@ class Movement(BaseModel):
     documentos_adicionales: list[DocumentoAdicional] = []
     # Anexo JWT token extracted from the Anexo column's modal link
     anexo_token: str | None = None
+    anexo_func: str | None = None  # JS function name, e.g. "anexoEscritoApelaciones"
 
 
 class Litigante(BaseModel):

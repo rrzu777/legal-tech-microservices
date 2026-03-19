@@ -292,16 +292,59 @@ class TestAnexoToken:
             assert mov["anexo_token"] is None
 
 
+class TestAnexoFunc:
+    """Tests for anexo JS function name extraction."""
+
+    def test_apelaciones_folio_8_has_func(self):
+        """Apelaciones folio 8 should capture anexoEscritoApelaciones."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_8 = [m for m in result["movements"] if m["folio"] == 8]
+        assert len(folio_8) == 1
+        assert folio_8[0]["anexo_func"] == "anexoEscritoApelaciones"
+
+    def test_civil_folio_10_has_func(self):
+        """Civil folio 10 should capture anexoSolicitudCivil."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        folio_10 = [m for m in result["movements"] if m["folio"] == 10]
+        assert len(folio_10) == 1
+        assert folio_10[0]["anexo_func"] == "anexoSolicitudCivil"
+
+    def test_movement_without_anexo_has_none_func(self):
+        """Movements without anexos should have anexo_func=None."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        folio_11 = [m for m in result["movements"] if m["folio"] == 11]
+        assert len(folio_11) == 1
+        assert folio_11[0]["anexo_func"] is None
+
+    def test_suprema_no_anexo_func(self):
+        """Suprema fixture has no anexo functions."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        for mov in result["movements"]:
+            assert mov["anexo_func"] is None
+
+    def test_penal_no_anexo_func(self):
+        """Penal fixture has no anexo functions."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        for mov in result["movements"]:
+            assert mov["anexo_func"] is None
+
+
 class TestBackwardCompatibility:
     """Ensure new fields don't break existing behavior."""
 
     def test_all_movements_have_new_fields(self):
-        """Every movement dict should include documentos_adicionales and anexo_token."""
+        """Every movement dict should include documentos_adicionales, anexo_token, and anexo_func."""
         html = _load("detail_Civil_C_1234_2024.html")
         result = parse_detail(html)
         for mov in result["movements"]:
             assert "documentos_adicionales" in mov
             assert "anexo_token" in mov
+            assert "anexo_func" in mov
             assert isinstance(mov["documentos_adicionales"], list)
 
     def test_primary_doc_unchanged_civil(self):

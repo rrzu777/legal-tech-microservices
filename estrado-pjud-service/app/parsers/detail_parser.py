@@ -13,10 +13,10 @@ from app.parsers.normalizer import normalize_date
 
 _WS_RE = re.compile(r"\s+")
 
-# Regex to extract JWT from anexo onclick handlers like:
+# Regex to extract function name + JWT from anexo onclick handlers like:
 #   anexoEscritoApelaciones('eyJ...')
 #   anexoSolicitudCivil('eyJ...')
-_ANEXO_JWT_RE = re.compile(r"anexo\w+\(\s*'(eyJ[^']+)'\s*\)")
+_ANEXO_RE = re.compile(r"(anexo\w+)\(\s*'(eyJ[^']+)'\s*\)")
 
 # Div IDs for movements per competencia type
 _MOVEMENT_DIV_IDS = [
@@ -345,18 +345,20 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
                     "param": form_param,
                 })
 
-        # --- Anexo column: extract JWT from onclick handler ---
+        # --- Anexo column: extract function name + JWT from onclick handler ---
         anexo_token = None
+        anexo_func = None
         anexo_idx = cols.get("anexo", -1)
         if anexo_idx >= 0 and anexo_idx < len(tds):
             anexo_td = tds[anexo_idx]
             # Look for an <a> tag with an onclick that calls an anexo function
-            anexo_link = anexo_td.find("a", onclick=_ANEXO_JWT_RE)
+            anexo_link = anexo_td.find("a", onclick=_ANEXO_RE)
             if anexo_link:
                 onclick_val = anexo_link.get("onclick", "")
-                m = _ANEXO_JWT_RE.search(onclick_val)
+                m = _ANEXO_RE.search(onclick_val)
                 if m:
-                    anexo_token = m.group(1)
+                    anexo_func = m.group(1)
+                    anexo_token = m.group(2)
 
         movements.append({
             "folio": folio,
@@ -371,6 +373,7 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
             "documento_param": documento_param,
             "documentos_adicionales": documentos_adicionales,
             "anexo_token": anexo_token,
+            "anexo_func": anexo_func,
         })
 
     return movements
