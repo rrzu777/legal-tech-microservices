@@ -4,7 +4,9 @@ import logging
 import uuid
 from datetime import datetime, timedelta, date
 
+from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
+from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
@@ -435,6 +437,54 @@ class SyncEngine:
                     except Exception:
                         logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
                         # Cert failure must NOT block primary or anexos
+
+            # --- Anexos ---
+            for doc_result in docs:
+                mov = movements[doc_result.index]
+                anexo_func = mov.get("anexo_func")
+                anexo_token = mov.get("anexo_token")
+                if not anexo_func or not anexo_token:
+                    continue
+
+                ext_key = _build_external_movement_key(
+                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
+                )
+
+                endpoint_info = ANEXO_ENDPOINTS.get(anexo_func)
+                if not endpoint_info:
+                    logger.warning("Unknown anexo function '%s' for folio %s — skipping", anexo_func, mov.get("folio"))
+                    continue
+
+                endpoint, param = endpoint_info
+                try:
+                    anexo_html = await session.fetch_anexo_list(endpoint, param, anexo_token)
+                    anexo_files = parse_anexo_list(anexo_html)
+
+                    if not anexo_files:
+                        logger.info("No anexo files found for folio %s", mov.get("folio"))
+                        continue
+
+                    for anexo_i, anexo_file in enumerate(anexo_files):
+                        try:
+                            anexo_doc = await download_single_document(
+                                session,
+                                anexo_file["download_url"],
+                                anexo_file["download_token"],
+                                anexo_file.get("download_param", "dtaDoc"),
+                            )
+                            if not anexo_doc:
+                                continue
+
+                            r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}-anexo-{anexo_i}.{anexo_doc.extension}"
+                            # Always overwrite (no r2.exists check)
+                            await self._r2.upload(r2_key, anexo_doc.data, anexo_doc.content_type)
+                            logger.info("Uploaded anexo %s (%d bytes)", r2_key, len(anexo_doc.data))
+                        except Exception:
+                            logger.warning("Failed to download/upload anexo %d for %s", anexo_i, ext_key, exc_info=True)
+
+                except Exception:
+                    logger.warning("Failed to resolve anexo list for %s (func=%s)", ext_key, anexo_func, exc_info=True)
+                    # Anexo failure must NOT block primary or certs
 
         except Exception:
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
