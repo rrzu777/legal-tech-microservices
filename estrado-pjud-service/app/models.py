@@ -115,6 +115,9 @@ class Movement(BaseModel):
     # Anexo JWT token extracted from the Anexo column's modal link
     anexo_token: str | None = None
     anexo_func: str | None = None  # JS function name, e.g. "anexoEscritoApelaciones"
+    # Appellate-court-specific fields (Suprema / Apelaciones)
+    sala: str = ""
+    estado: str = ""
 
 
 class Litigante(BaseModel):

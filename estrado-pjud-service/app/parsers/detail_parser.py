@@ -235,18 +235,22 @@ _MOVEMENT_COLUMN_MAP: dict[str, dict] = {
     "movimientosSup": {
         "min_cols": 10, "folio": 0, "doc": 1, "anexo": 2, "fecha": 4,
         "tramite": 5, "descripcion": 6, "etapa": -1, "foja": -1,
+        "sala": 8, "estado": 9,
     },
     "movimientosApe": {
         "min_cols": 9, "folio": 0, "doc": 1, "anexo": 2, "fecha": 5,
         "tramite": 3, "descripcion": 4, "etapa": -1, "foja": -1,
+        "sala": 6, "estado": 7,
     },
     "historiaPen": {
         "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
         "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+        "sala": -1, "estado": -1,
     },
     "movimientosPen": {
         "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
         "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+        "sala": -1, "estado": -1,
     },
 }
 
@@ -254,6 +258,7 @@ _MOVEMENT_COLUMN_MAP: dict[str, dict] = {
 _CIVIL_COLS: dict = {
     "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
     "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
+    "sala": -1, "estado": -1,
 }
 
 
@@ -300,6 +305,8 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
         fecha = _normalize_movement_date(_clean(tds[cols["fecha"]].get_text()))
         etapa = _clean(tds[cols["etapa"]].get_text()) if cols["etapa"] >= 0 else ""
         foja = _int_or_none(tds[cols["foja"]].get_text()) if cols["foja"] >= 0 else None
+        sala = _clean(tds[cols["sala"]].get_text()) if cols.get("sala", -1) >= 0 and len(tds) > cols["sala"] else ""
+        estado = _clean(tds[cols["estado"]].get_text()) if cols.get("estado", -1) >= 0 and len(tds) > cols["estado"] else ""
 
         # --- Doc column: extract ALL forms (main doc + certificate, etc.) ---
         doc_td = tds[cols["doc"]]
@@ -374,6 +381,8 @@ def _parse_movements(soup: BeautifulSoup) -> list[dict]:
             "documentos_adicionales": documentos_adicionales,
             "anexo_token": anexo_token,
             "anexo_func": anexo_func,
+            "sala": sala,
+            "estado": estado,
         })
 
     return movements
