@@ -90,6 +90,11 @@ class CaseMetadata(BaseModel):
     caratulado: str = ""    # suprema
     tipo: str = ""          # suprema
     recurso: str = ""       # apelaciones
+    # Observación tab fields (suprema)
+    naturaleza_recurso: str = ""
+    numero_oficio: str = ""
+    abogado_suspendido: str = ""
+    tabla: str = ""
 
 
 class DocumentoAdicional(BaseModel):
@@ -124,6 +129,7 @@ class Litigante(BaseModel):
     rol: str
     rut: str
     nombre: str
+    persona: str = ""  # "Natural" or "Jurídica"
 
 
 class DetailResponse(BaseModel):
@@ -133,6 +139,14 @@ class DetailResponse(BaseModel):
     libro: str | None = None  # top-level convenience field
     blocked: bool
     error: str | None
+    # Case-level document tokens
+    ebook_token: str = ""  # JWT token for ebook download
+    certificado_disponible: bool = False  # whether the Certificado de Envío is downloadable
+    # Suprema-specific top-level document tokens
+    suprema_docs: list[dict] = []  # list of {tipo, token, func} for textoSuprema/tomoSuprema/documentosSuprema
+    # Exhortos and Incompetencia tables
+    exhortos: list[dict] = []
+    incompetencia: list[dict] = []
 
 
 class HealthResponse(BaseModel):

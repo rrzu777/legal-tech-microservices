@@ -185,6 +185,11 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             libro=metadata.libro or None,
             blocked=False,
             error=None,
+            ebook_token=parsed.get("ebook_token", ""),
+            certificado_disponible=parsed.get("certificado_disponible", False),
+            suprema_docs=parsed.get("suprema_docs", []),
+            exhortos=parsed.get("exhortos", []),
+            incompetencia=parsed.get("incompetencia", []),
         )
 
     except Exception as e:

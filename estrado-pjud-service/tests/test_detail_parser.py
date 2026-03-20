@@ -377,9 +377,261 @@ class TestBackwardCompatibility:
             assert m["documento_param"] == "valorFile"
 
 
+class TestEbookToken:
+    """Tests for ebook JWT token extraction."""
+
+    def test_civil_has_ebook_token(self):
+        """Civil fixture has an ebook form with dtaEbook."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        assert result["ebook_token"] != ""
+        assert result["ebook_token"].startswith("eyJ")
+
+    def test_apelaciones_has_ebook_token(self):
+        """Apelaciones fixture has an ebook form with dtaEbook."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        assert result["ebook_token"] != ""
+        assert result["ebook_token"].startswith("eyJ")
+
+    def test_suprema_has_ebook_token(self):
+        """Suprema fixture has an ebook form with dtaEbook."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        assert result["ebook_token"] != ""
+        assert result["ebook_token"].startswith("eyJ")
+
+    def test_penal_no_ebook(self):
+        """Penal fixture has no ebook form."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        assert result["ebook_token"] == ""
+
+    def test_empty_html_no_ebook(self):
+        """Empty HTML has no ebook token."""
+        result = parse_detail("<html><body></body></html>")
+        assert result["ebook_token"] == ""
+
+
+class TestCertificadoDisponible:
+    """Tests for Certificado de Envio availability detection."""
+
+    def test_civil_has_certificado(self):
+        """Civil fixture has a downloadable certificate (form with dtaCert)."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        assert result["certificado_disponible"] is True
+
+    def test_apelaciones_has_certificado(self):
+        """Apelaciones fixture has a downloadable certificate."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        assert result["certificado_disponible"] is True
+
+    def test_suprema_no_certificado(self):
+        """Suprema fixture has a disabled certificate (fa-ban icon)."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        assert result["certificado_disponible"] is False
+
+    def test_penal_no_certificado(self):
+        """Penal fixture has no certificate section."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        assert result["certificado_disponible"] is False
+
+    def test_empty_html_no_certificado(self):
+        """Empty HTML has no certificate."""
+        result = parse_detail("<html><body></body></html>")
+        assert result["certificado_disponible"] is False
+
+
+class TestLitigantPersona:
+    """Tests for litigant persona type extraction."""
+
+    def test_civil_litigants_have_persona(self):
+        """Civil litigants should have persona field."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        for lig in result["litigantes"]:
+            assert "persona" in lig
+            assert lig["persona"] != ""
+
+    def test_civil_has_natural_and_juridica(self):
+        """Civil fixture has both NATURAL and JURIDICA litigants."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        personas = [lig["persona"].upper() for lig in result["litigantes"]]
+        assert any("NATURAL" in p for p in personas)
+        assert any("JURIDICA" in p for p in personas)
+
+    def test_apelaciones_litigants_have_persona(self):
+        """Apelaciones litigants should have persona field."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        for lig in result["litigantes"]:
+            assert "persona" in lig
+            assert lig["persona"] != ""
+
+    def test_suprema_litigants_have_persona(self):
+        """Suprema litigants should have persona field."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        for lig in result["litigantes"]:
+            assert "persona" in lig
+            assert lig["persona"] != ""
+
+    def test_penal_litigants_have_persona(self):
+        """Penal intervinientes should have persona field."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        for lig in result["litigantes"]:
+            assert "persona" in lig
+            assert lig["persona"] != ""
+
+
+class TestSupremaDocs:
+    """Tests for Suprema top-level document token extraction."""
+
+    def test_suprema_has_three_doc_types(self):
+        """Suprema fixture has textoSuprema, tomoSuprema, documentosSuprema."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        docs = result["suprema_docs"]
+        assert len(docs) == 3
+        tipos = [d["tipo"] for d in docs]
+        assert "texto_recurso" in tipos
+        assert "tomo" in tipos
+        assert "documentos" in tipos
+
+    def test_suprema_docs_have_tokens(self):
+        """Each Suprema doc should have a JWT token."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        for doc in result["suprema_docs"]:
+            assert doc["token"].startswith("eyJ")
+            assert doc["func"] in ("textoSuprema", "tomoSuprema", "documentosSuprema")
+
+    def test_apelaciones_no_suprema_docs(self):
+        """Apelaciones fixture should not have suprema doc types."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        assert result["suprema_docs"] == []
+
+    def test_civil_no_suprema_docs(self):
+        """Civil fixture should not have suprema doc types."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        assert result["suprema_docs"] == []
+
+    def test_penal_no_suprema_docs(self):
+        """Penal fixture should not have suprema doc types."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        assert result["suprema_docs"] == []
+
+
+class TestExhortosIncompetencia:
+    """Tests for exhortos and incompetencia table parsing."""
+
+    def test_apelaciones_exhortos_empty(self):
+        """Apelaciones fixture has an exhortos tab but empty table."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        assert isinstance(result["exhortos"], list)
+        assert result["exhortos"] == []
+
+    def test_apelaciones_incompetencia_empty(self):
+        """Apelaciones fixture has an incompetencia tab but empty table."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        assert isinstance(result["incompetencia"], list)
+        assert result["incompetencia"] == []
+
+    def test_civil_exhortos_empty(self):
+        """Civil fixture has exhortos tab but empty table."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        assert isinstance(result["exhortos"], list)
+        assert result["exhortos"] == []
+
+    def test_suprema_no_exhortos(self):
+        """Suprema fixture has no exhortos tab."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        assert result["exhortos"] == []
+
+    def test_penal_no_exhortos(self):
+        """Penal fixture has no exhortos tab."""
+        html = _load("detail_Penal_O_100_2025.html")
+        result = parse_detail(html)
+        assert result["exhortos"] == []
+
+    def test_empty_html(self):
+        """Empty HTML has no exhortos or incompetencia."""
+        result = parse_detail("<html><body></body></html>")
+        assert result["exhortos"] == []
+        assert result["incompetencia"] == []
+
+
+class TestObservacion:
+    """Tests for Observacion tab parsing (Suprema)."""
+
+    def test_suprema_naturaleza_recurso(self):
+        """Suprema fixture has naturaleza del recurso in observacion tab."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert "naturaleza_recurso" in md
+        assert "Comisi" in md["naturaleza_recurso"]  # "Comisión de Libertad Condicional"
+
+    def test_suprema_tabla(self):
+        """Suprema fixture has tabla field in observacion tab."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert "tabla" in md
+        assert md["tabla"] == "--"
+
+    def test_suprema_numero_oficio(self):
+        """Suprema fixture has numero de oficio in observacion tab."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert "numero_oficio" in md
+        assert md["numero_oficio"] == "0-0"
+
+    def test_suprema_abogado_suspendido(self):
+        """Suprema fixture has abogado suspendido (empty) in observacion tab."""
+        html = _load("detail_Suprema_100_2025.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert "abogado_suspendido" in md
+
+    def test_civil_no_observacion(self):
+        """Civil fixture has no observacion tab."""
+        html = _load("detail_Civil_C_1234_2024.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert md.get("naturaleza_recurso", "") == ""
+        assert md.get("tabla", "") == ""
+
+    def test_apelaciones_no_observacion(self):
+        """Apelaciones fixture has no observacion tab."""
+        html = _load("detail_Apelaciones_Proteccion_4490_2025.html")
+        result = parse_detail(html)
+        md = result["metadata"]
+        assert md.get("naturaleza_recurso", "") == ""
+
+
 class TestParseDetailEmpty:
     def test_empty_html(self):
         result = parse_detail("<html><body></body></html>")
         assert result["metadata"] == {}
         assert result["movements"] == []
         assert result["litigantes"] == []
+        assert result["ebook_token"] == ""
+        assert result["certificado_disponible"] is False
+        assert result["suprema_docs"] == []
+        assert result["exhortos"] == []
+        assert result["incompetencia"] == []

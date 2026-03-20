@@ -18,6 +18,17 @@ _WS_RE = re.compile(r"\s+")
 #   anexoSolicitudCivil('eyJ...')
 _ANEXO_RE = re.compile(r"(anexo\w+)\(\s*'(eyJ[^']+)'\s*\)")
 
+# Regex for Suprema top-level document onclick handlers:
+#   textoSuprema('eyJ...')  tomoSuprema('eyJ...')  documentosSuprema('eyJ...')
+_SUPREMA_DOC_RE = re.compile(r"(textoSuprema|tomoSuprema|documentosSuprema)\(\s*'(eyJ[^']+)'\s*\)")
+
+# Map function names to human-readable types
+_SUPREMA_DOC_TYPES = {
+    "textoSuprema": "texto_recurso",
+    "tomoSuprema": "tomo",
+    "documentosSuprema": "documentos",
+}
+
 # Div IDs for movements per competencia type
 _MOVEMENT_DIV_IDS = [
     "historiaCiv", "movimientoLab", "historiaCob",
@@ -411,17 +422,181 @@ def _parse_litigantes(soup: BeautifulSoup) -> list[dict]:
 
         rol = _clean(tds[0].get_text())
         rut = _clean(tds[1].get_text())
+        persona = _clean(tds[2].get_text())
         nombre = _clean(tds[3].get_text())
 
-        litigantes.append({"rol": rol, "rut": rut, "nombre": nombre})
+        litigantes.append({"rol": rol, "rut": rut, "nombre": nombre, "persona": persona})
 
     return litigantes
+
+
+def _parse_ebook_token(soup: BeautifulSoup) -> str:
+    """Extract the ebook JWT token from the dtaEbook hidden input."""
+    # Look for the ebook form input by name
+    inp = soup.find("input", {"name": "dtaEbook"})
+    if inp:
+        val = inp.get("value", "")
+        if val and val.startswith("eyJ"):
+            return val
+    return ""
+
+
+def _parse_certificado_disponible(soup: BeautifulSoup) -> bool:
+    """Check if the Certificado de Envío is downloadable (not disabled).
+
+    Available: there's a <form> containing a dtaCert input near the
+    "Certificado de Envío" strong label at the case level (not per-movement).
+
+    Disabled (Suprema): the fa-ban icon is shown instead of a form.
+    """
+    # Find all <strong> tags mentioning "Certificado de Envío"
+    cert_strongs = soup.find_all("strong", string=re.compile(r"Certificado de Env", re.IGNORECASE))
+    for strong in cert_strongs:
+        # Walk up to the containing td
+        td = strong.find_parent("td")
+        if not td:
+            continue
+        # This should be a top-level certificate (in table-titulos), not a per-movement one.
+        # Check if the parent table is a table-titulos
+        parent_table = td.find_parent("table", class_="table-titulos")
+        if not parent_table:
+            continue
+        # Check for disabled indicator (fa-ban icon)
+        ban_icon = td.find("i", class_=re.compile(r"fa-ban"))
+        if ban_icon:
+            return False
+        # Check for a form with dtaCert — means it's downloadable
+        form = td.find("form")
+        if form:
+            cert_input = form.find("input", {"name": "dtaCert"})
+            if cert_input and cert_input.get("value"):
+                return True
+    return False
+
+
+def _parse_suprema_docs(soup: BeautifulSoup) -> list[dict]:
+    """Extract Suprema top-level document tokens (textoSuprema, tomoSuprema, documentosSuprema).
+
+    Returns a list of dicts with keys: tipo, token, func.
+    """
+    docs: list[dict] = []
+    # Find all links with onclick matching the suprema doc pattern
+    for link in soup.find_all("a", onclick=_SUPREMA_DOC_RE):
+        onclick_val = link.get("onclick", "")
+        m = _SUPREMA_DOC_RE.search(onclick_val)
+        if m:
+            func_name = m.group(1)
+            token = m.group(2)
+            docs.append({
+                "tipo": _SUPREMA_DOC_TYPES.get(func_name, func_name),
+                "token": token,
+                "func": func_name,
+            })
+    return docs
+
+
+# Div IDs for exhortos per competencia type
+_EXHORTO_DIV_IDS = [
+    "exhortosCiv", "ExhortosApe", "exhortosLab", "exhortosCob",
+]
+
+# Div IDs for incompetencia per competencia type
+_INCOMPETENCIA_DIV_IDS = [
+    "IncompetenciaApe", "incompetenciaApe",
+]
+
+
+def _parse_table_rows(div: Tag) -> list[dict]:
+    """Parse a generic table inside a div, returning rows as dicts keyed by header text."""
+    table = div.find("table", class_="table-bordered")
+    if not table:
+        return []
+
+    # Extract header names
+    thead = table.find("thead")
+    if not thead:
+        return []
+    headers = [_clean(th.get_text()) for th in thead.find_all("th")]
+    if not headers:
+        return []
+
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    rows: list[dict] = []
+    for tr in tbody.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        row_data: dict[str, str] = {}
+        for i, td in enumerate(tds):
+            key = headers[i] if i < len(headers) else f"col_{i}"
+            row_data[key] = _clean(td.get_text())
+        rows.append(row_data)
+    return rows
+
+
+def _parse_exhortos(soup: BeautifulSoup) -> list[dict]:
+    """Extract exhortos from the Exhortos tab table."""
+    div, _ = _find_div(soup, _EXHORTO_DIV_IDS)
+    if not div:
+        return []
+    return _parse_table_rows(div)
+
+
+def _parse_incompetencia(soup: BeautifulSoup) -> list[dict]:
+    """Extract incompetencia records from the Incompetencia tab table."""
+    div, _ = _find_div(soup, _INCOMPETENCIA_DIV_IDS)
+    if not div:
+        return []
+    return _parse_table_rows(div)
+
+
+def _parse_observacion(soup: BeautifulSoup) -> dict[str, str]:
+    """Extract Observación tab fields (Suprema).
+
+    Returns a dict with keys: naturaleza_recurso, numero_oficio,
+    abogado_suspendido, tabla.
+    """
+    obs: dict[str, str] = {}
+    obs_div = soup.find("div", id="observacionSup")
+    if not obs_div:
+        return obs
+
+    # Find strong labels and extract the text after them
+    for strong in obs_div.find_all("strong"):
+        label = _clean(strong.get_text())
+        # Get the parent div (col-sm-*) to extract value
+        parent = strong.find_parent("div", class_=re.compile(r"col-"))
+        if not parent:
+            continue
+        # Get all text in the parent div, remove the label portion
+        full_text = _clean(parent.get_text())
+        strong_text = label
+        if full_text.startswith(strong_text):
+            value = full_text[len(strong_text):].strip()
+        else:
+            value = full_text
+
+        if "Naturaleza del Recurso" in label:
+            obs["naturaleza_recurso"] = value
+        elif "mero de Oficio" in label or "Número de Oficio" in label:
+            obs["numero_oficio"] = value
+        elif "Abogado Suspendido" in label:
+            obs["abogado_suspendido"] = value
+        elif label.startswith("Tabla:") or label == "Tabla:":
+            obs["tabla"] = value
+
+    return obs
 
 
 def parse_detail(html: str) -> dict:
     """Parse a PJUD case detail HTML page.
 
-    Returns a dict with keys: metadata, movements, litigantes.
+    Returns a dict with keys: metadata, movements, litigantes,
+    ebook_token, certificado_disponible, suprema_docs,
+    exhortos, incompetencia.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -433,8 +608,19 @@ def parse_detail(html: str) -> dict:
         all_divs = [div.get("id") for div in soup.find_all("div", id=True)]
         logger.warning("Parser found 0 movements and 0 litigantes. Div IDs in HTML: %s", all_divs)
 
+    metadata = _parse_metadata(soup)
+
+    # Merge Observación fields into metadata (Suprema)
+    obs = _parse_observacion(soup)
+    metadata.update(obs)
+
     return {
-        "metadata": _parse_metadata(soup),
+        "metadata": metadata,
         "movements": movements,
         "litigantes": litigantes,
+        "ebook_token": _parse_ebook_token(soup),
+        "certificado_disponible": _parse_certificado_disponible(soup),
+        "suprema_docs": _parse_suprema_docs(soup),
+        "exhortos": _parse_exhortos(soup),
+        "incompetencia": _parse_incompetencia(soup),
     }
