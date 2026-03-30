@@ -31,7 +31,7 @@ class Scheduler:
         query = (
             self._sb.from_("cases")
             .select("*")
-            .eq("tracking_status", "active")
+            .in_("tracking_status", ["active", "error", "blocked"])
             .eq("source_system", "pjud_ojv")
             .or_(f"sync_blocked_until.is.null,sync_blocked_until.lt.{now_iso}")
             .or_(f"next_sync_at.is.null,next_sync_at.lte.{now_iso}")
