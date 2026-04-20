@@ -1,0 +1,39 @@
+{
+  "phase1": {
+    "status_code": 200,
+    "final_url": "https://ojv.pjud.cl/kpitec-ojv-web/views/login_pjud.html",
+    "cookies": {
+      "TS01320ea5": "01b485afe50d7689001a084f93427660bf2fbf5771cbc960e88d4ae17a4fe257e431a0e172b912f0cc574b2ff3cceb11d82db1dba5",
+      "TSe0c01ce7027": "08a336eaa2ab200081c77bd3c750fb62f32e7dcf84db20fccec41b451cc3d87d989cb63bedb0ed4808f6f6b19d11300028ae1337449124b31a9aff29b41910b4b33cd6a95250d23fe943d3917e6af78c9445bf1e4a8871906303401da4a9e6e1"
+    },
+    "forms": [
+      {
+        "action": "../login_pjud",
+        "method": "POST",
+        "inputs": [
+          {
+            "tag": "input",
+            "name": "rutPjud",
+            "type": "text",
+            "id": "inputRutPjud",
+            "value": null,
+            "placeholder": "Ej: 12345678 (Rut sin gui�n ni d�gito verificador)"
+          },
+          {
+            "tag": "input",
+            "name": "passwordPjud",
+            "type": "password",
+            "id": "inputPasswordPjud",
+            "value": null,
+            "placeholder": null
+          }
+        ]
+      }
+    ],
+    "captcha": [],
+    "recaptcha": [],
+    "js_frameworks": []
+  },
+  "phase2": null,
+  "phase3": null
+}

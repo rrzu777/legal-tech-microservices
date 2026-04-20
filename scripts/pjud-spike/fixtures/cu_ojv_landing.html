@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+
+<html lang="es">
+
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Oficina Judicial Virtual" />
+    <title>Oficina Judicial Virtual - Trámite Fácil</title>
+    <link rel="icon" type="image/png" href="img/logo_pj_small_bg.png?bust=rev5a3804fd" />
+    <link href="bower_modules/bootstrap/dist/css/bootstrap.min.css?bust=rev5a3804fd" rel="stylesheet" />
+    <link href="css/styleTramiteFacil.css?bust=rev5a3804fd" rel="stylesheet" />
+
+</head>
+
+<body>
+    <header class="container-fluid">
+        <div class="row px-sm-5 h-100 justify-content-center align-items-center">
+            <div class="col-auto text-center p-md-0">
+                <a class="m-0 px-3" href="https://www.pjud.cl/home" target="_blank">Sitio web del Poder Judicial</a>
+            </div>
+            <div class="col-12 col-lg-6 d-flex justify-content-center">
+                <div class="logoTF"></div>
+            </div>
+            <div class="col-auto text-center p-md-0">
+                <a class="m-0 px-3" href="https://oficinajudicialvirtual.pjud.cl/home/index.php" target="_blank">Oficina Judicial Virtual</a>
+            </div>
+        </div>
+    </header>
+    <div class="tramite_facil">
+        <div data-bind="component: { name: 'allTramites', params: {}}"></div>
+    </div>
+    <footer class="py-0">
+        <div class="container-fluid py-3 px-5">
+            <div class="row text-center text-md-left py-3">
+                <div class="col-12 col-sm-4 col-lg-3 d-flex justify-content-center align-items-center">
+                    <img id="logo-footer" src="img/tramiteFacil/logoPJUD.png" class="img-fluid" />
+                </div>
+                <div class="col-12 col-sm-8 col-lg-3 mt-3 mx-auto text-left">
+                    <h6>ACERCA DEL PODER JUDICIAL</h6>
+                    <p class="text-justify"> El Poder Judicial es uno de los tres pilares que sostienen el
+                        estado democrático de derecho de nuestro país, junto al Poder Ejecutivo y el Legislativo. Está
+                        conformado por tribunales de diversa competencia - civil, penal, laboral y familia - y su labor está
+                        destinada a otorgar a las personas una justicia oportuna y de calidad.
+                    </p>
+                </div>
+                <div class="col-12 col-sm-4 col-lg-3 mt-3 text-left">
+                    <h6>Enlaces de Interés</h6>
+                    <p class="m-0">
+                        <a class="f-link" href="https://claveunica.gob.cl/" target="_blank">Clave Única</a>
+                    </p>
+                    <p class="m-0">
+                        <a class="f-link" href="https://www.chileatiende.gob.cl/" target="_blank">Chile Atiende</a>
+                    </p>
+                    <p class="m-0">
+                        <a class="f-link" href="https://www.mediacionchile.cl/AML/Account/Login/" target="_blank">Solicitar hora para mediación Familiar</a>
+                    </p>
+                </div>
+                <div class="col-12 col-sm-8 col-lg-3 mt-3 mx-auto text-left">
+                    <h6>MESA DE AYUDA Y CALL CENTER</h6>
+                    <div class="row">
+                        <div class="col-auto pr-1"><div class="phone-icon"></div></div>
+                        <div class="col-8">
+                            <p>
+                                Comunícate a los siguientes números
+                                telefónicos: <a href="tel:+223900400">223900400 - </a>
+                                <br />
+                                Horario de atención de lunes a viernes, de
+                                8:00 a 17:00 horas.
+                            </p>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-auto pr-1"><div class="mail-icon"></div></div>
+                        <div class="col-8">
+                            <p>También puedes escribirnos en la opción <a class="f-link-primary text-nowrap" href="https://www.pjud.cl/transparencia/consulta-ciudadana/lte" target="_blank">OJV Responde</a></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="container-fluid">
+                <div class="row">
+                    <div class="col-12 text-center">
+                        <p id="copyright">Todos los derechos reservados, Poder Judicial de Chile.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+<!-- build:js -->
+<script src="app/requireTF.config.js?bust=rev5a3804fd"></script>
+<script data-main="app/startupTF" src="bower_modules/requirejs/require.js?bust=rev5a3804fd"></script>
+<!-- <script src="myScript.js"></script> -->
+<!-- /build:js -->
+
+</html>

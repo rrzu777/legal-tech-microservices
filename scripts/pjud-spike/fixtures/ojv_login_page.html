@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+
+<html lang="es">
+    <head>
+        <meta charset="utf-8" />
+        <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="description" content="Oficina Judicial Virtual" />
+        <meta name="author" content="kpitec" />
+        <title>Oficina Judicial Virtual- Inicio de Sesi�n - Poder Judicial </title>
+        <link rel="icon" type="image/png" href="../img/logo_pj_small_bg.png?bust=rev5a3804fd" />
+
+        <link href="../bower_modules/bootstrap/dist/css/bootstrap.min.css?bust=rev5a3804fd" rel="stylesheet" />
+        <link href="../css/styleLoginExterno.css?bust=rev5a3804fd" rel="stylesheet" />
+
+        <script type="text/javascript" src="../bower_modules/jquery-1.12.4/dist/jquery.js?bust=rev5a3804fd"></script>
+        <script type="text/javascript" src="../bower_modules/bootstrap/dist/js/bootstrap.bundle.min.js?bust=rev5a3804fd"></script>
+    </head>
+    <body>
+        <header>
+            <div class="container-logo d-flex justify-content-center justify-content-lg-start p-3 p-lg-4">
+                <a href="https://www.pjud.cl/home" class="imagen-logo"><img src="../img/tramiteFacil/login/logo_pjud.png?bust=rev5a3804fd" /></a>
+            </div> 
+        </header>
+        <div class="container-fluid">
+            <div id="login_box" class="row d-flex justify-content-center">
+                <div class="col-12 col-sm-10 col-lg-6 col-xl-5">
+                    <div class="cuerpo-login">
+                        <div class="row">
+                            <div class="col-12 d-flex justify-content-center">
+                                <img id="logo-tramite-facil" src="../img/tramiteFacil/login/logo_tramite_facil.svg?bust=rev5a3804fd" />
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-12">
+                                <h1 class="title-login">Acceso<br>Clave Poder Judicial</br></h1>
+                            </div>
+                        </div>
+                        <div class="row d-flex justify-content-center">
+                            <div class="col-10 col-sm-9 col-lg-8">
+                                <form id="formLoginPjud" role="form" method="post" action="../login_pjud" autocomplete="nope">
+                                    <div class="form-group">
+                                        <label class="login_font_h2 pb-2" for="inputRutPjud">Ingresa RUT (sin gui�n ni d�gito verificador)</label>
+                                        <input type="text" class="form-control" id="inputRutPjud" maxlength="12" name="rutPjud" onkeypress="return event.charCode &gt;= 48 &amp;&amp; event.charCode &lt;= 57" placeholder="Ej: 12345678 (Rut sin gui�n ni d�gito verificador)" />
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="login_font_h2 pb-2" for="inputPasswordPjud">Contrase�a(*)</label>
+                                        <input type="password" class="form-control" id="inputPasswordPjud" name="passwordPjud" />
+                                    </div>
+                                    <div class="form-group pt-3">
+                                        <div class="row">
+                                            <div class="col-12 d-flex justify-content-center p-2">
+                                                <button type="submit" class="btn btn-ingreso-pjud btn-block">Ingresar</button>
+                                            </div>
+                                        </div>
+                                        <div class="row">
+                                            <div class="col-12 d-flex justify-content-center p-2">
+                                                <a href="../tramite_facil" class="btn btn-volver" role="button">Volver</a>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+                                   
+                        </div>
+                    </div>
+                </div>
+            </div> 
+            <div class="row d-flex justify-content-center">
+                <div class="col-12 col-sm-10 col-lg-6 col-xl-5 pt-2">
+                    <div class="cuerpo-secundario d-flex justify-content-center">
+                        <div class="pg_text_info">
+                            <p class="m-3"><b>(*)</b>Se debe activar en la secci�n "Mis datos", una vez que se ha ingresado a la OJV con Clave �nica. Se recomienda activarla para aquellos casos en que la Cl�ve �nica presente alg�n problema.</p>
+                        </div>
+                    </div>    
+                </div>
+            </div>    
+        </div>                
+    </body>
+
+    <script type="text/javascript" src="../bower_modules/jquery-rut/jquery.rut.js?bust=rev5a3804fd"></script>
+
+    <script type="text/javascript">
+        $(function(){
+            $("input[name='rutPjud']").on('input', function (e) {
+                $(this).val($(this).val().replace(/[^0-9]/g, ''));
+                if (this.value.length > 8){
+                    this.value = this.value.slice(0,8);
+                }
+            });
+        });
+    </script>
+
+</html>

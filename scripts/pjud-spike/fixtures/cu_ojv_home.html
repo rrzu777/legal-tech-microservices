@@ -1,0 +1,907 @@
+<!DOCTYPE HTML>
+<html>
+   <head>
+      <link rel="icon" type="image/x-icon" href="images/favicon-2.png">
+      <title>Oficina Judicial Virtual</title>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+      <meta name="description" content="Oficina Judicial Virtual">
+      <link rel="stylesheet" href="assets/css/main.css?ver=15" />
+      <link rel="stylesheet" type="text/css" href="/jbility/css/jbility.css?ver=10">
+      <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.8.1/css/all.css" integrity="sha384-50oBUHEmvpQ+1lW4y57PTFmhCaXp0ML5d60M1M7uH2+nqUivzIebhndOJK28anvf" crossorigin="anonymous">
+      <link rel="stylesheet" href="../css/font-awesome.min.css" />
+      <link href="/cssN/returnToTop.css?ver=1" rel="stylesheet" type="text/css" media="screen" />
+      <noscript>
+         <link rel="stylesheet" href="assets/css/noscript.css" />
+      </noscript>
+      <link rel="stylesheet" href="assets/css/bootstrap.min.css" />
+      <!-- Main Stylesheet File -->
+      <link href="assets/css/style.css?ver=1" rel="stylesheet">
+      <link href="assets/css/color-74c9be.css" rel="stylesheet">
+      <link rel="stylesheet" href="//code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css">
+      <link rel="stylesheet" type="text/css" href="assets/css/jquery-confirm.css" />
+      <link rel="stylesheet" href="assets/css/index.css?ver=4" />
+
+
+      <script type="text/javascript">
+         function accesoClaveUnicaDDEE()
+         {
+             document.location.href="http://ojv.pjud.cl/kpitec-ojv-web/views/login.html";
+         }
+         
+         function accesoSegundaClaveDDEE(){
+             document.location.href="http://ojv.pjud.cl/kpitec-ojv-web/views/login.html";
+         }
+         function accesoConsultaCausas()
+         {
+           var accesoConsultaCausas = 'CC'
+            $.post("../includes/sesion-invitado.php", { nombreAcceso:accesoConsultaCausas }, function(data){
+               localStorage.setItem('InitSitioOld', '0');
+               localStorage.setItem('InitSitioNew', '1');
+               localStorage.setItem('logged-in', true);
+               sessionStorage.setItem('logged-in', true);
+            document.location.href="https://oficinajudicialvirtual.pjud.cl/indexN.php";
+             });
+         }
+         function accesoInvitado(){
+            var accesoInvitado   = 'B'
+            $.post("../includes/sesion-invitado.php", { nombreAcceso:accesoInvitado }, function(data){
+               localStorage.setItem('InitSitioOld', '0');
+               localStorage.setItem('InitSitioNew', '1');
+               localStorage.setItem('logged-in', true);
+               sessionStorage.setItem('logged-in', true);
+            document.location.href="https://oficinajudicialvirtual.pjud.cl/indexN.php";
+             });
+         }
+         function accesoTramiteFacil(){
+             document.location.href="http://tramitefacil.pjud.cl/kpitec-ojv-web/tramite_facil";
+         }
+         function accesoCertificadoDisponibilidad(){
+             document.location.href="https://oficinajudicialvirtual.pjud.cl/home/certificados_disponibilidad.php";
+         }
+         function accesoTribunalesMasCercanos(){
+         
+            var accesoInvitado   = 'TMC'
+            $.post("../includes/sesion-invitado.php", { nombreAcceso:accesoInvitado }, function(data){
+               localStorage.setItem('InitSitioOld', '0');
+               localStorage.setItem('InitSitioNew', '1');
+               localStorage.setItem('logged-in', true);
+               sessionStorage.setItem('logged-in', true);
+               parent.location.href = 'https://oficinajudicialvirtual.pjud.cl/indexN.php';
+             });
+         }
+         
+         function verRemates()
+         {
+         var accesoInvitado = 'REMA'
+            $.post("../includes/sesion-invitado.php", { nombreAcceso:accesoInvitado }, function(data){
+               localStorage.setItem('InitSitioOld', '0');
+               localStorage.setItem('InitSitioNew', '1');
+               localStorage.setItem('logged-in', true);
+               sessionStorage.setItem('logged-in', true);
+               parent.location.href = 'https://oficinajudicialvirtual.pjud.cl/indexN.php';
+             });
+         }
+		 function manuales(){
+             //document.location.href="";
+			 window.open('https://oficinajudicialvirtual.pjud.cl/home/videosymanuales.php', 'new');
+     }
+				
+     function accesoExtranjero(){
+			 var accesoExtranjero = 'FFAA'
+				$.post("../includes/sesion-invitado.php", { nombreAcceso:accesoExtranjero }, function(data){
+					 localStorage.setItem('InitSitioOld', '0');
+					 localStorage.setItem('InitSitioNew', '1');
+					 localStorage.setItem('logged-in', true);
+					 sessionStorage.setItem('logged-in', true);
+				document.location.href="https://oficinajudicialvirtual.pjud.cl/indexN.php";
+				 });
+		  }
+      </script>
+   </head>
+   <body class="landing is-preload">
+      <!-- Navigation -->
+      <nav class="navbar navbar-default navbar-fixed-top navbar-shrink">
+         <div class="container">
+            <!-- Brand and toggle get grouped for better mobile display -->
+            <div class="navbar-header page-scroll">
+               <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#bs-example-navbar-collapse-1">
+               <span class="sr-only">Toggle navigation</span>
+               <span class="icon-bar"></span>
+               <span class="icon-bar"></span>
+               <span class="icon-bar"></span>
+               </button>
+               <a href="https://www.pjud.cl">
+                  <div style="position: absolute; top: 0px;left: 10rem"><img src="images/LogoPJUD.png" style="width: 10rem; margin-bottom: 5rem">
+               </a>
+               </div>
+            </div>
+            <!-- Collect the nav links, forms, and other content for toggling -->
+            <div class="collapse navbar-collapse" id="bs-example-navbar-collapse-1">
+               <ul class="nav navbar-nav navbar-right">
+                  <li class="hidden active">
+                     <a href="#page-top"></a>
+                  </li>
+                  <li class="">
+                     <a class="page-scroll" onclick="javascript:bajarASeccion();">Contáctenos</a>
+                  </li>
+               </ul>
+            </div>
+            <!-- /.navbar-collapse -->
+         </div>
+         <!-- /.container-fluid -->
+      </nav>
+      <div id="imagen-banner">
+      </div>
+      <!-- Modal -->
+      <div class="modal fade" id="segunda-clave-access" tabindex="-1" role="dialog" aria-labelledby="exampleModalLabel" aria-hidden="true">
+         <form name='frmseg' id="fSGN">
+            <div class="modal-dialog" role="document">
+               <div class="modal-content">
+                  <div class="modal-header">
+                     <h5 class="modal-title" id="exampleModalLabel">Acceso a Oficina Judicial Virtual</h5>
+                  </div>
+                  <div class="modal-body">
+                     Para tener acceso con tu Clave Poder Judicial, debes configurarla al acceder por primera vez a la
+                     plataforma con tu Clave Única.
+                     <div class="row form-style">
+                        <div class="input-field col-11 text-center">
+                           <input id="rut" type="text"  onkeypress='return event.charCode >= 48 && event.charCode <= 57' class="form-control" placeholder="Ingrese su Rut sin dígito verificador, Ej: 12345678" title="Ingrese Rut" maxlength="8"> 
+                           <label for="rut">RUT</label> 
+                        </div>
+                     </div>
+                     <div class="row form-style">
+                        <div class="input-field col-11 text-center">
+                          <div class="input-group">
+                            <input id="password" type="password" value="" class="form-control" placeholder="" title="Ingrese Clave">
+                            <span class="input-group-btn">
+                              <button id="show_password" class="form-control btn btn-primary" type="button" onclick="mostrarPassword()">
+                                <span class="fa fa-eye-slash icon"></span>
+                              </button>
+                            </span>
+                          </div>
+                          <label for="password">Contrase&#xF1;a</label>
+                          <br>
+                          <a id="recPass" class="right olvide-pass" href="#sgdClave" style="color:blue; margin-left: 20px">Olvidé mi Contraseña</a>
+                        </div>
+                     </div>
+                  </div>
+                  <div class="modal-footer">
+                     <button type="button" class="btn btn-secondary" data-dismiss="modal">Cerrar</button>
+                     <button type="button" class="btn btn-primary" id="btnSegundaClaveIngresar">Ingresar</button>
+                  </div>
+               </div>
+         </form>
+         </div>
+      </div>
+      <!--Modal End-->
+      <!--Modal: modalPush-->   
+      <!--<div style="position: absolute; top: 0px;left: 5px"><img src="images/LogoPJUD.png" style="width: 15rem; margin-bottom: 5rem"></div>-->
+      <div style="position: absolute; top: 0px; width: 100%; color: #FFF;">
+      <!-- Page Wrapper -->
+      <div id="page-wrapper">
+
+      <!-- Banner -->
+      <section id="" class="banner">
+         <div class="inner tipo">
+            <div class="container">
+               <div class="row">
+                  <div class="col-sm-12">
+                     <h2 style="margin-bottom: 5rem; margin-top: 15rem; text-align: center">Oficina Judicial Virtual</h2>
+                  </div>
+               </div>
+            </div>
+            	
+
+	  <!--<div class="container hidden-xs" style="background-color:rgba(38,38,38,0.6); padding-top:15px; padding-bottom:15px;">
+    		Se informa que el día sábado 07 de septiembre de 2024 desde las 22:20 hrs. hasta aproximadamente las 04:00 hrs. del domingo 08 de septiembre, el ingreso de causas y escritos, junto a los demás servicios de Oficina Judicial Virtual, no estarán disponibles debido a una actualización programada por cambio de hora.
+	  </div>-->
+
+
+		
+			
+			
+			
+			
+			
+			   
+			   
+            
+            <br>
+            <div class="container hidden-xs">
+               <div class="row">
+                  <div class="col-sm-4">
+                     <div class="dropdown">
+                        <button class="dropbtn"  onclick="myFunction()" style="border-radius: 10px; margin-bottom:90px" title="Para navegar a traves de las opciones presione enter y utilice las teclas de desplazamiento" tabindex="1">Todos los servicios</button>
+                        <div id="myDropdown" class="dropdown-content" style="margin-top:-90px">
+                           <a href="#" onclick="AutenticaCUnica();" tabindex="2"><img src="images/clave_unica-01.png" style="width: 2rem; margin-top: 1px; margin-right:10px;margin-bottom: 3px;" >Clave Única</a>
+                           <a href="#" id="btnSegClave" data-toggle="modal" data-target="#segunda-clave-access" tabindex="3" >Clave Poder Judicial</a>
+                        </div>
+                     </div>
+                  </div>
+                  <div class="col-sm-4">
+                     <div class="dropdown" style="word-wrap: break-word;">
+                        <button class="dropbtn"  onclick="accesoClaveUnicaDDEE()" style="border-radius: 10px; margin-top: 0;margin-bottom:90px" tabindex="4" title="Ingreso de causas y escritos" > Ingreso de causas y escritos</button>  
+                     </div>
+                  </div>
+                  <div class="col-sm-4">
+                     <div class="dropdown" id="focus">
+                        <button class="dropbtn" onClick="accesoConsultaCausas();" tabindex="5" style="border-radius: 10px; margin-top:0px; margin-bottom:90px" title="Para navegar a traves de las opciones presione enter y utilice las teclas de desplazamiento">Consulta causas</button>
+                        <!--<div id="myDropdown3" class="dropdown-content">
+                           <a href="#" onClick="accesoConsultaCausas();" tabindex="8" >Consulta de Causas</a>
+                           <a href="#" onClick="accesoInvitado();" tabindex="9" >Como Invitado</a>
+                           <a href="#" onClick="accesoCertificadoDisponibilidad();" tabindex="10" >Certificado de Disponibilidad</a>
+                        </div>-->
+                     </div>
+                  </div>
+                  <div class="col-sm-4">
+                     <div class="dropdown" id="focus">
+                        <button class="dropbtn" onclick="accesoTramiteFacil()" tabindex="6" style="border-radius: 10px; margin-top:0px; margin-bottom:90px" title="Trámite fácil">Trámite Fácil</button>
+                     </div>
+                  </div>
+                  <div class="col-sm-4">
+                     <div class="dropdown" id="focus">
+                        <button class="dropbtn" onClick="accesoTribunalesMasCercanos();" tabindex="7" style="border-radius: 10px; margin-top:px; margin-bottom:90px" title="Guía de atención de público durante la pandemia">Guía de atención de público</button>
+                     </div>
+                  </div>
+                  <div class="col-sm-4">
+                     <div class="dropdown" id="focus"> 
+                        <button class="dropbtn" onClick="verRemates();" tabindex="8" style="border-radius: 10px; margin-top:0px; margin-bottom:90px" title="Audiencia de remates" >Audiencia de remates</button>
+                     </div>
+                  </div> 
+                  <div class="col-sm-4"></button>
+                     <div class="dropdown" id="focus"> 
+                        <button class="dropbtn" onClick="accesoInvitado();" tabindex="9" style="border-radius: 10px; margin-top:0px; margin-bottom:90px" title="Ingreso como invitado">Ingreso como invitado</button>
+                     </div>
+                  </div>
+
+                  <div class="col-sm-4"></button>
+                     <div class="dropdown" id="focus"> 
+                        <button class="dropbtn" onClick="accesoCertificadoDisponibilidad();" tabindex="10" style="border-radius: 10px; margin-top:0px; margin-bottom:90px" title="Certificado disponibilidad" >Certificado disponibilidad</button>
+                     </div>
+                  </div>
+				  
+				  <!--<div class="col-sm-4" style="display:none;">
+                     <div class="dropdown">
+                        <button class="dropbtn"  onclick="myFunction()" style="border-radius: 10px; margin-bottom:90px" title="Para navegar a traves de las opciones presione enter y utilice las teclas de desplazamiento" tabindex="1">Reclamo contra Receptor</button>
+                        <div id="myDropdown" class="dropdown-content" style="margin-top:-90px">
+                           <a href="#" onclick="AutenticaCUnica();" tabindex="2"><img src="images/clave_unica-01.png" style="width: 2rem; margin-top: 1px; margin-right:10px;margin-bottom: 3px;" >Clave Única</a>
+                           <a href="#" id="btnSegClave" data-toggle="modal" data-target="#segunda-clave-access" tabindex="3" >Clave Poder Judicial</a>
+                        </div>
+                     </div>
+                  </div>-->
+		  
+		  <div class="col-sm-4"></button>
+                     <div class="dropdown" id="focus"> 
+                        <button class="dropbtn" onClick="manuales();" tabindex="10" style="border-radius: 10px; margin-top:0px; margin-bottom:90px;font-size: 17px;" title="Manuales,videos y normativa" >Manuales,videos y normativa</button>
+                     </div>
+                  </div>
+
+               <!--<div class="arrow bounce" style="margin-top: 2rem">
+                  <a class="fa fa-chevron-circle-down fa-2x" onclick="javascript:bajarASeccion();" style="border-bottom:none!important"></a>
+               </div>-->
+            </div>
+            </div>
+
+            
+           <div class="container visible-xs visible-sm" style="text-align: center">
+               <div class="dropdown">
+                  <button class="btn btn-primary dropdown-toggle" type="button" id="dropdownMenuButton" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="width:232px;word-wrap: break-word" onclick="myFunction()" title="Para navegar a traves de las opciones presione enter y utilice las teclas de desplazamiento">
+                  Todos los servicios
+                  </button> 
+                  <div class="dropdown-menu dropdown-content" aria-labelledby="dropdownMenuButton" >
+                     <a href="#" onclick="AutenticaCUnica();" tabindex="2"><img src="images/clave_unica-01.png" style="width: 2rem; margin-top: 1px; margin-right:10px;margin-bottom: 3px;" >Clave Única</a>
+                     <a href="#" id="btnSegClave" data-toggle="modal" data-target="#segunda-clave-access" tabindex="3" >Clave Poder Judicial</a>
+                  </div>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onclick="accesoClaveUnicaDDEE()" tabindex="4" title="Ingreso de causas y escritos">
+                  Ingreso de causas y escritos
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button class="btn btn-primary dropdown-toggle" type="button" id="dropdownMenuButton" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="width:232px" onClick="accesoConsultaCausas();" tabindex="5" title="Para navegar a traves de las opciones presione enter y utilice las teclas de desplazamiento">
+                  Consulta causas
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onclick="accesoTramiteFacil()" tabindex="6" title="Trámite fácil">
+                  Trámite Fácil
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onClick="accesoTribunalesMasCercanos();" tabindex="7" title="Guía de atención de público durante la pandemia">
+                  Guía de atención de público
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onClick="verRemates();" tabindex="8" title="Audiencia de remates">
+                  Audiencia de remates
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onClick="accesoInvitado();" tabindex="9" title="Ingreso como invitado">
+                  Ingreso como invitado
+                  </button>
+               </div>
+               <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onClick="accesoCertificadoDisponibilidad();" tabindex="10" title="Certificado de disponibilidad">
+                  Certificado de disponibilidad
+                  </button>
+               </div> 
+			   <div class="dropdown">
+                  <button type="button" class="btn btn-primary dropdown-toggle" data-toggle="dropdown" style="width:232px" onClick="manuales();" tabindex="10" title="Manuales,videos y normativa">
+                  Manuales,videos y normativa
+                  </button>
+               </div> 
+			   
+			   
+      </section>
+      <!--Banner End-->
+
+
+       <!-- Nuevo -->
+
+      <section id="one" class="wrapper alt style2" style="margin-top: 100px;">
+      <div class="container">
+      <div class="row">
+      <div class="col-sm-12" style="text-align: center;"><h1>¿Tienes Dudas?</h1>
+      <p>Escoge alguna de las siguientes opciones o para mayor información sobre la <strong style="color:#fff">Oficina Judicial
+      Virtual (OJV)</strong><a href="nosotros.php">accede acá </a></p></div>
+      </div>
+      </div>
+      <div class="row" style="text-align: justify; margin-left: 20px; margin-right:20px; margin-top:50px">
+      <div class="col-sm-4">
+      <div class="card" >
+      <div class="card-body">
+      <h4 class="card-title">Manuales, Normativas y Preguntas</h4>
+      <p class="card-text">Conoce las normas aplicables a la tramitación electrónica,  manuales de uso de las secciones de la OJV y preguntas frecuentes. <strong
+         style="color:#fff">OJV</strong>.</p>
+
+
+
+
+         <a type="button" class="button fit tertiary" style="width:232px" tabindex="12" title="Manuales y Normativas" href="videosymanuales.php">
+                  Manuales y Normativas
+                  </a>
+
+         <a type="button" class="button fit tertiary" style="width:232px"  tabindex="13" title="Preguntas" href="FAQ.php">
+                  Preguntas
+                  </a> 
+       
+
+      </div>
+      </div>
+      </div>   
+      
+
+      <div class="col-sm-4">
+      <div class="card" >
+      <div class="card-body">
+      <h4 class="card-title">Mesa de ayuda y Call Center</h4>
+        <p class="card-text">Para asesoría en el uso de la Oficina Judicial Virtual y portal del Poder Judicial, puede comunicarse al número <strong style="color: white;">223900400</strong>, de lunes a viernes, de 08:00 a 17:00 horas o escribir en la opción<a href="https://www.pjud.cl/transparencia/consulta-ciudadana/lte" target="_blank" style="color:#FFF">OJV Responde.</a><a href="#" onClick="accesoExtranjero();" style="visibility: hidden">...</a></p>
+        <a type="button" class="button fit tertiary" style="width:240px" tabindex="13" title="ESCRIBIR A OJV RESPONDE" href="https://www.pjud.cl/transparencia/consulta-ciudadana/lte">ESCRIBIR A OJV RESPONDE</a>
+      </div>
+      </div>
+      </div>
+      <div class="col-sm-4">
+      <!--<div class="card">
+      <div class="card-body">
+      <h4 class="card-title">Bus de la justicia</h4>
+      <p class="card-text">Para recibir orientación jurídica sobre el estado de causas y trámites simples que no requieran comparecencia o patrocinio de abogados, puede comunicarse en los siguientes accesos:</p>
+
+      <div class="row ">
+        <div class="sidebar-social">
+          <ul>
+            <div class="col-sm-6 center ">
+              <li>
+                <a style="border-bottom:none!important" title="Messenger" href="https://m.me/108493167509857" target="_blank"><i class="fab fa-facebook-messenger fa-3x" tabindex="14"></i> Messenger</a>
+              </li>
+            </div>
+            <div class="col-sm-6">
+              <li>
+                <a style="border-bottom:none!important" title="plataforma de atención de personas sordas" href="https://zoom.us/j/97482600060?pwd=NkdyT2NUY2NHRzRQV1FoZWJJMjk1Zz09" target="_blank"><i class="fas fa-american-sign-language-interpreting fa-3x" tabindex="15"></i> Plataforma para personas sordas e idioma creole</a>
+              </li>
+            </div>
+          </ul>
+        </div>
+      </div>
+      <br>
+      <p><strong style="color:#fff;">22 667 95 24 - 22 667 95 64</strong></p>
+      <p>Nuestros horarios de atención son de lunes a jueves desde las 9:00 a las 17:00, viernes hasta las 16:00. No atendemos fines de semana, ni días festivos.</p>
+      </div>
+      </div>-->
+      </div>
+
+      <!--<div class="col-sm-3">
+      <div class="card" style="width: 35rem;">
+      <div class="card-body">
+      <h4 class="card-title">Preguntas Frecuentes</h4>
+      <p class="card-text">Respuesta a las consultas más habituales sobre la tramitación electrónica y
+      el funcionamiento de la <strong style="color:#fff">OJV</strong>.
+      </p>
+      <a href="FAQ.php" class="button fit tertiary" style="margin-top: 2px">Ver</a>
+      </div>
+      </div>
+      </div>-->
+      </div>
+      </section>
+
+     
+      <!--Nuevo End-->
+
+         
+ <!-- Site Footer -->
+      <footer class="site-footer">
+      <div class="container" style="width: 100%">
+      <div class="row flexthis">
+      <div class="col-sm-12 col-md-3">
+      <h6><img src="images/LogoPJUD.png" style="width: 15rem; margin-left: 5rem"></h6>
+      <p class="text-justify"></p>
+      </div>
+      <div class="col-xs-6 col-md-3" tabindex="16">
+      <h6>Oficina Judicial Virtual</h6>
+      <ul class="footer-links no-indent">
+      <li tabindex="17"><a href="nosotros.php" title="Conoce la Oficina">Conoce la Oficina</a></li>
+      <li tabindex="18"><a href="certificados_disponibilidad.php" title="Certificados de Disponibilidad">Certificados de
+      Disponibilidad</a></li>
+      <li tabindex="19"><a href="condicionesdeuso.php" title="Condiciones de Uso">Condiciones de
+      Uso</a></li>
+      </ul>
+      </div>
+      <div class="col-xs-6 col-md-3" tabindex="20">
+      <h6>Sitios de Interés</h6>
+      <ul class="footer-links">
+      <li tabindex="21"><a target="_blank" href="https://claveunica.gob.cl/" title="Clave Única">Clave Única</a></li>
+      <li tabindex="22"><a target="_blank" href="https://www.chileatiende.gob.cl/" title="Chile Atiende">Chile Atiende</a></li>
+      <li tabindex="23"><a target="_blank" href="https://www.mediacionchile.cl/AML/Account/Login/" title="Solicitar Hora para Mediación Familiar">Solicitar Hora para
+      Mediación Familiar</a></li>
+      </ul>
+      </div>
+      <div class="col-xs-6 col-md-3" tabindex="24" title="ayuda">
+      <h6>Ayuda</h6>
+      <ul class="footer-links no-indent">
+      <li tabindex="24"><a href="videosymanuales.php" title="Normativa y Manuales">Normativa y Manuales</a></li>
+      <li tabindex="25"><a href="FAQ.php" title="Preguntas Frecuentes">Preguntas Frecuentes</a></li>
+      <li tabindex="26"><a href="https://www.pjud.cl/transparencia/consulta-ciudadana/lte" title="OJV Responde" >OJV Responde</a></li>
+      <!--<li><a href="tel:2 24977040">Call Center LTE. 2 24 97 70 40</a></li>-->
+      <button type="button" class="btn btn-primary" data-toggle="modal" data-target=".bd-example-modal-lg" id="btn-modal" style="display:none;">Large modal</button>
+      <div class="modal fade bd-example-modal-lg" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+	  
+      <div class="modal-dialog" role="document">
+      <div class="modal-content">
+      <div class="modal-header">
+      <h5 class="modal-title" id="exampleModalLabel">Aviso</h5>
+      </div>
+      <div class="modal-body">
+    	<p align="justify">&nbsp;Se informa que el ingreso de querellas y escritos a los Juzgados de Garantía de Parral, Juzgado de Garantía de San Javier, Juzgado de Letras y Garantía de Chanco y Juzgado de Letras y Garantía de Curepto, se interrumpirá el miércoles 08 de abril de 2026 entre las 10:00 y las 23:59 horas, debido a la implementación de un nuevo sistema de tramitación.</p>
+	<p align="justify">&nbsp;Debido a lo anterior, se encontrará publicado el certificado de disponibilidad respectivo.</p>
+									 
+	
+      </div>
+      <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" data-dismiss="modal" id="close-modal">Cerrar</button>
+      </div>
+      </div>
+      </div>
+      </div>
+      </ul>
+      </div>
+      </div>
+      <hr>
+      </div>
+      <div class="container" style="width: 100%">
+      <div class="row">
+      <div class="col-md-8 col-sm-6 col-xs-12">
+      <ul class="social-icons" style="text-align: left;">
+      <li>Navegadores compatibles <i class="fa fa-brands fa-firefox fa-2x"></i> V 29+</li>
+      <li><i class="fa fa-brands fa-chrome fa-2x"></i> V 33+</li>
+      <li><i class="fa fa-brands fa-safari fa-2x"></i> V 7.1+</li>
+      <li><i class="fa fa-brands fa-internet-explorer fa-2x"></i> V 10</li>
+      </ul>
+      </div>
+
+      <div class="col-md-4 col-sm-6 col-xs-12">
+      <ul class="social-icons">
+      <li tabindex="27"><a class="facebook" target="_blank" title="Facebook"  href="https://www.facebook.com/PoderJudicialdeChile/"><i
+         class="fa fa-facebook"></i></a></li>
+      <li tabindex="28"><a class="twitter" target="_blank" title="Twitter" href="https://twitter.com/PJudicialChile"><i
+         class="fab fa-twitter"></i></a></li>
+      <li tabindex="29"><a class="Instagram" target="_blank" title="Instagram" href=""><i class="fab fa-instagram"></i></a></li>
+      <li tabindex="30" ><a class="tv" target="_blank" title="Poder Judicial Tv" href="http://www.poderjudicialtv.cl/"><i class="fas fa-tv"></i></a>
+      </li>
+      </ul>
+      </div>
+      </div>
+      </div>
+      </footer>
+      <!--Site Footer End-->
+      </div>
+      </div>
+      
+      <button type="button" class="btn btn-primary btn-lg" data-toggle="modal" data-target="#no-disponible" style="display:none;" id="modalhome">
+      modal home
+      </button>
+      <!--
+         <div id="acess-container" class="acess-container test">
+                <div class="balloon"><span class="balloontext">Contraste</span><img id="contrast" src="/jbility/img/contraste40.png" /></div>
+                <div class="balloon"><span class="balloontext">Aumentar Fuente</span><img id="increaseFont" src="/jbility/img/fontsma40.png" /></div>
+                <div class="balloon"><span class="balloontext">Disminuir Font</span><img id="decreaseFont" src="/jbility/img/fontsme40.png" /></div>
+         </div>
+         -->
+				 <div class="modal fade" id="no-disponible" tabindex="-1" role="dialog" aria-labelledby="modalHome" aria-hidden="true">
+					<div class="modal-dialog" role="document">
+						<div class="modal-content">
+							<div class="modal-header bg-primary">
+								<h5 class="modal-title" style="color: white !important;" id="exampleModalLabel">
+									Recomendaciones
+								</h5>
+							</div>
+							<div class="modal-body text-justify">                 
+                     El ingreso de querellas y escritos a los Juzgados de Garantía de Chillán,  de San Carlos y Juzgados de Letras y Garantía de 
+                     Licantén, se interrumpirá el día miércoles 15 de abril entre las 10:00 y las 23:59 horas, debido a la implementación de un nuevo sistema de tramitación.
+                     <br>En razón de lo anterior, se encontrará publicado el certificado de disponibilidad respectivo.
+                     
+                        <!--<a href="#!">
+									<img src="images/modales/estafa_2025.jpg" width="100%">
+								</a>-->
+							</div>				
+							<div class="modal-footer">
+								<button type="button" class="btn btn-primary" data-dismiss="modal">Cerrar</button>
+							</div>
+						</div>
+					</div>
+				</div>
+
+      <style>
+                  .banner{
+         height: 90vh;
+         }
+         @media (min-width: 200px) and (max-width: 750px) {
+         .visible-xs {
+         display: block !important;
+         }
+         .dropdown-content {
+         display: none;
+         position: absolute;
+         border-left: 4px solid #003f69;
+         background: rgba(33,33,33,0.5);
+         -webkit-box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         -moz-box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         border-radius: 5px;
+         top: 100%;
+         left: -4px;
+         width: 240px;
+         padding: 5px 0px;
+         min-width: 160px;
+         box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+         z-index: 1000;
+         border-left: 4px solid #bdbe36;
+         background: rgba(33,33,33,0.9);
+         margin-top: 0%;
+         }
+         }
+         @media (max-width: 768px) {
+         .hidden-xs {
+         display: none !important;}
+         .spotlight .content {
+         padding: 9em 2em 1em 2em;
+         }
+         }
+         }
+         @media (min-width: 768px) and (max-width: 991px) {
+         .visible-sm {
+         display: block !important;
+         }
+         .dropdown-content {
+         display: none;
+         position: absolute;
+         border-left: 4px solid #003f69;
+         background: rgba(33,33,33,0.5);
+         -webkit-box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         -moz-box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         box-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+         border-radius: 5px;
+         top: 100%;
+         left: -4px;
+         width: 240px;
+         padding: 5px 0px;
+         min-width: 160px;
+         box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2); 
+         z-index: 1000;
+         border-left: 4px solid #bdbe36;
+         background: rgba(33,33,33,0.9);
+         margin-top: 0%;
+         }
+         .banner{
+         height: 60vh
+         }
+         }
+         .navbar {
+         font-size: 16px;
+         background: #003f69!important;
+         height: 70px;
+         }
+         .navbar-default .navbar-nav > li > a:hover {
+         color: #bdbe36;
+         }
+         .navbar-default .navbar-nav > li > a {
+         color: #fff;
+         }
+
+
+
+
+
+
+         .sidebar-social {
+    margin: 0;
+    padding: 0;
+}
+
+.sidebar-social ul {
+    margin: 0;
+    padding: 5px;
+}
+
+.sidebar-social li {
+     text-align: center;
+    width: ;
+    margin-bottom: 3px!important;
+    background-color: #;
+    border: 1px solid #;
+    display: inline-block;
+    font-size: 10px;
+    padding:;
+}
+
+.sidebar-social i {
+  display: block;
+  margin: 0 auto 10px auto;
+   
+}
+.sidebar-social a{
+  text-decoration:none;
+  width:100%;
+  height:100%;
+  display:block;
+  margin:0;
+  padding:0;
+  font-size: 13px;
+}
+
+
+.center {
+text-align: center;
+margin-bottom: 20px;
+}
+      </style>
+      <!-- Scripts -->
+      <script src="assets/js/jquery-3.3.1.slim.min.js"></script>
+      <script src="assets/js/jquery.scrollex.min.js"></script>
+      <script src="assets/js/jquery.scrolly.min.js"></script>
+      <script src="assets/js/browser.min.js"></script>
+      <script src="assets/js/breakpoints.min.js"></script>
+      <script src="assets/js/util.js"></script>
+      <script src="assets/js/main.js"></script>
+      <script src="assets/js/popper.min.js"></script>
+      <script src="assets/js/bootstrap.js"></script>
+      <script src="assets/js/jquery.min.js"></script>
+      <script src="assets/js/jquery-ui.js"></script>
+      <script src="assets/js/jquery-confirm.js"></script>
+      <script src="https://www.google.com/recaptcha/api.js?render=6LelLWkUAAAAANPDMkBxllo_QJe5RQVpg6V2pIDt"></script>
+      <script>
+         //document.getElementById("focus").focus();
+        
+         //$( "#modalhome" ).click();
+        
+         function mostrarPassword(){
+          var cambio = document.getElementById("password");
+          if(cambio.type == "password"){
+            cambio.type = "text";
+            $('.icon').removeClass('fa fa-eye-slash').addClass('fa fa-eye');
+          }else{
+            cambio.type = "password";
+            $('.icon').removeClass('fa fa-eye').addClass('fa fa-eye-slash');
+          }
+        }
+        
+         var nav4 = document.all ? false : true;
+         
+         function acceptNum(evt){    
+         
+         // NOTE: Backspace = 8, Enter = 13, '0' = 48, '9' = 57
+         
+         var key = nav4 ? evt.which : evt.keyCode;   
+         
+         return (key <= 13 || (key >= 48 && key <= 57));
+         
+         }
+         
+         function AutenticaCUnica(){ 
+         $("#cuform").submit();
+         }
+         
+         function bajarASeccion()
+         {
+                 $("html,body").animate({ scrollTop : $("#one").offset().top  }, 1500 )
+         }
+          
+         
+         $(document).ready(function ()
+         {
+         
+             $('#recPass').click(function(){//alert('press');
+            
+         var rut = $('#rut').val();
+         if(rut=="")    {
+         
+         $.alert({
+            title: 'Aviso!',
+            content: 'Por favor Ingresar Rut',
+            btnClass: 'btn-blue',
+            type: 'blue',
+            useBootstrap: false,
+            boxWidth: '20%'
+         });
+         
+         }else{
+         $.confirm({
+                         confirmButton: 'Aceptar',          
+            confirmButtonClass: 'btn btn-primary',
+            cancelButton: 'Cancelar',                   
+            cancelButtonClass: 'btn-danger',
+            title: 'Aviso!',
+            content: '¿Desea recuperar su clave?',
+            confirm: function(){
+                //alert('confrimed');
+                //---------------------------------------------------
+                $.ajax({
+                    url         : 'includes/recupera-pass.php',
+                    type        : 'POST',
+                    dataType    : 'html',
+                    data        :{
+                            rut : rut
+                        }
+                })
+                .done(function(data) {
+         
+                    $.alert({
+                        confirmButton: 'Aceptar',
+                        title: 'Mensaje',
+                        content: data
+         
+                    });
+                })
+                //---------------------------------------------------
+            },
+            cancel:function(){
+                //alert('cancelar');
+            }
+            
+         })
+         
+         }
+         
+         });
+         
+             $('#btnSegundaClaveIngresar').click(function ()
+             {       
+                 var rut=$('#rut').val();
+                 var clave=$('#password').val();
+         
+                 if(rut=="" || rut==null || clave=="" || clave==null)
+                 {
+                     $.alert({                  
+                         title: 'Aviso!',
+                         content: 'Por favor Ingresar Rut/Clave',
+            /*
+                         btnClass: 'btn-blue',
+                         type: 'blue',
+                         useBootstrap: false,
+                         boxWidth: '20%',
+            confirmButton: 'Aceptar'*/
+                     });
+                     return false;
+                 }
+         
+         grecaptcha.ready(function() {
+         grecaptcha.execute('6LelLWkUAAAAANPDMkBxllo_QJe5RQVpg6V2pIDt', {action:'validate_captcha_seg_clave_hn'})
+              .then(function(token) {
+                  
+                  document.getElementById('g-recaptcha-response-seg-clave_hn').value = token;
+                  var acceso_paso = document.forms["frm"]["ACCESO"].value;
+                  var action_paso = document.forms["frm"]["action"].value;
+                  var g_recaptcha_clave_paso = document.forms["frm"]["g-recaptcha-response-seg-clave_hn"].value;
+                  
+                  //document.forms["frmseg"]["btnSegundaClaveIngresar"].disabled = true;
+                  
+                  $("#formSSGGNN").load("../sessionN.php", {'2257e205d71edbaab04591f61be0066f5582d591':acceso_paso, 'g-recaptcha-response-seg-clave_hn':g_recaptcha_clave_paso, 'rut':rut, 'password':clave});
+                    
+         });
+         });
+         
+         return false;
+         
+                          
+         
+             });
+         
+         
+             $('.cerrar').on('click', function () {
+         
+                 $('.modal').modal('close');
+             });
+         
+             $('#segunda-clave-access').on('hidden.bs.modal', function (e) {
+         
+                 $('.landing').css('padding-right', '0px');
+             });
+         
+            // $('#btn-modal').click();
+	 
+	
+   
+   
+   
+   
+   
+   
+         
+             });
+      </script>
+      <!--Modal Script End-->
+      <script>
+         /* When the user clicks on the button, 
+         toggle between hiding and showing the dropdown content */
+         function myFunction() {
+           document.getElementById("myDropdown").classList.toggle("show");
+         }
+         
+         
+         function myFunction2() {
+           document.getElementById("myDropdown2").classList.toggle("show");
+         }
+         
+         
+         function myFunction3() {
+           document.getElementById("myDropdown3").classList.toggle("show");
+         }
+         
+         
+         
+         // Close the dropdown if the user clicks outside of it
+         window.onclick = function(event) {
+           if (!event.target.matches('.dropbtn')) {
+             var dropdowns = document.getElementsByClassName("dropdown-content");
+             var i;
+             for (i = 0; i < dropdowns.length; i++) {
+               var openDropdown = dropdowns[i];
+               if (openDropdown.classList.contains('show')) {
+                 openDropdown.classList.remove('show');
+               }
+             }
+           }
+         }
+      </script>
+      <a href="javascript:" id="return-to-top"><i class="fas fa-arrow-up fa-2x" style="margin-left:15px"></i></a>
+      <script type="text/javascript" src="/js/returnToTop.js"></script>
+	  		<!--
+			Widget de accesibilidad de userway
+			-->
+		  <script>(function(d){var s = d.createElement("script");s.setAttribute("data-account", "UjIo0C0Zp4");s.setAttribute("src", "https://cdn.userway.org/widget.js");(d.body || d.head).appendChild(s);})(document)</script><noscript>Please ensure Javascript is enabled for purposes of <a href="https://userway.org">website accessibility</a></noscript>
+            <form id="cuform" action="initCU.php" method="POST">
+         <input type="hidden" name="2257e205d71edbaab04591f61be0066f5582d591" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3NjcwMTc5NCwiZXhwIjoxNzc2NzAzNTk0LCJkYXRhIjoiN2l1T3Vxak9aRjlOR01iUXB2OHNiS1dLNkJjYThUWFFhUGhEQzdQZmJwcFlnSjRIY0U5aWJxR1F5OHF0RXROZlVWaEo1M1RPcTg0eU5NekNWbmRveGc9PSJ9.KQU37IJvaZTR_scFmEPHCcVrDzkomztQWijLCjDVHvY">
+      </form>
+      <form action='' method='post' name='frm' id="formSSGGNN" class="col " >
+         <input type="hidden" name="rut" id="rut">
+         <input type="hidden" name="password" id="password">
+         <input type="hidden" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3NjcwMTc5NCwiZXhwIjoxNzc2NzAzNTk0LCJkYXRhIjoiN2l1T3Vxak9aRjlOR01iUXB2OHNiS1dLNkJjYThUWFFhUGhEQzdQZmJwcFlnSjRIY0U5aWJxR1F5OHF0RXROZlVWaEo1M1RPcTg0eU5NekNWbmRveGc9PSJ9.KQU37IJvaZTR_scFmEPHCcVrDzkomztQWijLCjDVHvY" name="ACCESO" id="ACCESO">
+         <input type="hidden" id="g-recaptcha-response-seg-clave_hn" name="g-recaptcha-response-seg-clave_hn">
+         <input type="hidden" name="action" id="action" value="validate_captcha_seg_clave_hn">
+      </form>
+      
+   </body>
+</html>
+

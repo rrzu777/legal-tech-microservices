@@ -1,0 +1,28 @@
+{
+  "phase1": {
+    "ojv_home_status": 200,
+    "cuform_found": true,
+    "cuform_action": "initCU.php",
+    "cuform_field_name": "2257e205d71edbaab04591f61be0066f5582d591",
+    "cuform_jwt_len": 389,
+    "cu_form_field_constant": "2257e205d71edbaab04591f61be0066f5582d591",
+    "init_cu_status": 302,
+    "init_cu_redirects_to_cu": true,
+    "init_cu_has_state": true,
+    "cu_login_url": "https://accounts.claveunica.gob.cl/accounts/login/?next=/openid/authorize%3Fclient_id%3Dd602a0071f3f4db8b37a87cffd89bf23%26redirect_uri%3Dhttps%253A%252F%252Foficinajudicialvirtual.pjud.cl%252Fclaveunica%252Freturn.php%253Fboton%253D1%26response_type%3Dcode%26scope%3Dopenid%2Brut%26state%3DeyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3NjcwMTc5OCwiZXhwIjoxNzc2NzAyNjk4LCJkYXRhIjoiMytJb3JSekgzOXJha2dlM2N4REs3c3VUcFhOYldLOUdrUkdwNmh3VHVGMD0ifQ.lFEu5x3y26ESP6EdIidN0GemcRffinTqYV4yYsatK04",
+    "cu_login_form_action": "/accounts/login?next=/openid/authorize%3Fclient_id%3Dd602a0071f3f4db8b37a87cffd89bf23%26redirect_uri%3Dhttps%253A%252F%252Foficinajudicialvirtual.pjud.cl%252Fclaveunica%252Freturn.php%253Fboton%253D1%26response_type%3Dcode%26scope%3Dopenid%2Brut%26state%3DeyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc3NjcwMTc5OCwiZXhwIjoxNzc2NzAyNjk4LCJkYXRhIjoiMytJb3JSekgzOXJha2dlM2N4REs3c3VUcFhOYldLOUdrUkdwNmh3VHVGMD0ifQ.lFEu5x3y26ESP6EdIidN0GemcRffinTqYV4yYsatK04",
+    "cu_login_fields": [
+      "csrfmiddlewaretoken",
+      "next",
+      "app_name",
+      "token",
+      "run",
+      "password"
+    ],
+    "csrf_found": true,
+    "recaptcha_in_page": true,
+    "token_field_default": ""
+  },
+  "phase2": null,
+  "phase3": null
+}
