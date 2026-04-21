@@ -74,10 +74,10 @@ def _detect_login_error(html: str) -> bool:
     ])
 
 
-def _detect_session_ok(url: str) -> bool:
-    return any(k in url for k in [
-        "indexN.php", "/home/index", "consultaUnificada", "/misCausas",
-    ])
+def _detect_session_error(url: str) -> bool:
+    """Return True if the final URL looks like a login/error page rather than an OJV session."""
+    low = url.lower()
+    return any(k in low for k in ["login", "error", "claveunica.gob.cl", "ojv.pjud.cl"])
 
 
 class FamiliaAuthSession:
@@ -119,7 +119,7 @@ class FamiliaAuthSession:
 
         if _detect_login_error(html):
             raise InvalidCredentialsError("Clave PJ: credentials rejected")
-        if not _detect_session_ok(final_url):
+        if _detect_session_error(final_url):
             logger.warning("Clave PJ login: unexpected final URL %s", final_url[:80])
             raise SessionError(f"Clave PJ: unexpected redirect to {final_url[:80]}")
 
@@ -182,7 +182,7 @@ class FamiliaAuthSession:
 
         if _detect_login_error(html_login):
             raise InvalidCredentialsError("Clave Única: credentials rejected")
-        if not _detect_session_ok(final_url):
+        if _detect_session_error(final_url):
             logger.warning("Clave Única login: unexpected final URL %s", final_url[:80])
             raise SessionError(f"Clave Única: unexpected redirect to {final_url[:80]}")
 

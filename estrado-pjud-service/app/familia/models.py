@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 FamiliaErrorCode = Literal["invalid_credentials", "session_error", "no_cases", "parse_error"]
+
+_MAX_CASES = 10
 
 
 class FamiliaCaseFilter(BaseModel):
@@ -16,7 +18,7 @@ class FamiliaSyncRequest(BaseModel):
     rut: str              # "12345678-9" or "12345678"
     password: str
     auth_type: Literal["clave_pj", "clave_unica"] = "clave_unica"
-    cases: list[FamiliaCaseFilter] = []  # empty = return all cases
+    cases: Annotated[list[FamiliaCaseFilter], Field(max_length=_MAX_CASES)] = []
 
     @field_validator("rut")
     @classmethod
