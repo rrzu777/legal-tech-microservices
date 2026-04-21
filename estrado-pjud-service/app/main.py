@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
 from app.rate_limit import limiter
-from app.routes import health, search, detail
+from app.routes import health, search, detail, familia
 from app.session_pool import APISessionPool
 
 
@@ -58,6 +58,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(search.router)
     app.include_router(detail.router)
+    app.include_router(familia.router)
 
     return app
 
