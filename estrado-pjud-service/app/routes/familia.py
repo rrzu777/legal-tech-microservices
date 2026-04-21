@@ -1,5 +1,3 @@
-"""POST /api/v1/familia/sync — sync Familia cases for an authenticated user."""
-
 from __future__ import annotations
 
 import logging
@@ -22,17 +20,7 @@ async def familia_sync(
     req: FamiliaSyncRequest,
     _api_key: str = verify_api_key,
 ) -> FamiliaSyncResponse:
-    """Login to OJV with user credentials and return their Familia cases.
-
-    auth_type:
-      - "clave_unica"  (default) — OAuth2 flow via CU
-      - "clave_pj"               — Direct POST with Clave Poder Judicial
-
-    If cases[] is provided, each RIT is queried individually.
-    If cases[] is empty, returns all cases for the RUT.
-    """
     async with FamiliaAuthSession() as session:
-        # Step 1: authenticate
         try:
             await session.login(req.rut, req.password, req.auth_type)
         except InvalidCredentialsError:
@@ -56,17 +44,12 @@ async def familia_sync(
                 error=safe_error(e),
             )
 
-        # Step 2: query — either per-RIT or all cases at once
-        all_casos = []
-        error_code = None
-
         if req.cases:
+            all_casos = []
             for case_filter in req.cases:
                 try:
                     html = await session.search_familia(
-                        rut=req.rut,
-                        rit=case_filter.rit,
-                        year=case_filter.year,
+                        rut=req.rut, rit=case_filter.rit, year=case_filter.year,
                     )
                     casos, err = parse_familia_results(html)
                     if err and err != "no_cases":
@@ -77,24 +60,19 @@ async def familia_sync(
                     all_casos.extend(casos)
                 except Exception as e:
                     logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
-        else:
-            try:
-                html = await session.search_familia(rut=req.rut)
-                all_casos, error_code = parse_familia_results(html)
-            except Exception as e:
-                logger.exception("familia_sync: unexpected error querying Familia")
-                return FamiliaSyncResponse(
-                    ok=False, casos=[],
-                    error_code="session_error",
-                    error=safe_error(e),
-                )
+            return FamiliaSyncResponse(ok=True, casos=all_casos)
 
-    if error_code == "no_cases" and not all_casos:
-        return FamiliaSyncResponse(
-            ok=True, casos=[],
-            error_code="no_cases",
-            error=None,
-        )
+        try:
+            html = await session.search_familia(rut=req.rut)
+        except Exception as e:
+            logger.exception("familia_sync: unexpected error querying Familia")
+            return FamiliaSyncResponse(
+                ok=False, casos=[],
+                error_code="session_error",
+                error=safe_error(e),
+            )
+
+    all_casos, error_code = parse_familia_results(html)
 
     if error_code == "parse_error":
         return FamiliaSyncResponse(
