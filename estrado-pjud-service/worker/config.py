@@ -31,4 +31,8 @@ class WorkerConfig(BaseSettings):
     R2_BUCKET: str = "estrado-documents"
     R2_ENABLED: bool = False
 
+    # Familia credential decryption (calls Vercel internal endpoint)
+    VERCEL_APP_URL: str = ""
+    INTERNAL_CREDENTIALS_API_KEY: str = ""
+
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

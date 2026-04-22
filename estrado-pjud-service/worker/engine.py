@@ -4,8 +4,12 @@ import logging
 import uuid
 from datetime import datetime, timedelta, date
 
+import httpx
+
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
+from app.familia.auth import FamiliaAuthSession, InvalidCredentialsError, SessionError
+from app.familia.parser import parse_familia_results
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
@@ -166,6 +170,16 @@ class SyncEngine:
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
+            if case.get("matter") == "familia":
+                result = await self._sync_familia_case(case, sync_run_id, started_at)
+                if result["success"]:
+                    self._backoff.record_success()
+                    self._metrics.record_sync()
+                else:
+                    self._backoff.record_failure()
+                    self._metrics.record_error()
+                return result
+
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Unsupported matter")
@@ -311,6 +325,171 @@ class SyncEngine:
         finally:
             if session:
                 self._pool.release(session)
+
+    async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
+        """Fetch decrypted credential from Vercel internal endpoint."""
+        url = self._config.VERCEL_APP_URL
+        key = self._config.INTERNAL_CREDENTIALS_API_KEY
+        if not url or not key:
+            logger.error("VERCEL_APP_URL or INTERNAL_CREDENTIALS_API_KEY not configured")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{url}/api/internal/credentials/{credential_id}/decrypt",
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("Decrypt endpoint returned %d for credential %s", resp.status_code, credential_id)
+            return None
+        except Exception:
+            logger.exception("Failed to fetch decrypted credential %s", credential_id)
+            return None
+
+    async def _sync_familia_case(self, case: dict, sync_run_id: str | None, started_at: datetime) -> dict:
+        credential_id = case.get("ojv_credential_id")
+        if not credential_id:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "Missing ojv_credential_id")
+            await self._terminal_error(case["id"], "Causa Familia sin credencial OJV configurada")
+            return {"success": False, "new_movements": 0}
+
+        cred = await self._get_decrypted_credential(credential_id)
+        if not cred:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "Credential inactive or missing")
+            await self._terminal_error(case["id"], "Credencial OJV inactiva o no encontrada")
+            return {"success": False, "new_movements": 0}
+
+        try:
+            parsed = parse_case_identifier(case["case_number"])
+        except ValueError:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
+            await self._terminal_error(case["id"], "Identificador invalido")
+            return {"success": False, "new_movements": 0}
+
+        # "clave_poder_judicial" stored in DB maps to "clave_pj" in the auth module
+        auth_type = "clave_pj" if cred.get("password_type") == "clave_poder_judicial" else "clave_unica"
+
+        try:
+            async with asyncio.timeout(90):
+                async with FamiliaAuthSession(rate_limit_s=2.5) as session:
+                    try:
+                        await session.login(cred["rut"], cred["password"], auth_type)
+                    except InvalidCredentialsError:
+                        await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
+                        await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
+                        return {"success": False, "new_movements": 0}
+                    except SessionError as e:
+                        await self._finish_run(sync_run_id, started_at, "error", 0, str(e))
+                        await self._update_case_error(case["id"], "Error de sesion OJV Familia", case.get("sync_attempts", 0))
+                        return {"success": False, "new_movements": 0}
+
+                    html = await session.search_familia(
+                        rut=cred["rut"],
+                        rit=str(parsed["numero"]),
+                        year=str(parsed["anno"]),
+                    )
+
+        except TimeoutError:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "Timeout Familia sync")
+            await self._update_case_error(case["id"], "Timeout al sincronizar causa Familia", case.get("sync_attempts", 0))
+            return {"success": False, "new_movements": 0}
+
+        casos, err = parse_familia_results(html)
+        if err and err != "no_cases":
+            await self._finish_run(sync_run_id, started_at, "error", 0, f"Parse error: {err}")
+            await self._update_case_error(case["id"], "Error al interpretar respuesta OJV Familia", case.get("sync_attempts", 0))
+            return {"success": False, "new_movements": 0}
+
+        if not casos:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "Case not found in Familia portal")
+            await self._update_case_error(case["id"], "Causa no encontrada en portal Familia", case.get("sync_attempts", 0))
+            return {"success": False, "new_movements": 0}
+
+        caso = casos[0]
+
+        prev_payload = case.get("external_payload") or {}
+        prev_estado = prev_payload.get("estado")
+        estado_changed = prev_estado != caso.estado
+
+        new_count = 0
+        if estado_changed or not prev_estado:
+            mov_title = (
+                f"Estado actualizado: {prev_estado} → {caso.estado}"
+                if prev_estado
+                else f"Estado: {caso.estado}"
+            )
+            ext_key = f"familia:{case['case_number']}:{caso.estado}"
+            try:
+                await run_query(
+                    self._sb.from_("case_movements").upsert(
+                        {
+                            "law_firm_id": case["law_firm_id"],
+                            "case_id": case["id"],
+                            "date": datetime.now(TZ_SANTIAGO).date().isoformat(),
+                            "title": mov_title,
+                            "description": f"Tribunal: {caso.tribunal} | Materia: {caso.materia}",
+                            "movement_type": "resolution",
+                            "source": "sync",
+                            "include_in_report": True,
+                            "external_movement_key": ext_key,
+                            "raw_payload": caso.model_dump(),
+                        },
+                        on_conflict="case_id,external_movement_key",
+                        ignore_duplicates=False,
+                    )
+                )
+                # Only notify on a genuine estado change, not the initial registration
+                if estado_changed and prev_estado:
+                    new_count = 1
+            except Exception:
+                logger.warning("Failed to upsert familia movement for case %s", case["id"], exc_info=True)
+
+        priority = _compute_priority(case.get("status", "active"), None)
+        next_sync = _compute_next_sync_at(priority)
+
+        await run_query(
+            self._sb.from_("cases").update({
+                "tracking_status": "active",
+                "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
+                "last_sync_status": "success",
+                "last_sync_error": None,
+                "sync_attempts": 0,
+                "sync_blocked_until": None,
+                "court": caso.tribunal or case.get("court", ""),
+                "title": caso.caratulado or case.get("title", ""),
+                "sync_priority": priority,
+                "next_sync_at": next_sync,
+                "external_payload": {
+                    "estado": caso.estado,
+                    "materia": caso.materia,
+                    "tribunal": caso.tribunal,
+                    "caratulado": caso.caratulado,
+                    "fecha_ingreso": caso.fecha_ingreso,
+                },
+            }).eq("id", case["id"])
+        )
+
+        await self._finish_run(sync_run_id, started_at, "success", new_count)
+
+        if new_count > 0:
+            try:
+                await self._notifier.notify_new_movements(case, new_count)
+            except Exception:
+                logger.warning("Failed to notify for familia case %s", case["id"], exc_info=True)
+
+        logger.info("Familia sync OK for case %s — estado: %s", case["case_number"], caso.estado)
+        return {"success": True, "new_movements": new_count}
+
+    async def _terminal_error(self, case_id: str, error: str):
+        """Permanent error — pause tracking (no backoff retry)."""
+        await run_query(
+            self._sb.from_("cases").update({
+                "tracking_status": "paused",
+                "last_sync_status": "error",
+                "last_sync_error": error,
+            }).eq("id", case_id)
+        )
 
     async def _upsert_movements(self, case: dict, detail: dict) -> int:
         movements = detail.get("movements", [])

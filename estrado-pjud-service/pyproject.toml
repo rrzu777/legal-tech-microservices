@@ -1,7 +1,7 @@
 [project]
 name = "estrado-pjud-service"
 version = "0.1.0"
-description = "Proxy service between Estrado and PJUD Oficina Judicial Virtual"
+description = "Proxy service between JurisTrack and PJUD Oficina Judicial Virtual"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
