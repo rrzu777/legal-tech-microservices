@@ -126,6 +126,7 @@ class TestResolveLibro:
         # Apelaciones: uses tipo/libro like civil
         ("apelaciones", "PROTECCION", "", "PROTECCION"),
         ("apelaciones", None, "PROTECCION", "PROTECCION"),
+        ("apelaciones", "34", "PROTECCION", "PROTECCION"),
     ])
     def test_resolve_libro(self, competencia, libro, tipo, expected):
         assert resolve_libro(competencia, tipo, libro) == expected

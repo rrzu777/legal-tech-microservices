@@ -154,3 +154,11 @@ class TestDetectBlocked:
 
     def test_empty_response_is_blocked(self):
         assert detect_blocked("") is True
+
+    def test_request_rejected_is_blocked(self):
+        html = (
+            "<html><head><title>Request Rejected</title></head>"
+            "<body>The requested URL was rejected. Please consult with your "
+            "administrator (2).<br>Your support ID is: <123></body></html>"
+        )
+        assert detect_blocked(html) is True

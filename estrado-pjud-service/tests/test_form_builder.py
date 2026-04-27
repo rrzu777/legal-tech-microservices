@@ -63,3 +63,16 @@ class TestBuildSearchFormData:
                 competencia="civil", tipo="C", numero="1234", anno="2024", libro="V",
             )
         assert "not in known values" not in caplog.text
+
+    def test_apelaciones_numeric_libro_maps_to_pjud_text_value(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            tipo="PROTECCION",
+            numero="7661",
+            anno="2026",
+            corte=46,
+            libro="34",
+        )
+
+        assert form["conTipoCausa"] == "PROTECCION"
+        assert form["conCorte"] == "46"

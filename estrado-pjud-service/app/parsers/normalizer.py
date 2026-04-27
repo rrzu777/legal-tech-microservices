@@ -13,6 +13,24 @@ VALID_LIBROS: dict[str, set[str]] = {
     "cobranza": {"A", "C", "D", "E", "J", "P", "R"},
 }
 
+APELACIONES_LIBRO_CODE_MAP: dict[str, str] = {
+    "28": "CIVIL",
+    "29": "FAMILIA",
+    "30": "LABORAL",
+    "31": "PENAL",
+    "32": "CONTENCIOSO",
+    "33": "TRIBUTARIO",
+    "34": "PROTECCION",
+    "35": "AMPARO",
+    "36": "POLICIA",
+    "37": "EXHORTO",
+    "38": "NAVEGACION",
+    "39": "AMBIENTAL",
+    "40": "TRASPASO",
+    "41": "MINISTRO",
+    "42": "COMLIBCOND",
+}
+
 LIBRO_DEFAULTS: dict[str, str] = {
     "civil": "C",
     "laboral": "O",
@@ -29,6 +47,8 @@ def resolve_libro(competencia: str, tipo: str, libro: str | None = None) -> str:
     if competencia == "suprema":
         return ""
     if libro:
+        if competencia == "apelaciones":
+            return APELACIONES_LIBRO_CODE_MAP.get(libro, libro)
         return libro
     if tipo:
         return tipo

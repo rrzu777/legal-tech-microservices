@@ -260,6 +260,10 @@ def detect_blocked(html: str) -> bool:
     if not html or not html.strip():
         return True
 
+    lower_html = html.lower()
+    if "request rejected" in lower_html or "the requested url was rejected" in lower_html:
+        return True
+
     soup = BeautifulSoup(html, "html.parser")
     if soup.find(class_="g-recaptcha"):
         return True
