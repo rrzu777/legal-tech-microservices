@@ -66,7 +66,7 @@ async def main():
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors
-        block_pause_seconds=120,  # con el minter, un bloqueo se recupera por re-mint; pausa corta = rate-limit
+        block_pause_seconds=config.BLOCK_PAUSE_S,  # re-mint recupera el bloqueo; la pausa solo rate-limita el minteo
     )
 
     shutdown_event = asyncio.Event()
