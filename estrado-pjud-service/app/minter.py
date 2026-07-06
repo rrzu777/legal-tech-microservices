@@ -10,6 +10,13 @@ _CONSULTA_PATH = "/consultaUnificada.php"
 _FORM_READY_SELECTOR = "select#competencia, select[name='competencia']"
 _MINT_TIMEOUT_MS = 30_000
 
+# El challenge JS de F5 NO se resuelve en un browser headless ni en uno con
+# el flag de automatización visible. Verificado empíricamente (6 jul 2026):
+# solo la combinación headed + este arg mintea TSPD_101; cualquier variante
+# headless deja el challenge en loop. En el VPS (sin monitor) esto corre
+# dentro de Xvfb (display virtual). Ver spec §3.1 y §9.
+_ANTIBOT_ARGS = ["--disable-blink-features=AutomationControlled"]
+
 
 @dataclass
 class MintResult:
@@ -22,9 +29,11 @@ def cookies_to_dict(pw_cookies: list[dict]) -> dict[str, str]:
 
 
 class CookieMinter:
-    """Lanza Chromium headless, resuelve el challenge F5 y devuelve cookies TSPD + UA.
+    """Lanza Chromium (headed, bajo Xvfb en el VPS), resuelve el challenge F5
+    y devuelve cookies TSPD + UA.
 
     Launch-on-demand: no mantiene el browser vivo. Cleanup garantizado.
+    Corre headed a propósito: el challenge anti-bot de F5 no se resuelve headless.
     """
 
     def __init__(self, base_url: str, proxy: str | None = None):
@@ -32,7 +41,7 @@ class CookieMinter:
         self._proxy = proxy
 
     async def mint(self) -> MintResult:
-        launch_kwargs = {"headless": True}
+        launch_kwargs = {"headless": False, "args": _ANTIBOT_ARGS}
         if self._proxy:
             launch_kwargs["proxy"] = {"server": self._proxy}
 
