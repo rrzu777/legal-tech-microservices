@@ -264,6 +264,10 @@ def detect_blocked(html: str) -> bool:
     if "request rejected" in lower_html or "the requested url was rejected" in lower_html:
         return True
 
+    # F5 BIG-IP anti-bot JS challenge (TSPD / bobcmn) — added 2026-07
+    if 'window["bobcmn"]' in html or "/TSPD/" in html:
+        return True
+
     soup = BeautifulSoup(html, "html.parser")
     if soup.find(class_="g-recaptcha"):
         return True
