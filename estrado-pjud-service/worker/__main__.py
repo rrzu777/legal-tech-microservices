@@ -38,6 +38,19 @@ def setup_logging(level: str):
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
+async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
+    """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
+    sin crashear (evita el crash-loop de systemd martillando PJUD)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await pool.initialize()
+            return True
+        except Exception:
+            logger.exception("Fallo al inicializar el pool (intento %d/%d)", attempt, max_retries)
+            await asyncio.sleep(base_delay * attempt)
+    return False
+
+
 async def main():
     config = WorkerConfig()
     setup_logging(config.LOG_LEVEL)
@@ -64,7 +77,14 @@ async def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     # Initialize session pool
-    await pool.initialize()
+    if not await safe_initialize_pool(pool, max_retries=config.MINT_MAX_RETRIES):
+        logger.error(
+            "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
+            config.MINT_MAX_RETRIES,
+        )
+        await shutdown_event.wait()
+        return
+
     metrics.start()
 
     engine = SyncEngine(
