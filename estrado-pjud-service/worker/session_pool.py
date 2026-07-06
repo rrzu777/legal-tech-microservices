@@ -4,10 +4,22 @@ import time
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
+from app.cookie_store import CookieStore
+from app.minter import CookieMinter, MintResult
 from app.session import OJVSession
 from worker.config import WorkerConfig
 
 logger = logging.getLogger(__name__)
+
+
+async def get_or_mint_cookies(store, minter, max_age_s: int):
+    """Devuelve cookies frescos del store, o mintea y persiste si faltan/expiraron."""
+    bundle = store.load()
+    if bundle is not None and bundle.age_seconds < max_age_s:
+        return MintResult(cookies=bundle.cookies, user_agent=bundle.user_agent)
+    result = await minter.mint()
+    store.save(cookies=result.cookies, user_agent=result.user_agent)
+    return result
 
 
 class SessionPool:
@@ -18,6 +30,8 @@ class SessionPool:
         self._global_rate_lock = asyncio.Lock()
         self._last_global_request: float = 0.0
         self._global_min_delay: float = 1.2
+        self._store = CookieStore(config.COOKIE_STORE_PATH)
+        self._minter = CookieMinter(config.PJUD_BASE_URL)
 
     async def initialize(self):
         settings = Settings(
@@ -26,7 +40,12 @@ class SessionPool:
             RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
         )
         for i in range(self._config.POOL_SIZE):
-            adapter = OJVHttpAdapter(settings)
+            creds = await get_or_mint_cookies(self._store, self._minter, self._config.SESSION_MAX_AGE_S)
+            adapter = OJVHttpAdapter(
+                settings,
+                user_agent=creds.user_agent,
+                cookies=creds.cookies,
+            )
             session = OJVSession(adapter)
             await session.initialize()
             self._pool.append(session)
@@ -66,7 +85,12 @@ class SessionPool:
             OJV_BASE_URL=self._config.PJUD_BASE_URL,
             RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
         )
-        adapter = OJVHttpAdapter(settings)
+        creds = await get_or_mint_cookies(self._store, self._minter, self._config.SESSION_MAX_AGE_S)
+        adapter = OJVHttpAdapter(
+            settings,
+            user_agent=creds.user_agent,
+            cookies=creds.cookies,
+        )
         new_session = OJVSession(adapter)
         await new_session.initialize()
         self._pool[idx] = new_session

@@ -23,6 +23,8 @@ class WorkerConfig(BaseSettings):
     RATE_LIMIT_MS: int = 2500
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     LOG_LEVEL: str = "INFO"
+    COOKIE_STORE_PATH: str = "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json"
+    MINT_MAX_RETRIES: int = 3
 
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""
