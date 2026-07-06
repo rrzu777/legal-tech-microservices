@@ -1,6 +1,7 @@
 # worker/engine.py
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, date
 
@@ -21,6 +22,10 @@ from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
+# Un parse-failure reintenta en ~1h (no cada ciclo) y las alertas se agrupan a
+# lo más 1 por hora, para no spamear Telegram ante un drift global del parser.
+_PARSE_RETRY_S = 3600
+_PARSE_ALERT_COOLDOWN_S = 3600
 
 MATTER_TO_COMPETENCIA = {
     "civil": "civil",
@@ -119,17 +124,14 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
     if len(html.strip()) < 100 or detect_blocked(html):
         return {"metadata": {}, "movements": [], "litigantes": [], "blocked": True, "error": None}
     parsed = parse_detail(html)
-    # Señal de fallo de parseo: la página es una causa real (renderizó el ROL)
-    # pero el parser no extrajo NADA (ni metadata, ni movimientos, ni
-    # litigantes). Indica que F5 cambió la forma de la página o el parser
-    # driftó — el usuario quiere alerta a este nivel. No es un bloqueo (no se
-    # penaliza ni re-mintea); solo se reporta para intervención humana.
-    parse_suspect = (
-        "ROL:" in html
-        and not parsed.get("metadata")
-        and not parsed.get("movements")
-        and not parsed.get("litigantes")
-    )
+    # Señal de fallo de parseo: la página NO está bloqueada (no bobcmn, >100
+    # chars) pero el parser no extrajo NADA — ni metadata, ni movimientos, ni
+    # litigantes. Una causa real siempre rinde algo (al menos metadata con el
+    # ROL/RIT/Libro), así que "nada" == la página cambió de forma (drift de F5
+    # u OJV) o el parser se rompió. No es un bloqueo: no se penaliza ni se
+    # re-mintea. Se reporta a ops para intervención humana. Cubre TODAS las
+    # competencias (no solo civil) y el hueco de "página rara que no bloquea".
+    parse_suspect = not (parsed.get("metadata") or parsed.get("movements") or parsed.get("litigantes"))
     return {**parsed, "blocked": False, "error": None, "parse_suspect": parse_suspect}
 
 
@@ -141,6 +143,7 @@ class SyncEngine:
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
             self._r2 = R2Client(
@@ -270,13 +273,13 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
 
             if detail.get("parse_suspect"):
-                logger.warning("Parse-failure on real causa page: case=%s comp=%s", case["id"], competencia)
-                await send_ops_alert(
-                    self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
-                    "parse_failed",
-                    f"Causa {case.get('external_case_number') or case['id']} ({competencia}): "
-                    f"página real pero el parser no extrajo nada. Revisar forma de la página / parser.",
-                )
+                # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
+                # el external_payload bueno marcando "success". Corto-circuito
+                # sin penalizar la causa (no incrementa sync_attempts).
+                await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
+                await self._handle_parse_suspect(case, competencia)
+                self._metrics.record_error()
+                return {"success": False, "new_movements": 0}
 
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
@@ -765,6 +768,31 @@ class SyncEngine:
                 "mint_failed", "Re-minteo tras bloqueo fallo (posible bloqueo real de PJUD).",
             )
         self._backoff.record_blocked()
+
+    async def _handle_parse_suspect(self, case: dict, competencia: str):
+        """Maneja una página recibida-pero-no-parseable SIN penalizar la causa
+        ni tocar su external_payload. Reintenta en ~1h y alerta a ops (con
+        cooldown) para intervención humana (drift de F5/OJV o del parser)."""
+        retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
+        await run_query(
+            self._sb.from_("cases").update({
+                "last_sync_status": "parse_error",
+                "last_sync_error": "Página recibida pero no parseable (revisar parser/F5)",
+                "next_sync_at": retry_at,
+            }).eq("id", case["id"])
+        )
+        now = time.monotonic()
+        if now - self._last_parse_alert_at < _PARSE_ALERT_COOLDOWN_S:
+            logger.warning("Parse-failure (alerta en cooldown): case=%s comp=%s", case["id"], competencia)
+            return
+        self._last_parse_alert_at = now
+        logger.warning("Parse-failure en página real: case=%s comp=%s", case["id"], competencia)
+        await send_ops_alert(
+            self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
+            "parse_failed",
+            f"Causa {case.get('external_case_number') or case['id']} ({competencia}): "
+            f"página recibida pero el parser no extrajo nada. Revisar forma de la página / parser.",
+        )
 
     async def _update_case_blocked(self, case_id: str):
         blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_BLOCK_DURATION_S)).isoformat()

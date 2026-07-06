@@ -1,7 +1,15 @@
-"""Señal parse_suspect en detail_pjud_via_session: página real que no parsea."""
+"""Señal parse_suspect: página no bloqueada que el parser no logra parsear.
+
+Cubre TODAS las competencias (no solo civil) y el hueco de "página rara que no
+bloquea": si no está bloqueada y el parser no saca nada, es sospechosa.
+"""
+from pathlib import Path
+
 import pytest
 
 from worker.engine import detail_pjud_via_session
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class _FakeSession:
@@ -13,10 +21,20 @@ class _FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_real_page_that_parses_nothing_is_flagged():
-    # Página con ROL (causa real) pero sin estructura que el parser reconozca.
-    html = "<html><body><table><tr><td><strong>ROL:</strong> C-9-2024</td></tr></table>" + "x" * 200 + "</body></html>"
+async def test_unparseable_non_blocked_page_is_flagged():
+    # >100 chars, sin bobcmn, sin estructura reconocible por el parser.
+    html = "<html><body><div>página inesperada de OJV</div>" + "x" * 200 + "</body></html>"
     result = await detail_pjud_via_session(_FakeSession(html), "civil", "key", timeout=5)
+    assert result["blocked"] is False
+    assert result["parse_suspect"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_rol_hole_is_flagged_not_silent_success():
+    # El hueco que Fable detectó: página sin 'ROL:' (p.ej. RIT/Libro o error de
+    # OJV) que no parsea. Antes pasaba como éxito vacío silencioso.
+    html = "<html><body><table><tr><td>RIT : O-1-2024</td></tr></table>" + "z" * 200 + "</body></html>"
+    result = await detail_pjud_via_session(_FakeSession(html), "laboral", "key", timeout=5)
     assert result["blocked"] is False
     assert result["parse_suspect"] is True
 
@@ -31,8 +49,7 @@ async def test_blocked_page_is_not_parse_suspect():
 
 @pytest.mark.asyncio
 async def test_real_detail_fixture_is_not_parse_suspect():
-    from pathlib import Path
-    html = (Path(__file__).parent / "fixtures" / "civil_detail_tspd_instrumented.html").read_text()
+    html = (FIXTURES / "civil_detail_tspd_instrumented.html").read_text()
     result = await detail_pjud_via_session(_FakeSession(html), "civil", "key", timeout=5)
     assert result["blocked"] is False
     assert result["parse_suspect"] is False

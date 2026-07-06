@@ -291,6 +291,31 @@ class TestSyncEngine:
         mock_metrics.record_error.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_sync_parse_suspect_short_circuits_without_clobber(self):
+        """parse_suspect NO debe seguir al path de éxito (que haría upsert vacío
+        y sobrescribiría el external_payload marcando success). Debe cortar antes
+        del upsert y delegar en _handle_parse_suspect."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case()
+        detail = _mock_detail_response()
+        detail["parse_suspect"] = True
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
+             patch.object(engine, "_upsert_movements", new_callable=AsyncMock) as mock_upsert, \
+             patch.object(engine, "_handle_parse_suspect", new_callable=AsyncMock) as mock_hps:
+            mock_search.return_value = _mock_search_response()
+            mock_detail.return_value = detail
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+        mock_hps.assert_called_once()
+        mock_upsert.assert_not_called()  # no clobber del payload bueno
+        mock_backoff.record_blocked.assert_not_called()  # no es un bloqueo
+        mock_metrics.record_error.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_sync_timeout_triggers_failure_backoff(self):
         """Timeout should trigger record_failure on backoff, not record_blocked."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()

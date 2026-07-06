@@ -262,12 +262,14 @@ def detect_blocked(html: str) -> bool:
     if "request rejected" in lower_html or "the requested url was rejected" in lower_html:
         return True
 
-    # F5 BIG-IP anti-bot JS challenge. El marcador fiable es window["bobcmn"]:
-    # aparece SOLO en la página-challenge. OJO: NO usar "/TSPD/" como señal —
-    # F5 inyecta scripts /TSPD/ en TODA respuesta legítima (instrumentación
-    # APM), así que marcaba cada detalle exitoso como bloqueado y tumbó el sync
-    # (jul 2026). Ver tests/test_detect_blocked_challenge.py.
-    if 'window["bobcmn"]' in html:
+    # F5 BIG-IP anti-bot JS challenge. El marcador fiable es "bobcmn": aparece
+    # SOLO en la página-challenge, nunca en páginas legítimas (verificado con
+    # fixture real). Se busca la subcadena suelta (no `window["bobcmn"]` exacto)
+    # para tolerar variantes de comillas/espaciado entre versiones de TSPD.
+    # OJO: NO usar "/TSPD/" como señal — F5 inyecta scripts /TSPD/ en TODA
+    # respuesta legítima (instrumentación APM), así que marcaba cada detalle
+    # exitoso como bloqueado y tumbó el sync (jul 2026).
+    if "bobcmn" in html:
         return True
 
     soup = BeautifulSoup(html, "html.parser")
