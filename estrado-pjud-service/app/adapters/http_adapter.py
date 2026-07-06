@@ -16,7 +16,13 @@ _USER_AGENT = (
 
 
 class OJVHttpAdapter:
-    def __init__(self, settings: Settings, proxy: str | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        proxy: str | None = None,
+        user_agent: str | None = None,
+        cookies: dict[str, str] | None = None,
+    ):
         self._settings = settings
         self._base = settings.OJV_BASE_URL.rstrip("/")
         self._rate_limit_s = settings.RATE_LIMIT_MS / 1000.0
@@ -25,8 +31,9 @@ class OJVHttpAdapter:
             proxy=proxy,
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
+            cookies=cookies or {},
             headers={
-                "User-Agent": _USER_AGENT,
+                "User-Agent": user_agent or _USER_AGENT,
                 "Accept-Language": "es-CL,es;q=0.9",
             },
         )
