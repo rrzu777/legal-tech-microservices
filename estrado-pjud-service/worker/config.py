@@ -27,6 +27,10 @@ class WorkerConfig(BaseSettings):
     LOG_LEVEL: str = "INFO"
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
     MINT_MAX_RETRIES: int = 3
+    # Pausa del circuit breaker tras un bloqueo. Con el minter, un bloqueo se
+    # recupera por re-mint; esta pausa solo rate-limita el re-minteo (evita
+    # mint-storms). Configurable por env para tunear throughput sin redeploy.
+    BLOCK_PAUSE_S: int = 30
 
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""
