@@ -17,7 +17,7 @@ async def test_safe_initialize_retries_then_returns_false_no_crash(monkeypatch):
     ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
     assert ok is False
     assert pool.initialize.await_count == 3
-    assert len(slept) == 3  # backed off instead of crashing
+    assert len(slept) == 2  # backed off between attempts, not after the last one
 
 
 @pytest.mark.asyncio

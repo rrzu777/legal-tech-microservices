@@ -5,6 +5,7 @@ import signal
 import sys
 import json
 
+from app.alerting import send_ops_alert
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -47,7 +48,8 @@ async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10)
             return True
         except Exception:
             logger.exception("Fallo al inicializar el pool (intento %d/%d)", attempt, max_retries)
-            await asyncio.sleep(base_delay * attempt)
+            if attempt < max_retries:
+                await asyncio.sleep(base_delay * attempt)
     return False
 
 
@@ -82,7 +84,6 @@ async def main():
             "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
             config.MINT_MAX_RETRIES,
         )
-        from app.alerting import send_ops_alert
         await send_ops_alert(
             config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
             "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",

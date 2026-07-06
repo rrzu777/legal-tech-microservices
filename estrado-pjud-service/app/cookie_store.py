@@ -4,6 +4,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 
+DEFAULT_COOKIE_STORE_PATH = "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json"
+
 
 @dataclass
 class CookieBundle:
@@ -42,18 +44,15 @@ class CookieStore:
             raise
 
     def load(self) -> CookieBundle | None:
+        # Tolera archivo ausente, JSON mal formado, o JSON con forma incorrecta
+        # (ej. cambio de esquema entre procesos en un deploy) → re-mint en vez de crashear.
         try:
             with open(self._path) as f:
                 data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-        # Tolera JSON con forma incorrecta (ej. cambio de esquema entre procesos
-        # que comparten el store durante un deploy) → re-mint en vez de crashear.
-        try:
             return CookieBundle(
                 cookies=data["cookies"],
                 user_agent=data["user_agent"],
                 saved_at=data["saved_at"],
             )
-        except (KeyError, TypeError):
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
             return None

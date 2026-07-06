@@ -9,7 +9,8 @@ async def test_send_ops_alert_posts_to_telegram():
     with patch("app.alerting.httpx.AsyncClient") as mock_client:
         instance = mock_client.return_value
         instance.post = AsyncMock()
-        instance.aclose = AsyncMock()
+        instance.__aenter__ = AsyncMock(return_value=instance)
+        instance.__aexit__ = AsyncMock(return_value=False)
         await send_ops_alert("token", "chat", "mint_failed", "minter caido")
         instance.post.assert_awaited_once()
         _, kwargs = instance.post.call_args

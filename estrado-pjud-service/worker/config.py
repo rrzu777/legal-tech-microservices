@@ -3,6 +3,8 @@ from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings
 
+from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
+
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 
 
@@ -23,7 +25,7 @@ class WorkerConfig(BaseSettings):
     RATE_LIMIT_MS: int = 2500
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     LOG_LEVEL: str = "INFO"
-    COOKIE_STORE_PATH: str = "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json"
+    COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
     MINT_MAX_RETRIES: int = 3
 
     # R2 document storage

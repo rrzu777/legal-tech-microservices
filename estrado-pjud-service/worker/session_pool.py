@@ -12,7 +12,7 @@ from worker.config import WorkerConfig
 logger = logging.getLogger(__name__)
 
 
-async def get_or_mint_cookies(store, minter, max_age_s: int):
+async def get_or_mint_cookies(store: CookieStore, minter: CookieMinter, max_age_s: int) -> MintResult:
     """Devuelve cookies frescos del store, o mintea y persiste si faltan/expiraron."""
     bundle = store.load()
     if bundle is not None and bundle.age_seconds < max_age_s:
@@ -33,22 +33,22 @@ class SessionPool:
         self._store = CookieStore(config.COOKIE_STORE_PATH)
         self._minter = CookieMinter(config.PJUD_BASE_URL)
 
-    async def initialize(self):
+    async def _new_session(self, creds: MintResult | None = None) -> OJVSession:
         settings = Settings(
             API_KEY="unused-by-worker",
             OJV_BASE_URL=self._config.PJUD_BASE_URL,
             RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
         )
-        for i in range(self._config.POOL_SIZE):
+        if creds is None:
             creds = await get_or_mint_cookies(self._store, self._minter, self._config.SESSION_MAX_AGE_S)
-            adapter = OJVHttpAdapter(
-                settings,
-                user_agent=creds.user_agent,
-                cookies=creds.cookies,
-            )
-            session = OJVSession(adapter)
-            await session.initialize()
-            self._pool.append(session)
+        adapter = OJVHttpAdapter(settings, user_agent=creds.user_agent, cookies=creds.cookies)
+        session = OJVSession(adapter)
+        await session.initialize()
+        return session
+
+    async def initialize(self):
+        for i in range(self._config.POOL_SIZE):
+            self._pool.append(await self._new_session())
             logger.info("Session %d initialized", i)
             if i < self._config.POOL_SIZE - 1:
                 await asyncio.sleep(1.5)  # stagger
@@ -84,23 +84,11 @@ class SessionPool:
                 await asyncio.sleep(self._global_min_delay - elapsed)
             self._last_global_request = time.monotonic()
 
-    async def _refresh_session(self, session: OJVSession):
+    async def _refresh_session(self, session: OJVSession, creds: MintResult | None = None):
         idx = self._pool.index(session)
-        settings = Settings(
-            API_KEY="unused-by-worker",
-            OJV_BASE_URL=self._config.PJUD_BASE_URL,
-            RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
-        )
-        creds = await get_or_mint_cookies(self._store, self._minter, self._config.SESSION_MAX_AGE_S)
-        adapter = OJVHttpAdapter(
-            settings,
-            user_agent=creds.user_agent,
-            cookies=creds.cookies,
-        )
-        new_session = OJVSession(adapter)
         # Init the NEW session before touching the old one: if this raises, the
         # old (still-open) session stays in the pool instead of a dead closed one.
-        await new_session.initialize()
+        new_session = await self._new_session(creds)
         self._pool[idx] = new_session
         await session.close()
 
@@ -111,10 +99,9 @@ class SessionPool:
         NOTA: seguro solo para POOL_SIZE=1 (consumidor único). Con POOL_SIZE>1
         haría falta un lock para no cerrar sesiones en uso por otras corrutinas.
         """
-        result = await self._minter.mint()
-        self._store.save(cookies=result.cookies, user_agent=result.user_agent)
+        creds = await get_or_mint_cookies(self._store, self._minter, max_age_s=0)
         for session in list(self._pool):
-            await self._refresh_session(session)
+            await self._refresh_session(session, creds=creds)
 
     async def close_all(self):
         for session in self._pool:

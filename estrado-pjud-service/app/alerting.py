@@ -93,10 +93,8 @@ async def send_ops_alert(bot_token: str, chat_id: str, event: str, detail: str) 
         return
     text = f"\U0001F6A8 [{event}] {detail}"
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    client = httpx.AsyncClient(timeout=10.0)
     try:
-        await client.post(url, json={"chat_id": chat_id, "text": text})
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(url, json={"chat_id": chat_id, "text": text})
     except Exception:
         logger.exception("Fallo enviando ops alert")
-    finally:
-        await client.aclose()

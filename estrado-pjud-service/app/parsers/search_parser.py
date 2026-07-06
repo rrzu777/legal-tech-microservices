@@ -253,10 +253,8 @@ def parse_search_results(html: str, competencia: str) -> list[dict]:
 
 
 def detect_blocked(html: str) -> bool:
-    """Detect whether the response indicates blocking (captcha / empty).
-
-    Returns ``True`` when the HTML is empty or contains a reCAPTCHA widget.
-    """
+    """Return True for empty HTML, WAF rejection pages, the F5 BIG-IP JS
+    challenge (TSPD/bobcmn), or a reCAPTCHA widget."""
     if not html or not html.strip():
         return True
 

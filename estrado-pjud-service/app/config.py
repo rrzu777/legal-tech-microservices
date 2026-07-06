@@ -2,6 +2,8 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings
 
+from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
+
 
 class Settings(BaseSettings):
     API_KEY: str
@@ -10,7 +12,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     SESSION_POOL_SIZE: int = 2
     SESSION_MAX_AGE_S: int = 1200
-    COOKIE_STORE_PATH: str = "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json"
+    COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""
