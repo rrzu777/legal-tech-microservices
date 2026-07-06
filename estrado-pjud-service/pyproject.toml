@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "supabase>=2.0.0",
     "slowapi>=0.1.9",
+    "playwright==1.61.0",
 ]
 
 [project.optional-dependencies]

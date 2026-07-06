@@ -68,6 +68,7 @@ class TestScheduler:
         chain = MagicMock()
         mock_sb.from_.return_value = chain
         chain.select.return_value = chain
+        chain.in_.return_value = chain
         chain.eq.return_value = chain
         chain.or_.return_value = chain
         chain.order.return_value = chain

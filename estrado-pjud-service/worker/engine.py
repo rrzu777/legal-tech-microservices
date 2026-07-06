@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, date
 
 import httpx
 
+from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
 from app.familia.auth import FamiliaAuthSession, InvalidCredentialsError, SessionError
@@ -115,7 +116,7 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
         session.detail(comp_path, detail_key),
         timeout=timeout,
     )
-    if len(html.strip()) < 100:
+    if len(html.strip()) < 100 or detect_blocked(html):
         return {"metadata": {}, "movements": [], "litigantes": [], "blocked": True, "error": None}
     parsed = parse_detail(html)
     return {**parsed, "blocked": False, "error": None}
@@ -227,8 +228,7 @@ class SyncEngine:
 
             if search_result["blocked"]:
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
-                await self._update_case_blocked(case["id"])
-                self._backoff.record_blocked()
+                await self._handle_blocked(case["id"])
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -254,8 +254,7 @@ class SyncEngine:
 
             if detail["blocked"]:
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
-                await self._update_case_blocked(case["id"])
-                self._backoff.record_blocked()
+                await self._handle_blocked(case["id"])
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -727,6 +726,25 @@ class SyncEngine:
             )
         except Exception:
             logger.exception("Failed to finish sync_run %s", run_id)
+
+    async def _handle_blocked(self, case_id: str):
+        """Maneja un bloqueo (challenge F5 / OJV) SIN penalizar la causa.
+
+        Marca la causa como blocked (sin incrementar sync_attempts), intenta
+        recuperarse con un re-mint inmediato de cookies, y abre el circuit
+        breaker con una pausa corta (rate-limita el re-minteo).
+        """
+        await self._update_case_blocked(case_id)
+        try:
+            await self._pool.force_remint()
+            logger.info("Re-minteo tras bloqueo OK (cookie refrescado)")
+        except Exception:
+            logger.exception("Re-minteo tras bloqueo FALLO (posible bloqueo real)")
+            await send_ops_alert(
+                self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
+                "mint_failed", "Re-minteo tras bloqueo fallo (posible bloqueo real de PJUD).",
+            )
+        self._backoff.record_blocked()
 
     async def _update_case_blocked(self, case_id: str):
         blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_BLOCK_DURATION_S)).isoformat()

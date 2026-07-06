@@ -253,15 +253,17 @@ def parse_search_results(html: str, competencia: str) -> list[dict]:
 
 
 def detect_blocked(html: str) -> bool:
-    """Detect whether the response indicates blocking (captcha / empty).
-
-    Returns ``True`` when the HTML is empty or contains a reCAPTCHA widget.
-    """
+    """Return True for empty HTML, WAF rejection pages, the F5 BIG-IP JS
+    challenge (TSPD/bobcmn), or a reCAPTCHA widget."""
     if not html or not html.strip():
         return True
 
     lower_html = html.lower()
     if "request rejected" in lower_html or "the requested url was rejected" in lower_html:
+        return True
+
+    # F5 BIG-IP anti-bot JS challenge (TSPD / bobcmn) — added 2026-07
+    if 'window["bobcmn"]' in html or "/TSPD/" in html:
         return True
 
     soup = BeautifulSoup(html, "html.parser")

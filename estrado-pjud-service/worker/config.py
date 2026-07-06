@@ -3,6 +3,8 @@ from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings
 
+from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
+
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 
 
@@ -23,6 +25,8 @@ class WorkerConfig(BaseSettings):
     RATE_LIMIT_MS: int = 2500
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     LOG_LEVEL: str = "INFO"
+    COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
+    MINT_MAX_RETRIES: int = 3
 
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""
@@ -34,5 +38,9 @@ class WorkerConfig(BaseSettings):
     # Familia credential decryption (calls Vercel internal endpoint)
     VERCEL_APP_URL: str = ""
     INTERNAL_CREDENTIALS_API_KEY: str = ""
+
+    # Ops alerting (Telegram)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
 
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

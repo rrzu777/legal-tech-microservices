@@ -57,3 +57,33 @@ class TestAPISessionPool:
         await pool.release(session)
 
         assert len(pool._pool) == 1
+
+
+class TestWorkerSessionPoolAcquire:
+    @pytest.mark.asyncio
+    async def test_acquire_returns_stale_session_when_refresh_fails(self):
+        """A mint/refresh failure during acquire() must NOT propagate — the
+        stale (expired-cookie) session should be returned instead. The F5
+        challenge it produces is detected downstream and routed through the
+        no-penalty blocked path (see engine._handle_blocked / detect_blocked),
+        which keeps the anti-outage invariant: mint failures never reach
+        _update_case_error / sync_attempts."""
+        from worker.session_pool import SessionPool
+
+        config = MagicMock()
+        config.COOKIE_STORE_PATH = "/tmp/x.json"
+        config.PJUD_BASE_URL = "https://x"
+        config.RATE_LIMIT_MS = 0
+        config.SESSION_MAX_AGE_S = 1500
+        config.POOL_SIZE = 1
+
+        pool = SessionPool(config)
+        old = MagicMock()
+        old.age_seconds = 999999  # forces refresh
+        pool._pool = [old]
+        pool._refresh_session = AsyncMock(side_effect=RuntimeError("mint failed"))
+
+        result = await pool.acquire()
+
+        assert result is old  # stale session returned, NOT raised
+        pool.release(result)  # must not raise; semaphore consistent

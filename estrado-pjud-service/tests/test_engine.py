@@ -678,6 +678,26 @@ class TestDetailPjudViaSession:
 
         assert result["blocked"] is True
 
+    @pytest.mark.asyncio
+    async def test_detail_detects_f5_challenge(self):
+        """A long-enough F5 challenge response at the detail step must be
+        detected as blocked, not treated as a valid (empty) success."""
+        from worker.engine import detail_pjud_via_session
+
+        challenge_html = (
+            '<html><head><script>window["bobcmn"] = "10111...";</script></head><body>'
+            + ("x" * 200)
+            + "</body></html>"
+        )
+        mock_session = AsyncMock()
+        mock_session.detail = AsyncMock(return_value=challenge_html)
+
+        result = await detail_pjud_via_session(
+            mock_session, "civil", "somekey", 25.0
+        )
+
+        assert result["blocked"] is True
+
 
 class TestSyncErrorBackoff:
     @pytest.mark.asyncio

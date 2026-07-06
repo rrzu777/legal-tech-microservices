@@ -5,6 +5,7 @@ import signal
 import sys
 import json
 
+from app.alerting import send_ops_alert
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -38,6 +39,20 @@ def setup_logging(level: str):
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
+async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
+    """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
+    sin crashear (evita el crash-loop de systemd martillando PJUD)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await pool.initialize()
+            return True
+        except Exception:
+            logger.exception("Fallo al inicializar el pool (intento %d/%d)", attempt, max_retries)
+            if attempt < max_retries:
+                await asyncio.sleep(base_delay * attempt)
+    return False
+
+
 async def main():
     config = WorkerConfig()
     setup_logging(config.LOG_LEVEL)
@@ -51,7 +66,7 @@ async def main():
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors
-        block_pause_seconds=3600,  # 60 min on OJV block
+        block_pause_seconds=120,  # con el minter, un bloqueo se recupera por re-mint; pausa corta = rate-limit
     )
 
     shutdown_event = asyncio.Event()
@@ -64,7 +79,18 @@ async def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     # Initialize session pool
-    await pool.initialize()
+    if not await safe_initialize_pool(pool, max_retries=config.MINT_MAX_RETRIES):
+        logger.error(
+            "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
+            config.MINT_MAX_RETRIES,
+        )
+        await send_ops_alert(
+            config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
+            "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
+        )
+        await shutdown_event.wait()
+        return
+
     metrics.start()
 
     engine = SyncEngine(

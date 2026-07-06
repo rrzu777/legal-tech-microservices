@@ -4,6 +4,7 @@ from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
+from app.cookie_store import CookieStore
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class APISessionPool:
         self._lock = asyncio.Lock()
         self._max_size = settings.SESSION_POOL_SIZE
         self._max_age = settings.SESSION_MAX_AGE_S
+        self._store = CookieStore(settings.COOKIE_STORE_PATH)
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
@@ -37,7 +39,12 @@ class APISessionPool:
 
         # No valid session available — create outside the lock to avoid blocking
         logger.info("Creating new API session")
-        adapter = OJVHttpAdapter(self._settings)
+        bundle = self._store.load()
+        adapter = OJVHttpAdapter(
+            self._settings,
+            user_agent=bundle.user_agent if bundle else None,
+            cookies=bundle.cookies if bundle else None,
+        )
         session = OJVSession(adapter)
         try:
             await session.initialize()
