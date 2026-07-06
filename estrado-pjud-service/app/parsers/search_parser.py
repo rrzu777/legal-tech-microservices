@@ -254,7 +254,7 @@ def parse_search_results(html: str, competencia: str) -> list[dict]:
 
 def detect_blocked(html: str) -> bool:
     """Return True for empty HTML, WAF rejection pages, the F5 BIG-IP JS
-    challenge (TSPD/bobcmn), or a reCAPTCHA widget."""
+    challenge (bobcmn), or a reCAPTCHA widget."""
     if not html or not html.strip():
         return True
 
@@ -262,8 +262,12 @@ def detect_blocked(html: str) -> bool:
     if "request rejected" in lower_html or "the requested url was rejected" in lower_html:
         return True
 
-    # F5 BIG-IP anti-bot JS challenge (TSPD / bobcmn) — added 2026-07
-    if 'window["bobcmn"]' in html or "/TSPD/" in html:
+    # F5 BIG-IP anti-bot JS challenge. El marcador fiable es window["bobcmn"]:
+    # aparece SOLO en la página-challenge. OJO: NO usar "/TSPD/" como señal —
+    # F5 inyecta scripts /TSPD/ en TODA respuesta legítima (instrumentación
+    # APM), así que marcaba cada detalle exitoso como bloqueado y tumbó el sync
+    # (jul 2026). Ver tests/test_detect_blocked_challenge.py.
+    if 'window["bobcmn"]' in html:
         return True
 
     soup = BeautifulSoup(html, "html.parser")

@@ -119,7 +119,18 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
     if len(html.strip()) < 100 or detect_blocked(html):
         return {"metadata": {}, "movements": [], "litigantes": [], "blocked": True, "error": None}
     parsed = parse_detail(html)
-    return {**parsed, "blocked": False, "error": None}
+    # Señal de fallo de parseo: la página es una causa real (renderizó el ROL)
+    # pero el parser no extrajo NADA (ni metadata, ni movimientos, ni
+    # litigantes). Indica que F5 cambió la forma de la página o el parser
+    # driftó — el usuario quiere alerta a este nivel. No es un bloqueo (no se
+    # penaliza ni re-mintea); solo se reporta para intervención humana.
+    parse_suspect = (
+        "ROL:" in html
+        and not parsed.get("metadata")
+        and not parsed.get("movements")
+        and not parsed.get("litigantes")
+    )
+    return {**parsed, "blocked": False, "error": None, "parse_suspect": parse_suspect}
 
 
 class SyncEngine:
@@ -257,6 +268,15 @@ class SyncEngine:
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
+
+            if detail.get("parse_suspect"):
+                logger.warning("Parse-failure on real causa page: case=%s comp=%s", case["id"], competencia)
+                await send_ops_alert(
+                    self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
+                    "parse_failed",
+                    f"Causa {case.get('external_case_number') or case['id']} ({competencia}): "
+                    f"página real pero el parser no extrajo nada. Revisar forma de la página / parser.",
+                )
 
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
