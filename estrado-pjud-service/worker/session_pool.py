@@ -95,6 +95,14 @@ class SessionPool:
         await new_session.initialize()
         self._pool[idx] = new_session
 
+    async def force_remint(self):
+        """Fuerza un minteo fresco tras un bloqueo. Persiste al store y
+        refresca las sesiones vivas del pool con los cookies nuevos."""
+        result = await self._minter.mint()
+        self._store.save(cookies=result.cookies, user_agent=result.user_agent)
+        for session in list(self._pool):
+            await self._refresh_session(session)
+
     async def close_all(self):
         for session in self._pool:
             await session.close()
