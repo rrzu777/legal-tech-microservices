@@ -79,7 +79,6 @@ class SessionPool:
 
     async def _refresh_session(self, session: OJVSession):
         idx = self._pool.index(session)
-        await session.close()
         settings = Settings(
             API_KEY="unused-by-worker",
             OJV_BASE_URL=self._config.PJUD_BASE_URL,
@@ -92,12 +91,19 @@ class SessionPool:
             cookies=creds.cookies,
         )
         new_session = OJVSession(adapter)
+        # Init the NEW session before touching the old one: if this raises, the
+        # old (still-open) session stays in the pool instead of a dead closed one.
         await new_session.initialize()
         self._pool[idx] = new_session
+        await session.close()
 
     async def force_remint(self):
         """Fuerza un minteo fresco tras un bloqueo. Persiste al store y
-        refresca las sesiones vivas del pool con los cookies nuevos."""
+        refresca las sesiones vivas del pool con los cookies nuevos.
+
+        NOTA: seguro solo para POOL_SIZE=1 (consumidor único). Con POOL_SIZE>1
+        haría falta un lock para no cerrar sesiones en uso por otras corrutinas.
+        """
         result = await self._minter.mint()
         self._store.save(cookies=result.cookies, user_agent=result.user_agent)
         for session in list(self._pool):
