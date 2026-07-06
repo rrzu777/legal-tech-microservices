@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, date
 
 import httpx
 
+from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
 from app.familia.auth import FamiliaAuthSession, InvalidCredentialsError, SessionError
@@ -739,6 +740,10 @@ class SyncEngine:
             logger.info("Re-minteo tras bloqueo OK (cookie refrescado)")
         except Exception:
             logger.exception("Re-minteo tras bloqueo FALLO (posible bloqueo real)")
+            await send_ops_alert(
+                self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
+                "mint_failed", "Re-minteo tras bloqueo fallo (posible bloqueo real de PJUD).",
+            )
         self._backoff.record_blocked()
 
     async def _update_case_blocked(self, case_id: str):

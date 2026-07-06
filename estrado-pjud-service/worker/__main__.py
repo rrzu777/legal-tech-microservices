@@ -82,6 +82,11 @@ async def main():
             "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
             config.MINT_MAX_RETRIES,
         )
+        from app.alerting import send_ops_alert
+        await send_ops_alert(
+            config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
+            "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
+        )
         await shutdown_event.wait()
         return
 

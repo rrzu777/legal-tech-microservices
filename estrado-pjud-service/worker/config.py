@@ -37,4 +37,8 @@ class WorkerConfig(BaseSettings):
     VERCEL_APP_URL: str = ""
     INTERNAL_CREDENTIALS_API_KEY: str = ""
 
+    # Ops alerting (Telegram)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

@@ -81,3 +81,22 @@ async def maybe_alert(request: Request):
     alerter = getattr(request.app.state, "alerter", None)
     if alerter:
         await alerter.check_and_alert()
+
+
+async def send_ops_alert(bot_token: str, chat_id: str, event: str, detail: str) -> None:
+    """Envia una alerta ops puntual a Telegram. No-op si falta token/chat.
+
+    Nota: sin dedup/cooldown en esta fase (el pause del circuit breaker ya
+    rate-limitea la frecuencia). El dedup completo llega en la Fase 2.
+    """
+    if not bot_token or not chat_id:
+        return
+    text = f"\U0001F6A8 [{event}] {detail}"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    client = httpx.AsyncClient(timeout=10.0)
+    try:
+        await client.post(url, json={"chat_id": chat_id, "text": text})
+    except Exception:
+        logger.exception("Fallo enviando ops alert")
+    finally:
+        await client.aclose()
