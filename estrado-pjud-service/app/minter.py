@@ -15,7 +15,15 @@ _MINT_TIMEOUT_MS = 30_000
 # solo la combinación headed + este arg mintea TSPD_101; cualquier variante
 # headless deja el challenge en loop. En el VPS (sin monitor) esto corre
 # dentro de Xvfb (display virtual). Ver spec §3.1 y §9.
-_ANTIBOT_ARGS = ["--disable-blink-features=AutomationControlled"]
+_ANTIBOT_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    # Requeridos al correr bajo el servicio systemd (User=estrado no-root,
+    # NoNewPrivileges, PrivateTmp): Chromium no puede usar su sandbox setuid
+    # (--no-sandbox) y /dev/shm está restringido (--disable-dev-shm-usage).
+    # No afectan la resolución del challenge (son de aislamiento de proceso).
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
 
 
 @dataclass
