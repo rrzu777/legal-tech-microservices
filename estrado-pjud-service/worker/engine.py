@@ -116,7 +116,7 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
         session.detail(comp_path, detail_key),
         timeout=timeout,
     )
-    if len(html.strip()) < 100:
+    if len(html.strip()) < 100 or detect_blocked(html):
         return {"metadata": {}, "movements": [], "litigantes": [], "blocked": True, "error": None}
     parsed = parse_detail(html)
     return {**parsed, "blocked": False, "error": None}

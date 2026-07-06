@@ -63,7 +63,14 @@ class SessionPool:
         for i, session in enumerate(self._pool):
             if session.age_seconds > self._config.SESSION_MAX_AGE_S:
                 logger.info("Refreshing expired session %d (age=%.0fs)", i, session.age_seconds)
-                await self._refresh_session(session)
+                try:
+                    await self._refresh_session(session)
+                except Exception:
+                    # No penalizar la causa por un fallo de minteo/refresh: devolver la
+                    # sesión existente (expirada). El challenge F5 que devuelva se detecta
+                    # downstream y va por el path de bloqueo (sin incrementar sync_attempts),
+                    # disparando el re-mint reactivo. El semáforo se libera normalmente en release().
+                    logger.exception("Refresh de sesión %d falló; usando la sesión existente", i)
                 return self._pool[i]
         return self._pool[0]
 
