@@ -37,6 +37,12 @@ class CookieStore:
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(payload, f)
+            # El worker (User=estrado) escribe el store; el servicio API
+            # (User=www-data) lo lee. mkstemp crea 0600 → hacerlo legible por
+            # ambos. Los cookies TSPD son de baja sensibilidad (tokens anti-bot
+            # + sesión invitado, no credenciales). Revisar si Familia (sesión
+            # autenticada) llega a persistirse acá.
+            os.chmod(tmp, 0o644)
             os.replace(tmp, self._path)
         except BaseException:
             if os.path.exists(tmp):

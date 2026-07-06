@@ -14,6 +14,16 @@ def test_load_missing_returns_none(tmp_path):
     assert store.load() is None
 
 
+def test_saved_file_is_group_world_readable(tmp_path):
+    import os
+    import stat
+    p = tmp_path / "cookies.json"
+    CookieStore(path=str(p)).save(cookies={"TSPD_101": "x"}, user_agent="UA")
+    mode = stat.S_IMODE(os.stat(p).st_mode)
+    # Worker (estrado) escribe, API (www-data) lee → debe ser legible por otros.
+    assert mode == 0o644
+
+
 def test_load_malformed_json_returns_none(tmp_path):
     p = tmp_path / "cookies.json"
     p.write_text("{oops not json")
