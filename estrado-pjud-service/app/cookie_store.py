@@ -47,8 +47,13 @@ class CookieStore:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return None
-        return CookieBundle(
-            cookies=data["cookies"],
-            user_agent=data["user_agent"],
-            saved_at=data["saved_at"],
-        )
+        # Tolera JSON con forma incorrecta (ej. cambio de esquema entre procesos
+        # que comparten el store durante un deploy) → re-mint en vez de crashear.
+        try:
+            return CookieBundle(
+                cookies=data["cookies"],
+                user_agent=data["user_agent"],
+                saved_at=data["saved_at"],
+            )
+        except (KeyError, TypeError):
+            return None
