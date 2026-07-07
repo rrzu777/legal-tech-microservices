@@ -47,4 +47,11 @@ class WorkerConfig(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
 
+    # Residential proxy pool (IPRoyal). None = no proxy (legacy single-IP).
+    OJV_PROXY_URL: str | None = None
+    OJV_PROXY_STICKY_LIFETIME: str = "1h"
+    OJV_PROXY_POOL_SIZE: int = 3
+    OJV_PROXY_GB_BUDGET: float = 2.0
+    OJV_PROXY_GB_ALERT_PCT: int = 80
+
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}
