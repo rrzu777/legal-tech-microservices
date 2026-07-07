@@ -101,8 +101,7 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
         session.search(comp_path, form_data),
         timeout=timeout,
     )
-    blocked = detect_blocked(html)
-    if blocked:
+    if detect_blocked(html) or len(html.strip()) < 100:
         return {"found": False, "match_count": 0, "matches": [], "blocked": True, "error": None}
     matches = parse_search_results(html, competencia)
     return {
@@ -329,12 +328,16 @@ class SyncEngine:
             logger.info("Synced case %s: %d new movements", case["case_number"], new_count)
             return {"success": True, "new_movements": new_count}
 
-        except asyncio.TimeoutError:
-            msg = "Timeout al consultar OJV"
-            logger.warning("Timeout syncing case %s", case["case_number"])
-            await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
-            self._backoff.record_failure()
+        except (httpx.TransportError, asyncio.TimeoutError) as e:
+            # IP residencial caída/lenta o timeout de red = falla de INFRA, no de la causa.
+            # Se trata como bloqueo: re-mint del slot (session_healthy=False) SIN penalizar
+            # (sin _update_case_error, sin sync_attempts++). El circuit breaker global via
+            # _handle_blocked/record_blocked da la protección sistémica.
+            session_healthy = False
+            msg = f"infra: {type(e).__name__}: {e}"
+            logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
+            await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+            await self._handle_blocked(case["id"])
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
 
