@@ -175,6 +175,7 @@ class SyncEngine:
             sync_run_id = None
 
         session = None
+        session_healthy = True
         try:
             # Parse identifier — raises ValueError on invalid input
             try:
@@ -241,6 +242,7 @@ class SyncEngine:
             )
 
             if search_result["blocked"]:
+                session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
@@ -267,6 +269,7 @@ class SyncEngine:
             )
 
             if detail["blocked"]:
+                session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
@@ -346,7 +349,7 @@ class SyncEngine:
 
         finally:
             if session:
-                self._pool.release(session)
+                await self._pool.release(session, healthy=session_healthy)
 
     async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
         """Fetch decrypted credential from Vercel internal endpoint."""
@@ -753,20 +756,14 @@ class SyncEngine:
     async def _handle_blocked(self, case_id: str):
         """Maneja un bloqueo (challenge F5 / OJV) SIN penalizar la causa.
 
-        Marca la causa como blocked (sin incrementar sync_attempts), intenta
-        recuperarse con un re-mint inmediato de cookies, y abre el circuit
-        breaker con una pausa corta (rate-limita el re-minteo).
+        Marca la causa como blocked (sin incrementar sync_attempts) y abre el
+        circuit breaker con una pausa corta. El re-mint de cookies ya NO se
+        hace aquí: ocurre por-slot, de forma reactiva, cuando `sync_case`
+        libera la sesión con `release(session, healthy=False)` — el slot que
+        realmente vio el bloqueo es el único que se re-mintea, y solo cuando
+        su dueño (esta corrutina) lo devuelve al pool.
         """
         await self._update_case_blocked(case_id)
-        try:
-            await self._pool.force_remint()
-            logger.info("Re-minteo tras bloqueo OK (cookie refrescado)")
-        except Exception:
-            logger.exception("Re-minteo tras bloqueo FALLO (posible bloqueo real)")
-            await send_ops_alert(
-                self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
-                "mint_failed", "Re-minteo tras bloqueo fallo (posible bloqueo real de PJUD).",
-            )
         self._backoff.record_blocked()
 
     async def _handle_parse_suspect(self, case: dict, competencia: str):
