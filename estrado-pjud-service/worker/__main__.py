@@ -4,8 +4,10 @@ import logging
 import signal
 import sys
 import json
+import time
 
 from app.alerting import send_ops_alert
+from app.bandwidth import METER
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -37,6 +39,73 @@ def setup_logging(level: str):
     handler.setFormatter(JsonFormatter())
     logging.root.handlers = [handler]
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
+async def process_batch(
+    batch: list,
+    engine: SyncEngine,
+    concurrency: int,
+    shutdown_event: asyncio.Event,
+    backoff: CircuitBreaker,
+) -> None:
+    """Process a batch of cases concurrently, bounded to `concurrency` in-flight
+    at a time (matches the number of residential IP slots in the pool).
+
+    Cases already dispatched (past the semaphore gate) are allowed to finish
+    even if shutdown is requested or the circuit breaker opens mid-batch; only
+    not-yet-started cases are skipped, for a graceful drain.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run_one(case):
+        async with sem:
+            if shutdown_event.is_set() or backoff.is_open:
+                return
+            try:
+                await engine.sync_case(case)
+            except Exception:
+                logger.exception("Unhandled error syncing case %s", case.get("id"))
+
+    # _run_one nunca propaga una Exception (la captura y loguea internamente);
+    # return_exceptions=True contiene además cualquier BaseException (p.ej.
+    # CancelledError durante shutdown) para que un caso no cancele a los demás.
+    await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
+
+
+BANDWIDTH_ALERT_COOLDOWN_S = 6 * 60 * 60  # 6h, avoid spamming ops once over budget
+
+
+class BandwidthAlertState:
+    """Tracks when the last bandwidth alert fired, so we only alert once per
+    cooldown window instead of on every loop iteration."""
+
+    def __init__(self):
+        self.last_alert_ts: float | None = None
+
+
+async def maybe_alert_bandwidth(config, state: "BandwidthAlertState", now: float | None = None) -> None:
+    """Fire-and-forget check: alert ops when proxy bandwidth usage crosses
+    OJV_PROXY_GB_ALERT_PCT% of OJV_PROXY_GB_BUDGET. No-op in no-proxy mode
+    (OJV_PROXY_URL unset) and rate-limited to once per cooldown window.
+    """
+    if not config.OJV_PROXY_URL:
+        return
+
+    threshold_gb = config.OJV_PROXY_GB_BUDGET * config.OJV_PROXY_GB_ALERT_PCT / 100
+    if METER.total_gb < threshold_gb:
+        return
+
+    now = time.monotonic() if now is None else now
+    if state.last_alert_ts is not None and (now - state.last_alert_ts) < BANDWIDTH_ALERT_COOLDOWN_S:
+        return
+
+    state.last_alert_ts = now
+    await send_ops_alert(
+        config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
+        "bandwidth_high",
+        f"Proxy bandwidth {METER.total_gb:.2f}GB / budget {config.OJV_PROXY_GB_BUDGET}GB "
+        f"(>{config.OJV_PROXY_GB_ALERT_PCT}%)",
+    )
 
 
 async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
@@ -105,6 +174,8 @@ async def main():
     logger.info("Worker ready, entering main loop")
     notify_ready()
 
+    bandwidth_alert_state = BandwidthAlertState()
+
     try:
         while not shutdown_event.is_set():
             if backoff.is_open:
@@ -121,6 +192,7 @@ async def main():
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
                 await metrics.send_heartbeat()
+                await maybe_alert_bandwidth(config, bandwidth_alert_state)
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -129,15 +201,12 @@ async def main():
 
             case_ids = [c["id"] for c in batch]
 
-            for case in batch:
-                if shutdown_event.is_set():
-                    break
-                if backoff.is_open:
-                    break
-                await engine.sync_case(case)
+            concurrency = config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            await process_batch(batch, engine, concurrency, shutdown_event, backoff)
 
             await scheduler.release_batch(case_ids)
             await metrics.send_heartbeat()
+            await maybe_alert_bandwidth(config, bandwidth_alert_state)
 
     finally:
         notify_stopping()

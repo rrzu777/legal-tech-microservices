@@ -89,7 +89,8 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         mock_session = AsyncMock()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
-        mock_pool.release = MagicMock()
+        mock_pool.release = AsyncMock()
+        mock_pool.force_remint = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
     if mock_sb is None:
@@ -131,7 +132,7 @@ class TestSyncEngine:
         mock_session = AsyncMock()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
-        mock_pool.release = MagicMock()
+        mock_pool.release = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
         mock_sb = MagicMock()
@@ -169,7 +170,7 @@ class TestSyncEngine:
 
         assert result["success"] is True
         mock_pool.acquire.assert_called_once()
-        mock_pool.release.assert_called_once()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
         mock_backoff.record_success.assert_called_once()
 
     @pytest.mark.asyncio
@@ -179,7 +180,8 @@ class TestSyncEngine:
         mock_session = AsyncMock()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
-        mock_pool.release = MagicMock()
+        mock_pool.release = AsyncMock()
+        mock_pool.force_remint = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
         mock_sb = MagicMock()
@@ -207,12 +209,23 @@ class TestSyncEngine:
 
         case = _make_case()
 
-        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
             mock_search.return_value = _mock_search_response(blocked=True)
             result = await engine.sync_case(case)
 
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
+        # Per-slot reactive re-mint: release(healthy=False), NOT force_remint.
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.force_remint.assert_not_called()
+        # Anti-apagón: a block must never penalize the case via _update_case_error
+        # nor increment sync_attempts.
+        mock_update_error.assert_not_called()
+        update_calls = chain.update.call_args_list
+        for call in update_calls:
+            payload = call[0][0] if call[0] else {}
+            assert "sync_attempts" not in payload
 
     @pytest.mark.asyncio
     async def test_sync_invalid_identifier(self):
@@ -220,7 +233,7 @@ class TestSyncEngine:
 
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=AsyncMock())
-        mock_pool.release = MagicMock()
+        mock_pool.release = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
         mock_sb = MagicMock()
@@ -277,11 +290,13 @@ class TestSyncEngine:
     async def test_sync_detail_blocked(self):
         """When detail fetch is blocked, backoff should be triggered."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
 
         case = _make_case()
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
             mock_search.return_value = _mock_search_response()
             mock_detail.return_value = _mock_detail_response(blocked=True)
             result = await engine.sync_case(case)
@@ -289,6 +304,11 @@ class TestSyncEngine:
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
         mock_metrics.record_error.assert_called_once()
+        # Per-slot reactive re-mint: release(healthy=False), NOT force_remint.
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.force_remint.assert_not_called()
+        # Anti-apagón: a block must never penalize the case via _update_case_error.
+        mock_update_error.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sync_parse_suspect_short_circuits_without_clobber(self):
@@ -316,20 +336,117 @@ class TestSyncEngine:
         mock_metrics.record_error.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_sync_timeout_triggers_failure_backoff(self):
-        """Timeout should trigger record_failure on backoff, not record_blocked."""
+    async def test_sync_timeout_is_infra_non_penalizing(self):
+        """G2: a timeout is an INFRA failure (bad/slow residential IP), not the
+        case's fault. It must be treated like a block: _handle_blocked (which
+        calls record_blocked, NOT record_failure), no _update_case_error, no
+        sync_attempts increment, and release(healthy=False) so the slot
+        re-mints."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
 
         case = _make_case()
 
-        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
             mock_search.side_effect = TimeoutError("timed out")
             result = await engine.sync_case(case)
 
         assert result["success"] is False
+        mock_backoff.record_blocked.assert_called_once()
+        mock_backoff.record_failure.assert_not_called()
+        mock_metrics.record_error.assert_called_once()
+        mock_update_error.assert_not_called()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        update_calls = mock_sb.from_.return_value.update.call_args_list
+        for call in update_calls:
+            payload = call[0][0] if call[0] else {}
+            assert "sync_attempts" not in payload
+
+    @pytest.mark.asyncio
+    async def test_sync_transport_error_is_infra_non_penalizing(self):
+        """G2: httpx.ConnectError (dead residential proxy IP) must be treated
+        as an infra failure, not a case-fault error. Same non-penalizing
+        block-like handling as timeouts."""
+        import httpx
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        case = _make_case()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = httpx.ConnectError("boom")
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+        mock_backoff.record_blocked.assert_called_once()
+        mock_metrics.record_error.assert_called_once()
+        mock_update_error.assert_not_called()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+
+    @pytest.mark.asyncio
+    async def test_sync_read_timeout_is_infra_non_penalizing(self):
+        """G2: httpx.ReadTimeout is also an httpx.TransportError subclass and
+        must be caught by the same infra handler (proves the base-class
+        catch, not just ConnectError)."""
+        import httpx
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        case = _make_case()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = httpx.ReadTimeout("read timed out")
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+        mock_backoff.record_blocked.assert_called_once()
+        mock_update_error.assert_not_called()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+
+    @pytest.mark.asyncio
+    async def test_sync_proxy_error_is_infra_non_penalizing(self):
+        """G2: httpx.ProxyError (proxy-level failure) must also be caught by
+        the httpx.TransportError base-class handler."""
+        import httpx
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        case = _make_case()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = httpx.ProxyError("proxy boom")
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+        mock_backoff.record_blocked.assert_called_once()
+        mock_update_error.assert_not_called()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+
+    @pytest.mark.asyncio
+    async def test_sync_generic_exception_still_penalizes(self):
+        """Regression: a genuine unexpected bug (e.g. ValueError deep in
+        parsing) is NOT an infra failure and must still go through the
+        generic Exception path — _update_case_error IS called, record_failure
+        (not record_blocked), and the session is released healthy=True."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        case = _make_case()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = ValueError("deep parsing bug")
+            result = await engine.sync_case(case)
+
+        assert result["success"] is False
+        mock_update_error.assert_called_once()
         mock_backoff.record_failure.assert_called_once()
         mock_backoff.record_blocked.assert_not_called()
-        mock_metrics.record_error.assert_called_once()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
 
     @pytest.mark.asyncio
     async def test_sync_prefers_fresh_search_key_over_stored(self):
@@ -423,7 +540,7 @@ class TestSyncEngine:
         mock_session = AsyncMock()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
-        mock_pool.release = MagicMock()
+        mock_pool.release = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
         mock_sb = MagicMock()
@@ -453,8 +570,9 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is False
-        # Session must be released in finally block
-        mock_pool.release.assert_called_once_with(mock_session)
+        # Session must be released in finally block. A generic (non-block)
+        # exception is not an "IP is bad" signal, so healthy stays True.
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
 
     @pytest.mark.asyncio
     async def test_sync_apelaciones_uses_corte_from_external_payload(self):
@@ -622,7 +740,9 @@ class TestSearchPjudViaSession:
         from worker.engine import search_pjud_via_session
 
         mock_session = AsyncMock()
-        mock_session.search = AsyncMock(return_value="<html>result</html>")
+        # Realistic-length body (real OJV search results pages are always
+        # well over 100 chars) so this doesn't trip the G1 contentless guard.
+        mock_session.search = AsyncMock(return_value="<html>" + "result " * 20 + "</html>")
 
         with patch("worker.engine.detect_blocked", return_value=False), \
              patch("worker.engine.parse_search_results", return_value=[{"key": "abc"}]):
@@ -654,7 +774,10 @@ class TestSearchPjudViaSession:
         from worker.engine import search_pjud_via_session
 
         mock_session = AsyncMock()
-        mock_session.search = AsyncMock(return_value="<html>empty</html>")
+        # Realistic-length body — genuinely "no results" pages from OJV still
+        # render a full page shell, they just have 0 result rows. This is
+        # distinct from the G1 contentless soft-block case (~39 bytes).
+        mock_session.search = AsyncMock(return_value="<html>" + "no results here " * 20 + "</html>")
 
         with patch("worker.engine.detect_blocked", return_value=False), \
              patch("worker.engine.parse_search_results", return_value=[]):
@@ -664,6 +787,33 @@ class TestSearchPjudViaSession:
 
         assert result["found"] is False
         assert result["match_count"] == 0
+        assert result["blocked"] is False
+
+    @pytest.mark.asyncio
+    async def test_returns_blocked_on_contentless_soft_block(self):
+        """G1: an F5 soft-block returns a NON-empty but contentless page
+        (`<html><head></head><body></body></html>`, ~39 bytes). detect_blocked
+        returns False for it (no bobcmn marker), but it must still be treated
+        as blocked — mirroring the detail path's len<100 guard — instead of
+        being parsed into 0 matches and treated as "not found"."""
+        from worker.engine import search_pjud_via_session
+
+        soft_block_html = "<html><head></head><body></body></html>"
+        assert len(soft_block_html.strip()) < 100
+
+        mock_session = AsyncMock()
+        mock_session.search = AsyncMock(return_value=soft_block_html)
+
+        with patch("worker.engine.detect_blocked", return_value=False), \
+             patch("worker.engine.parse_search_results") as mock_parse:
+            result = await search_pjud_via_session(
+                mock_session, "civil", {"action": "search"}, 25.0
+            )
+
+        assert result["blocked"] is True
+        assert result["found"] is False
+        assert result["match_count"] == 0
+        mock_parse.assert_not_called()
 
 
 class TestDetailPjudViaSession:

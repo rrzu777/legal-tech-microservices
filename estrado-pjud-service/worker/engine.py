@@ -101,8 +101,7 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
         session.search(comp_path, form_data),
         timeout=timeout,
     )
-    blocked = detect_blocked(html)
-    if blocked:
+    if detect_blocked(html) or len(html.strip()) < 100:
         return {"found": False, "match_count": 0, "matches": [], "blocked": True, "error": None}
     matches = parse_search_results(html, competencia)
     return {
@@ -175,6 +174,7 @@ class SyncEngine:
             sync_run_id = None
 
         session = None
+        session_healthy = True
         try:
             # Parse identifier — raises ValueError on invalid input
             try:
@@ -241,6 +241,7 @@ class SyncEngine:
             )
 
             if search_result["blocked"]:
+                session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
@@ -267,6 +268,7 @@ class SyncEngine:
             )
 
             if detail["blocked"]:
+                session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
@@ -276,6 +278,9 @@ class SyncEngine:
                 # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
                 # el external_payload bueno marcando "success". Corto-circuito
                 # sin penalizar la causa (no incrementa sync_attempts).
+                # session_healthy queda True a propósito: el contenido SÍ llegó
+                # por esta IP (no es bloqueo ni caída de proxy), el problema es
+                # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
                 await self._handle_parse_suspect(case, competencia)
                 self._metrics.record_error()
@@ -326,12 +331,16 @@ class SyncEngine:
             logger.info("Synced case %s: %d new movements", case["case_number"], new_count)
             return {"success": True, "new_movements": new_count}
 
-        except asyncio.TimeoutError:
-            msg = "Timeout al consultar OJV"
-            logger.warning("Timeout syncing case %s", case["case_number"])
-            await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
-            self._backoff.record_failure()
+        except (httpx.TransportError, asyncio.TimeoutError) as e:
+            # IP residencial caída/lenta o timeout de red = falla de INFRA, no de la causa.
+            # Se trata como bloqueo: re-mint del slot (session_healthy=False) SIN penalizar
+            # (sin _update_case_error, sin sync_attempts++). El circuit breaker global via
+            # _handle_blocked/record_blocked da la protección sistémica.
+            session_healthy = False
+            msg = f"infra: {type(e).__name__}: {e}"
+            logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
+            await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+            await self._handle_blocked(case["id"])
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
 
@@ -346,7 +355,7 @@ class SyncEngine:
 
         finally:
             if session:
-                self._pool.release(session)
+                await self._pool.release(session, healthy=session_healthy)
 
     async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
         """Fetch decrypted credential from Vercel internal endpoint."""
@@ -753,20 +762,14 @@ class SyncEngine:
     async def _handle_blocked(self, case_id: str):
         """Maneja un bloqueo (challenge F5 / OJV) SIN penalizar la causa.
 
-        Marca la causa como blocked (sin incrementar sync_attempts), intenta
-        recuperarse con un re-mint inmediato de cookies, y abre el circuit
-        breaker con una pausa corta (rate-limita el re-minteo).
+        Marca la causa como blocked (sin incrementar sync_attempts) y abre el
+        circuit breaker con una pausa corta. El re-mint de cookies ya NO se
+        hace aquí: ocurre por-slot, de forma reactiva, cuando `sync_case`
+        libera la sesión con `release(session, healthy=False)` — el slot que
+        realmente vio el bloqueo es el único que se re-mintea, y solo cuando
+        su dueño (esta corrutina) lo devuelve al pool.
         """
         await self._update_case_blocked(case_id)
-        try:
-            await self._pool.force_remint()
-            logger.info("Re-minteo tras bloqueo OK (cookie refrescado)")
-        except Exception:
-            logger.exception("Re-minteo tras bloqueo FALLO (posible bloqueo real)")
-            await send_ops_alert(
-                self._config.TELEGRAM_BOT_TOKEN, self._config.TELEGRAM_CHAT_ID,
-                "mint_failed", "Re-minteo tras bloqueo fallo (posible bloqueo real de PJUD).",
-            )
         self._backoff.record_blocked()
 
     async def _handle_parse_suspect(self, case: dict, competencia: str):

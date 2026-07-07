@@ -4,7 +4,7 @@ from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
-from app.cookie_store import CookieStore
+from app.cookie_store import CookieBundle, CookieStore
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ class APISessionPool:
         self._max_size = settings.SESSION_POOL_SIZE
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
+        self._rr_index = 0
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
@@ -39,9 +40,10 @@ class APISessionPool:
 
         # No valid session available — create outside the lock to avoid blocking
         logger.info("Creating new API session")
-        bundle = self._store.load()
+        bundle = self._pick_bundle()
         adapter = OJVHttpAdapter(
             self._settings,
+            proxy=bundle.proxy_url if bundle else None,
             user_agent=bundle.user_agent if bundle else None,
             cookies=bundle.cookies if bundle else None,
         )
@@ -53,7 +55,23 @@ class APISessionPool:
             raise
         return session
 
-    async def release(self, session: OJVSession, healthy: bool = True):
+    def _pick_bundle(self) -> CookieBundle | None:
+        """Pick one slot bundle from the multi-bundle store via round-robin.
+
+        Round-robins across the sorted slot ids so successive new-session
+        creations spread egress across the N residential IPs the worker has
+        minted. Returns None when the store has no bundles yet (worker
+        hasn't minted) — callers fall back to no-proxy/no-cookies.
+        """
+        bundles = self._store.load_all()
+        if not bundles:
+            return None
+        slot_ids = sorted(bundles.keys())
+        chosen_id = slot_ids[self._rr_index % len(slot_ids)]
+        self._rr_index += 1
+        return bundles[chosen_id]
+
+    async def release(self, session: OJVSession, healthy: bool = True) -> None:
         """Return a session to the pool for reuse.
         If healthy=False the session is closed immediately and not recycled.
         """

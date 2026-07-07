@@ -20,7 +20,14 @@ class Settings(BaseSettings):
     TELEGRAM_BLOCKED_RATE_THRESHOLD: float = 0.3
     TELEGRAM_COOLDOWN_S: int = 300
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Residential proxy pool (IPRoyal). None = no proxy (legacy single-IP).
+    OJV_PROXY_URL: str | None = None
+    OJV_PROXY_STICKY_LIFETIME: str = "1h"
+
+    # extra=ignore: el .env es compartido y trae claves del worker (POOL_SIZE,
+    # WORKER_ID, OJV_PROXY_POOL_SIZE, etc.) que Settings no define; sin esto
+    # pydantic falla al cargar. (Reconcilia un fix que estaba local en el VPS.)
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 @lru_cache
