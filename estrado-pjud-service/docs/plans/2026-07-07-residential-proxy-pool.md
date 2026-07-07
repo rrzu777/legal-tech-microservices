@@ -138,11 +138,48 @@ Script one-shot que en el VPS: inicializa el pool real (N mints por N IPs), veri
 
 ---
 
+## Gaps/mejoras integrados (revisión CTO, 7 jul 2026)
+
+Revisión crítica del diseño. Estos requisitos MODIFICAN las tareas indicadas.
+
+### 🔴 Críticos
+- **G1 — Soft-block en SEARCH (anti-apagón).** El soft-block devuelve `<html><head></head><body></body></html>` (39 bytes, NO vacío, sin bobcmn). En detalle está cubierto (`len<100`); en `search_pjud_via_session` NO → se parsea a 0 matches → "No encontrada en OJV" → `_update_case_error` (PENALIZA). Es el mismo bug que causó el outage. **Fix (nueva Task 8):** una página chica/contentless (body vacío o `len(strip)<100`) en search se trata como `blocked`, no como "not found". Extender `detect_blocked` o agregar guarda en el search path. Va por el path de bloqueo (sin penalizar).
+- **G2 — Errores de proxy → re-mint del slot, NO penalizar (anti-apagón).** IPs residenciales se caen a media sesión. `httpx.ConnectError`/`ProxyError`/`TimeoutException` de un request deben clasificarse como "IP muerta" → re-mint del slot con token fresco (IP nueva) + path de bloqueo (sin `sync_attempts`, sin `_update_case_error`). **Fix (Task 8 + Task 5):** clasificar excepciones de red del adapter como remint-trigger.
+- **G3 — Concurrencia = checkout de slots distintos, NO round-robin.** Dos corrutinas NUNCA comparten slot (si una está a mitad de request y otra re-mintea ese slot, le cierra la sesión abajo). **Fix (Task 5):** modelar slots como pool de checkout (libre/ocupado); `acquire()` toma un slot LIBRE distinto, `release()` lo devuelve; el re-mint ocurre sobre un slot que el caller posee. Agregar **test de estrés de concurrencia** (mocks no atrapan la race solos).
+
+### 🟠 Importantes
+- **G4 — Redacción del secreto en logs (Task 5, y helper en `app/proxy.py`).** El `proxy_url` lleva el password. NUNCA loguearlo entero. Agregar `redact_proxy_url(url) -> str` en `app/proxy.py` (deja host + token, password `***`) y usarlo en todo log del pool/adapter.
+- **G5 — Observabilidad de GB + alerta de casi-agotamiento (Task 8).** Quedarse sin GB = outage total silencioso. Contador de bytes por-slot en el adapter (sumar `len(resp.content)` + request) expuesto en métricas; alerta ops cuando se supera un umbral configurable (`OJV_PROXY_GB_BUDGET`, `OJV_PROXY_GB_ALERT_PCT`).
+- **G6 — Cooldown de re-mint por slot (Task 5).** Un slot que falla en loop quema IPs (churn). Cooldown por-slot (reusar `BLOCK_PAUSE_S`) entre reintentos de mint del mismo slot.
+
+### 🟡 Notas (no cambian tareas, documentar)
+- **G7 — lifetime vs max-age.** `SESSION_MAX_AGE_S`(25m) < `lifetime`(60m) ✓: el re-mint con token fresco siempre precede a la expiración sticky. Caso idle: worker sin causas >60m → IPs expiran → el API (que no mintea) queda degradado hasta el próximo mint del worker. Se auto-cura. Documentar; evaluar re-mint proactivo en idle a futuro.
+- **G8 — Mint secuencial/escalonado al arranque (Task 5).** N Chromium headed simultáneos = pico RAM/CPU. Mintear slots en serie (stagger), NO en paralelo.
+- **G9 — Kill-switch.** `OJV_PROXY_URL` vacío → modo viejo (sin proxy). Rollback en prod = dessetear la env var. Documentar en README.
+
+---
+
+## Task 8: Hardening del sync (engine + adapter)  [NUEVA]
+
+**Files:** Modify `worker/engine.py` (search path), `app/parsers/search_parser.py` (detect_blocked) si aplica, `app/adapters/http_adapter.py` (byte counter + net-error surfacing); Tests correspondientes.
+
+- **G1:** en `search_pjud_via_session`, una página no-vacía pero contentless (`len(html.strip())<100` o `<body></body>` vacío) → `{"blocked": True, ...}` (mismo trato que detalle). Test: página de 39 bytes en search → blocked, NO penaliza.
+- **G2:** el adapter/session propaga `httpx.ConnectError/ProxyError/TimeoutException`; en `sync_case` estas se clasifican como bloqueo → `_handle_blocked` + trigger de re-mint del slot, SIN `_update_case_error` ni `sync_attempts++`. Test: request lanza ProxyError → path de bloqueo, causa no penalizada.
+- **G5:** contador de bytes por-slot en el adapter; métrica agregada; alerta ops al superar `OJV_PROXY_GB_ALERT_PCT` de `OJV_PROXY_GB_BUDGET`. Test del contador y del disparo de alerta con cooldown.
+
+- [ ] TDD por cada sub-punto (test falla → implementa → pasa). Commit(s).
+
+## Task 9: Validación E2E en VPS + docs .env  [antes Task 8]
+
+(Sin cambios respecto a la Task 8 original: script one-shot que inicializa el pool real de N IPs, verifica IPs CL distintas, sync de 1 causa por el path real, y documenta las env vars nuevas — incl. `OJV_PROXY_GB_BUDGET` — sin el secreto.)
+
+---
+
 ## Cierre (lo hace el controlador, no los subagentes)
 
 1. Review final de todo el branch (Opus).
 2. `/simplify` sobre el diff.
 3. PR + merge a main.
-4. Deploy VPS: `git pull`, poner `OJV_PROXY_URL` real en `.env`, `OJV_PROXY_POOL_SIZE=3`.
-5. Correr Task 8 en el VPS (E2E real).
+4. Deploy VPS: `git pull`, poner `OJV_PROXY_URL` real en `.env`, `OJV_PROXY_POOL_SIZE=3`, `OJV_PROXY_GB_BUDGET`.
+5. Correr Task 9 en el VPS (E2E real).
 6. Si OK: `systemctl enable --now estrado-pjud-worker`.
