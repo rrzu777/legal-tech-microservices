@@ -95,3 +95,24 @@ def test_slot_id_coerced_from_int(tmp_path):
     assert bundle.cookies == {"a": "1"}
     all_bundles = store.load_all()
     assert "0" in all_bundles
+
+
+def test_malformed_slot_entry_skipped_good_slots_survive(tmp_path):
+    """Un slot malformado (no-dict / faltan keys) dentro de un {"slots"} válido
+    NO debe crashear ni tumbar los slots sanos: se saltea el malo y se conservan
+    los buenos. Es la ruta de robustez más propensa a regresión silenciosa."""
+    p = tmp_path / "cookies.json"
+    # slot "0" sano, "1" no-dict, "2" dict sin las keys esperadas
+    p.write_text(
+        '{"slots": {'
+        '"0": {"cookies": {"a": "1"}, "user_agent": "UA/0", "proxy_url": null, "saved_at": 123},'
+        '"1": "not-a-dict",'
+        '"2": {"user_agent": "UA/2"}'
+        '}}'
+    )
+    store = CookieStore(path=str(p))
+    all_bundles = store.load_all()  # no debe lanzar
+    assert set(all_bundles.keys()) == {"0"}
+    assert all_bundles["0"].cookies == {"a": "1"}
+    assert store.load_slot("1") is None
+    assert store.load_slot("2") is None
