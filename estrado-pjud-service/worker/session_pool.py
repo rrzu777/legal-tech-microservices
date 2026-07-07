@@ -254,3 +254,6 @@ class SessionPool:
             if slot.session is not None:
                 await slot.session.close()
         self._slots.clear()
+        # Limpia el registro de checkout: en el shutdown normal el pool se drena
+        # antes, pero si quedara algo apuntaría a sesiones ya cerradas.
+        self._checkout.clear()
