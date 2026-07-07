@@ -10,6 +10,10 @@ def _make_pool():
     config.RATE_LIMIT_MS = 0
     config.SESSION_MAX_AGE_S = 1500
     config.POOL_SIZE = 1
+    config.OJV_PROXY_URL = None
+    config.OJV_PROXY_STICKY_LIFETIME = "1h"
+    config.OJV_PROXY_POOL_SIZE = 3
+    config.BLOCK_PAUSE_S = 30
     return SessionPool(config)
 
 
@@ -21,11 +25,17 @@ async def test_refresh_keeps_old_session_when_new_init_fails(monkeypatch):
     pool = _make_pool()
     old = MagicMock()
     old.close = AsyncMock()
-    pool._pool = [old]
+    slot = sp._Slot(index=0, token=None, proxy_url=None, session=old)
+    pool._slots = [slot]
 
-    async def fake_creds(*a, **k):
-        return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
-    monkeypatch.setattr(sp, "get_or_mint_cookies", fake_creds)
+    class FakeMinter:
+        def __init__(self, base_url, proxy=None):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
+
+    monkeypatch.setattr(sp, "CookieMinter", FakeMinter)
     monkeypatch.setattr(sp, "Settings", lambda **k: MagicMock())
     monkeypatch.setattr(sp, "OJVHttpAdapter", lambda *a, **k: MagicMock())
 
@@ -38,8 +48,8 @@ async def test_refresh_keeps_old_session_when_new_init_fails(monkeypatch):
     monkeypatch.setattr(sp, "OJVSession", FailingSession)
 
     with pytest.raises(RuntimeError):
-        await pool._refresh_session(old)
+        await pool._refresh_slot(slot)
 
-    # The old session must NOT have been closed, and must still be in the pool.
+    # The old session must NOT have been closed, and must still be on the slot.
     old.close.assert_not_awaited()
-    assert pool._pool == [old]
+    assert slot.session is old

@@ -60,3 +60,28 @@ def split_proxy_for_playwright(proxy_url: str) -> dict:
         "username": parsed.username,
         "password": parsed.password,
     }
+
+
+def redact_proxy_url(url: str | None) -> str:
+    """Enmascara el password de una proxy URL para logging seguro.
+
+    El password de IPRoyal lleva el secreto de cuenta + el session token
+    sticky; nunca debe aparecer en texto plano en logs. Preserva scheme,
+    username, host y port (útil para debug), reemplaza el password entero
+    por `***`.
+    """
+    if url is None:
+        return "<none>"
+
+    parsed = urlparse(url)
+    userinfo = parsed.username or ""
+    if parsed.password is not None:
+        userinfo = f"{userinfo}:***"
+
+    netloc = userinfo
+    if parsed.hostname:
+        netloc = f"{netloc}@{parsed.hostname}" if netloc else parsed.hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return urlunparse(parsed._replace(netloc=netloc))

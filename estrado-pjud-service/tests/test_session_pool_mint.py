@@ -4,6 +4,11 @@ import pytest
 from app.minter import MintResult
 from app.cookie_store import CookieBundle
 
+# NOTE: get_or_mint_cookies (single-bundle helper) is kept for back-compat /
+# no-proxy legacy path but the SessionPool itself now mints per-slot via
+# CookieMinter directly (see test_session_pool_proxy.py). These tests cover
+# the helper function in isolation, unchanged in intent.
+
 
 @pytest.mark.asyncio
 async def test_reuses_fresh_store_without_minting():

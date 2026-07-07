@@ -8,6 +8,7 @@ from app.proxy import (
     generate_session_token,
     build_sticky_proxy_url,
     split_proxy_for_playwright,
+    redact_proxy_url,
 )
 
 DUMMY_BASE_URL = "http://user123:pw_country-cl@geo.iproyal.com:12321"
@@ -77,3 +78,22 @@ class TestRoundTrip:
         assert result["username"] == "user123"
         assert result["password"].endswith("_session-tok12345_lifetime-1h")
         assert result["password"].startswith("pw_country-cl")
+
+
+class TestRedactProxyUrl:
+    def test_none_returns_placeholder(self):
+        assert redact_proxy_url(None) == "<none>"
+
+    def test_masks_password_fully(self):
+        sticky_url = build_sticky_proxy_url(DUMMY_BASE_URL, "tok12345")
+        result = redact_proxy_url(sticky_url)
+        assert "***" in result
+        assert "pw_country-cl" not in result
+        assert "tok12345" not in result
+
+    def test_preserves_host_user_port(self):
+        result = redact_proxy_url(DUMMY_BASE_URL)
+        assert "geo.iproyal.com" in result
+        assert "user123" in result
+        assert ":12321" in result
+        assert result == "http://user123:***@geo.iproyal.com:12321"
