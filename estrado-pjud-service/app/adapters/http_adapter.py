@@ -4,6 +4,7 @@ import time
 
 import httpx
 
+from app.bandwidth import METER
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -48,13 +49,17 @@ class OJVHttpAdapter:
         await self._rate_limit()
         url = f"{self._base}{path}"
         logger.debug("GET %s", url)
-        return await self._client.get(url, **kwargs)
+        response = await self._client.get(url, **kwargs)
+        METER.add(len(response.content))
+        return response
 
     async def post(self, path: str, **kwargs) -> httpx.Response:
         await self._rate_limit()
         url = f"{self._base}{path}"
         logger.debug("POST %s", url)
-        return await self._client.post(url, **kwargs)
+        response = await self._client.post(url, **kwargs)
+        METER.add(len(response.content))
+        return response
 
     @property
     def cookies(self) -> httpx.Cookies:

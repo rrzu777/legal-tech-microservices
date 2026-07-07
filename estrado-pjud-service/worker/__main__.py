@@ -4,8 +4,10 @@ import logging
 import signal
 import sys
 import json
+import time
 
 from app.alerting import send_ops_alert
+from app.bandwidth import METER
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -62,6 +64,42 @@ async def process_batch(batch, engine, concurrency, shutdown_event, backoff):
     for result in results:
         if isinstance(result, Exception):
             logger.exception("Unhandled exception in process_batch task", exc_info=result)
+
+
+BANDWIDTH_ALERT_COOLDOWN_S = 6 * 60 * 60  # 6h, avoid spamming ops once over budget
+
+
+class BandwidthAlertState:
+    """Tracks when the last bandwidth alert fired, so we only alert once per
+    cooldown window instead of on every loop iteration."""
+
+    def __init__(self):
+        self.last_alert_ts: float | None = None
+
+
+async def maybe_alert_bandwidth(config, state: "BandwidthAlertState", now: float | None = None) -> None:
+    """Fire-and-forget check: alert ops when proxy bandwidth usage crosses
+    OJV_PROXY_GB_ALERT_PCT% of OJV_PROXY_GB_BUDGET. No-op in no-proxy mode
+    (OJV_PROXY_URL unset) and rate-limited to once per cooldown window.
+    """
+    if not config.OJV_PROXY_URL:
+        return
+
+    threshold_gb = config.OJV_PROXY_GB_BUDGET * config.OJV_PROXY_GB_ALERT_PCT / 100
+    if METER.total_gb < threshold_gb:
+        return
+
+    now = time.monotonic() if now is None else now
+    if state.last_alert_ts is not None and (now - state.last_alert_ts) < BANDWIDTH_ALERT_COOLDOWN_S:
+        return
+
+    state.last_alert_ts = now
+    await send_ops_alert(
+        config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
+        "bandwidth_high",
+        f"Proxy bandwidth {METER.total_gb:.2f}GB / budget {config.OJV_PROXY_GB_BUDGET}GB "
+        f"(>{config.OJV_PROXY_GB_ALERT_PCT}%)",
+    )
 
 
 async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
@@ -130,6 +168,8 @@ async def main():
     logger.info("Worker ready, entering main loop")
     notify_ready()
 
+    bandwidth_alert_state = BandwidthAlertState()
+
     try:
         while not shutdown_event.is_set():
             if backoff.is_open:
@@ -146,6 +186,7 @@ async def main():
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
                 await metrics.send_heartbeat()
+                await maybe_alert_bandwidth(config, bandwidth_alert_state)
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -159,6 +200,7 @@ async def main():
 
             await scheduler.release_batch(case_ids)
             await metrics.send_heartbeat()
+            await maybe_alert_bandwidth(config, bandwidth_alert_state)
 
     finally:
         notify_stopping()
