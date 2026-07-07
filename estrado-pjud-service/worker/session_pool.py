@@ -58,8 +58,8 @@ class SessionPool:
 
     def __init__(self, config: WorkerConfig):
         self._config = config
-        self._proxy_base = getattr(config, "OJV_PROXY_URL", None)
-        self._sticky_lifetime = getattr(config, "OJV_PROXY_STICKY_LIFETIME", "1h")
+        self._proxy_base = config.OJV_PROXY_URL
+        self._sticky_lifetime = config.OJV_PROXY_STICKY_LIFETIME
         self._pool_size = (
             config.OJV_PROXY_POOL_SIZE if self._proxy_base else config.POOL_SIZE
         )
@@ -73,7 +73,7 @@ class SessionPool:
         # → el escaneo devuelve None → semáforo sobre-liberado / slot atascado
         # en busy. El registro se puebla al retornar de acquire() y se limpia
         # en release(): una release de algo no registrado es un no-op seguro.
-        self._checkout: dict = {}
+        self._checkout: dict[OJVSession, _Slot] = {}
         # Rate-limit global: solo tiene sentido en modo sin-proxy (una sola
         # IP saliente compartida). En modo proxy cada slot egresa por su
         # propia IP y el rate-limit efectivo es per-adapter (ver G_relax).

@@ -4,7 +4,7 @@ from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
-from app.cookie_store import CookieStore
+from app.cookie_store import CookieBundle, CookieStore
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class APISessionPool:
             raise
         return session
 
-    def _pick_bundle(self):
+    def _pick_bundle(self) -> CookieBundle | None:
         """Pick one slot bundle from the multi-bundle store via round-robin.
 
         Round-robins across the sorted slot ids so successive new-session
@@ -71,7 +71,7 @@ class APISessionPool:
         self._rr_index += 1
         return bundles[chosen_id]
 
-    async def release(self, session: OJVSession, healthy: bool = True):
+    async def release(self, session: OJVSession, healthy: bool = True) -> None:
         """Return a session to the pool for reuse.
         If healthy=False the session is closed immediately and not recycled.
         """

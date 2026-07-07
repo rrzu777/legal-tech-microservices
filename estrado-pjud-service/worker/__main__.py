@@ -41,7 +41,13 @@ def setup_logging(level: str):
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
-async def process_batch(batch, engine, concurrency, shutdown_event, backoff):
+async def process_batch(
+    batch: list,
+    engine: SyncEngine,
+    concurrency: int,
+    shutdown_event: asyncio.Event,
+    backoff: CircuitBreaker,
+) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
 
@@ -60,10 +66,10 @@ async def process_batch(batch, engine, concurrency, shutdown_event, backoff):
             except Exception:
                 logger.exception("Unhandled error syncing case %s", case.get("id"))
 
-    results = await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            logger.exception("Unhandled exception in process_batch task", exc_info=result)
+    # _run_one nunca propaga una Exception (la captura y loguea internamente);
+    # return_exceptions=True contiene además cualquier BaseException (p.ej.
+    # CancelledError durante shutdown) para que un caso no cancele a los demás.
+    await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
 
 
 BANDWIDTH_ALERT_COOLDOWN_S = 6 * 60 * 60  # 6h, avoid spamming ops once over budget

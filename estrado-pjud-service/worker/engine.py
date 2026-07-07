@@ -278,6 +278,9 @@ class SyncEngine:
                 # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
                 # el external_payload bueno marcando "success". Corto-circuito
                 # sin penalizar la causa (no incrementa sync_attempts).
+                # session_healthy queda True a propósito: el contenido SÍ llegó
+                # por esta IP (no es bloqueo ni caída de proxy), el problema es
+                # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
                 await self._handle_parse_suspect(case, competencia)
                 self._metrics.record_error()
