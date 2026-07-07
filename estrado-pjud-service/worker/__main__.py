@@ -39,6 +39,31 @@ def setup_logging(level: str):
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
+async def process_batch(batch, engine, concurrency, shutdown_event, backoff):
+    """Process a batch of cases concurrently, bounded to `concurrency` in-flight
+    at a time (matches the number of residential IP slots in the pool).
+
+    Cases already dispatched (past the semaphore gate) are allowed to finish
+    even if shutdown is requested or the circuit breaker opens mid-batch; only
+    not-yet-started cases are skipped, for a graceful drain.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run_one(case):
+        async with sem:
+            if shutdown_event.is_set() or backoff.is_open:
+                return
+            try:
+                await engine.sync_case(case)
+            except Exception:
+                logger.exception("Unhandled error syncing case %s", case.get("id"))
+
+    results = await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            logger.exception("Unhandled exception in process_batch task", exc_info=result)
+
+
 async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
     """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
     sin crashear (evita el crash-loop de systemd martillando PJUD)."""
@@ -129,12 +154,8 @@ async def main():
 
             case_ids = [c["id"] for c in batch]
 
-            for case in batch:
-                if shutdown_event.is_set():
-                    break
-                if backoff.is_open:
-                    break
-                await engine.sync_case(case)
+            concurrency = config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            await process_batch(batch, engine, concurrency, shutdown_event, backoff)
 
             await scheduler.release_batch(case_ids)
             await metrics.send_heartbeat()
