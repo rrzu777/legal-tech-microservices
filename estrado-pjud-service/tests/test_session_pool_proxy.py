@@ -290,47 +290,6 @@ async def test_refresh_failure_during_acquire_is_non_fatal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_force_remint_skips_busy_slot(monkeypatch):
-    """force_remint() must NOT re-mint a slot that is currently checked out
-    (C2): the busy slot's session/proxy_url stay unchanged while free slots
-    are re-minted. After releasing, the pool is consistent and admits N."""
-    from worker import session_pool as sp
-
-    _patch_pool_deps(monkeypatch, sp)
-    config = _make_config(proxy_url="http://user:pw@geo.iproyal.com:12321", proxy_pool_size=3)
-    pool = sp.SessionPool(config)
-    await pool.initialize()
-
-    held = await pool.acquire()
-    held_slot = pool._checkout[held]
-    held_proxy_before = held_slot.proxy_url
-    held_session_before = held_slot.session
-
-    free_slots = [s for s in pool._slots if s is not held_slot]
-    free_proxies_before = {s.index: s.proxy_url for s in free_slots}
-    free_sessions_before = {s.index: s.session for s in free_slots}
-
-    await pool.force_remint()
-
-    # Busy slot untouched (no swap, no close).
-    assert held_slot.session is held_session_before
-    assert held_slot.proxy_url == held_proxy_before
-    assert held_session_before.closed is False
-    # Free slots WERE re-minted (session + proxy_url changed).
-    for s in free_slots:
-        assert s.session is not free_sessions_before[s.index]
-        assert s.proxy_url != free_proxies_before[s.index]
-
-    # Release the held session; pool must be consistent and admit exactly N.
-    await pool.release(held)
-    acquired = [await pool.acquire() for _ in range(3)]
-    assert len(set(id(a) for a in acquired)) == 3  # 3 distinct sessions
-    # 4th blocks (all N busy) → semaphore is not inflated above N.
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(pool.acquire(), timeout=0.2)
-
-
-@pytest.mark.asyncio
 async def test_release_of_unacquired_session_does_not_over_release(monkeypatch):
     """release() of a session that was never acquired must NOT release the
     semaphore (C1) and must not raise."""

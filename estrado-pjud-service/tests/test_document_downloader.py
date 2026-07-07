@@ -1,9 +1,18 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
+from app import document_downloader
 from app.document_downloader import download_documents, DownloadedDoc, MAX_DOC_SIZE
+
+
+def _pdf_resp():
+    resp = MagicMock()
+    resp.content = b"%PDF-1.4 " + b"x" * 200
+    resp.headers = {"content-type": "application/pdf"}
+    return resp
 
 
 @pytest.mark.asyncio
@@ -73,3 +82,52 @@ async def test_handles_download_failure_gracefully():
     results = await download_documents(session, movements)
 
     assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_retries_transient_error_then_succeeds(monkeypatch):
+    """Transient residential-proxy flakiness (RemoteProtocolError, ProxyError
+    504, timeouts) should be retried, not dropped on the first failure."""
+    monkeypatch.setattr(document_downloader.asyncio, "sleep", AsyncMock())
+    session = AsyncMock()
+    session.download_document.side_effect = [
+        httpx.RemoteProtocolError("peer closed connection"),
+        httpx.ProxyError("504 Gateway Timeout"),
+        _pdf_resp(),
+    ]
+
+    movements = [{"documento_url": "doc.php", "documento_token": "tok"}]
+    results = await download_documents(session, movements)
+
+    assert len(results) == 1
+    assert session.download_document.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_gives_up_after_exhausting_transient_retries(monkeypatch):
+    """After DOC_RETRY_ATTEMPTS transient failures the doc is dropped (None),
+    non-fatal — sync continues. Attempts are bounded."""
+    monkeypatch.setattr(document_downloader.asyncio, "sleep", AsyncMock())
+    session = AsyncMock()
+    session.download_document.side_effect = httpx.ConnectError("no route to host")
+
+    movements = [{"documento_url": "doc.php", "documento_token": "tok"}]
+    results = await download_documents(session, movements)
+
+    assert len(results) == 0
+    assert session.download_document.call_count == document_downloader.DOC_RETRY_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_does_not_retry_non_transient_error(monkeypatch):
+    """A non-transport error (e.g. bad token / programming error) is NOT a
+    residential hiccup — fail fast, no retry."""
+    monkeypatch.setattr(document_downloader.asyncio, "sleep", AsyncMock())
+    session = AsyncMock()
+    session.download_document.side_effect = ValueError("bad token")
+
+    movements = [{"documento_url": "doc.php", "documento_token": "tok"}]
+    results = await download_documents(session, movements)
+
+    assert len(results) == 0
+    assert session.download_document.call_count == 1
