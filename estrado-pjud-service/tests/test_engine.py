@@ -90,7 +90,6 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
         mock_pool.release = AsyncMock()
-        mock_pool.force_remint = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
     if mock_sb is None:
@@ -181,7 +180,6 @@ class TestSyncEngine:
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_session)
         mock_pool.release = AsyncMock()
-        mock_pool.force_remint = AsyncMock()
         mock_pool.enforce_global_rate_limit = AsyncMock()
 
         mock_sb = MagicMock()
@@ -216,9 +214,8 @@ class TestSyncEngine:
 
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
-        # Per-slot reactive re-mint: release(healthy=False), NOT force_remint.
+        # Per-slot reactive re-mint on block: release(healthy=False).
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
-        mock_pool.force_remint.assert_not_called()
         # Anti-apagón: a block must never penalize the case via _update_case_error
         # nor increment sync_attempts.
         mock_update_error.assert_not_called()
@@ -304,9 +301,8 @@ class TestSyncEngine:
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
         mock_metrics.record_error.assert_called_once()
-        # Per-slot reactive re-mint: release(healthy=False), NOT force_remint.
+        # Per-slot reactive re-mint on block: release(healthy=False).
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
-        mock_pool.force_remint.assert_not_called()
         # Anti-apagón: a block must never penalize the case via _update_case_error.
         mock_update_error.assert_not_called()
 

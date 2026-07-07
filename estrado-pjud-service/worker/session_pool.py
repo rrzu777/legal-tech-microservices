@@ -6,28 +6,12 @@ from dataclasses import dataclass
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieStore
-from app.minter import CookieMinter, MintResult
+from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
 from app.session import OJVSession
 from worker.config import WorkerConfig
 
 logger = logging.getLogger(__name__)
-
-
-async def get_or_mint_cookies(store: CookieStore, minter: CookieMinter, max_age_s: int) -> MintResult:
-    """Devuelve cookies frescos del store, o mintea y persiste si faltan/expiraron.
-
-    NOTA: helper single-bundle, mantenido por back-compat (usado en tests y
-    potencialmente por otros callers). El SessionPool multi-slot mintea
-    directamente vía CookieMinter por slot (ver _mint_slot) porque cada slot
-    tiene su propio bundle (proxy_url distinto).
-    """
-    bundle = store.load()
-    if bundle is not None and bundle.age_seconds < max_age_s:
-        return MintResult(cookies=bundle.cookies, user_agent=bundle.user_agent)
-    result = await minter.mint()
-    store.save(cookies=result.cookies, user_agent=result.user_agent)
-    return result
 
 
 @dataclass
@@ -81,12 +65,6 @@ class SessionPool:
         self._last_global_request: float = 0.0
         self._global_min_delay: float = 1.2
         self._store = CookieStore(config.COOKIE_STORE_PATH)
-
-    @property
-    def _pool(self) -> list:
-        """Back-compat shim: algunas pruebas/callers viejos podrían inspeccionar
-        `_pool` como lista de sesiones. Preferir `_slots` en código nuevo."""
-        return [slot.session for slot in self._slots]
 
     # -- Minteo por-slot ------------------------------------------------
 
@@ -230,24 +208,6 @@ class SessionPool:
             if elapsed < self._global_min_delay:
                 await asyncio.sleep(self._global_min_delay - elapsed)
             self._last_global_request = time.monotonic()
-
-    async def force_remint(self):
-        """Back-compat: re-mintea los slots LIBRES. El engine (Task 5b) pasará
-        a usar release(healthy=False) por-slot; esto se mantiene seguro hasta
-        que ese rewire ocurra.
-
-        CRÍTICO: NUNCA tocar un slot `busy` (C2). Un slot ocupado es propiedad
-        de una corrutina que sostiene su sesión; re-mintearlo swappea+cierra
-        esa sesión bajo el caller → sesión huérfana (release() no la encuentra
-        → slot atascado en busy + semáforo sobre-liberado) + use-after-close
-        (la vieja sesión se cierra mientras otra corrutina la usa). Solo la
-        propia corrutina dueña puede swappear su slot (vía el refresh de su
-        acquire, o release(healthy=False)), y esas rutas liberan/registran bien."""
-        for slot in list(self._slots):
-            if slot.busy:
-                logger.info("force_remint: slot %d ocupado; se omite (lo re-mintea su dueño)", slot.index)
-                continue
-            await self._refresh_slot(slot)
 
     async def close_all(self):
         for slot in self._slots:
