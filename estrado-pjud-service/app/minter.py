@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 from playwright.async_api import async_playwright
 
+from app.proxy import split_proxy_for_playwright
+
 logger = logging.getLogger(__name__)
 
 _CONSULTA_PATH = "/consultaUnificada.php"
@@ -51,7 +53,10 @@ class CookieMinter:
     async def mint(self) -> MintResult:
         launch_kwargs = {"headless": False, "args": _ANTIBOT_ARGS}
         if self._proxy:
-            launch_kwargs["proxy"] = {"server": self._proxy}
+            # Playwright rechaza credenciales embebidas en `server`
+            # (net::ERR_INVALID_AUTH_CREDENTIALS, verificado en el VPS).
+            # Deben ir separadas en username/password.
+            launch_kwargs["proxy"] = split_proxy_for_playwright(self._proxy)
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(**launch_kwargs)
