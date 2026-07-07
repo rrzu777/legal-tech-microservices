@@ -6,6 +6,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, NamedTuple
 
+import httpx
+
 if TYPE_CHECKING:
     from app.session import OJVSession
 
@@ -14,6 +16,15 @@ logger = logging.getLogger(__name__)
 MAX_DOC_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_CONCURRENT = 3
 DOWNLOAD_DELAY_S = 0.5
+
+# Retry acotado para flakiness transitoria de la IP residencial (peer closed /
+# RemoteProtocolError, ProxyError 504, timeouts de lectura). Solo reintenta
+# errores de transporte httpx — un fallo no-transitorio (token malo, bug) NO se
+# reintenta. Al agotar los intentos el doc se descarta (None): no-fatal, el sync
+# sigue. httpx.TransportError cubre RemoteProtocolError, ProxyError,
+# TimeoutException, ConnectError y ReadError.
+DOC_RETRY_ATTEMPTS = 3
+DOC_RETRY_BACKOFF_S = 1.0
 
 _CONTENT_TYPE_EXT = {
     "application/pdf": "pdf",
@@ -28,6 +39,29 @@ class DownloadedDoc(NamedTuple):
     data: bytes
     content_type: str
     extension: str
+
+
+async def _fetch_with_retry(
+    session: OJVSession, url: str, token: str, param: str
+) -> httpx.Response:
+    """Descarga un documento reintentando solo ante errores de transporte.
+
+    Reintenta hasta DOC_RETRY_ATTEMPTS con backoff lineal. Re-lanza la última
+    excepción transitoria si se agotan los intentos (el caller la captura y
+    descarta el doc). Errores no-transitorios se propagan de inmediato.
+    """
+    for attempt in range(DOC_RETRY_ATTEMPTS):
+        try:
+            return await session.download_document(url, token, param)
+        except httpx.TransportError as e:
+            if attempt == DOC_RETRY_ATTEMPTS - 1:
+                raise
+            logger.info(
+                "Descarga transitoria falló (intento %d/%d): %s; reintentando",
+                attempt + 1, DOC_RETRY_ATTEMPTS, type(e).__name__,
+            )
+            await asyncio.sleep(DOC_RETRY_BACKOFF_S * (attempt + 1))
+    raise RuntimeError("unreachable")  # el loop retorna o re-lanza; satisface el type checker
 
 
 async def download_documents(
@@ -55,7 +89,7 @@ async def download_documents(
         async with sem:
             await asyncio.sleep(DOWNLOAD_DELAY_S)
             try:
-                resp = await session.download_document(url, token, param_name)
+                resp = await _fetch_with_retry(session, url, token, param_name)
 
                 content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
                 ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
@@ -91,7 +125,7 @@ async def download_single_document(
 ) -> DownloadedDoc | None:
     """Download a single document by URL + token. Returns None on failure."""
     try:
-        resp = await session.download_document(url, token, param)
+        resp = await _fetch_with_retry(session, url, token, param)
         content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
         ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
         if len(resp.content) > MAX_DOC_SIZE:
