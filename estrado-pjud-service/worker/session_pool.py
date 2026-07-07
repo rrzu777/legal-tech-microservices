@@ -66,6 +66,14 @@ class SessionPool:
         self._slots: list[_Slot] = []
         self._sem = asyncio.Semaphore(self._pool_size)
         self._lock = asyncio.Lock()
+        # Registro explícito de checkouts: sesión -> slot que la posee. NO
+        # mapear por identidad escaneando `_slots` (s.session is session):
+        # otras rutas (re-mint) swappean `slot.session` bajo el caller, así
+        # que la sesión que un caller sostiene puede dejar de estar en `_slots`
+        # → el escaneo devuelve None → semáforo sobre-liberado / slot atascado
+        # en busy. El registro se puebla al retornar de acquire() y se limpia
+        # en release(): una release de algo no registrado es un no-op seguro.
+        self._checkout: dict = {}
         # Rate-limit global: solo tiene sentido en modo sin-proxy (una sola
         # IP saliente compartida). En modo proxy cada slot egresa por su
         # propia IP y el rate-limit efectivo es per-adapter (ver G_relax).
@@ -158,7 +166,13 @@ class SessionPool:
         se re-mintea (manteniendo busy=True para que nadie más lo tome)."""
         await self._sem.acquire()
         async with self._lock:
-            slot = next(s for s in self._slots if not s.busy)
+            slot = next((s for s in self._slots if not s.busy), None)
+            if slot is None:
+                # Invariante violada: el semáforo dio un permiso pero no hay
+                # slot libre. Convertir en un error claro (I1) en vez de un
+                # StopIteration desnudo. Devolver el permiso para no filtrarlo.
+                self._sem.release()
+                raise RuntimeError("acquire: semáforo dio permiso pero no hay slot libre")
             slot.busy = True
 
         needs_refresh = (
@@ -175,22 +189,34 @@ class SessionPool:
                 # re-mint reactivo vía release(healthy=False).
                 logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
 
-        return slot.session
+        # Registrar el checkout DESPUÉS de cualquier refresh: la sesión que
+        # devolvemos es la que el caller sostendrá y con la que llamará release().
+        session = slot.session
+        self._checkout[session] = slot
+        return session
 
     async def release(self, session: OJVSession, healthy: bool = True) -> None:
         """Libera un slot. Si `healthy=False`, re-mintea ESE slot (IP nueva)
         antes de devolverlo al pool — reactivo, por-slot, sin afectar otros
-        slots en uso por otras corrutinas."""
-        slot = next((s for s in self._slots if s.session is session), None)
+        slots en uso por otras corrutinas.
+
+        El slot se resuelve por el registro explícito de checkouts (no por
+        identidad escaneando `_slots`). Una release de una sesión no registrada
+        (nunca adquirida, o ya liberada, o swappeada externamente) es un no-op
+        seguro: NO libera el semáforo (nada fue tomado por ella) — así se evita
+        sobre-liberar el semáforo por encima de N (C1)."""
+        slot = self._checkout.pop(session, None)
+        if slot is None:
+            logger.warning("release() de una sesión no registrada; ignorada")
+            return
         try:
-            if slot is not None and not healthy:
+            if not healthy:
                 try:
                     await self._refresh_slot(slot)
                 except Exception:
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
         finally:
-            if slot is not None:
-                slot.busy = False
+            slot.busy = False
             self._sem.release()
 
     async def enforce_global_rate_limit(self):
@@ -206,10 +232,21 @@ class SessionPool:
             self._last_global_request = time.monotonic()
 
     async def force_remint(self):
-        """Back-compat: re-mintea TODOS los slots. El engine (Task 5b) pasará
-        a usar release(healthy=False) por-slot; esto se mantiene simple hasta
-        que ese rewire ocurra."""
+        """Back-compat: re-mintea los slots LIBRES. El engine (Task 5b) pasará
+        a usar release(healthy=False) por-slot; esto se mantiene seguro hasta
+        que ese rewire ocurra.
+
+        CRÍTICO: NUNCA tocar un slot `busy` (C2). Un slot ocupado es propiedad
+        de una corrutina que sostiene su sesión; re-mintearlo swappea+cierra
+        esa sesión bajo el caller → sesión huérfana (release() no la encuentra
+        → slot atascado en busy + semáforo sobre-liberado) + use-after-close
+        (la vieja sesión se cierra mientras otra corrutina la usa). Solo la
+        propia corrutina dueña puede swappear su slot (vía el refresh de su
+        acquire, o release(healthy=False)), y esas rutas liberan/registran bien."""
         for slot in list(self._slots):
+            if slot.busy:
+                logger.info("force_remint: slot %d ocupado; se omite (lo re-mintea su dueño)", slot.index)
+                continue
             await self._refresh_slot(slot)
 
     async def close_all(self):
