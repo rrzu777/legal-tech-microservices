@@ -16,7 +16,10 @@ _TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 
 
 def generate_session_token(n: int = 8) -> str:
-    """Genera un token alfanumérico aleatorio de largo `n` usando `secrets`."""
+    """Genera un token alfanumérico en minúscula de largo `n` usando `secrets`.
+
+    Minúscula a propósito: los session tokens de IPRoyal son case-insensitive.
+    """
     return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(n))
 
 
@@ -27,11 +30,14 @@ def build_sticky_proxy_url(base_url: str, token: str, lifetime: str = "1h") -> s
     para no romper si el password ya contiene `_` o `-` (ej. "pw_country-cl").
     """
     parsed = urlparse(base_url)
-    new_password = f"{parsed.password}_session-{token}_lifetime-{lifetime}"
+    base_pw = parsed.password or ""
+    new_password = f"{base_pw}_session-{token}_lifetime-{lifetime}"
 
     userinfo = parsed.username or ""
     userinfo = f"{userinfo}:{new_password}"
 
+    # netloc se reconstruye a mano (no round-trip por el parser). Válido porque
+    # los passwords de IPRoyal son [a-z0-9_-]: sin `@`/`:` que ambigüen el netloc.
     netloc = f"{userinfo}@{parsed.hostname}"
     if parsed.port is not None:
         netloc = f"{netloc}:{parsed.port}"
