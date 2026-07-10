@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 
 from app.adapters.http_adapter import _USER_AGENT
 from app.bandwidth import METER
+from app.parsers.search_parser import detect_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,19 @@ class FamiliaAuthSession:
         html = _decode(resp)
         final_url = str(resp.url)
 
+        if detect_blocked(html):
+            raise FamiliaBlockedError("Clave PJ login: challenge F5")
+
+        # TODO(U3): validar con credencial Clave PJ productiva real:
+        #  (1) la URL/HTML exacta del RECHAZO de credencial (hoy _detect_login_error
+        #      es por texto de body; confirmar si además existe una URL tipo
+        #      loginErrorPjud.html), y
+        #  (2) el redirect del ÉXITO. OJO: _detect_session_error matchea la
+        #      subcadena "ojv.pjud.cl", que ES el host de login Clave PJ. Si un
+        #      login exitoso queda en ojv.pjud.cl, daría un SessionError falso
+        #      (transitorio → causa atascada en "blocked"). Verificar el host de
+        #      éxito real antes de confiar en _detect_session_error para Clave PJ.
+
         if _detect_login_error(html):
             raise InvalidCredentialsError("Clave PJ: credentials rejected")
         if _detect_session_error(final_url):
@@ -241,7 +255,10 @@ class FamiliaAuthSession:
             headers={**_FAMILIA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
-        return _decode(resp)
+        html = _decode(resp)
+        if detect_blocked(html):
+            raise FamiliaBlockedError("Familia search: challenge F5")
+        return html
 
     async def close(self) -> None:
         await self._client.aclose()

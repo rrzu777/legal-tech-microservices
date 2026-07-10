@@ -51,3 +51,35 @@ async def test_search_familia_counts_bandwidth():
     await s.search_familia(rut="11111111-1")
     assert METER.total_bytes > 0
     await s.close()
+
+
+from app.familia.auth import FamiliaBlockedError as _FBE  # alias para claridad
+
+
+async def test_search_raises_blocked_on_f5_challenge():
+    # 'bobcmn' es el marcador de challenge F5 que detect_blocked reconoce.
+    def handler(request):
+        return httpx.Response(200, text="<html>window.bobcmn = 1</html>")
+
+    s = FamiliaAuthSession(proxy_url=None, cookies=None, user_agent=None, rate_limit_s=0)
+    await s._client.aclose()
+    s._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    with pytest.raises(_FBE):
+        await s.search_familia(rut="11111111-1")
+    await s.close()
+
+
+async def test_login_clave_pj_raises_blocked_on_f5_challenge():
+    def handler(request):
+        return httpx.Response(200, text="<html>bobcmn challenge</html>")
+
+    s = FamiliaAuthSession(proxy_url=None, cookies=None, user_agent=None, rate_limit_s=0)
+    await s._client.aclose()
+    s._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    with pytest.raises(_FBE):
+        await s.login("11111111-1", "x", "clave_pj")
+    await s.close()
