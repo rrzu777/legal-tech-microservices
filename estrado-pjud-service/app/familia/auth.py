@@ -68,6 +68,7 @@ def _detect_login_error(html: str) -> bool:
     lower = html.lower()
     return any(k in lower for k in [
         "gob-response-error", "clave incorrecta", "rut o clave",
+        "rut o contraseña", "rut o constraseña",  # variante correcta + typo real del portal
         "credenciales inválidas", "no existe", "contraseña incorrecta",
         "rut incorrecto", "usuario no encontrado",
         "clave poder judicial incorrecta", "rut no registrado",
@@ -237,3 +238,7 @@ class InvalidCredentialsError(Exception):
 
 class SessionError(Exception):
     """Failed to establish an authenticated OJV session."""
+
+
+class FamiliaBlockedError(Exception):
+    """OJV devolvió un challenge F5 (bloqueo transitorio; NO penaliza sync_attempts)."""
