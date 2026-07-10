@@ -389,11 +389,21 @@ En `app/familia/auth.py`:
 from app.parsers.search_parser import detect_blocked
 ```
 
-(b) En `_login_clave_pj`, después de `html = _decode(resp)` (línea 117) y ANTES de `if _detect_login_error(html):`, insertar:
+(b) En `_login_clave_pj`, después de `html = _decode(resp)` (línea 117) y ANTES de `if _detect_login_error(html):`, insertar el chequeo de bloqueo y el TODO de validación con credencial real:
 
 ```python
         if detect_blocked(html):
             raise FamiliaBlockedError("Clave PJ login: challenge F5")
+
+        # TODO(U3): validar con credencial Clave PJ productiva real:
+        #  (1) la URL/HTML exacta del RECHAZO de credencial (hoy _detect_login_error
+        #      es por texto de body; confirmar si además existe una URL tipo
+        #      loginErrorPjud.html), y
+        #  (2) el redirect del ÉXITO. OJO: _detect_session_error matchea la
+        #      subcadena "ojv.pjud.cl", que ES el host de login Clave PJ. Si un
+        #      login exitoso queda en ojv.pjud.cl, daría un SessionError falso
+        #      (transitorio → causa atascada en "blocked"). Verificar el host de
+        #      éxito real antes de confiar en _detect_session_error para Clave PJ.
 ```
 
 (c) En `search_familia`, cambiar el final (líneas 221-222) de:
@@ -561,6 +571,27 @@ async def test_release_unhealthy_remints_the_slot(monkeypatch):
     assert slot.busy is False
     assert slot.proxy_url != proxy_before  # IP nueva
     assert slot.session is not session_before
+
+
+@pytest.mark.asyncio
+async def test_acquire_familia_bundle_releases_on_load_failure(monkeypatch):
+    """Si load_slot() tira tras tomar el semáforo, el permiso y el slot NO
+    deben quedar colgados (sin leak de capacidad)."""
+    import asyncio
+    from worker import session_pool as sp
+
+    store = _patch(monkeypatch, sp)
+    pool = sp.SessionPool(_make_config(proxy_pool_size=1))
+    await pool.initialize()
+
+    store.load_slot = MagicMock(side_effect=RuntimeError("store corrupto"))
+    sem_before = pool._sem._value
+
+    with pytest.raises(RuntimeError):
+        await pool.acquire_familia_bundle()
+
+    assert pool._sem._value == sem_before  # semáforo no se filtró
+    assert all(not s.busy for s in pool._slots)  # slot liberado
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -607,7 +638,17 @@ from app.cookie_store import CookieBundle, CookieStore
                 # por el path de bloqueo sin incrementar sync_attempts.
                 logger.exception("Refresh de slot %d falló (Familia); usando bundle existente", slot.index)
 
-        bundle = self._store.load_slot(slot.index)
+        # load_slot puede fallar (JSON corrupto/locked). Si tira DESPUÉS de tomar
+        # el semáforo + busy=True, hay que liberar ambos o el slot queda colgado
+        # para siempre (pérdida de capacidad). El path `slot is None` ya libera lo
+        # suyo; este guard cubre el resto.
+        try:
+            bundle = self._store.load_slot(slot.index)
+        except Exception:
+            logger.exception("load_slot falló para slot %d (Familia)", slot.index)
+            slot.busy = False
+            self._sem.release()
+            raise
         return bundle, slot
 
     async def release_familia_bundle(self, slot: _Slot, healthy: bool = True) -> None:
@@ -627,7 +668,7 @@ from app.cookie_store import CookieBundle, CookieStore
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd estrado-pjud-service && python -m pytest tests/test_familia_pool.py -v`
-Expected: PASS (3 passed)
+Expected: PASS (4 passed)
 
 - [ ] **Step 5: Verificar que no rompimos el pool existente**
 
@@ -695,7 +736,7 @@ En `app/session_pool.py`, agregar dentro de `class APISessionPool`, después de 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd estrado-pjud-service && python -m pytest tests/test_familia_pool.py -v`
-Expected: PASS (5 passed)
+Expected: PASS (6 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -772,7 +813,9 @@ async def test_clave_unica_credential_is_terminal_not_crash():
 
 
 @pytest.mark.asyncio
-async def test_login_block_does_not_penalize_and_remints():
+async def test_login_block_does_not_penalize_and_remints(monkeypatch):
+    import worker.engine as eng
+
     engine = _make_engine()
     engine._get_decrypted_credential = AsyncMock(
         return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
@@ -782,8 +825,8 @@ async def test_login_block_does_not_penalize_and_remints():
     fake_session.login = AsyncMock(side_effect=FamiliaBlockedError("F5"))
     fake_session.__aenter__ = AsyncMock(return_value=fake_session)
     fake_session.__aexit__ = AsyncMock(return_value=False)
-    import worker.engine as eng
-    eng.FamiliaAuthSession = MagicMock(return_value=fake_session)
+    # monkeypatch (no asignación cruda) → se restaura al terminar el test.
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
     result = await engine._sync_familia_case(_CASE, None, MagicMock())
 
@@ -796,7 +839,9 @@ async def test_login_block_does_not_penalize_and_remints():
 
 
 @pytest.mark.asyncio
-async def test_invalid_credentials_is_terminal_and_releases_healthy():
+async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch):
+    import worker.engine as eng
+
     engine = _make_engine()
     engine._get_decrypted_credential = AsyncMock(
         return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
@@ -806,8 +851,7 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy():
     fake_session.login = AsyncMock(side_effect=InvalidCredentialsError("bad"))
     fake_session.__aenter__ = AsyncMock(return_value=fake_session)
     fake_session.__aexit__ = AsyncMock(return_value=False)
-    import worker.engine as eng
-    eng.FamiliaAuthSession = MagicMock(return_value=fake_session)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
     result = await engine._sync_familia_case(_CASE, None, MagicMock())
 
@@ -989,6 +1033,33 @@ async def test_run_sync_blocked_when_login_challenged(monkeypatch):
 
     assert resp.ok is False
     assert resp.error_code == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_run_sync_multicase_block_aborts_batch(monkeypatch):
+    from app.routes import familia as mod
+    from app.familia.auth import FamiliaBlockedError
+    from app.familia.models import FamiliaCaseFilter
+
+    pool = MagicMock()
+    pool.pick_familia_bundle = MagicMock(return_value=_bundle())
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(side_effect=FamiliaBlockedError("F5"))
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    req = FamiliaSyncRequest(
+        rut="11111111-1", password="p", auth_type="clave_pj",
+        cases=[FamiliaCaseFilter(rit="100", year="2024")],
+    )
+    resp = await mod._run_sync(req, rate_s=0.0, pool=pool)
+
+    # No debe reportar ok=True ocultando el bloqueo.
+    assert resp.ok is False
+    assert resp.error_code == "blocked"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1088,12 +1159,58 @@ a:
             )
 ```
 
-> El bloque multi-causa (`if req.cases:`, líneas 71-87) ya captura `Exception` por causa y continúa; un `FamiliaBlockedError` ahí se loguea y se saltea esa causa, lo cual es aceptable (no aborta el batch). No requiere cambio.
+(e) El bloque multi-causa (`if req.cases:`, líneas 71-87) captura `Exception` por causa y continúa. Sin cambio, un `FamiliaBlockedError` ahí se tragaría → devolvería `ok=True` con casos parciales/vacíos, ocultando el bloqueo (el caller no reintentaría). Insertar un `except FamiliaBlockedError` ANTES del `except Exception` del loop, que **aborta el batch** con `blocked`. Cambiar:
+
+```python
+            for case_filter in req.cases:
+                try:
+                    html = await session.search_familia(
+                        rut=req.rut, rit=case_filter.rit, year=case_filter.year,
+                    )
+                    casos, err = parse_familia_results(html)
+                    if err and err != "no_cases":
+                        logger.warning(
+                            "familia_sync: parse error for RIT %s-%s: %s",
+                            case_filter.rit, case_filter.year, err,
+                        )
+                    all_casos.extend(casos)
+                except Exception as e:
+                    logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
+            return FamiliaSyncResponse(ok=True, casos=all_casos)
+```
+
+a:
+
+```python
+            for case_filter in req.cases:
+                try:
+                    html = await session.search_familia(
+                        rut=req.rut, rit=case_filter.rit, year=case_filter.year,
+                    )
+                    casos, err = parse_familia_results(html)
+                    if err and err != "no_cases":
+                        logger.warning(
+                            "familia_sync: parse error for RIT %s-%s: %s",
+                            case_filter.rit, case_filter.year, err,
+                        )
+                    all_casos.extend(casos)
+                except FamiliaBlockedError:
+                    # Un bloqueo F5 aborta el batch: no seguir martillando la
+                    # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
+                    return FamiliaSyncResponse(
+                        ok=False, casos=[],
+                        error_code="blocked",
+                        error="OJV está limitando el acceso; reintentá en unos minutos",
+                    )
+                except Exception as e:
+                    logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
+            return FamiliaSyncResponse(ok=True, casos=all_casos)
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd estrado-pjud-service && python -m pytest tests/test_familia_routes.py -v`
-Expected: PASS (2 passed)
+Expected: PASS (3 passed)
 
 - [ ] **Step 5: Verificar rutas + suite completa Familia**
 
