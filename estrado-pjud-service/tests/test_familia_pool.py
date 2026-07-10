@@ -142,3 +142,24 @@ async def test_acquire_familia_bundle_releases_on_load_failure(monkeypatch):
 
     assert pool._sem._value == sem_before  # semáforo no se filtró
     assert all(not s.busy for s in pool._slots)  # slot liberado
+
+
+def test_api_pick_familia_bundle_none_when_empty(monkeypatch):
+    from app.session_pool import APISessionPool
+
+    settings = MagicMock(SESSION_POOL_SIZE=2, SESSION_MAX_AGE_S=1500, COOKIE_STORE_PATH="/tmp/x.json")
+    pool = APISessionPool(settings)
+    pool._store = MagicMock()
+    pool._store.load_all = MagicMock(return_value={})
+    assert pool.pick_familia_bundle() is None
+
+
+def test_api_pick_familia_bundle_returns_bundle(monkeypatch):
+    from app.session_pool import APISessionPool
+
+    settings = MagicMock(SESSION_POOL_SIZE=2, SESSION_MAX_AGE_S=1500, COOKIE_STORE_PATH="/tmp/x.json")
+    pool = APISessionPool(settings)
+    b = CookieBundle(cookies={"TSPD_101": "z"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
+    pool._store = MagicMock()
+    pool._store.load_all = MagicMock(return_value={"0": b})
+    assert pool.pick_familia_bundle() is b
