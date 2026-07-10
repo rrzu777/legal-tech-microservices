@@ -10,6 +10,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.adapters.http_adapter import _USER_AGENT
+from app.bandwidth import METER
+from app.parsers.search_parser import detect_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,7 @@ def _detect_login_error(html: str) -> bool:
     lower = html.lower()
     return any(k in lower for k in [
         "gob-response-error", "clave incorrecta", "rut o clave",
+        "rut o contraseña", "rut o constraseña",  # variante correcta + typo real del portal
         "credenciales inválidas", "no existe", "contraseña incorrecta",
         "rut incorrecto", "usuario no encontrado",
         "clave poder judicial incorrecta", "rut no registrado",
@@ -83,18 +86,36 @@ def _detect_session_error(url: str) -> bool:
 class FamiliaAuthSession:
     """Short-lived authenticated OJV session for a single Familia sync."""
 
-    def __init__(self, rate_limit_s: float = 2.5):
+    def __init__(
+        self,
+        proxy_url: str | None = None,
+        cookies: dict[str, str] | None = None,
+        user_agent: str | None = None,
+        rate_limit_s: float = 2.5,
+    ):
         self._rate_s = rate_limit_s
         self._last: float = 0.0
         self._client = httpx.AsyncClient(
+            proxy=proxy_url,
+            cookies=cookies or {},
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             headers={
-                "User-Agent": _USER_AGENT,
+                "User-Agent": user_agent or _USER_AGENT,
                 "Accept-Language": "es-CL,es;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
         )
+
+    async def _get(self, url: str, **kwargs) -> httpx.Response:
+        resp = await self._client.get(url, **kwargs)
+        METER.add(len(resp.content))
+        return resp
+
+    async def _post(self, url: str, **kwargs) -> httpx.Response:
+        resp = await self._client.post(url, **kwargs)
+        METER.add(len(resp.content))
+        return resp
 
     async def _wait(self) -> None:
         elapsed = time.monotonic() - self._last
@@ -106,16 +127,29 @@ class FamiliaAuthSession:
         rut_digits, _ = _rut_parts(rut)
 
         await self._wait()
-        await self._client.get(_CPJ_LOGIN_PAGE)  # obtain F5 BIG-IP cookies
+        await self._get(_CPJ_LOGIN_PAGE)  # obtain F5 BIG-IP cookies
 
         await self._wait()
-        resp = await self._client.post(
+        resp = await self._post(
             _CPJ_LOGIN_API,
             data={"rutPjud": rut_digits, "passwordPjud": password},
             headers={"Referer": _CPJ_LOGIN_PAGE, "Content-Type": "application/x-www-form-urlencoded"},
         )
         html = _decode(resp)
         final_url = str(resp.url)
+
+        if detect_blocked(html):
+            raise FamiliaBlockedError("Clave PJ login: challenge F5")
+
+        # TODO(U3): validar con credencial Clave PJ productiva real:
+        #  (1) la URL/HTML exacta del RECHAZO de credencial (hoy _detect_login_error
+        #      es por texto de body; confirmar si además existe una URL tipo
+        #      loginErrorPjud.html), y
+        #  (2) el redirect del ÉXITO. OJO: _detect_session_error matchea la
+        #      subcadena "ojv.pjud.cl", que ES el host de login Clave PJ. Si un
+        #      login exitoso queda en ojv.pjud.cl, daría un SessionError falso
+        #      (transitorio → causa atascada en "blocked"). Verificar el host de
+        #      éxito real antes de confiar en _detect_session_error para Clave PJ.
 
         if _detect_login_error(html):
             raise InvalidCredentialsError("Clave PJ: credentials rejected")
@@ -126,10 +160,12 @@ class FamiliaAuthSession:
         logger.info("Clave PJ session established")
 
     async def _login_clave_unica(self, rut: str, password: str) -> None:
+        # DORMANT: login() ya no enruta a clave_unica (decisión: solo Clave PJ).
+        # Se conserva para una eventual reactivación; ver TODO(U3) en _login_clave_pj.
         rut_digits, _ = _rut_parts(rut)
 
         await self._wait()
-        resp_home = await self._client.get(_CU_HOME)
+        resp_home = await self._get(_CU_HOME)
         soup = BeautifulSoup(_decode(resp_home), "html.parser")
         cuform = soup.find("form", {"id": "cuform"})
         if not cuform:
@@ -148,7 +184,7 @@ class FamiliaAuthSession:
             )
 
         await self._wait()
-        resp_cu = await self._client.post(
+        resp_cu = await self._post(
             _CU_INIT_URL,
             data={field_name: jwt_value},
             headers={"Referer": _CU_HOME},
@@ -165,7 +201,7 @@ class FamiliaAuthSession:
 
         # token="" is intentional — reCAPTCHA v3 present but not enforced server-side (verified 2026-04-20)
         await self._wait()
-        resp_login = await self._client.post(
+        resp_login = await self._post(
             cu_url,
             data={
                 "csrfmiddlewaretoken": csrf,
@@ -192,7 +228,9 @@ class FamiliaAuthSession:
         if auth_type == "clave_pj":
             await self._login_clave_pj(rut, password)
         elif auth_type == "clave_unica":
-            await self._login_clave_unica(rut, password)
+            # Clave Única quedó dormida (solo Clave PJ). El método sigue en el
+            # archivo pero login() ya no enruta a él.
+            raise ValueError("Clave Única no soportada; usá Clave Poder Judicial")
         else:
             raise ValueError(f"Unknown auth_type: {auth_type!r}")
 
@@ -213,13 +251,16 @@ class FamiliaAuthSession:
             "apeMatMisCauFam":        "",
         }
         await self._wait()
-        resp = await self._client.post(
+        resp = await self._post(
             _FAMILIA_SEARCH,
             data=form_data,
             headers={**_FAMILIA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
-        return _decode(resp)
+        html = _decode(resp)
+        if detect_blocked(html):
+            raise FamiliaBlockedError("Familia search: challenge F5")
+        return html
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -237,3 +278,7 @@ class InvalidCredentialsError(Exception):
 
 class SessionError(Exception):
     """Failed to establish an authenticated OJV session."""
+
+
+class FamiliaBlockedError(Exception):
+    """OJV devolvió un challenge F5 (bloqueo transitorio; NO penaliza sync_attempts)."""

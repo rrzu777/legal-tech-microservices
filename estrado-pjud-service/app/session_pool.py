@@ -71,6 +71,12 @@ class APISessionPool:
         self._rr_index += 1
         return bundles[chosen_id]
 
+    def pick_familia_bundle(self) -> CookieBundle | None:
+        """Bundle F5 para el path Familia (el login autenticado se monta encima).
+        None si el worker aún no minteó ningún slot → la ruta responde 'blocked'
+        transitorio en vez de intentar un login pelado."""
+        return self._pick_bundle()
+
     async def release(self, session: OJVSession, healthy: bool = True) -> None:
         """Return a session to the pool for reuse.
         If healthy=False the session is closed immediately and not recycled.

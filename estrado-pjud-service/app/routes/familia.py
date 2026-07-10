@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from app.auth import verify_api_key
 from app.config import get_settings
 from app.errors import safe_error
-from app.familia.auth import FamiliaAuthSession, InvalidCredentialsError, SessionError
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
 from app.familia.parser import parse_familia_results
 from app.rate_limit import limiter
@@ -33,7 +33,8 @@ async def familia_sync(
 
     try:
         async with asyncio.timeout(_SYNC_TIMEOUT_S):
-            return await _run_sync(req, rate_s)
+            pool = request.app.state.session_pool
+            return await _run_sync(req, rate_s, pool)
     except TimeoutError:
         logger.warning("familia_sync: timed out after %ds", _SYNC_TIMEOUT_S)
         return FamiliaSyncResponse(
@@ -43,10 +44,24 @@ async def familia_sync(
         )
 
 
-async def _run_sync(req: FamiliaSyncRequest, rate_s: float) -> FamiliaSyncResponse:
-    async with FamiliaAuthSession(rate_limit_s=rate_s) as session:
+_BLOCKED_MSG = "OJV está limitando el acceso; reintentá en unos minutos"
+
+
+def _blocked(error: str = _BLOCKED_MSG) -> FamiliaSyncResponse:
+    return FamiliaSyncResponse(ok=False, casos=[], error_code="blocked", error=error)
+
+
+async def _run_sync(req: FamiliaSyncRequest, rate_s: float, pool) -> FamiliaSyncResponse:
+    bundle = pool.pick_familia_bundle()
+    if bundle is None:
+        return _blocked("Servicio inicializándose, reintentá en unos minutos")
+    async with FamiliaAuthSession(
+        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
+    ) as session:
         try:
             await session.login(req.rut, req.password, req.auth_type)
+        except FamiliaBlockedError:
+            return _blocked()
         except InvalidCredentialsError:
             return FamiliaSyncResponse(
                 ok=False, casos=[],
@@ -82,12 +97,18 @@ async def _run_sync(req: FamiliaSyncRequest, rate_s: float) -> FamiliaSyncRespon
                             case_filter.rit, case_filter.year, err,
                         )
                     all_casos.extend(casos)
+                except FamiliaBlockedError:
+                    # Un bloqueo F5 aborta el batch: no seguir martillando la
+                    # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
+                    return _blocked()
                 except Exception as e:
                     logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
             return FamiliaSyncResponse(ok=True, casos=all_casos)
 
         try:
             html = await session.search_familia(rut=req.rut)
+        except FamiliaBlockedError:
+            return _blocked()
         except Exception as e:
             logger.exception("familia_sync: unexpected error querying Familia")
             return FamiliaSyncResponse(

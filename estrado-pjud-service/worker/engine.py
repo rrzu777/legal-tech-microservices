@@ -10,7 +10,7 @@ import httpx
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
-from app.familia.auth import FamiliaAuthSession, InvalidCredentialsError, SessionError
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
@@ -398,33 +398,57 @@ class SyncEngine:
             await self._terminal_error(case["id"], "Identificador invalido")
             return {"success": False, "new_movements": 0}
 
-        # "clave_poder_judicial" stored in DB maps to "clave_pj" in the auth module
-        auth_type = "clave_pj" if cred.get("password_type") == "clave_poder_judicial" else "clave_unica"
-
-        try:
-            async with asyncio.timeout(90):
-                async with FamiliaAuthSession(rate_limit_s=2.5) as session:
-                    try:
-                        await session.login(cred["rut"], cred["password"], auth_type)
-                    except InvalidCredentialsError:
-                        await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
-                        await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
-                        return {"success": False, "new_movements": 0}
-                    except SessionError as e:
-                        await self._finish_run(sync_run_id, started_at, "error", 0, str(e))
-                        await self._update_case_error(case["id"], "Error de sesion OJV Familia", case.get("sync_attempts", 0))
-                        return {"success": False, "new_movements": 0}
-
-                    html = await session.search_familia(
-                        rut=cred["rut"],
-                        rit=str(parsed["numero"]),
-                        year=str(parsed["anno"]),
-                    )
-
-        except TimeoutError:
-            await self._finish_run(sync_run_id, started_at, "error", 0, "Timeout Familia sync")
-            await self._update_case_error(case["id"], "Timeout al sincronizar causa Familia", case.get("sync_attempts", 0))
+        # Solo Clave PJ (Clave Única quedó dormida). Cualquier otro password_type
+        # es terminal — no crashea ni penaliza en loop (Gap #5).
+        if cred.get("password_type") != "clave_poder_judicial":
+            await self._finish_run(sync_run_id, started_at, "error", 0, "auth_type no soportado")
+            await self._terminal_error(case["id"], "Método de credencial no soportado — reingresá con Clave Poder Judicial")
             return {"success": False, "new_movements": 0}
+        auth_type = "clave_pj"
+
+        # Bundle F5 del pool, FUERA del timeout de 90s: el minteo no es culpa de
+        # la causa (Gap #6). El slot queda busy hasta release_familia_bundle.
+        bundle, slot = await self._pool.acquire_familia_bundle()
+        if bundle is None:
+            await self._pool.release_familia_bundle(slot, healthy=True)
+            await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
+            await self._handle_blocked(case["id"])
+            self._metrics.record_error()
+            return {"success": False, "new_movements": 0}
+
+        session_healthy = True
+        try:
+            try:
+                async with asyncio.timeout(90):
+                    async with FamiliaAuthSession(
+                        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
+                    ) as session:
+                        try:
+                            await session.login(cred["rut"], cred["password"], auth_type)
+                        except InvalidCredentialsError:
+                            # Credencial inválida = terminal (no reintenta en loop);
+                            # la IP está sana, se libera healthy=True.
+                            await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
+                            await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
+                            return {"success": False, "new_movements": 0}
+
+                        html = await session.search_familia(
+                            rut=cred["rut"],
+                            rit=str(parsed["numero"]),
+                            year=str(parsed["anno"]),
+                        )
+            # Bloqueo F5 / sesión / timeout / transporte = transitorio: NO penaliza
+            # sync_attempts (_handle_blocked), y marca el slot para re-mint
+            # (healthy=False en el finally). str(e) preserva el detalle (los
+            # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
+            except (FamiliaBlockedError, SessionError, TimeoutError, httpx.TransportError) as e:
+                session_healthy = False
+                await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e) or "Timeout Familia sync")
+                await self._handle_blocked(case["id"])
+                self._metrics.record_error()
+                return {"success": False, "new_movements": 0}
+        finally:
+            await self._pool.release_familia_bundle(slot, healthy=session_healthy)
 
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
