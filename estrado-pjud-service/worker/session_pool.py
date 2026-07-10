@@ -138,10 +138,12 @@ class SessionPool:
             if i < self._pool_size - 1:
                 await asyncio.sleep(1.5)  # stagger: evita N Chromium headed a la vez (G8)
 
-    async def acquire(self) -> OJVSession:
-        """Checkout de un slot LIBRE y DISTINTO (G3). Bloquea si los N slots
-        están ocupados. Si el slot elegido no tiene sesión o está vencido,
-        se re-mintea (manteniendo busy=True para que nadie más lo tome)."""
+    async def _borrow_slot(self) -> _Slot:
+        """Primitiva de checkout: toma un slot LIBRE y DISTINTO (G3), lo marca
+        busy y lo re-mintea si no tiene sesión o está vencido. Bloquea si los N
+        slots están ocupados. Base compartida por `acquire` (guest session) y
+        `acquire_familia_bundle` (bundle F5) — el invariante de semáforo/busy
+        vive en un solo lugar."""
         await self._sem.acquire()
         async with self._lock:
             slot = next((s for s in self._slots if not s.busy), None)
@@ -150,7 +152,7 @@ class SessionPool:
                 # slot libre. Convertir en un error claro (I1) en vez de un
                 # StopIteration desnudo. Devolver el permiso para no filtrarlo.
                 self._sem.release()
-                raise RuntimeError("acquire: semáforo dio permiso pero no hay slot libre")
+                raise RuntimeError("borrow: semáforo dio permiso pero no hay slot libre")
             slot.busy = True
 
         needs_refresh = (
@@ -160,33 +162,19 @@ class SessionPool:
             try:
                 await self._refresh_slot(slot)
             except Exception:
-                # No penalizar la causa por un fallo de minteo/refresh: devolver
-                # la sesión existente (posiblemente vencida). El challenge F5
-                # que devuelva se detecta downstream y va por el path de
-                # bloqueo (sin incrementar sync_attempts), disparando el
-                # re-mint reactivo vía release(healthy=False).
+                # No penalizar la causa por un fallo de minteo/refresh: usar la
+                # sesión/bundle existente (posiblemente vencido). El challenge F5
+                # que devuelva se detecta downstream y va por el path de bloqueo
+                # (sin incrementar sync_attempts), disparando el re-mint reactivo
+                # vía la release correspondiente (healthy=False).
                 logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
+        return slot
 
-        # Registrar el checkout DESPUÉS de cualquier refresh: la sesión que
-        # devolvemos es la que el caller sostendrá y con la que llamará release().
-        session = slot.session
-        self._checkout[session] = slot
-        return session
-
-    async def release(self, session: OJVSession, healthy: bool = True) -> None:
-        """Libera un slot. Si `healthy=False`, re-mintea ESE slot (IP nueva)
-        antes de devolverlo al pool — reactivo, por-slot, sin afectar otros
-        slots en uso por otras corrutinas.
-
-        El slot se resuelve por el registro explícito de checkouts (no por
-        identidad escaneando `_slots`). Una release de una sesión no registrada
-        (nunca adquirida, o ya liberada, o swappeada externamente) es un no-op
-        seguro: NO libera el semáforo (nada fue tomado por ella) — así se evita
-        sobre-liberar el semáforo por encima de N (C1)."""
-        slot = self._checkout.pop(session, None)
-        if slot is None:
-            logger.warning("release() de una sesión no registrada; ignorada")
-            return
+    async def _return_slot(self, slot: _Slot, healthy: bool) -> None:
+        """Primitiva de devolución: si `healthy=False`, re-mintea ESE slot (IP
+        nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
+        en uso por otras corrutinas. Base compartida por `release` y
+        `release_familia_bundle`."""
         try:
             if not healthy:
                 try:
@@ -197,57 +185,48 @@ class SessionPool:
             slot.busy = False
             self._sem.release()
 
+    async def acquire(self) -> OJVSession:
+        """Checkout de un slot para el sync guest (devuelve su OJVSession)."""
+        slot = await self._borrow_slot()
+        # Registrar el checkout DESPUÉS de cualquier refresh: la sesión que
+        # devolvemos es la que el caller sostendrá y con la que llamará release().
+        session = slot.session
+        self._checkout[session] = slot
+        return session
+
+    async def release(self, session: OJVSession, healthy: bool = True) -> None:
+        """Libera un slot tomado por `acquire`. El slot se resuelve por el
+        registro explícito de checkouts (no por identidad escaneando `_slots`).
+        Una release de una sesión no registrada (nunca adquirida, o ya liberada,
+        o swappeada externamente) es un no-op seguro: NO libera el semáforo (nada
+        fue tomado por ella) — así se evita sobre-liberar el semáforo (C1)."""
+        slot = self._checkout.pop(session, None)
+        if slot is None:
+            logger.warning("release() de una sesión no registrada; ignorada")
+            return
+        await self._return_slot(slot, healthy)
+
     async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
         """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
         SIN tomar la guest OJVSession. El slot queda busy (nadie más lo usa)
         hasta release_familia_bundle. El bundle sale del store persistido del
         slot; puede ser None si el slot nunca minteó y el refresh falló — el
         caller lo trata como bloqueo transitorio."""
-        await self._sem.acquire()
-        async with self._lock:
-            slot = next((s for s in self._slots if not s.busy), None)
-            if slot is None:
-                self._sem.release()
-                raise RuntimeError("acquire_familia_bundle: semáforo dio permiso pero no hay slot libre")
-            slot.busy = True
-
-        needs_refresh = (
-            slot.session is None or slot.session.age_seconds > self._config.SESSION_MAX_AGE_S
-        )
-        if needs_refresh:
-            try:
-                await self._refresh_slot(slot)
-            except Exception:
-                # No penalizar la causa por un fallo de minteo: se usa el bundle
-                # existente (posiblemente vencido). Un challenge F5 downstream va
-                # por el path de bloqueo sin incrementar sync_attempts.
-                logger.exception("Refresh de slot %d falló (Familia); usando bundle existente", slot.index)
-
+        slot = await self._borrow_slot()
         # load_slot puede fallar (JSON corrupto/locked). Si tira DESPUÉS de tomar
-        # el semáforo + busy=True, hay que liberar ambos o el slot queda colgado
-        # para siempre (pérdida de capacidad). El path `slot is None` ya libera lo
-        # suyo; este guard cubre el resto.
+        # el slot, hay que devolverlo o queda colgado para siempre (pérdida de
+        # capacidad). healthy=True: no re-mintea, solo libera sem+busy.
         try:
             bundle = self._store.load_slot(slot.index)
         except Exception:
             logger.exception("load_slot falló para slot %d (Familia)", slot.index)
-            slot.busy = False
-            self._sem.release()
+            await self._return_slot(slot, healthy=True)
             raise
         return bundle, slot
 
     async def release_familia_bundle(self, slot: _Slot, healthy: bool = True) -> None:
-        """Libera un slot prestado a Familia. Si `healthy=False`, re-mintea ESE
-        slot (IP nueva) antes de devolverlo — misma semántica que release()."""
-        try:
-            if not healthy:
-                try:
-                    await self._refresh_slot(slot)
-                except Exception:
-                    logger.exception("Re-mint reactivo de slot %d (Familia) falló", slot.index)
-        finally:
-            slot.busy = False
-            self._sem.release()
+        """Libera un slot prestado a Familia. Misma semántica que release()."""
+        await self._return_slot(slot, healthy)
 
     async def enforce_global_rate_limit(self):
         """En modo proxy: no-op (cada IP tiene su propio rate-limit per-adapter;

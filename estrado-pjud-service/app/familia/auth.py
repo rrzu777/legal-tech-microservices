@@ -160,6 +160,8 @@ class FamiliaAuthSession:
         logger.info("Clave PJ session established")
 
     async def _login_clave_unica(self, rut: str, password: str) -> None:
+        # DORMANT: login() ya no enruta a clave_unica (decisión: solo Clave PJ).
+        # Se conserva para una eventual reactivación; ver TODO(U3) en _login_clave_pj.
         rut_digits, _ = _rut_parts(rut)
 
         await self._wait()

@@ -426,43 +426,24 @@ class SyncEngine:
                         try:
                             await session.login(cred["rut"], cred["password"], auth_type)
                         except InvalidCredentialsError:
+                            # Credencial inválida = terminal (no reintenta en loop);
+                            # la IP está sana, se libera healthy=True.
                             await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
                             await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
                             return {"success": False, "new_movements": 0}
-                        except FamiliaBlockedError:
-                            session_healthy = False
-                            await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV (login)")
-                            await self._handle_blocked(case["id"])
-                            self._metrics.record_error()
-                            return {"success": False, "new_movements": 0}
-                        except SessionError as e:
-                            session_healthy = False
-                            await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e))
-                            await self._handle_blocked(case["id"])
-                            self._metrics.record_error()
-                            return {"success": False, "new_movements": 0}
 
-                        try:
-                            html = await session.search_familia(
-                                rut=cred["rut"],
-                                rit=str(parsed["numero"]),
-                                year=str(parsed["anno"]),
-                            )
-                        except FamiliaBlockedError:
-                            session_healthy = False
-                            await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV (search)")
-                            await self._handle_blocked(case["id"])
-                            self._metrics.record_error()
-                            return {"success": False, "new_movements": 0}
-            except TimeoutError:
+                        html = await session.search_familia(
+                            rut=cred["rut"],
+                            rit=str(parsed["numero"]),
+                            year=str(parsed["anno"]),
+                        )
+            # Bloqueo F5 / sesión / timeout / transporte = transitorio: NO penaliza
+            # sync_attempts (_handle_blocked), y marca el slot para re-mint
+            # (healthy=False en el finally). str(e) preserva el detalle (los
+            # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
+            except (FamiliaBlockedError, SessionError, TimeoutError, httpx.TransportError) as e:
                 session_healthy = False
-                await self._finish_run(sync_run_id, started_at, "blocked", 0, "Timeout Familia sync")
-                await self._handle_blocked(case["id"])
-                self._metrics.record_error()
-                return {"success": False, "new_movements": 0}
-            except httpx.TransportError as e:
-                session_healthy = False
-                await self._finish_run(sync_run_id, started_at, "blocked", 0, f"Transport error: {e}")
+                await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e) or "Timeout Familia sync")
                 await self._handle_blocked(case["id"])
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
