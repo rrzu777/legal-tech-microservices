@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
-from app.cookie_store import CookieStore
+from app.cookie_store import CookieBundle, CookieStore
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
 from app.session import OJVSession
@@ -193,6 +193,58 @@ class SessionPool:
                     await self._refresh_slot(slot)
                 except Exception:
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
+        finally:
+            slot.busy = False
+            self._sem.release()
+
+    async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
+        """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
+        SIN tomar la guest OJVSession. El slot queda busy (nadie más lo usa)
+        hasta release_familia_bundle. El bundle sale del store persistido del
+        slot; puede ser None si el slot nunca minteó y el refresh falló — el
+        caller lo trata como bloqueo transitorio."""
+        await self._sem.acquire()
+        async with self._lock:
+            slot = next((s for s in self._slots if not s.busy), None)
+            if slot is None:
+                self._sem.release()
+                raise RuntimeError("acquire_familia_bundle: semáforo dio permiso pero no hay slot libre")
+            slot.busy = True
+
+        needs_refresh = (
+            slot.session is None or slot.session.age_seconds > self._config.SESSION_MAX_AGE_S
+        )
+        if needs_refresh:
+            try:
+                await self._refresh_slot(slot)
+            except Exception:
+                # No penalizar la causa por un fallo de minteo: se usa el bundle
+                # existente (posiblemente vencido). Un challenge F5 downstream va
+                # por el path de bloqueo sin incrementar sync_attempts.
+                logger.exception("Refresh de slot %d falló (Familia); usando bundle existente", slot.index)
+
+        # load_slot puede fallar (JSON corrupto/locked). Si tira DESPUÉS de tomar
+        # el semáforo + busy=True, hay que liberar ambos o el slot queda colgado
+        # para siempre (pérdida de capacidad). El path `slot is None` ya libera lo
+        # suyo; este guard cubre el resto.
+        try:
+            bundle = self._store.load_slot(slot.index)
+        except Exception:
+            logger.exception("load_slot falló para slot %d (Familia)", slot.index)
+            slot.busy = False
+            self._sem.release()
+            raise
+        return bundle, slot
+
+    async def release_familia_bundle(self, slot: _Slot, healthy: bool = True) -> None:
+        """Libera un slot prestado a Familia. Si `healthy=False`, re-mintea ESE
+        slot (IP nueva) antes de devolverlo — misma semántica que release()."""
+        try:
+            if not healthy:
+                try:
+                    await self._refresh_slot(slot)
+                except Exception:
+                    logger.exception("Re-mint reactivo de slot %d (Familia) falló", slot.index)
         finally:
             slot.busy = False
             self._sem.release()
