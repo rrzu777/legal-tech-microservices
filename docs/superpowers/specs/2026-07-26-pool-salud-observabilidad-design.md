@@ -2,7 +2,13 @@
 
 **Fecha:** 2026-07-26
 **Estado:** diseño aprobado, pendiente de plan de implementación
-**Repos afectados:** `legal-tech-microservices` (código + scripts de ops)
+**Repos afectados:**
+- `legal-tech-microservices` — worker, scripts de ops (tracks A y B)
+- `LegalTech` — app web, migración (track C)
+
+Este spec vive en el repo del microservicio pero cubre los dos, porque es una sola historia
+causal: el microservicio introdujo un estado terminal que la app web no conoce. Cada PR
+recibe su propio plan de implementación.
 
 ## Contexto
 
@@ -127,6 +133,88 @@ cae de inmediato a la sesión vieja, que ya no sirve, y el sync de la causa muer
 (`/opt/estrado-cron`, modo `700 root`), fuera de todo repositorio. Sin review, sin
 historial, sin rollback.
 
+### P6 — `suspended` es un estado huérfano en la app web (repo `LegalTech`)
+
+Causa estructural: la columna no tiene validación.
+
+```sql
+-- apps/web/supabase/migrations/00008_add_pjud_tracking.sql:9
+ALTER TABLE cases ADD COLUMN tracking_status TEXT NOT NULL DEFAULT 'none';
+```
+
+Sin `CHECK` ni enum. El microservicio introdujo `'suspended'`, Postgres lo aceptó, y
+ningún consumidor de la app web se enteró. La palabra `suspended` **no aparece ni una vez**
+en `apps/web/src` ni en `packages`.
+
+El tipo lo declara imposible (`packages/types/src/index.ts:77`): 8 valores, ninguno es
+`suspended`. La DB contiene un valor que el sistema de tipos considera inalcanzable.
+
+Cuatro filtros independientes lo excluyen:
+
+| Consumidor | Filtro | Consecuencia |
+|---|---|---|
+| `api/cron/stale-sync-recovery:31` | `["error","blocked"]` | nunca se recupera |
+| `api/cron/stale-sync-alert:32` | `["active","error","blocked"]` | nunca se avisa |
+| `lib/actions/pjud-sync.ts:100` | `["active","error","blocked"]` | el sync web lo saltea |
+| `admin/sync/page.tsx:173-176` | no lo cuenta | ausente de los tiles |
+
+Esto explica por completo los 17 días de silencio de `C-1000-2024` y `T-100-2024`:
+caen en un estado del que ningún cron las saca y del que ninguna alerta habla.
+
+En `components/dashboard/pjud-alerts.tsx` faltan las entradas de `suspended` en
+`STATUS_LABEL`, `STATUS_STYLE` y `STATUS_PRIORITY` → se le muestra al abogado la palabra
+`suspended` en inglés crudo, sin badge y ordenada al final.
+
+### P7 — `stale-sync-alert` esquiva el chokepoint de notificaciones
+
+Inserta directo en la tabla `notifications` en vez de usar `dispatchNotification`
+(`lib/data/notify-dispatch.ts`), el único punto que resuelve preferencias. Se pierde:
+
+- Preferencias categoría×canal (el trabajo de PR #24): el usuario no puede configurarlo.
+- Push y email: la alerta queda solo in-app.
+- El campo `link`: el insert no lo envía y la campana solo renderiza el enlace si existe
+  (`notifications-client.tsx:139`) → la notificación no es clickeable.
+
+Además, `stale-sync-alert:51` hace `if (!c.assigned_user_id) continue;` — una causa sin
+responsable asignado se descarta en silencio y nadie recibe nada.
+
+El mismo bypass existe en `api/cron/sync-health`, `lib/actions/pjud-sync.ts` y
+`lib/data/notify-stage-change.ts`.
+
+### P8 — Errores crudos de DB expuestos al abogado
+
+`components/cases/case-tracking-status.tsx:106` renderiza `last_sync_error` sin traducir.
+Con los bugs de P2, el abogado ve literalmente:
+
+```
+{'message': 'ON CONFLICT DO UPDATE command cannot affect row a second time',
+ 'code': '21000', 'hint': 'Ensure that no rows proposed for insertion...'}
+```
+
+Mismo problema en `case-detail-focused.tsx:109` y en `getAlertDescription` de
+`pjud-alerts.tsx`.
+
+### P9 — El contador roto está expuesto en la UI
+
+`case-tracking-status.tsx:95` muestra `sync_attempts` bajo la etiqueta "Intentos".
+Hoy le informa `82` a un abogado cuya causa nunca falló. Acopla A0 con la UI: al corregir
+la semántica, el número visible cambia de significado.
+
+### P10 — El panel admin despriorriza el estado más grave
+
+Las causas suspendidas sí aparecen en la lista de atención (entran por
+`last_sync_status === "error"`), pero el score de orden no las puntúa:
+
+```ts
+(a.tracking_status === "error" ? 30 : 0) + (a.tracking_status === "blocked" ? 25 : 0)
+// suspended -> 0 puntos
+```
+
+El estado terminal rankea debajo de un error transitorio que se auto-cura en ~1h.
+
+**Verificado y descartado:** `/admin` está correctamente gateado por `isPlatformAdminEmail`
+en `app/(app)/admin/layout.tsx`. No hay fuga de datos entre estudios.
+
 ## Diseño
 
 Orden de ejecución por impacto, no por el orden en que se reportaron.
@@ -201,6 +289,50 @@ Cada uno con test de regresión usando el payload real que lo rompió.
 Mover `estrado-watchdog.sh`, `estrado-digest.sh` y `hermes-backup.sh` a `ops/cron/` en
 este repo, con un `deploy-cron.sh` que los copia al VPS preservando modo `700 root`.
 
+### Track C — Integración con la app web (repo `LegalTech`)
+
+Resuelve P6–P10. Dependencia de orden que importa: **A0 evita crear suspendidas nuevas;
+C hace visibles las que existan.** Son complementarios — sin C, cualquier suspensión futura
+que no anticipemos vuelve a ser invisible durante semanas.
+
+**C1 — Fuente única de verdad para `tracking_status` (la mejora durable).**
+Agregar `suspended` al tipo `TrackingStatus` en `packages/types`, exportar la lista de
+estados como constante, y derivar de ella los filtros de los consumidores en vez de repetir
+arrays literales en cuatro archivos. Añadir un `CHECK` constraint en la columna (migración).
+
+Justificación: hoy introducir un estado nuevo en el microservicio no rompe nada de forma
+visible — falla en silencio en cuatro lugares distintos. Con el constraint, un estado no
+declarado falla al escribir, que es exactamente cuando conviene enterarse. Requiere que la
+migración se aplique **antes** de que el microservicio pueda escribir el estado nuevo.
+
+**C2 — Incluir `suspended` en los consumidores.**
+- `stale-sync-alert`: incorporarlo al filtro para que la suspensión avise.
+- `admin/sync`: contarlo en los tiles y puntuarlo por encima de `error` en el score de orden.
+- `pjud-alerts`: agregar `STATUS_LABEL` ("Suspendida"), `STATUS_STYLE` y `STATUS_PRIORITY`.
+- `stale-sync-recovery`: **no** incorporarlo. La suspensión debe seguir siendo terminal para
+  causas genuinamente muertas (ej. `PROTECCION-23483-2025`, "No encontrada en OJV" ×13).
+  Auto-recuperarla sería un loop infinito de reintentos sobre una causa inexistente. La
+  salida de `suspended` es una acción manual explícita (C3).
+
+**C3 — Reactivación manual desde la UI.**
+Acción para que el abogado (o el admin) saque una causa de `suspended`, reseteando
+`sync_attempts=0` y `tracking_status='active'`. Hoy la única salida es un UPDATE a mano
+en la DB.
+
+**C4 — `stale-sync-alert` pasa por `dispatchNotification`.**
+Migrarlo al chokepoint con su `category` y un `link` a la causa. Recupera preferencias,
+push, email y notificación clickeable. Decidir qué hacer con las causas sin
+`assigned_user_id`: propuesta = notificar al owner del estudio en vez de descartarlas.
+
+**C5 — Traducir errores técnicos.**
+Mapa error-técnico → mensaje humano para `last_sync_error` antes de renderizarlo. Los
+errores sin mapeo caen a un texto genérico ("Error al sincronizar; el equipo fue
+notificado") y el detalle crudo queda solo en el panel admin.
+
+**C6 — Resolver el contador visible.**
+Re-etiquetar "Intentos" a "Fallos consecutivos" (coherente con la semántica de A0) o
+quitarlo de la vista del abogado. Decisión de producto pendiente; por defecto, re-etiquetar.
+
 ### Recuperación de las causas suspendidas
 
 - `T-100-2024` y `C-1000-2024`: tras A2, volver a `tracking_status=active` con
@@ -210,10 +342,21 @@ este repo, con un `deploy-cron.sh` que los copia al VPS preservando modo `700 ro
 
 ## Entrega
 
-Dos PRs:
+Tres PRs, en dos repos.
+
+**Repo `legal-tech-microservices`:**
 
 1. **B1 + B1b** — bash y versionado de ops. No requiere deploy del worker.
 2. **A0 + A1 + A2 + B2** — Python, un solo deploy. A0 primero dentro del PR, con su test.
+
+**Repo `LegalTech`:**
+
+3. **Track C** — app web + migración del `CHECK` constraint.
+
+**Orden entre repos:** la migración de C1 debe aplicarse antes de que el constraint pueda
+rechazar escrituras del microservicio. Como `suspended` ya se escribe hoy, la migración
+tiene que incluirlo desde el inicio — si no, el PR 3 rompe producción en la primera
+suspensión. Este es el único acoplamiento duro entre los tres PRs.
 
 ## Restricciones de seguridad
 
