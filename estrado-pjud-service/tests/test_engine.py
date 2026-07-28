@@ -173,6 +173,41 @@ class TestSyncEngine:
         mock_backoff.record_success.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_sync_success_resets_sync_attempts(self):
+        """Un sync exitoso debe resetear sync_attempts a 0, no incrementarlo.
+
+        Regresión: el path de éxito lo incrementaba, así que las causas sanas
+        acumulaban intentos hasta cruzar _MAX_SYNC_ATTEMPTS y quedar a un solo
+        error de la suspensión permanente.
+        """
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(sync_attempts=20)
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response()
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+
+        update_calls = mock_sb.from_.return_value.update.call_args_list
+        success_update = None
+        for call in update_calls:
+            args = call[0] if call[0] else ()
+            payload = args[0] if args else {}
+            if payload and payload.get("last_sync_status") == "success":
+                success_update = payload
+                break
+
+        assert success_update is not None, "Se esperaba un update con last_sync_status='success'"
+        assert success_update["sync_attempts"] == 0, (
+            f"Un sync exitoso debe resetear sync_attempts a 0, "
+            f"pero quedó en {success_update['sync_attempts']}"
+        )
+
+    @pytest.mark.asyncio
     async def test_sync_blocked_triggers_backoff(self):
         from worker.engine import SyncEngine
 

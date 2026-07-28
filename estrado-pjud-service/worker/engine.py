@@ -306,7 +306,11 @@ class SyncEngine:
                     "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                     "last_sync_status": "success",
                     "last_sync_error": None,
-                    "sync_attempts": (case.get("sync_attempts") or 0) + 1,
+                    # sync_attempts = fallos CONSECUTIVOS desde el último éxito
+                    # (lo lee _update_case_error para decidir backoff vs suspensión).
+                    # No es un contador de sincronizaciones totales: incrementarlo acá
+                    # suspendía causas sanas tras 10 éxitos.
+                    "sync_attempts": 0,
                     "canonical_identifier": canonical,
                     "external_case_key": case.get("external_case_key") or detail_key,
                     "external_payload": {
@@ -509,6 +513,7 @@ class SyncEngine:
                 "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                 "last_sync_status": "success",
                 "last_sync_error": None,
+                # ver comentario en el path PJUD: sync_attempts = fallos CONSECUTIVOS
                 "sync_attempts": 0,
                 "sync_blocked_until": None,
                 "court": caso.tribunal or case.get("court", ""),
