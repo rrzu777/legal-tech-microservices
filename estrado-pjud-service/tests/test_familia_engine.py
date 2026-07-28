@@ -6,6 +6,9 @@ import pytest
 
 from app.cookie_store import CookieBundle
 from app.familia.auth import FamiliaBlockedError, InvalidCredentialsError
+from app.familia.models import FamiliaCaso
+
+from tests.helpers import find_update_payload
 
 
 def _bundle():
@@ -99,3 +102,49 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
     engine._handle_blocked.assert_not_awaited()
     _, kwargs = engine._pool.release_familia_bundle.call_args
     assert kwargs.get("healthy") is True  # credencial inválida NO es culpa de la IP
+
+
+@pytest.mark.asyncio
+async def test_sync_success_resets_sync_attempts(monkeypatch):
+    """Un sync Familia exitoso también debe resetear sync_attempts a 0.
+
+    Espejo de test_sync_success_resets_sync_attempts en test_engine.py (path
+    PJUD): la invariante "éxito resetea sync_attempts" vale en los dos únicos
+    lugares que la escriben, y este era el que quedaba sin cobertura.
+    """
+    import worker.engine as eng
+
+    engine = _make_engine()
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
+    )
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(return_value="<html></html>")
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    caso = FamiliaCaso(
+        rit="100-2024",
+        tribunal="Juzgado de Familia",
+        caratulado="TEST vs TEST",
+        materia="Alimentos",
+        estado="En tramitación",
+        fecha_ingreso="2024-01-15",
+    )
+    monkeypatch.setattr(eng, "parse_familia_results", MagicMock(return_value=([caso], None)))
+
+    case = {**_CASE, "sync_attempts": 20}
+    result = await engine._sync_familia_case(case, None, MagicMock())
+
+    assert result["success"] is True
+
+    success_update = find_update_payload(engine._sb, last_sync_status="success")
+
+    assert success_update is not None, "Se esperaba un update con last_sync_status='success'"
+    assert success_update["sync_attempts"] == 0, (
+        f"Un sync Familia exitoso debe resetear sync_attempts a 0, "
+        f"pero quedó en {success_update['sync_attempts']}"
+    )

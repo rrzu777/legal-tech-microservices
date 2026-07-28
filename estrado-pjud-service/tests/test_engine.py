@@ -3,6 +3,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 
+from tests.helpers import find_update_payload
+
 
 def _make_case(**overrides):
     base = {
@@ -171,6 +173,34 @@ class TestSyncEngine:
         mock_pool.acquire.assert_called_once()
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
         mock_backoff.record_success.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_success_resets_sync_attempts(self):
+        """Un sync exitoso debe resetear sync_attempts a 0, no incrementarlo.
+
+        Regresión: el path de éxito lo incrementaba, así que las causas sanas
+        acumulaban intentos hasta cruzar _MAX_SYNC_ATTEMPTS y quedar a un solo
+        error de la suspensión permanente.
+        """
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        case = _make_case(sync_attempts=20)
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response()
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+
+        success_update = find_update_payload(mock_sb, last_sync_status="success")
+
+        assert success_update is not None, "Se esperaba un update con last_sync_status='success'"
+        assert success_update["sync_attempts"] == 0, (
+            f"Un sync exitoso debe resetear sync_attempts a 0, "
+            f"pero quedó en {success_update['sync_attempts']}"
+        )
 
     @pytest.mark.asyncio
     async def test_sync_blocked_triggers_backoff(self):
@@ -885,15 +915,7 @@ class TestSyncErrorBackoff:
         assert result["success"] is False
 
         # Find the update call that sets tracking_status to "error"
-        update_calls = mock_sb.from_.return_value.update.call_args_list
-        error_update = None
-        for call in update_calls:
-            args = call[0] if call[0] else ()
-            kwargs = call[1] if call[1] else {}
-            payload = args[0] if args else kwargs.get("data")
-            if payload and payload.get("tracking_status") == "error":
-                error_update = payload
-                break
+        error_update = find_update_payload(mock_sb, tracking_status="error")
 
         assert error_update is not None, "Expected an update call with tracking_status='error'"
         assert "sync_blocked_until" in error_update, "Error update should set sync_blocked_until"
@@ -912,14 +934,7 @@ class TestSyncErrorBackoff:
         assert result["success"] is False
 
         # Find the update call that sets tracking_status to "suspended"
-        update_calls = mock_sb.from_.return_value.update.call_args_list
-        suspended_update = None
-        for call in update_calls:
-            args = call[0] if call[0] else ()
-            payload = args[0] if args else {}
-            if payload and payload.get("tracking_status") == "suspended":
-                suspended_update = payload
-                break
+        suspended_update = find_update_payload(mock_sb, tracking_status="suspended")
 
         assert suspended_update is not None, "Expected an update call with tracking_status='suspended'"
         assert suspended_update["last_sync_status"] == "error"
@@ -955,14 +970,7 @@ class TestSyncErrorBackoff:
             after = dt.now(TZ_SANTIAGO)
 
             # Find the error update payload
-            update_calls = mock_sb.from_.return_value.update.call_args_list
-            error_update = None
-            for call in update_calls:
-                args = call[0] if call[0] else ()
-                payload = args[0] if args else {}
-                if payload and payload.get("tracking_status") == "error":
-                    error_update = payload
-                    break
+            error_update = find_update_payload(mock_sb, tracking_status="error")
 
             assert error_update is not None
             blocked_until = dt.fromisoformat(error_update["sync_blocked_until"])
