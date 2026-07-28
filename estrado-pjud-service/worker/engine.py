@@ -513,7 +513,7 @@ class SyncEngine:
                 "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                 "last_sync_status": "success",
                 "last_sync_error": None,
-                # ver comentario en el path PJUD: sync_attempts = fallos CONSECUTIVOS
+                # ver comentario en sync_case: sync_attempts = fallos CONSECUTIVOS
                 "sync_attempts": 0,
                 "sync_blocked_until": None,
                 "court": caso.tribunal or case.get("court", ""),
