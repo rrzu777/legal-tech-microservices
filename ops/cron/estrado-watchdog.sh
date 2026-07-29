@@ -65,6 +65,49 @@ for hsvc in hermes-gateway hermes-dashboard; do
     || add "Servicio de Hermes caído: ${hsvc}.service" "hermes-$hsvc"
 done
 
+# 7. Salud de los crons de la app (los que run-cron.sh le pega a Vercel).
+#    Nadie miraba este log: run-cron.sh apuntó a un dominio viejo del 2026-04-01 al
+#    2026-07-29 y las 1183 corridas que devolvieron 404 pasaron inadvertidas 4 meses.
+#
+#    ZONA HORARIA: run-cron.sh escribe con `date` LOCAL (el VPS es Europe/Berlin),
+#    mientras que NOW de acá arriba es UTC. Comparar una contra otra da mal cerca de
+#    medianoche. El corte se calcula con `date` LOCAL y, como el formato es
+#    YYYY-MM-DD HH:MM, el orden lexicográfico ES el cronológico: alcanza un awk, sin
+#    mktime (que en mawk no existe) y sin un fork de `date` por línea.
+CRON_LOG="${CRON_LOG:-/var/log/estrado-cron.log}"
+if [ ! -r "$CRON_LOG" ]; then
+  add "No puedo leer $CRON_LOG — los crons de la app quedan sin vigilancia." "cron-log-missing"
+else
+  CRON_CUTOFF=$(date -d '-24 hours' '+%Y-%m-%d %H:%M')
+  CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "$CRON_LOG" 2>/dev/null || true)
+  if [ -z "${CRON_RECENT// }" ]; then
+    # El piso normal son ~10 corridas por día. Cero en 24h no es "poca carga": es el
+    # crontab borrado, run-cron.sh sin permiso de ejecución o el disco lleno. Este es
+    # el modo de falla que un chequeo de "¿hay errores?" NO atrapa — el log deja de
+    # crecer y todo se ve sano.
+    add "Ningún cron de la app corrió en las últimas 24h (el piso normal son ~10). Revisar el crontab de root y los permisos de /opt/estrado-cron/run-cron.sh." "cron-silent"
+  else
+    # Se mira la ÚLTIMA corrida de cada endpoint, no todas: la pregunta es "¿esto
+    # está roto AHORA?". Un 404 suelto que se recuperó en la corrida siguiente no
+    # despierta a nadie — con el cooldown de 3h, un blip alertaría 8 veces mientras
+    # sigue dentro de la ventana de 24h. Un endpoint roto de verdad falla también en
+    # su última corrida, y los que corren una vez al día tienen esa única corrida
+    # como la última, así que igual se atrapan.
+    CRON_BAD=$(printf '%s\n' "$CRON_RECENT" | grep -F ' - HTTP ' \
+                | awk '{ultimo[$3] = $NF} END {for (e in ultimo) if (ultimo[e] != 200) print e, ultimo[e]}' \
+                | sort || true)
+    if [ -n "${CRON_BAD// }" ]; then
+      CRON_DETAIL=$(printf '%s\n' "$CRON_BAD" | awk '{printf "    %s -> HTTP %s\n", $1, $2}' || true)
+      # La firma lleva los códigos: 404 en todo (APP_URL roto) y 401 (CRON_SECRET
+      # desincronizado con Vercel) son incidentes distintos, y si el segundo aparece
+      # mientras el primero está en cooldown NO puede quedar tapado.
+      CRON_CODES=$(printf '%s\n' "$CRON_BAD" | awk '{print $2}' | sort -u | paste -sd, - || true)
+      # Ojo: $(...) come el \n final de CRON_DETAIL, así que la pista va con su propio salto.
+      add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." "cron-fail:$CRON_CODES"
+    fi
+  fi
+fi
+
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
 
