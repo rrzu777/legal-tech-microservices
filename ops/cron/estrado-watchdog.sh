@@ -5,7 +5,7 @@
 # Complementa a legaltech-monitor (que solo avisa up/down); esto DIAGNOSTICA.
 set -uo pipefail
 
-ENV=/opt/legal-tech-microservices/estrado-pjud-service/.env
+ENV="${WD_ENV:-/opt/legal-tech-microservices/estrado-pjud-service/.env}"
 set -a; . "$ENV"; set +a
 API="${SUPABASE_URL%/}/rest/v1"
 AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
@@ -22,8 +22,11 @@ ANOMALIES=""
 SIG=""
 # add <texto humano> <tag estable para firma anti-spam>
 add() { ANOMALIES+="- $1"$'\n'; SIG+="${2:-x};"; }
-STATE=/var/tmp/estrado-wd-state
-COOLDOWN=10800   # 3h: no re-alertar la MISMA anomalía dentro de esta ventana
+# Rutas inyectables para poder testear el script sin tocar el estado real ni
+# mandar nada a Telegram. Ver ops/cron/tests/test-watchdog.sh.
+WD_STATE_DIR="${WD_STATE_DIR:-/var/tmp}"
+STATE="$WD_STATE_DIR/estrado-wd-state"
+COOLDOWN="${WD_COOLDOWN:-10800}"   # 3h: no re-alertar la MISMA anomalía dentro de esta ventana
 
 # 1. API de scraping viva
 systemctl is-active --quiet estrado-pjud.service || add "estrado-pjud.service (API PJUD) NO está activo." "api-down"
@@ -74,6 +77,12 @@ if [ -f "$STATE" ]; then
   fi
 fi
 echo "$HASH $(date -u +%s)" > "$STATE"
+
+# Modo prueba: imprime lo que habría alertado y sale. No llama a Luna ni a Telegram.
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  printf 'ANOMALIES:\n%sSIG: %s\n' "$ANOMALIES" "$SIG"
+  exit 0
+fi
 
 # Anomalía → diagnóstico con Luna
 PROMPT_FILE=$(mktemp /tmp/estrado-watchdog-prompt.XXXXXX)
