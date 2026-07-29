@@ -268,7 +268,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             if not search_result["found"]:
@@ -295,7 +295,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             if detail.get("parse_suspect"):
@@ -307,7 +307,7 @@ class SyncEngine:
                 # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
                 await self._handle_parse_suspect(case, competencia)
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             # Upsert movements
@@ -369,7 +369,7 @@ class SyncEngine:
             logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
             await self._handle_blocked(case["id"])
-            self._metrics.record_error()
+            self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
         except Exception as e:
@@ -441,7 +441,7 @@ class SyncEngine:
             await self._pool.release_familia_bundle(slot, healthy=True)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
             await self._handle_blocked(case["id"])
-            self._metrics.record_error()
+            self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
         session_healthy = True
@@ -473,7 +473,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e) or "Timeout Familia sync")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
         finally:
             await self._pool.release_familia_bundle(slot, healthy=session_healthy)

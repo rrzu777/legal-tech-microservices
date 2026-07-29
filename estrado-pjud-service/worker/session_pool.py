@@ -79,6 +79,12 @@ class SessionPool:
         self._global_min_delay: float = 1.2
         self._store = CookieStore(config.COOKIE_STORE_PATH)
 
+    @property
+    def effective_pool_size(self) -> int:
+        """Slots que realmente corren. En modo proxy es OJV_PROXY_POOL_SIZE, NO
+        config.POOL_SIZE — el heartbeat reportaba 1 mientras andaban 3."""
+        return self._pool_size
+
     # -- Minteo por-slot ------------------------------------------------
 
     async def _mint_slot(self, slot: _Slot) -> None:
