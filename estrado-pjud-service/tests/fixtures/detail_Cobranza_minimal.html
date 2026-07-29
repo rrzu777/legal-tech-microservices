@@ -1,0 +1,80 @@
+<!--
+  Fixture minima de COBRANZA. Reproduce la estructura real de la tabla de
+  movimientos de OJV (bajada el 29 jul 2026 de una causa de cobranza en
+  produccion) con contenido anonimizado: lo que se testea es el MAPA DE
+  COLUMNAS, no los datos de la causa.
+
+  Lo que importa y por que:
+  - 9 columnas, no 8. El fallback _CIVIL_COLS asumia 8 y ponia `fecha` en el
+    indice 6, que en cobranza es "Estado Firma" -> el parser mandaba "Firmado"
+    a una columna `date` de Postgres (22007) y a los 10 intentos la causa
+    quedaba suspendida.
+  - El select de cuaderno se llama selCuadernoCob, no selCuaderno: por eso el
+    cuaderno salia vacio y las claves de movimiento quedaban "ROL::folio".
+  - El div de movimientos es historiaCob (el que matchea _MOVEMENT_DIV_IDS).
+
+  Los acentos van como entidades HTML a proposito: el loader de los tests decodifica
+  latin-1 (que es lo que sirve OJV de verdad), asi que un archivo UTF-8 con acentos
+  crudos llega como mojibake. Con entidades, el fixture no depende de la codificacion.
+-->
+<html>
+<body>
+  <div id="datosCausa">
+    <table>
+      <tr><td><strong>ROL :</strong> C-9999-2024</td></tr>
+      <tr><td><strong>Tribunal :</strong> Juzgado de Cobranza Laboral y Previsional de Ejemplo</td></tr>
+    </table>
+  </div>
+
+  <select id="selCuadernoCob" name="selCuadernoCob">
+    <option value="tok-principal" selected="selected">Principal</option>
+    <option value="tok-apremio">Apremio</option>
+  </select>
+
+  <div class="tab-pane fade in active" id="historiaCob">
+    <table class="table table-bordered">
+      <thead>
+        <tr>
+          <th>Folio</th>
+          <th>Doc.</th>
+          <th>Anexo</th>
+          <th>Etapa</th>
+          <th>Tr&aacute;mite</th>
+          <th>Desc. Tr&aacute;mite</th>
+          <th>Estado Firma</th>
+          <th>Fec. Tr&aacute;mite</th>
+          <th>Georref.</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>26</td>
+          <td>
+            <form action="documentos/docuCobranza.php" method="post">
+              <input type="hidden" name="dtaDoc" value="tok-doc-26" />
+            </form>
+          </td>
+          <td></td>
+          <td>Embargo</td>
+          <td>Resoluci&oacute;n</td>
+          <td>Notificaci&oacute;n Art. 52 C.P.C.</td>
+          <td>Firmado</td>
+          <td>27/05/2026</td>
+          <td></td>
+        </tr>
+        <tr>
+          <td>25</td>
+          <td></td>
+          <td></td>
+          <td>Embargo</td>
+          <td>Escrito</td>
+          <td>Giro cheque</td>
+          <td>Firmado</td>
+          <td>26/05/2026</td>
+          <td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

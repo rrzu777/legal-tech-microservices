@@ -635,3 +635,46 @@ class TestParseDetailEmpty:
         assert result["suprema_docs"] == []
         assert result["exhortos"] == []
         assert result["incompetencia"] == []
+
+
+class TestParseDetailCobranza:
+    """Cobranza no tenia entrada en _MOVEMENT_COLUMN_MAP y caia en el fallback
+    _CIVIL_COLS (8 columnas, fecha en el indice 6). La tabla real tiene 9 y el
+    indice 6 es "Estado Firma": el parser mandaba "Firmado" a una columna `date`
+    de Postgres. Eso tuvo a C-1000-2024 sin sincronizar NUNCA, y es la unica
+    causa de cobranza del sistema, asi que el mapa jamas funciono."""
+
+    @pytest.fixture
+    def result(self):
+        return parse_detail(_load("detail_Cobranza_minimal.html"))
+
+    def test_encuentra_los_movimientos(self, result):
+        assert len(result["movements"]) == 2
+
+    def test_la_fecha_sale_de_fec_tramite_no_de_estado_firma(self, result):
+        mov = result["movements"][0]
+        assert mov["fecha"] == "2026-05-27", f"fecha mal mapeada: {mov['fecha']!r}"
+
+    def test_ninguna_fecha_queda_en_none(self, result):
+        """Con el mapa corrido, normalize_date descartaba 'Firmado' y el null
+        chocaba contra el NOT NULL de case_movements.date (23502)."""
+        assert all(m["fecha"] for m in result["movements"])
+
+    def test_estado_sale_de_estado_firma(self, result):
+        assert result["movements"][0]["estado"] == "Firmado"
+
+    def test_el_resto_de_las_columnas_sigue_bien(self, result):
+        mov = result["movements"][0]
+        assert mov["folio"] == 26
+        assert mov["etapa"] == "Embargo"
+        assert mov["tramite"] == "Resolución"
+        assert mov["descripcion"] == "Notificación Art. 52 C.P.C."
+
+    def test_cobranza_no_tiene_foja(self, result):
+        assert result["movements"][0]["foja"] is None
+
+    def test_lee_el_cuaderno_de_selCuadernoCob(self, result):
+        """El select de cobranza NO se llama selCuaderno: el cuaderno salia
+        vacio y las claves de movimiento quedaban 'ROL::folio', colisionando
+        entre cuadernos distintos."""
+        assert result["movements"][0]["cuaderno"] == "Principal"
