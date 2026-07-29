@@ -94,6 +94,30 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
 
 
+def _dedupe_movement_keys(keys: list[str]) -> list[str]:
+    """Desambigua claves repetidas DENTRO de un mismo batch de upsert.
+
+    La clave es `case_number:cuaderno:folio` y un mismo folio puede tener mas de un
+    tramite, asi que dos filas del mismo batch colisionan. Postgres rechaza el upsert
+    ENTERO con 21000 ("ON CONFLICT DO UPDATE command cannot affect row a second
+    time"), no solo la fila repetida: eso dejo a T-100-2024 sin sincronizar desde el
+    13 de marzo.
+
+    La PRIMERA ocurrencia conserva la clave de siempre — si cambiara, las filas ya
+    guardadas dejarian de matchear y se reinsertarian como movimientos nuevos,
+    disparando notificaciones falsas en todas las causas — y las siguientes llevan
+    sufijo. No se descarta ninguna: perder un movimiento de una causa judicial en
+    silencio es peor que el bug original.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for key in keys:
+        n = seen.get(key, 0) + 1
+        seen[key] = n
+        out.append(key if n == 1 else f"{key}#{n}")
+    return out
+
+
 async def search_pjud_via_session(session, competencia: str, form_data: dict, timeout: float) -> dict:
     """Call OJV search via session and parse results."""
     comp_path = competencia_path(competencia)
@@ -576,6 +600,17 @@ class SyncEngine:
                 ),
                 "raw_payload": mov,
             })
+
+        keys = _dedupe_movement_keys([r["external_movement_key"] for r in rows])
+        n_dupes = sum(1 for k in keys if "#" in k)
+        if n_dupes:
+            logger.warning(
+                "Causa %s: %d movimiento(s) con cuaderno+folio repetido en el mismo "
+                "batch; se les agrega sufijo para no perderlos",
+                case["case_number"], n_dupes,
+            )
+        for row, key in zip(rows, keys):
+            row["external_movement_key"] = key
 
         # Count before
         before_resp = await run_query(

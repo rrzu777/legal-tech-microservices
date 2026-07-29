@@ -741,6 +741,64 @@ class TestHelperFunctions:
         key = _build_external_movement_key("C-1234-2024", "Principal", 5)
         assert key == "C-1234-2024:Principal:5"
 
+    @pytest.mark.asyncio
+    async def test_upsert_movements_manda_claves_unicas(self):
+        """El helper puede estar perfecto y no estar CABLEADO: una lista de rows sin
+        pasar por _dedupe_movement_keys sigue siendo Python valido y ningun test
+        unitario del helper lo nota. Este test mira lo que llega al upsert."""
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        detail = {"movements": [
+            {"folio": 5, "cuaderno": "Principal", "tramite": "Resolucion",
+             "descripcion": "primera", "fecha": "01/05/2024", "etapa": ""},
+            {"folio": 5, "cuaderno": "Principal", "tramite": "Escrito",
+             "descripcion": "segunda", "fecha": "01/05/2024", "etapa": ""},
+        ]}
+        await engine._upsert_movements(_make_case(), detail)
+
+        rows = mock_sb.from_.return_value.upsert.call_args[0][0]
+        keys = [r["external_movement_key"] for r in rows]
+        assert len(keys) == 2, "no puede perder movimientos"
+        assert len(set(keys)) == 2, f"claves duplicadas llegan al upsert: {keys}"
+        assert keys[0] == "C-1234-2024:Principal:5", "la primera conserva su clave"
+
+    def test_desambigua_claves_duplicadas_en_el_mismo_batch(self):
+        """Dos movimientos con el mismo cuaderno+folio rompian el upsert ENTERO con
+        'ON CONFLICT DO UPDATE command cannot affect row a second time' (21000).
+        Es lo que dejo T-100-2024 suspendida desde el 13 de marzo."""
+        from worker.engine import _dedupe_movement_keys
+        keys = _dedupe_movement_keys([
+            "T-100-2024:Principal:5",
+            "T-100-2024:Principal:5",
+            "T-100-2024:Principal:6",
+            "T-100-2024:Principal:5",
+        ])
+        assert keys == [
+            "T-100-2024:Principal:5",
+            "T-100-2024:Principal:5#2",
+            "T-100-2024:Principal:6",
+            "T-100-2024:Principal:5#3",
+        ]
+
+    def test_la_primera_ocurrencia_conserva_su_clave(self):
+        """Si la primera cambiara, las filas ya guardadas dejarian de matchear y se
+        reinsertarian como movimientos NUEVOS -> notificaciones falsas en masa."""
+        from worker.engine import _dedupe_movement_keys
+        assert _dedupe_movement_keys(["a:b:1", "a:b:1"])[0] == "a:b:1"
+
+    def test_no_toca_las_claves_si_no_hay_duplicados(self):
+        from worker.engine import _dedupe_movement_keys
+        assert _dedupe_movement_keys(["a:b:1", "a:b:2"]) == ["a:b:1", "a:b:2"]
+
+    def test_no_pierde_ningun_movimiento(self):
+        """Deduplicar descartando perderia un movimiento de una causa judicial en
+        silencio, que es justo lo que este proyecto existe para evitar."""
+        from worker.engine import _dedupe_movement_keys
+        entrada = ["x:y:1"] * 4
+        salida = _dedupe_movement_keys(entrada)
+        assert len(salida) == len(entrada)
+        assert len(set(salida)) == len(entrada)
+
     def test_map_tramite_resolution(self):
         from worker.engine import _map_tramite
         assert _map_tramite("Resolución auto") == "resolution"
