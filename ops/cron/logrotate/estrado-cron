@@ -1,0 +1,21 @@
+# /etc/logrotate.d/estrado-cron
+#
+# El log venia creciendo sin rotar desde marzo 2026. `create` alcanza y no hace falta
+# copytruncate: run-cron.sh appendea con `>>` y reabre el archivo en cada corrida.
+#
+# OJO: el chequeo #7 del watchdog lee este archivo y alerta si no ve ninguna linea en
+# 24h. Con rotacion mensual eso no se pisa nunca; si alguna vez se baja a `daily`, hay
+# que hacer que el chequeo lea tambien el .1 recien rotado.
+/var/log/estrado-cron.log {
+    # /var/log en este VPS es root:syslog drwxrwxr-x, o sea group-writable, y logrotate
+    # se planta ("parent directory has insecure permissions") si no le decis con que
+    # usuario rotar. Sin esta linea el archivo NO se rota y el config queda de adorno.
+    su root root
+    monthly
+    rotate 6
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
