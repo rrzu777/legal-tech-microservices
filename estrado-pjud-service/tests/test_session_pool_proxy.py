@@ -26,6 +26,9 @@ def _make_config(pool_size=1, proxy_url=None, proxy_pool_size=3, block_pause_s=3
     config.OJV_PROXY_STICKY_LIFETIME = "1h"
     config.OJV_PROXY_POOL_SIZE = proxy_pool_size
     config.BLOCK_PAUSE_S = block_pause_s
+    # Estos tests miden el comportamiento POR INTENTO de minteo; con reintentos
+    # internos un mint fallido no propagaria y las aserciones perderian sentido.
+    config.MINT_MAX_RETRIES = 1
     return config
 
 

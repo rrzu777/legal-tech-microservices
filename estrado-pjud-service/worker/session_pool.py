@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 
@@ -12,6 +13,13 @@ from app.session import OJVSession
 from worker.config import WorkerConfig
 
 logger = logging.getLogger(__name__)
+
+# Backoff entre reintentos de minteo. Corto a proposito: el fallo tipico es un
+# tunel de proxy que no levanta, o sea inmediato, no un rate-limit del origen.
+# Tiene que quedar MUY por debajo de BLOCK_PAUSE_S (30s) — ese cooldown existe
+# para otra cosa (un slot re-minteando en loop) y no debe confundirse con esto.
+_MINT_RETRY_BASE_S = 2.0
+_MINT_RETRY_JITTER_S = 1.0
 
 
 @dataclass
@@ -48,6 +56,11 @@ class SessionPool:
             config.OJV_PROXY_POOL_SIZE if self._proxy_base else config.POOL_SIZE
         )
         self._slots: list[_Slot] = []
+        # Contadores de minteo (B2). Van al heartbeat: sin ellos no hay forma de
+        # ver si el proxy se degrada — el basal es ~12% de fallo y lo que importa
+        # es distinguir eso de "el proveedor se cayo".
+        self.mint_attempts: int = 0
+        self.mint_failures: int = 0
         self._sem = asyncio.Semaphore(self._pool_size)
         self._lock = asyncio.Lock()
         # Registro explícito de checkouts: sesión -> slot que la posee. NO
@@ -84,30 +97,67 @@ class SessionPool:
                 logger.info("Slot %d en cooldown; esperando %.1fs antes de re-mint", slot.index, remaining)
                 await asyncio.sleep(remaining)
 
-        if self._proxy_base:
-            token = generate_session_token()
-            proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
-            minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
-        else:
+        # Retry con backoff (A1). El proxy residencial falla ~12% de las veces, de
+        # forma uniforme y desde el dia 1: sin reintento, cada uno de esos fallos le
+        # cuesta una sincronizacion a una causa. Con fallos independientes, 12% baja
+        # a ~1,5% con un reintento y a ~0,2% con dos.
+        #
+        # Cada vuelta pide un TOKEN NUEVO, o sea una IP nueva: el que falla es el
+        # tunel de esa IP, asi que reintentar contra la misma no arregla nada.
+        #
+        # El retry vive DESPUES del cooldown BLOCK_PAUSE_S de arriba y no lo
+        # re-dispara: ese cooldown es para un slot que re-mintea en loop, no para
+        # los reintentos de un mismo minteo.
+        attempts = max(1, self._config.MINT_MAX_RETRIES)
+        for attempt in range(1, attempts + 1):
             token = None
             proxy_url = None
-            minter = CookieMinter(self._config.PJUD_BASE_URL)
+            new_session = None
+            self.mint_attempts += 1
+            try:
+                if self._proxy_base:
+                    token = generate_session_token()
+                    proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
+                    minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
+                else:
+                    minter = CookieMinter(self._config.PJUD_BASE_URL)
 
-        creds = await minter.mint()
+                creds = await minter.mint()
 
-        settings = Settings(
-            API_KEY="unused-by-worker",
-            OJV_BASE_URL=self._config.PJUD_BASE_URL,
-            RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
-        )
-        adapter = OJVHttpAdapter(
-            settings,
-            proxy=proxy_url,
-            user_agent=creds.user_agent,
-            cookies=creds.cookies,
-        )
-        new_session = OJVSession(adapter)
-        await new_session.initialize()
+                settings = Settings(
+                    API_KEY="unused-by-worker",
+                    OJV_BASE_URL=self._config.PJUD_BASE_URL,
+                    RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
+                )
+                adapter = OJVHttpAdapter(
+                    settings,
+                    proxy=proxy_url,
+                    user_agent=creds.user_agent,
+                    cookies=creds.cookies,
+                )
+                new_session = OJVSession(adapter)
+                await new_session.initialize()
+                break
+            except Exception as exc:
+                self.mint_failures += 1
+                if new_session is not None:
+                    # La sesion a medio construir se cierra acá: si no, cada
+                    # reintento deja un adapter httpx colgado.
+                    try:
+                        await new_session.close()
+                    except Exception:
+                        logger.debug("No se pudo cerrar la sesion fallida del slot %d", slot.index)
+                if attempt >= attempts:
+                    logger.error(
+                        "Slot %d: minteo fallido tras %d intentos", slot.index, attempts
+                    )
+                    raise
+                delay = _MINT_RETRY_BASE_S * 2 ** (attempt - 1) + random.uniform(0, _MINT_RETRY_JITTER_S)
+                logger.warning(
+                    "Slot %d: minteo fallido (intento %d/%d: %s); reintento en %.1fs con IP nueva",
+                    slot.index, attempt, attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
 
         self._store.save_slot(slot.index, creds.cookies, creds.user_agent, proxy_url)
 

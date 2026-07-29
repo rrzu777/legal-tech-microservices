@@ -31,6 +31,7 @@ def _worker_config(store_path, pool_size=3):
     c.OJV_PROXY_STICKY_LIFETIME = "1h"
     c.OJV_PROXY_POOL_SIZE = pool_size
     c.BLOCK_PAUSE_S = 30
+    c.MINT_MAX_RETRIES = 3
     return c
 
 
