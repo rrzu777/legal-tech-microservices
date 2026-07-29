@@ -38,8 +38,30 @@ MEMAVAIL=$(free -m | awk '/^Mem:/{print $7}')
 [ "${MEMAVAIL:-9999}" -lt 400 ] && add "RAM disponible baja: ${MEMAVAIL}MB (<400MB)." "mem"
 
 # 3. Causas con error de sync o bloqueadas
-SYNC_ERR=$(cnt "cases?select=id&last_sync_status=eq.error&tracking_status=eq.active")
-[ "${SYNC_ERR:-0}" -ge 3 ] && add "${SYNC_ERR} causas activas con last_sync_status=error." "sync-err"
+# El chequeo original cruzaba last_sync_status=error CON tracking_status=active, y esa
+# combinación no existe: cuando una causa falla, el worker le mueve el tracking_status.
+# Devolvía */0 siempre — verificado el 29 jul con 3 causas genuinamente rotas en la base.
+# `tracking_status` es la señal de calidad: los errores de infra no lo tocan.
+#
+# Suspendidas: alerta UNA vez por causa. El anti-spam global es por cooldown de 3h y la
+# suspensión es terminal, así que sin esto la misma causa avisaría cada 3h para siempre.
+# El archivo guarda los IDs ya avisados y se REESCRIBE entero en cada corrida: si una
+# causa se reactiva sale de la lista, y si vuelve a caer se avisa de nuevo.
+SUSP_STATE="$WD_STATE_DIR/estrado-wd-suspended"
+SUSP_JSON=$(curl -s -m 20 "$API/cases?select=id,case_number&tracking_status=eq.suspended" "${AUTH[@]}" 2>/dev/null || true)
+SUSP_IDS=$(printf '%s' "$SUSP_JSON" | jq -r '.[]?.id' 2>/dev/null | sort || true)
+touch "$SUSP_STATE"
+NEW_IDS=$(comm -23 <(printf '%s\n' "$SUSP_IDS" | grep -v '^$' | sort) <(sort "$SUSP_STATE") || true)
+if [ -n "${NEW_IDS// }" ]; then
+  NEW_NUMS=$(printf '%s' "$SUSP_JSON" \
+              | jq -r --argjson want "$(printf '%s\n' "$NEW_IDS" | grep -v '^$' | jq -R . | jq -s .)" \
+                   '[.[] | select(.id as $i | $want | index($i))] | map(.case_number) | join(", ")' 2>/dev/null || true)
+  add "Causa(s) con monitoreo SUSPENDIDO: ${NEW_NUMS:-$NEW_IDS}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended"
+fi
+printf '%s\n' "$SUSP_IDS" | grep -v '^$' | sort > "$SUSP_STATE"
+
+TRACK_ERR=$(cnt "cases?select=id&tracking_status=eq.error")
+[ "${TRACK_ERR:-0}" -ge 3 ] && add "${TRACK_ERR} causas con tracking_status=error." "track-err"
 BLOCKED=$(cnt "cases?select=id&sync_blocked_until=gte.$NOW")
 [ "${BLOCKED:-0}" -ge 3 ] && add "${BLOCKED} causas con sync bloqueado (sync_blocked_until futuro)." "blocked"
 
