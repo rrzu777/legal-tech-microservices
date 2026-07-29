@@ -67,7 +67,7 @@ class TestWorkerSessionPoolAcquire:
         challenge it produces is detected downstream and routed through the
         no-penalty blocked path (see engine._handle_blocked / detect_blocked),
         which keeps the anti-outage invariant: mint failures never reach
-        _update_case_error / sync_attempts.
+        _update_case_error / consecutive_sync_failures.
 
         NOTE: as of the N-slot checkout pool (Task 5a), the worker pool is
         slot-based (`_slots`, `_refresh_slot`) rather than a flat `_pool` of

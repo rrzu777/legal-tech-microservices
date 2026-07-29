@@ -221,7 +221,7 @@ class SessionPool:
                 # No penalizar la causa por un fallo de minteo/refresh: usar la
                 # sesión/bundle existente (posiblemente vencido). El challenge F5
                 # que devuelva se detecta downstream y va por el path de bloqueo
-                # (sin incrementar sync_attempts), disparando el re-mint reactivo
+                # (sin incrementar consecutive_sync_failures), disparando el re-mint reactivo
                 # vía la release correspondiente (healthy=False).
                 logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
         return slot
