@@ -57,6 +57,28 @@ class TestNormalizeDate:
     def test_with_spaces(self):
         assert normalize_date("  31/05/2024  ") == "2024-05-31"
 
+    def test_rechaza_texto_que_no_es_fecha(self):
+        # El string real que dejo C-1000-2024 suspendida: venia en la columna de
+        # fecha por un corrimiento del mapa de columnas del parser, y Postgres lo
+        # rechazo con 22007 (invalid input syntax for type date). Devolver None es
+        # fail-safe; devolver el crudo tumba la causa a los 10 intentos.
+        assert normalize_date("Firmado") is None
+
+    def test_rechaza_fecha_incompleta(self):
+        assert normalize_date("31/05") is None
+
+    def test_rechaza_dia_imposible(self):
+        assert normalize_date("32/05/2024") is None
+
+    def test_rechaza_mes_imposible(self):
+        assert normalize_date("01/13/2024") is None
+
+    def test_rechaza_iso_imposible(self):
+        assert normalize_date("2024-02-31") is None
+
+    def test_acepta_dmy_con_un_digito(self):
+        assert normalize_date("1/5/2024") == "2024-05-01"
+
 
 class TestCompetenciaCodes:
     def test_civil(self):

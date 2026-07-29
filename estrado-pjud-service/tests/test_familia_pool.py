@@ -20,6 +20,7 @@ def _make_config(proxy_url="http://user:pw@geo.iproyal.com:12321", proxy_pool_si
     config.OJV_PROXY_STICKY_LIFETIME = "1h"
     config.OJV_PROXY_POOL_SIZE = proxy_pool_size
     config.BLOCK_PAUSE_S = 30
+    config.MINT_MAX_RETRIES = 3
     return config
 
 

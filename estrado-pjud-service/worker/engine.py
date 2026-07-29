@@ -94,6 +94,30 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
 
 
+def _dedupe_movement_keys(keys: list[str]) -> list[str]:
+    """Desambigua claves repetidas DENTRO de un mismo batch de upsert.
+
+    La clave es `case_number:cuaderno:folio` y un mismo folio puede tener mas de un
+    tramite, asi que dos filas del mismo batch colisionan. Postgres rechaza el upsert
+    ENTERO con 21000 ("ON CONFLICT DO UPDATE command cannot affect row a second
+    time"), no solo la fila repetida: eso dejo a T-100-2024 sin sincronizar desde el
+    13 de marzo.
+
+    La PRIMERA ocurrencia conserva la clave de siempre — si cambiara, las filas ya
+    guardadas dejarian de matchear y se reinsertarian como movimientos nuevos,
+    disparando notificaciones falsas en todas las causas — y las siguientes llevan
+    sufijo. No se descarta ninguna: perder un movimiento de una causa judicial en
+    silencio es peor que el bug original.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for key in keys:
+        n = seen.get(key, 0) + 1
+        seen[key] = n
+        out.append(key if n == 1 else f"{key}#{n}")
+    return out
+
+
 async def search_pjud_via_session(session, competencia: str, form_data: dict, timeout: float) -> dict:
     """Call OJV search via session and parse results."""
     comp_path = competencia_path(competencia)
@@ -244,7 +268,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             if not search_result["found"]:
@@ -271,7 +295,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             if detail.get("parse_suspect"):
@@ -283,7 +307,7 @@ class SyncEngine:
                 # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
                 await self._handle_parse_suspect(case, competencia)
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
             # Upsert movements
@@ -345,7 +369,7 @@ class SyncEngine:
             logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
             await self._handle_blocked(case["id"])
-            self._metrics.record_error()
+            self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
         except Exception as e:
@@ -417,7 +441,7 @@ class SyncEngine:
             await self._pool.release_familia_bundle(slot, healthy=True)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
             await self._handle_blocked(case["id"])
-            self._metrics.record_error()
+            self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
         session_healthy = True
@@ -449,7 +473,7 @@ class SyncEngine:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e) or "Timeout Familia sync")
                 await self._handle_blocked(case["id"])
-                self._metrics.record_error()
+                self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
         finally:
             await self._pool.release_familia_bundle(slot, healthy=session_healthy)
@@ -576,6 +600,17 @@ class SyncEngine:
                 ),
                 "raw_payload": mov,
             })
+
+        keys = _dedupe_movement_keys([r["external_movement_key"] for r in rows])
+        n_dupes = sum(1 for k in keys if "#" in k)
+        if n_dupes:
+            logger.warning(
+                "Causa %s: %d movimiento(s) con cuaderno+folio repetido en el mismo "
+                "batch; se les agrega sufijo para no perderlos",
+                case["case_number"], n_dupes,
+            )
+        for row, key in zip(rows, keys):
+            row["external_movement_key"] = key
 
         # Count before
         before_resp = await run_query(

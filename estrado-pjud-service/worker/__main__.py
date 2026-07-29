@@ -131,7 +131,7 @@ async def main():
     pool = SessionPool(config)
     scheduler = Scheduler(config, supabase)
     notifier = Notifier(supabase)
-    metrics = Metrics(config, supabase)
+    metrics = Metrics(config, supabase, pool=pool)
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors

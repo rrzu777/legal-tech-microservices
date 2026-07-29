@@ -86,6 +86,7 @@ class TestWorkerSessionPoolAcquire:
         config.OJV_PROXY_STICKY_LIFETIME = "1h"
         config.OJV_PROXY_POOL_SIZE = 3
         config.BLOCK_PAUSE_S = 30
+        config.MINT_MAX_RETRIES = 3
 
         pool = SessionPool(config)
         old = MagicMock()
