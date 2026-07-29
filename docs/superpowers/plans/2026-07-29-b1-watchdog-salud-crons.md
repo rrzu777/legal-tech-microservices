@@ -334,10 +334,14 @@ if [ ! -r "$CRON_LOG" ]; then
 else
   CRON_CUTOFF=$(date -d '-24 hours' '+%Y-%m-%d %H:%M')
   CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "$CRON_LOG" 2>/dev/null || true)
-  CRON_BAD=$(printf '%s\n' "$CRON_RECENT" | grep -F ' - HTTP ' | awk '$NF != 200 {print $3, $NF}' || true)
+  # Se mira la ULTIMA corrida de cada endpoint, no todas: la pregunta es "¿esto está
+  # roto AHORA?". Con cooldown de 3h y ventana de 24h, un 404 suelto ya recuperado
+  # alertaría 8 veces. Un endpoint roto de verdad falla también en su última corrida.
+  CRON_BAD=$(printf '%s\n' "$CRON_RECENT" | grep -F ' - HTTP ' \
+              | awk '{ultimo[$3] = $NF} END {for (e in ultimo) if (ultimo[e] != 200) print e, ultimo[e]}' \
+              | sort || true)
   if [ -n "${CRON_BAD// }" ]; then
-    CRON_DETAIL=$(printf '%s\n' "$CRON_BAD" | sort | uniq -c \
-                   | awk '{printf "    %sx %s -> HTTP %s\n", $1, $2, $3}' || true)
+    CRON_DETAIL=$(printf '%s\n' "$CRON_BAD" | awk '{printf "    %s -> HTTP %s\n", $1, $2}' || true)
     # La firma lleva los códigos: 404 en todo (APP_URL roto) y 401 (CRON_SECRET
     # desincronizado con Vercel) son incidentes distintos, y si el segundo aparece
     # mientras el primero está en cooldown NO puede quedar tapado.
@@ -666,6 +670,9 @@ git commit -m "feat(watchdog): anti-spam por causa para suspendidas (terminal, n
 # run-cron.sh appendea con `>>` y reabre el archivo en cada corrida, así que
 # `create` alcanza: no hace falta copytruncate.
 /var/log/estrado-cron.log {
+    # Sin esto logrotate SALTA el archivo: /var/log es root:syslog group-writable
+    # y se planta con "parent directory has insecure permissions".
+    su root root
     monthly
     rotate 6
     compress
