@@ -330,10 +330,9 @@ class SyncEngine:
                     "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                     "last_sync_status": "success",
                     "last_sync_error": None,
-                    # consecutive_sync_failures = fallos CONSECUTIVOS desde el último éxito
-                    # (lo lee _update_case_error para decidir backoff vs suspensión).
-                    # No es un contador de sincronizaciones totales: incrementarlo acá
-                    # suspendía causas sanas tras 10 éxitos.
+                    # Se RESETEA en el éxito. Incrementarlo acá suspendía causas
+                    # sanas tras 10 sincronizaciones buenas (el bug que motivó el
+                    # rename de esta columna).
                     "consecutive_sync_failures": 0,
                     "canonical_identifier": canonical,
                     "external_case_key": case.get("external_case_key") or detail_key,
@@ -537,7 +536,7 @@ class SyncEngine:
                 "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                 "last_sync_status": "success",
                 "last_sync_error": None,
-                # ver comentario en sync_case: consecutive_sync_failures = fallos CONSECUTIVOS
+                # Se resetea en el éxito, igual que el path PJUD de sync_case.
                 "consecutive_sync_failures": 0,
                 "sync_blocked_until": None,
                 "court": caso.tribunal or case.get("court", ""),
