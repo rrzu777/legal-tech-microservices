@@ -77,9 +77,23 @@ if [ -n "$HB_TS" ] && [ "$HB_TS" != "[]" ]; then
   fi
 fi
 
-# 5. Errores recientes en journal de servicios estrado (última hora)
-JERR=$(journalctl -u estrado-pjud.service -u estrado-pjud-worker.service --since "-1 hour" -p err --no-pager 2>/dev/null | grep -viE "^-- " | tail -8)
-[ -n "$JERR" ] && add "Errores en journal (última hora):"$'\n'"$JERR" "journal-err"
+# 5. Errores reales del worker en la última hora. Tres trampas, las tres pisadas:
+#    (a) `-p err` no sirve: el worker sale por stdout vía xvfb-run, así que TODO entra
+#        como PRIORITY=6 (info). El chequeo devolvía 0 líneas en 7 días habiendo 40 errores.
+#    (b) `grep -i` tampoco: las URLs de PostgREST llevan `tracking_status=in.(active,
+#        error,blocked)` dentro de líneas INFO → 19.565 falsos positivos en 7 días contra
+#        40 reales. Case-sensitive sobre el campo "level" del log JSON da exactamente 40.
+#    (c) alertar por cualquier error inunda: "Refresh de slot N falló" es el ~12% de fallo
+#        conocido del proxy residencial, se auto-cura (lo dice el propio mensaje: "usando
+#        la sesión existente") y ya se decidió que va como número en el digest, no como
+#        ping. Sin ese ruido quedan 0 errores en 24h, así que 3 en una hora es señal.
+JERR=$(journalctl -u estrado-pjud.service -u estrado-pjud-worker.service --since "-1 hour" --no-pager 2>/dev/null \
+        | grep -E '"level": "(ERROR|CRITICAL)"|Traceback' \
+        | grep -vE 'Refresh de slot [0-9]+ fall' || true)
+JERR_N=$(printf '%s' "$JERR" | grep -c . || true)
+if [ "${JERR_N:-0}" -ge 3 ]; then
+  add "${JERR_N} errores del worker en la última hora (excluye el ruido conocido del pool):"$'\n'"$(printf '%s' "$JERR" | tail -5 | cut -c1-200)" "journal-err"
+fi
 
 # 6. Salud del propio Hermes (gateway + dashboard son servicios de usuario de hermes)
 for hsvc in hermes-gateway hermes-dashboard; do
@@ -129,6 +143,13 @@ else
     fi
   fi
 fi
+
+# 8. Causas atascadas: next_sync_at vencido hace más de 2h.
+#    Se mira `next_sync_at` vencido y no "N horas sin sincronizar" porque la cadencia es
+#    por prioridad (_compute_next_sync_at): un umbral fijo daría falsos positivos en las
+#    causas de cadencia diaria. Las 2h son margen para un scheduler unos minutos atrasado.
+STUCK=$(cnt "cases?select=id&tracking_status=eq.active&next_sync_at=lt.$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%S)")
+[ "${STUCK:-0}" -ge 1 ] && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
 
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
