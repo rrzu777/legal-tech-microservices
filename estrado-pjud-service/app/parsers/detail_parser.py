@@ -210,9 +210,19 @@ def _normalize_movement_date(raw: str) -> str | None:
     return normalize_date(first_date)
 
 
+# El dropdown de cuaderno no se llama igual en todas las competencias: en
+# cobranza es `selCuadernoCob`. Con solo `selCuaderno`, el cuaderno de cobranza
+# salía vacío y las claves de movimiento quedaban "ROL::folio" — o sea que dos
+# cuadernos distintos con el mismo folio colisionaban.
+_CUADERNO_SELECT_IDS = ("selCuaderno", "selCuadernoCob")
+
+
 def _get_selected_cuaderno(soup: BeautifulSoup) -> str:
     """Extract the currently selected cuaderno name from the dropdown."""
-    select = soup.find("select", id="selCuaderno")
+    select = next(
+        (s for s in (soup.find("select", id=i) for i in _CUADERNO_SELECT_IDS) if s),
+        None,
+    )
     if not select:
         return ""
     option = select.find("option", selected=True)
@@ -262,6 +272,19 @@ _MOVEMENT_COLUMN_MAP: dict[str, dict] = {
         "min_cols": 8, "folio": 0, "doc": 1, "anexo": 2, "fecha": 6,
         "tramite": 4, "descripcion": 5, "etapa": 3, "foja": 7,
         "sala": -1, "estado": -1,
+    },
+    # Cobranza NO tenia entrada acá y caía en el fallback _CIVIL_COLS, que asume 8
+    # columnas con `fecha` en el índice 6. La tabla real tiene 9 y el 6 es
+    # "Estado Firma": el parser mandaba "Firmado" a una columna `date` de Postgres
+    # (22007) y a los 10 intentos la causa quedaba suspendida. Verificado contra el
+    # HTML real el 29 jul 2026; las cabeceras son, en orden:
+    #   Folio | Doc. | Anexo | Etapa | Trámite | Desc. Trámite | Estado Firma |
+    #   Fec. Trámite | Georref.
+    # No hay columna de foja ni de sala.
+    "historiaCob": {
+        "min_cols": 9, "folio": 0, "doc": 1, "anexo": 2, "fecha": 7,
+        "tramite": 4, "descripcion": 5, "etapa": 3, "foja": -1,
+        "sala": -1, "estado": 6,
     },
 }
 
