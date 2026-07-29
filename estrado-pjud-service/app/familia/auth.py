@@ -281,4 +281,4 @@ class SessionError(Exception):
 
 
 class FamiliaBlockedError(Exception):
-    """OJV devolvió un challenge F5 (bloqueo transitorio; NO penaliza sync_attempts)."""
+    """OJV devolvió un challenge F5 (bloqueo transitorio; NO penaliza consecutive_sync_failures)."""

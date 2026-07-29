@@ -15,7 +15,7 @@ def _make_case(**overrides):
         "matter": "civil",
         "status": "active",
         "assigned_user_id": "user-uuid-1",
-        "sync_attempts": 3,
+        "consecutive_sync_failures": 3,
         "external_case_key": None,
     }
     base.update(overrides)
@@ -175,16 +175,16 @@ class TestSyncEngine:
         mock_backoff.record_success.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_sync_success_resets_sync_attempts(self):
-        """Un sync exitoso debe resetear sync_attempts a 0, no incrementarlo.
+    async def test_sync_success_resets_el_contador(self):
+        """Un sync exitoso debe resetear consecutive_sync_failures a 0, no incrementarlo.
 
         Regresión: el path de éxito lo incrementaba, así que las causas sanas
-        acumulaban intentos hasta cruzar _MAX_SYNC_ATTEMPTS y quedar a un solo
+        acumulaban intentos hasta cruzar _MAX_CONSECUTIVE_FAILURES y quedar a un solo
         error de la suspensión permanente.
         """
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-        case = _make_case(sync_attempts=20)
+        case = _make_case(consecutive_sync_failures=20)
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
              patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
@@ -197,9 +197,9 @@ class TestSyncEngine:
         success_update = find_update_payload(mock_sb, last_sync_status="success")
 
         assert success_update is not None, "Se esperaba un update con last_sync_status='success'"
-        assert success_update["sync_attempts"] == 0, (
-            f"Un sync exitoso debe resetear sync_attempts a 0, "
-            f"pero quedó en {success_update['sync_attempts']}"
+        assert success_update["consecutive_sync_failures"] == 0, (
+            f"Un sync exitoso debe resetear consecutive_sync_failures a 0, "
+            f"pero quedó en {success_update['consecutive_sync_failures']}"
         )
 
     @pytest.mark.asyncio
@@ -247,12 +247,12 @@ class TestSyncEngine:
         # Per-slot reactive re-mint on block: release(healthy=False).
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
         # Anti-apagón: a block must never penalize the case via _update_case_error
-        # nor increment sync_attempts.
+        # nor increment consecutive_sync_failures.
         mock_update_error.assert_not_called()
         update_calls = chain.update.call_args_list
         for call in update_calls:
             payload = call[0][0] if call[0] else {}
-            assert "sync_attempts" not in payload
+            assert "consecutive_sync_failures" not in payload
 
     @pytest.mark.asyncio
     async def test_sync_invalid_identifier(self):
@@ -366,7 +366,7 @@ class TestSyncEngine:
         """G2: a timeout is an INFRA failure (bad/slow residential IP), not the
         case's fault. It must be treated like a block: _handle_blocked (which
         calls record_blocked, NOT record_failure), no _update_case_error, no
-        sync_attempts increment, and release(healthy=False) so the slot
+        consecutive_sync_failures increment, and release(healthy=False) so the slot
         re-mints."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
         mock_session = mock_pool.acquire.return_value
@@ -387,7 +387,7 @@ class TestSyncEngine:
         update_calls = mock_sb.from_.return_value.update.call_args_list
         for call in update_calls:
             payload = call[0][0] if call[0] else {}
-            assert "sync_attempts" not in payload
+            assert "consecutive_sync_failures" not in payload
 
     @pytest.mark.asyncio
     async def test_sync_transport_error_is_infra_non_penalizing(self):
@@ -964,7 +964,7 @@ class TestSyncErrorBackoff:
         """When a case fails with an error, the update should include sync_blocked_until."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-        case = _make_case(sync_attempts=0)
+        case = _make_case(consecutive_sync_failures=0)
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.return_value = _mock_search_response(found=False, matches=[])
@@ -980,10 +980,10 @@ class TestSyncErrorBackoff:
 
     @pytest.mark.asyncio
     async def test_sync_error_suspended_after_max_attempts(self):
-        """After 10+ failed attempts, the case should be suspended instead of retried."""
+        """After 10+ CONSECUTIVE failures, the case should be suspended instead of retried."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-        case = _make_case(sync_attempts=10)
+        case = _make_case(consecutive_sync_failures=10)
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             mock_search.return_value = _mock_search_response(found=False, matches=[])
@@ -996,14 +996,14 @@ class TestSyncErrorBackoff:
 
         assert suspended_update is not None, "Expected an update call with tracking_status='suspended'"
         assert suspended_update["last_sync_status"] == "error"
-        assert "Suspended after 10 failed attempts" in suspended_update["last_sync_error"]
-        assert suspended_update["sync_attempts"] == 11
+        assert "Suspended after 10 consecutive failures" in suspended_update["last_sync_error"]
+        assert suspended_update["consecutive_sync_failures"] == 11
         # Suspended cases should NOT have sync_blocked_until (they don't retry)
         assert "sync_blocked_until" not in suspended_update
 
     @pytest.mark.asyncio
     async def test_sync_error_backoff_escalates(self):
-        """Higher sync_attempts should result in longer backoff durations."""
+        """Higher consecutive_sync_failures should result in longer backoff durations."""
         from worker.engine import SyncEngine, TZ_SANTIAGO
         from datetime import datetime as dt
 
@@ -1017,7 +1017,7 @@ class TestSyncErrorBackoff:
         for attempts, expected_seconds in backoff_expected.items():
             engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
-            case = _make_case(sync_attempts=attempts)
+            case = _make_case(consecutive_sync_failures=attempts)
 
             before = dt.now(TZ_SANTIAGO)
 
@@ -1035,10 +1035,10 @@ class TestSyncErrorBackoff:
             diff = (blocked_until - before).total_seconds()
             # Allow a small tolerance window (2 seconds)
             assert abs(diff - expected_seconds) < 2, (
-                f"For sync_attempts={attempts}, expected ~{expected_seconds}s backoff, got {diff:.1f}s"
+                f"For consecutive_sync_failures={attempts}, expected ~{expected_seconds}s backoff, got {diff:.1f}s"
             )
-            # Verify sync_attempts is incremented in the error update
-            assert error_update.get("sync_attempts") == attempts + 1, (
-                f"For sync_attempts={attempts}, expected update to set sync_attempts={attempts + 1}, "
-                f"got {error_update.get('sync_attempts')}"
+            # Verify consecutive_sync_failures is incremented in the error update
+            assert error_update.get("consecutive_sync_failures") == attempts + 1, (
+                f"For consecutive_sync_failures={attempts}, expected update to set consecutive_sync_failures={attempts + 1}, "
+                f"got {error_update.get('consecutive_sync_failures')}"
             )

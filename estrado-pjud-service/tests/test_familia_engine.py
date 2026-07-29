@@ -34,7 +34,7 @@ def _make_engine():
 
 _CASE = {
     "id": "c1", "case_number": "C-100-2024", "law_firm_id": "lf1",
-    "ojv_credential_id": "cred1", "sync_attempts": 0, "matter": "familia",
+    "ojv_credential_id": "cred1", "consecutive_sync_failures": 0, "matter": "familia",
 }
 
 
@@ -105,11 +105,11 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_sync_success_resets_sync_attempts(monkeypatch):
-    """Un sync Familia exitoso también debe resetear sync_attempts a 0.
+async def test_sync_success_resets_el_contador(monkeypatch):
+    """Un sync Familia exitoso también debe resetear consecutive_sync_failures a 0.
 
-    Espejo de test_sync_success_resets_sync_attempts en test_engine.py (path
-    PJUD): la invariante "éxito resetea sync_attempts" vale en los dos únicos
+    Espejo de test_sync_success_resets_el_contador en test_engine.py (path
+    PJUD): la invariante "éxito resetea consecutive_sync_failures" vale en los dos únicos
     lugares que la escriben, y este era el que quedaba sin cobertura.
     """
     import worker.engine as eng
@@ -136,7 +136,7 @@ async def test_sync_success_resets_sync_attempts(monkeypatch):
     )
     monkeypatch.setattr(eng, "parse_familia_results", MagicMock(return_value=([caso], None)))
 
-    case = {**_CASE, "sync_attempts": 20}
+    case = {**_CASE, "consecutive_sync_failures": 20}
     result = await engine._sync_familia_case(case, None, MagicMock())
 
     assert result["success"] is True
@@ -144,7 +144,7 @@ async def test_sync_success_resets_sync_attempts(monkeypatch):
     success_update = find_update_payload(engine._sb, last_sync_status="success")
 
     assert success_update is not None, "Se esperaba un update con last_sync_status='success'"
-    assert success_update["sync_attempts"] == 0, (
-        f"Un sync Familia exitoso debe resetear sync_attempts a 0, "
-        f"pero quedó en {success_update['sync_attempts']}"
+    assert success_update["consecutive_sync_failures"] == 0, (
+        f"Un sync Familia exitoso debe resetear consecutive_sync_failures a 0, "
+        f"pero quedó en {success_update['consecutive_sync_failures']}"
     )

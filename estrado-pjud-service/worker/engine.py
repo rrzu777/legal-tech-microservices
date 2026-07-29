@@ -205,7 +205,7 @@ class SyncEngine:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                await self._update_case_error(case["id"], "Identificador invalido", case.get("sync_attempts", 0))
+                await self._update_case_error(case["id"], "Identificador invalido", case.get("consecutive_sync_failures", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -222,7 +222,7 @@ class SyncEngine:
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Unsupported matter")
-                await self._update_case_error(case["id"], "Materia no soportada", case.get("sync_attempts", 0))
+                await self._update_case_error(case["id"], "Materia no soportada", case.get("consecutive_sync_failures", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -273,7 +273,7 @@ class SyncEngine:
 
             if not search_result["found"]:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Not found in OJV")
-                await self._update_case_error(case["id"], "No encontrada en OJV", case.get("sync_attempts", 0))
+                await self._update_case_error(case["id"], "No encontrada en OJV", case.get("consecutive_sync_failures", 0))
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -301,7 +301,7 @@ class SyncEngine:
             if detail.get("parse_suspect"):
                 # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
                 # el external_payload bueno marcando "success". Corto-circuito
-                # sin penalizar la causa (no incrementa sync_attempts).
+                # sin penalizar la causa (no incrementa consecutive_sync_failures).
                 # session_healthy queda True a propósito: el contenido SÍ llegó
                 # por esta IP (no es bloqueo ni caída de proxy), el problema es
                 # drift de parser/página; re-mintear el slot no ayudaría.
@@ -330,11 +330,10 @@ class SyncEngine:
                     "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                     "last_sync_status": "success",
                     "last_sync_error": None,
-                    # sync_attempts = fallos CONSECUTIVOS desde el último éxito
-                    # (lo lee _update_case_error para decidir backoff vs suspensión).
-                    # No es un contador de sincronizaciones totales: incrementarlo acá
-                    # suspendía causas sanas tras 10 éxitos.
-                    "sync_attempts": 0,
+                    # Se RESETEA en el éxito. Incrementarlo acá suspendía causas
+                    # sanas tras 10 sincronizaciones buenas (el bug que motivó el
+                    # rename de esta columna).
+                    "consecutive_sync_failures": 0,
                     "canonical_identifier": canonical,
                     "external_case_key": case.get("external_case_key") or detail_key,
                     "external_payload": {
@@ -362,7 +361,7 @@ class SyncEngine:
         except (httpx.TransportError, asyncio.TimeoutError) as e:
             # IP residencial caída/lenta o timeout de red = falla de INFRA, no de la causa.
             # Se trata como bloqueo: re-mint del slot (session_healthy=False) SIN penalizar
-            # (sin _update_case_error, sin sync_attempts++). El circuit breaker global via
+            # (sin _update_case_error, sin consecutive_sync_failures++). El circuit breaker global via
             # _handle_blocked/record_blocked da la protección sistémica.
             session_healthy = False
             msg = f"infra: {type(e).__name__}: {e}"
@@ -376,7 +375,7 @@ class SyncEngine:
             msg = str(e)
             logger.exception("Error syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg, case.get("sync_attempts", 0))
+            await self._update_case_error(case["id"], msg, case.get("consecutive_sync_failures", 0))
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -466,7 +465,7 @@ class SyncEngine:
                             year=str(parsed["anno"]),
                         )
             # Bloqueo F5 / sesión / timeout / transporte = transitorio: NO penaliza
-            # sync_attempts (_handle_blocked), y marca el slot para re-mint
+            # consecutive_sync_failures (_handle_blocked), y marca el slot para re-mint
             # (healthy=False en el finally). str(e) preserva el detalle (los
             # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
             except (FamiliaBlockedError, SessionError, TimeoutError, httpx.TransportError) as e:
@@ -481,12 +480,12 @@ class SyncEngine:
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
             await self._finish_run(sync_run_id, started_at, "error", 0, f"Parse error: {err}")
-            await self._update_case_error(case["id"], "Error al interpretar respuesta OJV Familia", case.get("sync_attempts", 0))
+            await self._update_case_error(case["id"], "Error al interpretar respuesta OJV Familia", case.get("consecutive_sync_failures", 0))
             return {"success": False, "new_movements": 0}
 
         if not casos:
             await self._finish_run(sync_run_id, started_at, "error", 0, "Case not found in Familia portal")
-            await self._update_case_error(case["id"], "Causa no encontrada en portal Familia", case.get("sync_attempts", 0))
+            await self._update_case_error(case["id"], "Causa no encontrada en portal Familia", case.get("consecutive_sync_failures", 0))
             return {"success": False, "new_movements": 0}
 
         caso = casos[0]
@@ -537,8 +536,8 @@ class SyncEngine:
                 "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                 "last_sync_status": "success",
                 "last_sync_error": None,
-                # ver comentario en sync_case: sync_attempts = fallos CONSECUTIVOS
-                "sync_attempts": 0,
+                # Se resetea en el éxito, igual que el path PJUD de sync_case.
+                "consecutive_sync_failures": 0,
                 "sync_blocked_until": None,
                 "court": caso.tribunal or case.get("court", ""),
                 "title": caso.caratulado or case.get("title", ""),
@@ -826,7 +825,7 @@ class SyncEngine:
     async def _handle_blocked(self, case_id: str):
         """Maneja un bloqueo (challenge F5 / OJV) SIN penalizar la causa.
 
-        Marca la causa como blocked (sin incrementar sync_attempts) y abre el
+        Marca la causa como blocked (sin incrementar consecutive_sync_failures) y abre el
         circuit breaker con una pausa corta. El re-mint de cookies ya NO se
         hace aquí: ocurre por-slot, de forma reactiva, cuando `sync_case`
         libera la sesión con `release(session, healthy=False)` — el slot que
@@ -872,32 +871,35 @@ class SyncEngine:
             }).eq("id", case_id)
         )
 
-    async def _update_case_error(self, case_id: str, error: str, sync_attempts: int = 0):
+    async def _update_case_error(self, case_id: str, error: str, consecutive_sync_failures: int = 0):
         """Update case with error status and escalating backoff.
 
-        Backoff schedule based on sync_attempts:
+        Backoff schedule based on consecutive_sync_failures:
           1st error: 5 minutes
           2nd error: 30 minutes
           3rd error: 2 hours
           4th+: 6 hours
           After 10 failures: suspended (irrecoverable)
         """
-        _MAX_SYNC_ATTEMPTS = 10
+        _MAX_CONSECUTIVE_FAILURES = 10
 
-        if sync_attempts >= _MAX_SYNC_ATTEMPTS:
-            logger.warning("Case %s exceeded max sync attempts (%d), suspending", case_id, _MAX_SYNC_ATTEMPTS)
+        if consecutive_sync_failures >= _MAX_CONSECUTIVE_FAILURES:
+            logger.warning(
+                "Case %s reached %d consecutive sync failures, suspending",
+                case_id, _MAX_CONSECUTIVE_FAILURES,
+            )
             await run_query(
                 self._sb.from_("cases").update({
                     "tracking_status": "suspended",
                     "last_sync_status": "error",
-                    "last_sync_error": f"Suspended after {sync_attempts} failed attempts: {error}",
-                    "sync_attempts": sync_attempts + 1,
+                    "last_sync_error": f"Suspended after {consecutive_sync_failures} consecutive failures: {error}",
+                    "consecutive_sync_failures": consecutive_sync_failures + 1,
                 }).eq("id", case_id)
             )
             return
 
         backoff_seconds = {0: 300, 1: 1800, 2: 7200}.get(
-            sync_attempts, 21600
+            consecutive_sync_failures, 21600
         )
         blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=backoff_seconds)).isoformat()
 
@@ -907,6 +909,6 @@ class SyncEngine:
                 "last_sync_status": "error",
                 "last_sync_error": error,
                 "sync_blocked_until": blocked_until,
-                "sync_attempts": sync_attempts + 1,
+                "consecutive_sync_failures": consecutive_sync_failures + 1,
             }).eq("id", case_id)
         )

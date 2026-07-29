@@ -12,9 +12,9 @@ def _make_engine(pool):
 
 
 @pytest.mark.asyncio
-async def test_blocked_does_not_increment_sync_attempts():
+async def test_blocked_no_incrementa_el_contador():
     """_handle_blocked marks the case as blocked and opens the circuit
-    breaker, without penalizing sync_attempts. It no longer touches the
+    breaker, without penalizing consecutive_sync_failures. It no longer touches the
     pool directly — per-slot re-mint now happens reactively in sync_case's
     finally via release(session, healthy=False), owned by the caller that
     saw the block, not by _handle_blocked itself."""
