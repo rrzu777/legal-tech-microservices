@@ -1,0 +1,52 @@
+# DISABLED - systemd handles restarts now
+# DISABLED - systemd handles restarts now
+# DISABLED - systemd handles monitoring now
+
+# All times in UTC (Chile = UTC-4)
+
+# PJUD sync cada 4 horas (8am, 12pm, 4pm, 8pm Chile = 12, 16, 20, 0 UTC)
+
+# Task reminders diario 8am Chile = 12 UTC
+
+# Event reminders diario 8am Chile = 12 UTC
+
+# Trial emails diario 9am Chile = 13 UTC
+
+
+# Estrado Cron Jobs (Vercel App)
+# All times in UTC (Chile = UTC-3 horario verano)
+
+# PJUD sync cada 4 horas (8am, 12pm, 4pm, 8pm Chile = 11, 15, 19, 23 UTC)
+# 0 11,15,19,23 * * * /opt/estrado-cron/run-cron.sh /api/cron/pjud-sync  # DISABLED - rate limiting OJV
+
+# Task reminders diario 8am Chile = 11 UTC
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
+
+# Event reminders diario 8am Chile = 11 UTC
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/event-reminders
+
+# Trial emails diario 9am Chile = 12 UTC
+0 12 * * * /opt/estrado-cron/run-cron.sh /api/cron/trial-emails
+
+# */5 * * * * /opt/legal-tech-microservices/estrado-pjud-service/scripts/check-worker-health.sh  # DISABLED - rate limiting OJV
+# */5 * * * * /opt/legal-tech-microservices/estrado-pjud-service/scripts/check-scraper-failures.sh  # DISABLED - rate limiting OJV
+# Daily Product Metrics - 5:00 AM Chile (08:00 UTC)
+0 8 * * * /opt/estrado-cron/run-cron.sh /api/cron/product-metrics
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/deadline-reminders
+
+# Estrado: resetea causas PJUD bloqueadas (cada 6h, safety net)
+30 */6 * * * /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-recovery
+
+# Estrado: alerta causas sin sync >48h (diario 9AM Chile)
+0 13 * * * /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-alert
+
+# Hermes: digest diario Estrado (8AM Chile invierno = 12 UTC)
+0 12 * * * /opt/estrado-cron/estrado-digest.sh >/dev/null 2>&1
+# Hermes: watchdog inteligente sync PJUD (cada 15 min, silencioso si sano)
+*/15 * * * * /opt/estrado-cron/estrado-watchdog.sh >/dev/null 2>&1
+# Hermes: backup diario de memoria/config (3:30 UTC, rota 7, offsite R2 si hay creds)
+30 3 * * * /opt/estrado-cron/hermes-backup.sh >/dev/null 2>&1
+
+# Estrado: purga de estudios eliminados + recordatorio a 3 dias
+# OJO: cron corre en hora LOCAL del VPS (Europe/Berlin), NO en UTC. 14:00 Berlin = 12:00 UTC = 08:00 Chile (invierno).
+0 14 * * * /opt/estrado-cron/run-cron.sh /api/cron/purge-deleted-firms
