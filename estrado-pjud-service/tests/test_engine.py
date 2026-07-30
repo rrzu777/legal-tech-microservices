@@ -1044,8 +1044,21 @@ class TestSyncErrorBackoff:
             )
 
 
+_ERROR_PATHS = [
+    "identificador_invalido",
+    "materia_no_soportada",
+    "no_encontrada_en_ojv",
+    "excepcion_generica",
+]
+
+
 async def _run_error_path(path: str, failures: int):
-    """Lleva `sync_case` a uno de sus caminos de error y devuelve el mock de Supabase."""
+    """Lleva `sync_case` a uno de sus caminos de error y devuelve el mock de Supabase.
+
+    Sin rama `else` que absorba lo desconocido: un camino nuevo mal escrito
+    tiene que explotar, no caer en el setup de otro y pasar el test contra el
+    camino equivocado. Es el mismo default silencioso que motivo este cambio.
+    """
     engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
     case = _make_case(consecutive_sync_failures=failures)
 
@@ -1055,24 +1068,18 @@ async def _run_error_path(path: str, failures: int):
     elif path == "materia_no_soportada":
         case["matter"] = "tributario"
         result = await engine.sync_case(case)
-    else:
+    elif path in ("no_encontrada_en_ojv", "excepcion_generica"):
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
             if path == "no_encontrada_en_ojv":
                 mock_search.return_value = _mock_search_response(found=False, matches=[])
             else:
                 mock_search.side_effect = RuntimeError("boom")
             result = await engine.sync_case(case)
+    else:
+        raise AssertionError(f"Camino de error desconocido: {path!r}")
 
     assert result["success"] is False, f"El camino {path} deberia fallar"
     return mock_sb
-
-
-_ERROR_PATHS = [
-    "identificador_invalido",
-    "materia_no_soportada",
-    "no_encontrada_en_ojv",
-    "excepcion_generica",
-]
 
 
 class TestElContadorSaleDeLaCausa:

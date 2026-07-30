@@ -893,9 +893,6 @@ class SyncEngine:
         queremos. `_run_one` en __main__ lo atrapa por causa y lo loguea con
         `logger.exception`, y el watchdog alerta al ver 3 tracebacks en una hora
         — ruidoso y contenido, en vez de silencioso y permanente.
-
-        `_handle_blocked` y `_terminal_error` siguen tomando `case_id`: no leen
-        el contador, y pedirles la fila entera solo agrandaria lo que tocan.
         """
         _MAX_CONSECUTIVE_FAILURES = 10
         case_id = case["id"]
