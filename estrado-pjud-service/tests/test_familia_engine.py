@@ -15,7 +15,10 @@ def _bundle():
     return CookieBundle(cookies={"TSPD_101": "x"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
 
 
-def _make_engine():
+def _make_engine(stub_update_error: bool = True):
+    """`stub_update_error=False` deja el `_update_case_error` de verdad, para los
+    tests que necesitan mirar el payload que sale a Supabase en vez de solo
+    verificar que se llamó."""
     from worker.engine import SyncEngine
     pool = MagicMock()
     pool.acquire_familia_bundle = AsyncMock(return_value=(_bundle(), MagicMock()))
@@ -28,7 +31,8 @@ def _make_engine():
     engine._finish_run = AsyncMock()
     engine._terminal_error = AsyncMock()
     engine._handle_blocked = AsyncMock()
-    engine._update_case_error = AsyncMock()
+    if stub_update_error:
+        engine._update_case_error = AsyncMock()
     return engine
 
 
@@ -147,4 +151,47 @@ async def test_sync_success_resets_el_contador(monkeypatch):
     assert success_update["consecutive_sync_failures"] == 0, (
         f"Un sync Familia exitoso debe resetear consecutive_sync_failures a 0, "
         f"pero quedó en {success_update['consecutive_sync_failures']}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parse_result",
+    [([], "boom"), ([], None)],
+    ids=["error_de_parseo", "causa_no_encontrada"],
+)
+async def test_el_error_familia_incrementa_el_contador_de_la_causa(monkeypatch, parse_result):
+    """Los dos caminos de error de Familia también penalizan con el contador REAL.
+
+    Espejo de TestElContadorSaleDeLaCausa en test_engine.py, que solo recorre los
+    caminos PJUD. Estos dos eran los últimos call sites de `_update_case_error`
+    sin un test que mirara el contador: el resto de este archivo lo mockea, así
+    que verificaba que se llamara pero no con qué.
+    """
+    import worker.engine as eng
+
+    engine = _make_engine(stub_update_error=False)
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
+    )
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(return_value="<html></html>")
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+    monkeypatch.setattr(eng, "parse_familia_results", MagicMock(return_value=parse_result))
+
+    case = {**_CASE, "consecutive_sync_failures": 7}
+    result = await engine._sync_familia_case(case, None, MagicMock())
+
+    assert result["success"] is False
+
+    error_update = find_update_payload(engine._sb, tracking_status="error")
+
+    assert error_update is not None, "Se esperaba un update con tracking_status='error'"
+    assert error_update["consecutive_sync_failures"] == 8, (
+        f"Con la causa en 7 el error tiene que dejarla en 8, no en "
+        f"{error_update['consecutive_sync_failures']}."
     )

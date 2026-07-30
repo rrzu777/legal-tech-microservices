@@ -205,7 +205,7 @@ class SyncEngine:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                await self._update_case_error(case["id"], "Identificador invalido", case.get("consecutive_sync_failures", 0))
+                await self._update_case_error(case, "Identificador invalido")
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -222,7 +222,7 @@ class SyncEngine:
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Unsupported matter")
-                await self._update_case_error(case["id"], "Materia no soportada", case.get("consecutive_sync_failures", 0))
+                await self._update_case_error(case, "Materia no soportada")
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -273,7 +273,7 @@ class SyncEngine:
 
             if not search_result["found"]:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Not found in OJV")
-                await self._update_case_error(case["id"], "No encontrada en OJV", case.get("consecutive_sync_failures", 0))
+                await self._update_case_error(case, "No encontrada en OJV")
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
@@ -375,7 +375,7 @@ class SyncEngine:
             msg = str(e)
             logger.exception("Error syncing case %s", case["case_number"])
             await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case["id"], msg, case.get("consecutive_sync_failures", 0))
+            await self._update_case_error(case, msg)
             self._backoff.record_failure()
             self._metrics.record_error()
             return {"success": False, "new_movements": 0}
@@ -480,12 +480,12 @@ class SyncEngine:
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
             await self._finish_run(sync_run_id, started_at, "error", 0, f"Parse error: {err}")
-            await self._update_case_error(case["id"], "Error al interpretar respuesta OJV Familia", case.get("consecutive_sync_failures", 0))
+            await self._update_case_error(case, "Error al interpretar respuesta OJV Familia")
             return {"success": False, "new_movements": 0}
 
         if not casos:
             await self._finish_run(sync_run_id, started_at, "error", 0, "Case not found in Familia portal")
-            await self._update_case_error(case["id"], "Causa no encontrada en portal Familia", case.get("consecutive_sync_failures", 0))
+            await self._update_case_error(case, "Causa no encontrada en portal Familia")
             return {"success": False, "new_movements": 0}
 
         caso = casos[0]
@@ -871,7 +871,7 @@ class SyncEngine:
             }).eq("id", case_id)
         )
 
-    async def _update_case_error(self, case_id: str, error: str, consecutive_sync_failures: int = 0):
+    async def _update_case_error(self, case: dict, error: str):
         """Update case with error status and escalating backoff.
 
         Backoff schedule based on consecutive_sync_failures:
@@ -880,8 +880,23 @@ class SyncEngine:
           3rd error: 2 hours
           4th+: 6 hours
           After 10 failures: suspended (irrecoverable)
+
+        Recibe la FILA, no `case["id"]` + el contador por separado: el contador
+        venia como tercer parametro desde 6 call sites, y olvidarlo caia al
+        default 0 en silencio — la causa reiniciaba el backoff a 5 minutos para
+        siempre y NUNCA se suspendia. Con la fila no queda nada que olvidar.
+
+        `case["consecutive_sync_failures"]` se indexa sin default a proposito.
+        La fila viene de `Scheduler.get_next_batch()`, que hace `select("*")`
+        sobre una columna NOT NULL DEFAULT 0, asi que la clave siempre esta; si
+        algun dia falta es drift de esquema, y ahi el KeyError es lo que
+        queremos. `_run_one` en __main__ lo atrapa por causa y lo loguea con
+        `logger.exception`, y el watchdog alerta al ver 3 tracebacks en una hora
+        — ruidoso y contenido, en vez de silencioso y permanente.
         """
         _MAX_CONSECUTIVE_FAILURES = 10
+        case_id = case["id"]
+        consecutive_sync_failures = case["consecutive_sync_failures"]
 
         if consecutive_sync_failures >= _MAX_CONSECUTIVE_FAILURES:
             logger.warning(
