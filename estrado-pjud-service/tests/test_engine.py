@@ -1042,3 +1042,78 @@ class TestSyncErrorBackoff:
                 f"For consecutive_sync_failures={attempts}, expected update to set consecutive_sync_failures={attempts + 1}, "
                 f"got {error_update.get('consecutive_sync_failures')}"
             )
+
+
+async def _run_error_path(path: str, failures: int):
+    """Lleva `sync_case` a uno de sus caminos de error y devuelve el mock de Supabase."""
+    engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+    case = _make_case(consecutive_sync_failures=failures)
+
+    if path == "identificador_invalido":
+        case["case_number"] = "esto-no-es-un-rol"
+        result = await engine.sync_case(case)
+    elif path == "materia_no_soportada":
+        case["matter"] = "tributario"
+        result = await engine.sync_case(case)
+    else:
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search:
+            if path == "no_encontrada_en_ojv":
+                mock_search.return_value = _mock_search_response(found=False, matches=[])
+            else:
+                mock_search.side_effect = RuntimeError("boom")
+            result = await engine.sync_case(case)
+
+    assert result["success"] is False, f"El camino {path} deberia fallar"
+    return mock_sb
+
+
+_ERROR_PATHS = [
+    "identificador_invalido",
+    "materia_no_soportada",
+    "no_encontrada_en_ojv",
+    "excepcion_generica",
+]
+
+
+class TestElContadorSaleDeLaCausa:
+    """El contador que decide backoff y suspension sale de la FILA de la causa.
+
+    `_update_case_error` recibia antes `case["id"]` y el contador como tercer
+    parametro con default 0, desde 6 call sites. De esos 6, solo el de "no
+    encontrada en OJV" tenia un test que mirara el contador (TestSyncErrorBackoff
+    va por ese camino): los otros cinco podian pasar 0 —o no pasar nada— y la
+    suite seguia verde. Un 0 ahi es invisible en produccion: la causa reinicia el
+    backoff a 5 minutos en cada vuelta y NUNCA llega al umbral de suspension, o
+    sea falla para siempre sin que nadie se entere.
+
+    Estos dos tests recorren los cuatro caminos de error de `sync_case` con el
+    `_update_case_error` de verdad (sin mock) y miran el payload que sale a
+    Supabase, que es donde la invariante se vuelve observable.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", _ERROR_PATHS)
+    async def test_el_error_incrementa_el_contador_de_la_causa(self, path):
+        mock_sb = await _run_error_path(path, failures=7)
+
+        error_update = find_update_payload(mock_sb, tracking_status="error")
+
+        assert error_update is not None, f"El camino {path} no escribio un update de error"
+        assert error_update["consecutive_sync_failures"] == 8, (
+            f"El camino {path} escribio consecutive_sync_failures="
+            f"{error_update['consecutive_sync_failures']}; con la causa en 7 tiene que ser 8. "
+            f"Un 0 aca significa que el contador no salio de la causa."
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", _ERROR_PATHS)
+    async def test_en_el_umbral_cualquier_camino_suspende(self, path):
+        mock_sb = await _run_error_path(path, failures=10)
+
+        assert find_update_payload(mock_sb, tracking_status="error") is None, (
+            f"El camino {path} aplico backoff en vez de suspender: la causa venia con "
+            f"10 fallas consecutivas, que es el umbral."
+        )
+        suspended = find_update_payload(mock_sb, tracking_status="suspended")
+        assert suspended is not None, f"El camino {path} no suspendio la causa"
+        assert suspended["consecutive_sync_failures"] == 11
