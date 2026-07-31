@@ -19,6 +19,7 @@ from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
+from worker.sync_messages import BlockCause, blocked_error_message
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -267,7 +268,7 @@ class SyncEngine:
             if search_result["blocked"]:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
-                await self._handle_blocked(case["id"])
+                await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
@@ -294,7 +295,7 @@ class SyncEngine:
             if detail["blocked"]:
                 session_healthy = False
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
-                await self._handle_blocked(case["id"])
+                await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
@@ -367,7 +368,10 @@ class SyncEngine:
             msg = f"infra: {type(e).__name__}: {e}"
             logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
-            await self._handle_blocked(case["id"])
+            # "infra": el `msg` ya se llama a si mismo asi. Escribir "Acceso
+            # bloqueado por OJV" aca era acusar al Poder Judicial de un timeout
+            # de nuestra IP residencial.
+            await self._handle_blocked(case["id"], "infra", msg)
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
@@ -439,7 +443,7 @@ class SyncEngine:
         if bundle is None:
             await self._pool.release_familia_bundle(slot, healthy=True)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
-            await self._handle_blocked(case["id"])
+            await self._handle_blocked(case["id"], "infra", "Pool sin bundle F5")
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
@@ -470,8 +474,16 @@ class SyncEngine:
             # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
             except (FamiliaBlockedError, SessionError, TimeoutError, httpx.TransportError) as e:
                 session_healthy = False
-                await self._finish_run(sync_run_id, started_at, "blocked", 0, str(e) or "Timeout Familia sync")
-                await self._handle_blocked(case["id"])
+                msg = str(e) or "Timeout Familia sync"
+                # El unico `except` de los cinco call sites que mezcla las dos
+                # causas: `FamiliaBlockedError` ES el portal cortandonos, y las
+                # otras tres (sesion que no levanta, timeout, transporte) son
+                # nuestras. Agruparlas para el retry esta bien —las cuatro son
+                # transitorias y ninguna penaliza a la causa—; agruparlas para el
+                # mensaje seria volver a inventar la culpa.
+                cause = "ojv" if isinstance(e, FamiliaBlockedError) else "infra"
+                await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+                await self._handle_blocked(case["id"], cause, msg)
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
         finally:
@@ -822,8 +834,10 @@ class SyncEngine:
         except Exception:
             logger.exception("Failed to finish sync_run %s", run_id)
 
-    async def _handle_blocked(self, case_id: str):
-        """Maneja un bloqueo (challenge F5 / OJV) SIN penalizar la causa.
+    async def _handle_blocked(
+        self, case_id: str, cause: BlockCause, detail: str | None = None
+    ):
+        """Maneja un bloqueo SIN penalizar la causa, dejando dicho QUIÉN bloqueó.
 
         Marca la causa como blocked (sin incrementar consecutive_sync_failures) y abre el
         circuit breaker con una pausa corta. El re-mint de cookies ya NO se
@@ -831,8 +845,21 @@ class SyncEngine:
         libera la sesión con `release(session, healthy=False)` — el slot que
         realmente vio el bloqueo es el único que se re-mintea, y solo cuando
         su dueño (esta corrutina) lo devuelve al pool.
+
+        `cause` separa el bloqueo del WAF de OJV ("ojv") de una caída nuestra
+        camino a OJV ("infra"): timeout de transporte, pool sin bundle F5, sesión
+        Familia que no levanta. Los dos siguen sin penalizar a la causa —eso no
+        cambia—, pero antes los dos escribían "Acceso bloqueado por OJV" en
+        `last_sync_error` y la app se lo mostraba al abogado tal cual: le
+        echábamos la culpa al Poder Judicial de fallas nuestras.
+
+        Sin default, igual que del lado de la app: los cinco call sites saben
+        cuál es, y un default los dejaría elegir por omisión — que es exactamente
+        como el texto de OJV terminó cubriendo los dos casos. Acá pesa más que
+        allá porque este repo no tiene CI ni type-checker: `BlockCause` documenta
+        el dominio, pero lo único que impide la omisión es que la firma la exija.
         """
-        await self._update_case_blocked(case_id)
+        await self._update_case_blocked(case_id, cause, detail)
         self._backoff.record_blocked()
 
     async def _handle_parse_suspect(self, case: dict, competencia: str):
@@ -860,13 +887,15 @@ class SyncEngine:
             f"página recibida pero el parser no extrajo nada. Revisar forma de la página / parser.",
         )
 
-    async def _update_case_blocked(self, case_id: str):
+    async def _update_case_blocked(
+        self, case_id: str, cause: BlockCause, detail: str | None = None
+    ):
         blocked_until = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_BLOCK_DURATION_S)).isoformat()
         await run_query(
             self._sb.from_("cases").update({
                 "tracking_status": "blocked",
                 "last_sync_status": "blocked",
-                "last_sync_error": "Acceso bloqueado por OJV",
+                "last_sync_error": blocked_error_message(cause, detail),
                 "sync_blocked_until": blocked_until,
             }).eq("id", case_id)
         )

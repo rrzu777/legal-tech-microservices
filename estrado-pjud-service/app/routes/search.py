@@ -12,6 +12,7 @@ from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
 from app.alerting import maybe_alert
+from app.pool_guard import acquire_or_alert
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,11 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 @limiter.limit("5/minute")
 async def search_case(req: SearchRequest, request: Request, _api_key: str = verify_api_key):
     pool = request.app.state.session_pool
-    session = await pool.acquire()
+    # Fuera del `try` de abajo a proposito: ese try devuelve 200 con `error` para
+    # TODO lo que falla adentro, asi que un fallo de pool ahi seria invisible.
+    # `acquire_or_alert` lo cuenta, alerta y re-lanza — el 500 es lo unico que le
+    # dice a la app que el problema es nuestro y no de la causa.
+    session = await acquire_or_alert(pool, request, "search")
 
     healthy = True
     try:
