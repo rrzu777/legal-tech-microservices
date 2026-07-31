@@ -44,11 +44,13 @@ fi'
 echo "==> watchdog en dry-run (no manda nada)"
 ssh "$HOST" 'DRY_RUN=1 WD_STATE_DIR=/tmp /opt/estrado-cron/estrado-watchdog.sh; echo "    exit=$?"'
 
-# sync-health y no otro: prueba lo que interesa (APP_URL + CRON_SECRET + el
-# wrapper) y no escribe nada mientras el worker este sano. Si llega a escribir
-# es porque el worker esta caido de verdad, y esa alerta la queriamos igual.
+# product-metrics y no otro: esta AGENDADO (no ensucia el log con un endpoint
+# que el watchdog no espera ver), su agregacion es idempotente por diseno
+# —upserts con onConflict— y no manda mails. Ojo con elegir sync-health: devuelve
+# 500 con el heartbeat vencido, asi que un deploy hecho con el worker caido le
+# deja al watchdog un cron-fail:500 pegado por 24h sobre algo que ni corre.
 echo "==> un cron de prueba, para confirmar que run-cron.sh sigue vivo"
-ssh "$HOST" '/opt/estrado-cron/run-cron.sh /api/cron/sync-health; echo "    exit=$?"; tail -1 /var/log/estrado-cron.log | sed "s/^/    /"'
+ssh "$HOST" '/opt/estrado-cron/run-cron.sh /api/cron/product-metrics; echo "    exit=$?"; tail -1 /var/log/estrado-cron.log | sed "s/^/    /"'
 
 echo
 echo "listo. rollback: cp /opt/estrado-cron/backup-$STAMP/*.sh /opt/estrado-cron/"

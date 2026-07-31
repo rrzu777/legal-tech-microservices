@@ -117,11 +117,12 @@ else
   CRON_CUTOFF=$(date -d '-24 hours' '+%Y-%m-%d %H:%M')
   CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "$CRON_LOG" 2>/dev/null || true)
   if [ -z "${CRON_RECENT// }" ]; then
-    # El piso normal son ~10 corridas por día. Cero en 24h no es "poca carga": es el
+    # El piso normal son ~7 corridas por día (eran ~10 hasta que se borró
+    # stale-sync-recovery, que corría 4 veces). Cero en 24h no es "poca carga": es el
     # crontab borrado, run-cron.sh sin permiso de ejecución o el disco lleno. Este es
     # el modo de falla que un chequeo de "¿hay errores?" NO atrapa — el log deja de
     # crecer y todo se ve sano.
-    add "Ningún cron de la app corrió en las últimas 24h (el piso normal son ~10). Revisar el crontab de root y los permisos de /opt/estrado-cron/run-cron.sh." "cron-silent"
+    add "Ningún cron de la app corrió en las últimas 24h (el piso normal son ~7). Revisar el crontab de root y los permisos de /opt/estrado-cron/run-cron.sh." "cron-silent"
   else
     # Se mira la ÚLTIMA corrida de cada endpoint, no todas: la pregunta es "¿esto
     # está roto AHORA?". Un 404 suelto que se recuperó en la corrida siguiente no
