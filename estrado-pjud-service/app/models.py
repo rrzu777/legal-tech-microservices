@@ -159,3 +159,8 @@ class HealthResponse(BaseModel):
     total_errors: int = 0
     total_blocked: int = 0
     blocked_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Fallos al conseguir sesión del pool. Es la única métrica que se mueve
+    # cuando el servicio no llega ni a hablar con OJV: todos los demás contadores
+    # se incrementan más adelante en el request, así que en ese escenario quedan
+    # en cero y el health se ve sano.
+    total_pool_failures: int = 0

@@ -17,6 +17,7 @@ from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
 from app.alerting import maybe_alert
+from app.pool_guard import acquire_or_alert
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,9 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         logger.info("Inferred competencia=%s from JWT", comp)
 
     pool = request.app.state.session_pool
-    session = await pool.acquire()
+    # Mismo motivo que en `search`: el try de abajo devuelve 200 con `error` para
+    # todo lo que pasa adentro, asi que un fallo de pool ahi seria invisible.
+    session = await acquire_or_alert(pool, request, "detail")
 
     healthy = True
     try:

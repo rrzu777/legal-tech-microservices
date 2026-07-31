@@ -23,10 +23,30 @@ async def test_blocked_no_incrementa_el_contador():
     engine._update_case_blocked = AsyncMock()
     engine._update_case_error = AsyncMock()
 
-    await engine._handle_blocked("c1")
+    await engine._handle_blocked("c1", "ojv")
 
-    engine._update_case_blocked.assert_awaited_once_with("c1")
+    # La causa va explicita en los cinco call sites: los dos call sites que no pasan causa son los de
+    # bloqueo real (`search_result["blocked"]` y `detail["blocked"]`).
+    engine._update_case_blocked.assert_awaited_once_with("c1", "ojv", None)
     engine._update_case_error.assert_not_awaited()
+    engine._backoff.record_blocked.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_una_caida_nuestra_se_registra_como_nuestra():
+    """Los tres caminos de infra que llaman a `_handle_blocked` —transporte,
+    pool sin bundle F5, sesion Familia que no levanta— escribian el mismo
+    "Acceso bloqueado por OJV" que un bloqueo de verdad, y la app se lo mostraba
+    al abogado tal cual. Seguir sin penalizar a la causa esta bien; seguir
+    culpando al Poder Judicial de una caida nuestra, no."""
+    engine = _make_engine(MagicMock())
+    engine._update_case_blocked = AsyncMock()
+
+    await engine._handle_blocked("c1", "infra", "infra: ConnectTimeout")
+
+    engine._update_case_blocked.assert_awaited_once_with("c1", "infra", "infra: ConnectTimeout")
+    # Y el invariante que no cambia: sigue sin penalizar y sigue abriendo el
+    # breaker. Si esto se cayera, el arreglo de la copy habria roto el de PR #47.
     engine._backoff.record_blocked.assert_called_once()
 
 
@@ -42,7 +62,7 @@ async def test_blocked_does_not_touch_the_pool():
     engine._update_case_blocked = AsyncMock()
     engine._update_case_error = AsyncMock()
 
-    await engine._handle_blocked("c1")
+    await engine._handle_blocked("c1", "ojv")
 
     # No pool interaction whatsoever (acquire/release/refresh/etc.).
     pool.assert_not_called()
