@@ -60,16 +60,16 @@ echo "== chequeo 7: un blip que se recupera no despierta a nadie =="
 # Con cooldown de 3h y ventana de 24h, alertar por un 404 suelto ya recuperado
 # significaria 8 alertas por un blip. Lo que importa es la ULTIMA corrida.
 cat > "$TMP/blip.log" <<EOF
-$(date -d '-8 hours' '+%Y-%m-%d %H:%M') /api/cron/stale-sync-recovery - HTTP 404
-$HOY /api/cron/stale-sync-recovery - HTTP 200
+$(date -d '-8 hours' '+%Y-%m-%d %H:%M') /api/cron/stale-sync-alert - HTTP 404
+$HOY /api/cron/stale-sync-alert - HTTP 200
 EOF
 OUT=$(run "$TMP/blip.log")
 expect_missing "blip recuperado: silencio" "$OUT" "cron-fail"
 
 echo "== chequeo 7: roto de verdad (falla la ultima corrida) =="
 cat > "$TMP/broken.log" <<EOF
-$(date -d '-8 hours' '+%Y-%m-%d %H:%M') /api/cron/stale-sync-recovery - HTTP 200
-$HOY /api/cron/stale-sync-recovery - HTTP 404
+$(date -d '-8 hours' '+%Y-%m-%d %H:%M') /api/cron/stale-sync-alert - HTTP 200
+$HOY /api/cron/stale-sync-alert - HTTP 404
 EOF
 OUT=$(run "$TMP/broken.log")
 expect_contains "ultima corrida rota: alerta" "$OUT" "cron-fail:404"

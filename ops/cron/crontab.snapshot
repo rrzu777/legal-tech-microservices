@@ -34,8 +34,7 @@
 0 8 * * * /opt/estrado-cron/run-cron.sh /api/cron/product-metrics
 0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/deadline-reminders
 
-# Estrado: resetea causas PJUD bloqueadas (cada 6h, safety net)
-30 */6 * * * /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-recovery
+# 30 */6 * * * /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-recovery  # BORRADO 30 jul 2026 - reseteaba consecutive_sync_failures en lote sin desbloquear nada
 
 # Estrado: alerta causas sin sync >48h (diario 9AM Chile)
 0 13 * * * /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-alert
