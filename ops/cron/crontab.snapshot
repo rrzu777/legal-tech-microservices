@@ -28,8 +28,13 @@
 # Trial emails diario 9am Chile = 12 UTC
 0 12 * * * /opt/estrado-cron/run-cron.sh /api/cron/trial-emails
 
-# */5 * * * * /opt/legal-tech-microservices/estrado-pjud-service/scripts/check-worker-health.sh  # DISABLED - rate limiting OJV
-# */5 * * * * /opt/legal-tech-microservices/estrado-pjud-service/scripts/check-scraper-failures.sh  # DISABLED - rate limiting OJV
+# ENTERRADOS 2026-08-01: check-worker-health.sh y check-scraper-failures.sh. Decían
+# "DISABLED - rate limiting OJV" como si alcanzara con descomentarlos, y no: el
+# directorio .../estrado-pjud-service/scripts/ NO EXISTE en el VPS y esos archivos
+# nunca estuvieron en git. Sus logs dejaron de escribirse el 2026-03-10. Lo que
+# hacían lo hace hoy el watchdog: el heartbeat viejo y el worker caído son los
+# chequeos 1 y 4; los errores del worker, el 5; el conteo de reinicios de systemd
+# lo cubre el propio Restart= de la unit.
 # Daily Product Metrics - 5:00 AM Chile (08:00 UTC)
 0 8 * * * /opt/estrado-cron/run-cron.sh /api/cron/product-metrics
 0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/deadline-reminders

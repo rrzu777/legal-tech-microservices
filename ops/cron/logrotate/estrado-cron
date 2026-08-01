@@ -3,9 +3,17 @@
 # El log venia creciendo sin rotar desde marzo 2026. `create` alcanza y no hace falta
 # copytruncate: run-cron.sh appendea con `>>` y reabre el archivo en cada corrida.
 #
-# OJO: el chequeo #7 del watchdog lee este archivo y alerta si no ve ninguna linea en
-# 24h. Con rotacion mensual eso no se pisa nunca; si alguna vez se baja a `daily`, hay
-# que hacer que el chequeo lea tambien el .1 recien rotado.
+# El chequeo #7 del watchdog lee este archivo y alerta si no ve ninguna linea en 24h,
+# asi que lee TAMBIEN el .1 recien rotado. `delaycompress` es lo que lo hace posible:
+# sin eso el .1 vendria .gz y el awk no lo podria leer. No sacar delaycompress.
+#
+# Este comentario decia antes que con rotacion mensual el problema "no se pisa nunca" y
+# que solo habia que preocuparse si se bajaba a `daily`. Es falso, y salio caro: el
+# 2026-08-01 a las 00:00:11 rotó —cambio de mes— y a las 00:01 el watchdog alerto que
+# ningun cron habia corrido en 24h, con las 8 corridas del dia en HTTP 200 dentro del .1.
+# La frecuencia de rotacion no cambia nada; lo que importa es la ventana entre la
+# rotacion (00:00 local) y la primera escritura (08:00, product-metrics), que son ocho
+# horas rote una vez al mes o una vez al dia.
 /var/log/estrado-cron.log {
     # /var/log en este VPS es root:syslog drwxrwxr-x, o sea group-writable, y logrotate
     # se planta ("parent directory has insecure permissions") si no le decis con que
