@@ -607,10 +607,10 @@ class SyncEngine:
         return {"success": True, "new_movements": new_count}
 
     async def _terminal_error(self, case_id: str, error: str):
-        """Permanent error — pause tracking (no backoff retry)."""
+        """Keep terminal failures alertable; ``paused`` is reserved for user pauses."""
         await run_query(
             self._sb.from_("cases").update({
-                "tracking_status": "paused",
+                "tracking_status": "suspended",
                 "last_sync_status": "error",
                 "last_sync_error": error,
             }).eq("id", case_id)
