@@ -11,11 +11,30 @@ API="${SUPABASE_URL%/}/rest/v1"
 AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
 NOW=$(date -u +%Y-%m-%dT%H:%M:%S)
 
+# Devuelve el conteo, o VACÍO si no se pudo consultar. Devolvía 0 en ese caso, y eso
+# es la misma enfermedad que el resto del archivo viene a curar: una consulta que
+# falla se leía como "no hay nada mal". Los dos call sites distinguen los dos casos.
 cnt() {
   local cr
   cr=$(curl -s -m 20 -I "$API/$1" "${AUTH[@]}" -H "Prefer: count=exact" -H "Range: 0-0" 2>/dev/null \
         | tr -d '\r' | grep -i '^content-range:' | sed -E 's#.*/([0-9]+|\*)$#\1#')
-  echo "${cr:-0}"
+  echo "$cr"
+}
+
+# Devuelve 0 (hay que alertar) si el conteo llega al umbral. Si el conteo no se pudo
+# obtener, alerta por su cuenta y devuelve 1: lo que no puede pasar es que una consulta
+# fallida se lea como "no hay nada mal". El mensaje de la anomalía se queda en el call
+# site, que es donde se entiende qué se estaba contando.
+sin_datos() { # <tag> <qué se consultaba>
+  add "No pude consultar $2 en Supabase: la respuesta no es una lista. Este chequeo queda sin datos; el estado de 'ya avisado' no se toca." "cases-query-fail:$1"
+}
+
+conteo_supera() { # <valor de cnt> <umbral> <tag> <qué se contaba>
+  if [ -z "${1// }" ]; then
+    add "No pude contar $4 en Supabase: la consulta no devolvió un conteo. Este chequeo queda sin datos." "count-fail:$3"
+    return 1
+  fi
+  [ "$1" -ge "$2" ] 2>/dev/null
 }
 
 ANOMALIES=""
@@ -28,8 +47,73 @@ WD_STATE_DIR="${WD_STATE_DIR:-/var/tmp}"
 STATE="$WD_STATE_DIR/estrado-wd-state"
 COOLDOWN="${WD_COOLDOWN:-10800}"   # 3h: no re-alertar la MISMA anomalía dentro de esta ventana
 
-# 1. API de scraping viva
+# "Avisar una vez por X": recibe claves (una por línea) y devuelve las que no
+# estaban en la corrida anterior, dejando el estado actualizado. Vacío = nada nuevo.
+#
+# El anti-spam global es un cooldown de 3h sobre la FIRMA del conjunto de anomalías,
+# así que sin esto cualquier condición que PERSISTA —una causa suspendida, que es
+# terminal; una en error, que dura hasta que alguien la mire; un contador que falta
+# hasta el próximo deploy— avisaría cada 3h para siempre.
+#
+# El archivo se REESCRIBE entero en cada corrida, no se le appendea: si la clave sale
+# del estado malo, sale de la lista, y si más tarde recae se vuelve a avisar. Una
+# recaída es noticia, y un archivo que solo crece se la comería en silencio.
+#
+# `printf '%s\n' "$var"` con la variable vacía imprime UNA LÍNEA EN BLANCO, y esa
+# línea fantasma se cuela como una clave que no existe: rompe el `comm` y hace que
+# un conjunto vacío no se vea vacío. Por eso hay que filtrarla en cada paso, y por
+# eso el filtro va con nombre en vez de repetir `grep -v '^$'` cinco veces.
+sin_vacias() { grep -v '^$' || true; }
+
+nuevas_claves() { # <slug de estado> <claves separadas por saltos de línea>
+  local estado="$WD_STATE_DIR/estrado-wd-$1" claves
+  claves=$(printf '%s\n' "$2" | sin_vacias | sort)
+  touch "$estado"
+  comm -23 <(printf '%s\n' "$claves" | sin_vacias) <(sin_vacias < "$estado" | sort) || true
+  printf '%s\n' "$claves" | sin_vacias > "$estado"
+}
+
+# Lo mismo, para causas: devuelve los `case_number` de las que matchean el filtro y
+# no estaban antes. Alerta por causa y no por cantidad, que es lo que permite bajar
+# los umbrales sin inundar el canal.
+nuevas_causas() { # <slug de estado> <filtro postgrest sobre cases>
+  local json ids nuevos nums
+  json=$(curl -s -m 20 "$API/cases?select=id,case_number&$2" "${AUTH[@]}" 2>/dev/null || true)
+  # Un curl que falla y un `[]` legítimo dejan `ids` vacío exactamente igual, y esa
+  # confusión cuesta dos veces: la corrida no alerta (razonable, no sabemos nada) pero
+  # ADEMÁS reescribe el estado en vacío, borrando la memoria de lo ya avisado. La
+  # corrida siguiente vuelve a alertar por causas viejas y se rompe el "avisar una
+  # vez" que esta función existe para dar. Y el fallo en sí sería mudo, que es
+  # justamente lo que este archivo entero viene a matar.
+  #
+  # Si no vino una lista, sale con 1 sin tocar el estado. PostgREST devuelve un objeto
+  # (`{"message":...}`) ante una key vencida o un filtro mal armado, así que el chequeo
+  # es por TIPO y no por "vacío".
+  #
+  # Avisar es tarea del call site, no de acá, y no es preferencia: a esta función se la
+  # llama dentro de `$(...)`, o sea en un subshell, donde `add` mutaría una copia de
+  # ANOMALIES que muere con el subshell. Sería una falla muda —el chequeo se ve andando
+  # y no alerta nunca—, que es la familia de bug que este archivo entero persigue.
+  printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  ids=$(printf '%s' "$json" | jq -r '.[]?.id' 2>/dev/null | sin_vacias)
+  nuevos=$(nuevas_claves "$1" "$ids")
+  [ -z "${nuevos// }" ] && return 0
+  nums=$(printf '%s' "$json" \
+          | jq -r --argjson want "$(printf '%s\n' "$nuevos" | sin_vacias | jq -R . | jq -s .)" \
+               '[.[] | select(.id as $i | $want | index($i))] | map(.case_number) | join(", ")' 2>/dev/null || true)
+  # Si ese jq falla, los UUID crudos son un mensaje feo pero accionable; devolver
+  # vacío se leería como "no hay nada nuevo" y se comería la alerta entera.
+  printf '%s' "${nums:-$(printf '%s' "$nuevos" | tr '\n' ' ')}"
+}
+
+# 1. Los dos servicios, vivos según systemd. El worker se agregó al absorber
+#    /api/cron/sync-health: era lo único en todo el sistema que preguntaba por él, y
+#    no estaba agendado en ningún lado. El chequeo 4 mira su heartbeat, pero SOLO si
+#    systemd lo da por activo — con el worker detenido, el 4 se saltea entero y hasta
+#    hoy no quedaba nadie mirando.
+#    Ojo: `active` es condición necesaria y no suficiente. Ver el chequeo 9.
 systemctl is-active --quiet estrado-pjud.service || add "estrado-pjud.service (API PJUD) NO está activo." "api-down"
+systemctl is-active --quiet estrado-pjud-worker.service || add "estrado-pjud-worker.service (worker de sync) NO está activo: ninguna causa se sincroniza hasta que vuelva." "worker-down"
 
 # 2. Disco y memoria
 DISK=$(df / | awk 'NR==2{gsub("%","",$5); print $5}')
@@ -43,27 +127,38 @@ MEMAVAIL=$(free -m | awk '/^Mem:/{print $7}')
 # Devolvía */0 siempre — verificado el 29 jul con 3 causas genuinamente rotas en la base.
 # `tracking_status` es la señal de calidad: los errores de infra no lo tocan.
 #
-# Suspendidas: alerta UNA vez por causa. El anti-spam global es por cooldown de 3h y la
-# suspensión es terminal, así que sin esto la misma causa avisaría cada 3h para siempre.
-# El archivo guarda los IDs ya avisados y se REESCRIBE entero en cada corrida: si una
-# causa se reactiva sale de la lista, y si vuelve a caer se avisa de nuevo.
-SUSP_STATE="$WD_STATE_DIR/estrado-wd-suspended"
-SUSP_JSON=$(curl -s -m 20 "$API/cases?select=id,case_number&tracking_status=eq.suspended" "${AUTH[@]}" 2>/dev/null || true)
-SUSP_IDS=$(printf '%s' "$SUSP_JSON" | jq -r '.[]?.id' 2>/dev/null | sort || true)
-touch "$SUSP_STATE"
-NEW_IDS=$(comm -23 <(printf '%s\n' "$SUSP_IDS" | grep -v '^$' | sort) <(sort "$SUSP_STATE") || true)
-if [ -n "${NEW_IDS// }" ]; then
-  NEW_NUMS=$(printf '%s' "$SUSP_JSON" \
-              | jq -r --argjson want "$(printf '%s\n' "$NEW_IDS" | grep -v '^$' | jq -R . | jq -s .)" \
-                   '[.[] | select(.id as $i | $want | index($i))] | map(.case_number) | join(", ")' 2>/dev/null || true)
-  add "Causa(s) con monitoreo SUSPENDIDO: ${NEW_NUMS:-$NEW_IDS}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended"
-fi
-printf '%s\n' "$SUSP_IDS" | grep -v '^$' | sort > "$SUSP_STATE"
+# `suspended` y `error` avisan por CAUSA, sin umbral de cantidad; `blocked` sigue
+# pidiendo 3. La diferencia no es de estilo, está medida — ver cada bloque.
+SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended") || sin_datos suspended "las causas suspendidas"
+[ -n "${SUSP// }" ] && add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended"
 
-TRACK_ERR=$(cnt "cases?select=id&tracking_status=eq.error")
-[ "${TRACK_ERR:-0}" -ge 3 ] && add "${TRACK_ERR} causas con tracking_status=error." "track-err"
+# De `>= 3` a una sola causa. Los tres motivos, con los números del 2026-08-01:
+#
+#   (a) La cartera son 25 causas, 15 activas. Pedir 3 es pedir que se rompa el 20%
+#       del negocio antes de que suene algo. El umbral venía de una época en que
+#       nadie había mirado ese número.
+#   (b) Este mismo archivo ya alertaba por UNA: `suspended` acá arriba no tiene
+#       umbral, y el chequeo 8 (`stuck`) usa `>= 1`. Tres criterios distintos para
+#       la misma pregunta —"¿hay una causa que dejó de andar?"— y el más sordo
+#       justo sobre la señal de calidad.
+#   (c) Lo que el umbral estaba conteniendo de verdad era el VOLUMEN de alertas, y
+#       para eso el instrumento correcto es el dedup por causa, no un piso que
+#       fabrica un punto ciego. Ese dedup ya existía tres líneas más arriba.
+#
+# Hoy hay 0 causas en `error`, así que bajarlo no cuesta una sola alerta nueva.
+ERR=$(nuevas_causas track-err "tracking_status=eq.error") || sin_datos track-err "las causas en error"
+[ -n "${ERR// }" ] && add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." "track-err"
+
+# `blocked` se queda en 3, y esto es lo contrario de (a): acá el umbral alto está
+# bien y bajarlo sería el error. Medido el 2026-08-01: 10 de las 15 causas activas
+# tienen `sync_blocked_until` seteado en algún momento entre el 21 y el 31 de julio,
+# y las últimas 24h dan 17 corridas `success` contra 2 `blocked`. Las 10 están hoy
+# en `active` con `consecutive_sync_failures = 0`, o sea que el bloqueo ES el backoff
+# funcionando y curándose solo. Con umbral 1 esto avisaría ~2 veces por día por el
+# sistema andando bien, y eso entrena a ignorar el canal. 3 a la vez sí es sistémico.
 BLOCKED=$(cnt "cases?select=id&sync_blocked_until=gte.$NOW")
-[ "${BLOCKED:-0}" -ge 3 ] && add "${BLOCKED} causas con sync bloqueado (sync_blocked_until futuro)." "blocked"
+conteo_supera "$BLOCKED" 3 blocked "las causas bloqueadas" \
+  && add "${BLOCKED} causas con sync bloqueado (sync_blocked_until futuro)." "blocked"
 
 # 4. Worker heartbeat fresco (si el worker está en uso). Alerta si el más reciente es viejo.
 HB_TS=$(curl -s -m 20 "$API/sync_worker_heartbeats?select=last_heartbeat_at&order=last_heartbeat_at.desc&limit=1" "${AUTH[@]}" 2>/dev/null \
@@ -110,12 +205,35 @@ done
 #    medianoche. El corte se calcula con `date` LOCAL y, como el formato es
 #    YYYY-MM-DD HH:MM, el orden lexicográfico ES el cronológico: alcanza un awk, sin
 #    mktime (que en mawk no existe) y sin un fork de `date` por línea.
+#
+#    ROTACIÓN: hay que leer también el `.1`, y no es una mejora sino el arreglo de
+#    un falso positivo que ya se cobró una madrugada. logrotate crea el archivo
+#    nuevo VACÍO y el primer cron de la app escribe recién a las 08:00 locales:
+#    durante esas ocho horas el archivo actual no tiene una sola línea aunque todo
+#    esté perfecto. Pasó el 2026-08-01 a las 00:00:11 —rotación mensual, o sea el
+#    cambio de mes— y a las 00:01 este chequeo alertó "ningún cron corrió en 24h"
+#    con las ocho corridas del día en HTTP 200 dentro del .1 recién rotado.
+#
+#    El comentario de /etc/logrotate.d/estrado-cron ya avisaba de esto, pero lo daba
+#    por imposible "con rotación mensual". Ahí está el error de razonamiento que
+#    conviene no repetir: la frecuencia de rotación no cambia NADA. Lo que importa
+#    es la ventana entre la rotación y la primera escritura, y esa ventana son ocho
+#    horas siempre, rote una vez al mes o una vez al día.
+#
+#    `delaycompress` en ese mismo config es lo que garantiza que el .1 esté sin
+#    comprimir; el .2 ya viene .gz y no hace falta, porque 24h nunca lo alcanzan.
 CRON_LOG="${CRON_LOG:-/var/log/estrado-cron.log}"
 if [ ! -r "$CRON_LOG" ]; then
   add "No puedo leer $CRON_LOG — los crons de la app quedan sin vigilancia." "cron-log-missing"
 else
+  # El rotado va PRIMERO: es el más viejo, y el awk de más abajo se queda con la
+  # última aparición de cada endpoint. Al revés, una corrida vieja del .1 pisaría
+  # a la actual y un endpoint recuperado se reportaría como roto.
+  CRON_FILES=()
+  [ -r "$CRON_LOG.1" ] && CRON_FILES+=("$CRON_LOG.1")
+  CRON_FILES+=("$CRON_LOG")
   CRON_CUTOFF=$(date -d '-24 hours' '+%Y-%m-%d %H:%M')
-  CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "$CRON_LOG" 2>/dev/null || true)
+  CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "${CRON_FILES[@]}" 2>/dev/null || true)
   if [ -z "${CRON_RECENT// }" ]; then
     # El piso normal son ~7 corridas por día (eran ~10 hasta que se borró
     # stale-sync-recovery, que corría 4 veces). Cero en 24h no es "poca carga": es el
@@ -150,7 +268,79 @@ fi
 #    por prioridad (_compute_next_sync_at): un umbral fijo daría falsos positivos en las
 #    causas de cadencia diaria. Las 2h son margen para un scheduler unos minutos atrasado.
 STUCK=$(cnt "cases?select=id&tracking_status=eq.active&next_sync_at=lt.$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%S)")
-[ "${STUCK:-0}" -ge 1 ] && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
+  && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+
+# 9. La API de scraping: viva no es lo mismo que útil.
+#    El chequeo 1 le pregunta a systemd, y systemd contestaba `active` mientras la
+#    API llevaba 3 días y 18 horas sin poder servir una sola consulta. Nos enteramos
+#    porque un tester mandó una foto de la pantalla.
+#
+#    LO QUE ESTE CHEQUEO NO MIRA, Y ES LA PARTE IMPORTANTE:
+#
+#    `total_requests == 0` y `last_successful_request: null` parecen la señal obvia
+#    —el propio /api/v1/health los devolvía así durante el outage— y NO sirven acá.
+#    Medido sobre el journal de estrado-pjud.service, 7 días al 2026-08-01: entraron
+#    DOS búsquedas reales. Todo el resto del tráfico son escáneres de internet
+#    pegándole a /api/v1/finchat, /swagger y /sms-sender. Con ese volumen, una semana
+#    sana se ve idéntica a una semana caída, y alertar por ausencia de tráfico sería
+#    repetir exactamente el error que trajo hasta acá: la ausencia de una señal que
+#    depende de que un tercero haga algo no dice NADA sobre nuestra salud. Es el
+#    mismo bug que el chequeo 7 tuvo con el log recién rotado, y el mismo por el que
+#    `check_and_alert` se calla cuando el servicio está peor.
+#
+#    Lo que sí sirve es un contador de EVENTOS. `total_pool_failures` sube solo
+#    cuando el pool no pudo entregar sesión, o sea cuando algo nuestro se rompió, y
+#    no depende de que nadie use el servicio: cero tráfico da cero fallas y silencio,
+#    una consulta que no consiguió sesión da 1 y alerta.
+#
+#    LIMITACIÓN, declarada y no cerrada: ese contador vive en la memoria del proceso.
+#    Un restart cualquiera —un deploy de rutina alcanza— lo vuelve a cero. El disparo
+#    por `> 0` cubre el estado CONTINUO (si el pool sigue roto, la próxima falla vuelve
+#    a sumar y alerta), no el histórico: si el pool falla y el servicio reinicia antes
+#    del poll siguiente, ese tramo no queda registrado en ningún lado. Por eso el
+#    mensaje lleva el uptime — "3 fallas en 2h" y "3 fallas en 4 días" son incidentes
+#    distintos y el contador solo no los distingue. Cerrarlo de verdad pide persistir
+#    el contador fuera del proceso, que es cambio en el servicio Python, no acá.
+API_HEALTH_URL="${API_HEALTH_URL:-http://127.0.0.1:8000/api/v1/health}"
+API_BODY=$(mktemp)
+API_CODE=$(curl -s -m 10 -o "$API_BODY" -w '%{http_code}' "$API_HEALTH_URL" 2>/dev/null || echo 000)
+if [ "$API_CODE" != "200" ]; then
+  # Esta ausencia sí es señal, y la diferencia con la de arriba es quién hace el
+  # request: acá lo hacemos nosotros, así que no contestar solo puede ser el
+  # servicio. 000 = ni siquiera hubo conexión.
+  add "La API de scraping no contesta su propio health en $API_HEALTH_URL (HTTP $API_CODE). systemd puede seguir diciendo 'active'." "api-health:$API_CODE"
+else
+  POOL_FAIL=$(jq -r '.total_pool_failures // empty' < "$API_BODY" 2>/dev/null || true)
+  FALTA_METRICA=""
+  [ -z "${POOL_FAIL// }" ] && FALTA_METRICA="falta-total_pool_failures"
+  # `nuevas_claves` se llama SIEMPRE que el health haya contestado: con la clave si
+  # el contador falta, con vacío si está. Es esa llamada la que reescribe el estado.
+  # Llamarla solo en la rama mala dejaba la clave pegada para siempre, y entonces un
+  # contador que volvía y más tarde desaparecía de nuevo ya no avisaba. Lo agarró el
+  # test "si desaparece de nuevo, vuelve a avisar", no yo.
+  NUEVA_CEGUERA=$(nuevas_claves api-sin-pool-metric "$FALTA_METRICA")
+  if [ -n "$FALTA_METRICA" ]; then
+    # El contador lo agregó el PR #21 y la instancia desplegada puede ser anterior
+    # (los contadores viven en memoria: hasta que el proceso no reinicie, la clave no
+    # aparece). Sin este aviso el chequeo quedaría mirando algo que no existe y no
+    # diría nada nunca: un chequeo ciego se ve exactamente igual que uno sano, que es
+    # la falla que este archivo entero viene tratando de matar. Avisa una vez.
+    #
+    # Es un parche puntual y conviene saberlo: mira la ausencia de UNA clave, así que
+    # el próximo campo que se agregue al health va a necesitar su propio chequeo igual.
+    # Lo que lo cerraría de raíz es que /api/v1/health exponga el commit desplegado y
+    # que esto lo compare contra HEAD: un solo chequeo para cualquier drift repo↔VPS,
+    # que es la misma familia del `crontab.snapshot` que puede divergir en silencio.
+    [ -n "${NUEVA_CEGUERA// }" ] && add "La API no expone total_pool_failures: corre código anterior al #21, así que el chequeo del pool está CIEGO. Se destraba reiniciando estrado-pjud.service — corta las sesiones OJV en curso, hacerlo a conciencia." "pool-metric-missing"
+  elif [ "$POOL_FAIL" -gt 0 ] 2>/dev/null; then
+    # El uptime va en el mensaje porque el contador se resetea con el proceso: sin él,
+    # una falla vieja y una tormenta de hace diez minutos se leen igual.
+    UP_H=$(jq -r 'if (.uptime_seconds|type)=="number" then (.uptime_seconds/3600|floor) else "?" end' < "$API_BODY" 2>/dev/null || echo "?")
+    add "El pool no pudo entregar sesión ${POOL_FAIL} vez(ces) en las últimas ${UP_H}h de uptime de la API. No es un bloqueo de OJV: es nuestro lado (sin bundle F5, sin proxy, initialize() que revienta). La API devuelve 500 a toda consulta mientras dure." "pool-fail"
+  fi
+fi
+rm -f "$API_BODY"
 
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
