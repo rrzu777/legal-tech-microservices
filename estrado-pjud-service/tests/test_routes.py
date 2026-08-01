@@ -9,8 +9,11 @@ coverage minus the network.
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+from tests.helpers import http_status_error, infra_exceptions
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -43,6 +46,22 @@ def client():
 
     app = create_app()
     return TestClient(app)
+
+
+@pytest.fixture
+def client_5xx():
+    """TestClient que DEVUELVE el 500 en vez de re-lanzar la excepción.
+
+    Necesario para los tests de fallas de infra: el contrato que importa no es
+    "la corrutina lanzó", es "la app recibe un 5xx y por eso la clasifica como
+    NUESTRA y no le suma una falla a la causa". Con el cliente por defecto la
+    excepción sube al test y el status code —que es lo que se está
+    verificando— nunca se materializa.
+    """
+    from app.main import create_app
+
+    app = create_app()
+    return TestClient(app, raise_server_exceptions=False)
 
 
 AUTH = {"Authorization": "Bearer test-key"}
@@ -88,6 +107,25 @@ class TestHealth:
         assert body["status"] == "ok"
         assert "uptime_seconds" in body
         assert isinstance(body["uptime_seconds"], int)
+
+    def test_health_reporta_down_cuando_el_pool_no_entrega_sesion(self, client):
+        """El status sale DERIVADO y no de la constante `"ok"` que había acá.
+
+        El 31 de julio de 2026 `/api/v1/health` respondía
+        `{"status": "ok", "total_requests": 0, "total_errors": 0}` con la
+        instancia llevando 3 días y 18 horas devolviendo 500 a todo. Un watchdog
+        externo mira `.status` antes que cualquier contador, así que ese literal
+        era lo que hacía indistinguible un servicio caído de uno ocioso.
+        """
+        from app.metrics import api_metrics
+        api_metrics.record_pool_failure("search")
+
+        body = client.get("/api/v1/health").json()
+
+        assert body["status"] == "down"
+        # Y la métrica de Familia se publica de verdad: `HealthResponse` se arma
+        # con `**snapshot` y pydantic ignora en silencio lo que no declara.
+        assert "familia_requests" in body
 
 
 # ===================================================================
@@ -188,36 +226,55 @@ class TestSearch:
         resp = client.post("/api/v1/search", json=payload, headers=bad_auth)
         assert resp.status_code == 401
 
-    def test_search_returns_blocked_on_timeout(self, client):
-        """Network timeout should return blocked=True so caller can retry."""
-        import httpx
+    @pytest.mark.parametrize("exc", infra_exceptions(), ids=lambda e: type(e).__name__)
+    def test_search_infra_devuelve_5xx_y_no_200(self, client_5xx, exc):
+        """Una falla NUESTRA no puede salir con 200.
+
+        Con 200 la app veía `found=False` y le escribía al abogado "No encontrada
+        en OJV — revisa el rol y el tribunal" por una causa que existe y un proxy
+        que estaba caído. El 5xx es lo único que la hace clasificar infra.
+        """
         mock_session = _make_mock_session()
-        mock_session.search = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
-        mock_pool = _make_mock_pool(mock_session)
-        client.app.state.session_pool = mock_pool
+        mock_session.search = AsyncMock(side_effect=exc)
+        client_5xx.app.state.session_pool = _make_mock_pool(mock_session)
+
+        payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
+        resp = client_5xx.post("/api/v1/search", json=payload, headers=AUTH)
+
+        assert resp.status_code >= 500
+
+    def test_search_5xx_de_ojv_si_es_bloqueo(self, client):
+        """Un 5xx del portal SÍ sale con 200 y `blocked`: es de ellos, no nuestro.
+
+        La otra mitad de la simetría. Antes caía en `blocked=False` y la app lo
+        contaba como falla de la causa; ahora no penaliza, pero tampoco se
+        disfraza de caída nuestra.
+        """
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(
+            side_effect=http_status_error(503)
+        )
+        client.app.state.session_pool = _make_mock_pool(mock_session)
 
         payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
         resp = client.post("/api/v1/search", json=payload, headers=AUTH)
 
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["blocked"] is True
-        assert body["error"] is not None
+        assert resp.json()["blocked"] is True
 
-    def test_search_returns_blocked_on_connect_error(self, client):
-        """Connection error should return blocked=True."""
-        import httpx
-        mock_session = _make_mock_session()
-        mock_session.search = AsyncMock(side_effect=httpx.ConnectError("refused"))
-        mock_pool = _make_mock_pool(mock_session)
-        client.app.state.session_pool = mock_pool
+    def test_search_cuerpo_vacio_es_infra_no_causa_inexistente(self, client_5xx):
+        """Cero bytes es el túnel cortándose, no "esa causa no existe".
+
+        Sin esto `parse_search_results("")` devuelve [] y la respuesta sale
+        `found=False` con 200 — indistinguible de un rol mal tipeado.
+        """
+        mock_session = _make_mock_session(search_html="   ")
+        client_5xx.app.state.session_pool = _make_mock_pool(mock_session)
 
         payload = {"case_type": "rol", "case_number": "C-1234-2024", "competencia": "civil"}
-        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+        resp = client_5xx.post("/api/v1/search", json=payload, headers=AUTH)
 
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["blocked"] is True
+        assert resp.status_code >= 500
 
     def test_search_non_network_error_not_blocked(self, client):
         """Non-network exceptions should return blocked=False."""
@@ -425,19 +482,58 @@ class TestDetail:
         # Should guess "civil" from the JWT payload
         mock_session.detail.assert_awaited_once_with("civil", self._CIVIL_JWT)
 
-    def test_detail_blocked_when_empty_response(self, client):
-        """POST /api/v1/detail with empty HTML returns blocked=True."""
+    def test_detail_cuerpo_vacio_es_infra(self, client_5xx):
+        """Cero bytes sale 5xx: es el túnel cortándose, no un bloqueo de OJV."""
         mock_session = _make_mock_session(detail_html="")
-        mock_pool = _make_mock_pool(mock_session)
-        client.app.state.session_pool = mock_pool
+        client_5xx.app.state.session_pool = _make_mock_pool(mock_session)
+
+        payload = {"detail_key": self._CIVIL_JWT}
+        resp = client_5xx.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code >= 500
+
+    def test_detail_reconoce_el_challenge_f5_completo(self, client):
+        """Una pagina de challenge de varios KB tambien es un bloqueo.
+
+        Esta ruta miraba SOLO el largo, asi que el challenge F5 completo pasaba
+        de largo: `parse_detail` no encontraba nada y la respuesta salia 200 con
+        `blocked=False` y la causa vacia. El abogado veia un expediente sin
+        movimientos en vez de un aviso de bloqueo. El worker tenia el test de
+        esto (`test_detail_detects_f5_challenge`) y la ruta HTTP no — otra vez
+        los dos servicios sin ser espejos.
+        """
+        challenge = (
+            '<html><head><script>window["bobcmn"] = "10111...";</script></head><body>'
+            + ("x" * 500)
+            + "</body></html>"
+        )
+        assert len(challenge) > 100
+        mock_session = _make_mock_session(detail_html=challenge)
+        client.app.state.session_pool = _make_mock_pool(mock_session)
 
         payload = {"detail_key": self._CIVIL_JWT}
         resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
 
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["blocked"] is True
-        assert body["error"] is not None
+        assert resp.json()["blocked"] is True
+
+    def test_detail_pagina_contentless_sigue_siendo_bloqueo(self, client):
+        """Una página de ~39 bytes SÍ es soft-block de F5: 200 con blocked.
+
+        La distinción con el test de arriba es fina y deliberada. Está medida:
+        el F5 devuelve un esqueleto HTML vacío, no cero bytes. Colapsar las dos
+        en "infra" perdería una señal real de bloqueo.
+        """
+        mock_session = _make_mock_session(
+            detail_html="<html><head></head><body></body></html>",
+        )
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+
+        payload = {"detail_key": self._CIVIL_JWT}
+        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code == 200
+        assert resp.json()["blocked"] is True
 
     def test_detail_logs_warning_on_competencia_extraction_failure(self, client, caplog):
         """When JWT doesn't contain competencia, an error should be logged and blocked=True returned."""
@@ -478,36 +574,30 @@ class TestDetail:
         assert "[redacted]" in body["error"]
         assert "Connection to" in body["error"]
 
-    def test_detail_returns_blocked_on_timeout(self, client):
-        """Network timeout should return blocked=True so caller can retry."""
-        import httpx
+    @pytest.mark.parametrize("exc", infra_exceptions(), ids=lambda e: type(e).__name__)
+    def test_detail_infra_devuelve_5xx_y_no_200(self, client_5xx, exc):
+        """Espejo del de `search`: una falla nuestra no puede salir con 200."""
         mock_session = _make_mock_session()
-        mock_session.detail = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
-        mock_pool = _make_mock_pool(mock_session)
-        client.app.state.session_pool = mock_pool
+        mock_session.detail = AsyncMock(side_effect=exc)
+        client_5xx.app.state.session_pool = _make_mock_pool(mock_session)
+
+        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
+        resp = client_5xx.post("/api/v1/detail", json=payload, headers=AUTH)
+
+        assert resp.status_code >= 500
+
+    def test_detail_5xx_de_ojv_si_es_bloqueo(self, client):
+        mock_session = _make_mock_session()
+        mock_session.detail = AsyncMock(
+            side_effect=http_status_error(503)
+        )
+        client.app.state.session_pool = _make_mock_pool(mock_session)
 
         payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
         resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
 
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["blocked"] is True
-        assert body["error"] is not None
-
-    def test_detail_returns_blocked_on_connect_error(self, client):
-        """Connection error should return blocked=True."""
-        import httpx
-        mock_session = _make_mock_session()
-        mock_session.detail = AsyncMock(side_effect=httpx.ConnectError("refused"))
-        mock_pool = _make_mock_pool(mock_session)
-        client.app.state.session_pool = mock_pool
-
-        payload = {"detail_key": self._CIVIL_JWT, "competencia": "civil"}
-        resp = client.post("/api/v1/detail", json=payload, headers=AUTH)
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["blocked"] is True
+        assert resp.json()["blocked"] is True
 
     def test_detail_non_network_error_not_blocked(self, client):
         """Non-network exceptions should return blocked=False."""

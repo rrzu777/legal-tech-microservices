@@ -73,8 +73,10 @@ class APISessionPool:
 
     def pick_familia_bundle(self) -> CookieBundle | None:
         """Bundle F5 para el path Familia (el login autenticado se monta encima).
-        None si el worker aún no minteó ningún slot → la ruta responde 'blocked'
-        transitorio en vez de intentar un login pelado."""
+        None si el worker aún no minteó ningún slot → `familia_bundle_or_alert`
+        lo convierte en 503 en vez de intentar un login pelado. Antes salía como
+        `error_code="blocked"` con HTTP 200: culpar a OJV de que nuestro pool
+        estuviera vacío, y de paso llevar la causa camino a `suspended`."""
         return self._pick_bundle()
 
     async def release(self, session: OJVSession, healthy: bool = True) -> None:

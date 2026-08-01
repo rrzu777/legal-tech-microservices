@@ -56,6 +56,17 @@ class TelegramAlerter:
 
     async def check_and_alert(self):
         """Check metrics and send alert if blocked rate exceeds threshold."""
+        # El cooldown primero: es la guardia que descarta el 99% de las llamadas
+        # y la unica que no cuesta nada —dos comparaciones de float, sin lock—.
+        # Importa ahora que `classify_and_alert` llama a esto para TODO lo
+        # clasificado "ojv" (403, 429, los 5xx) y no solo para dos tipos de
+        # excepcion: bajo un outage sostenido del portal, evaluarlo al final
+        # significaba una pasada completa a la ventana y dos tomas de lock por
+        # request, para terminar descartando igual.
+        now = time.monotonic()
+        if now - self._last_alert_time < self._cooldown:
+            return
+
         snapshot = api_metrics.snapshot()
         windowed_rate = api_metrics.windowed_blocked_rate()
 
@@ -67,10 +78,6 @@ class TelegramAlerter:
             return
 
         if windowed_rate < self._threshold:
-            return
-
-        now = time.monotonic()
-        if now - self._last_alert_time < self._cooldown:
             return
 
         self._last_alert_time = now

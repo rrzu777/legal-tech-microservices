@@ -8,9 +8,12 @@ from fastapi import APIRouter, Request
 from app.auth import verify_api_key
 from app.config import get_settings
 from app.errors import safe_error
+from app.failure_kind import classify_exception
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
 from app.familia.parser import parse_familia_results
+from app.metrics import api_metrics
+from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
 from app.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -31,30 +34,50 @@ async def familia_sync(
     settings = get_settings()
     rate_s = settings.RATE_LIMIT_MS / 1000.0
 
+    # El bundle F5 se pide FUERA del `try` del timeout y antes de contar el
+    # request, igual que `acquire_or_alert` en search y detail: si el pool no
+    # tiene con qué salir, esto lanza 503 y no contesta 200 con `blocked`.
+    pool = request.app.state.session_pool
+    bundle = await familia_bundle_or_alert(pool, request)
+
+    api_metrics.record_request("familia")
+
     try:
         async with asyncio.timeout(_SYNC_TIMEOUT_S):
-            pool = request.app.state.session_pool
-            return await _run_sync(req, rate_s, pool)
+            resp = await _run_sync(req, rate_s, bundle)
     except TimeoutError:
         logger.warning("familia_sync: timed out after %ds", _SYNC_TIMEOUT_S)
+        api_metrics.record_error("familia")
         return FamiliaSyncResponse(
             ok=False, casos=[],
             error_code="session_error",
             error="La operación excedió el tiempo máximo permitido",
         )
 
+    # Las métricas de esta ruta son nuevas: hasta acá `familia.py` no tenía UNA
+    # sola llamada a `api_metrics`, así que el agujero que se cerró para search y
+    # detail seguía abierto justo en la ruta cuya respuesta la app malinterpreta.
+    if resp.ok:
+        api_metrics.record_success("familia")
+    else:
+        api_metrics.record_error("familia")
+        if resp.error_code == "blocked":
+            await record_blocked_and_alert(request, "familia")
+
+    return resp
+
 
 _BLOCKED_MSG = "OJV está limitando el acceso; reintentá en unos minutos"
 
 
-def _blocked(error: str = _BLOCKED_MSG) -> FamiliaSyncResponse:
-    return FamiliaSyncResponse(ok=False, casos=[], error_code="blocked", error=error)
+def _blocked() -> FamiliaSyncResponse:
+    """Sin parametro: el unico call site que pasaba otro texto era el del pool
+    sin bundle F5, y ese ya no vive aca —sale 503 por `familia_bundle_or_alert`,
+    porque era una caida NUESTRA disfrazada de bloqueo del portal."""
+    return FamiliaSyncResponse(ok=False, casos=[], error_code="blocked", error=_BLOCKED_MSG)
 
 
-async def _run_sync(req: FamiliaSyncRequest, rate_s: float, pool) -> FamiliaSyncResponse:
-    bundle = pool.pick_familia_bundle()
-    if bundle is None:
-        return _blocked("Servicio inicializándose, reintentá en unos minutos")
+async def _run_sync(req: FamiliaSyncRequest, rate_s: float, bundle) -> FamiliaSyncResponse:
     async with FamiliaAuthSession(
         bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
     ) as session:
@@ -102,6 +125,30 @@ async def _run_sync(req: FamiliaSyncRequest, rate_s: float, pool) -> FamiliaSync
                     # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
                     return _blocked()
                 except Exception as e:
+                    # El mismo criterio que el bloqueo, extendido a las otras
+                    # fallas que tampoco son de la causa. Este `except` se tragaba
+                    # TODO y seguía, y después devolvía `ok=True` con `casos=[]` y
+                    # sin `error_code` — indistinguible de "esa causa no está en
+                    # el portal". La app entonces le sumaba una falla a la causa, y
+                    # a las 10 la suspendía por un proxy que se cayó medio segundo.
+                    #
+                    # Y es el camino que importa: la app SIEMPRE manda `cases`
+                    # con un RIT, así que esta rama es la única que se ejecuta en
+                    # producción. La de abajo —consultar todas las causas del
+                    # RUT— hoy no la usa nadie.
+                    kind = classify_exception(e)
+                    if kind == "ojv":
+                        return _blocked()
+                    if kind == "infra":
+                        logger.warning(
+                            "familia_sync: fallo de infra en RIT %s: %s",
+                            case_filter.rit, safe_error(e),
+                        )
+                        return FamiliaSyncResponse(
+                            ok=False, casos=[],
+                            error_code="session_error",
+                            error=safe_error(e),
+                        )
                     logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
             return FamiliaSyncResponse(ok=True, casos=all_casos)
 
