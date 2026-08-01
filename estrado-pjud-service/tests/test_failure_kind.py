@@ -9,13 +9,27 @@ por eso el mismo 503 de OJV suspendía la causa o no según quién la tomara.
 import httpx
 import pytest
 
-from app.failure_kind import EmptyResponseError, block_cause, classify_exception
+from app.failure_kind import (
+    EmptyResponseError,
+    NoUsableBundleError,
+    block_cause,
+    classify_exception,
+)
 from tests.helpers import http_status_error as _status, infra_exceptions
 
 
 @pytest.mark.parametrize(
     "exc",
-    [*infra_exceptions(), TimeoutError("asyncio"), EmptyResponseError("cuerpo vacio")],
+    [
+        *infra_exceptions(),
+        TimeoutError("asyncio"),
+        EmptyResponseError("cuerpo vacio"),
+        # Quedarse sin bundle F5 vigente es infra NUESTRA. Sin esta línea el
+        # arreglo del pool se muerde la cola: lo desconocido cae en "case", así
+        # que la excepción saldría como culpa de la causa y la ruta contestaría
+        # 200 `found=False` — el mismo defecto, por la puerta de atrás.
+        NoUsableBundleError("sin bundle vigente"),
+    ],
     ids=lambda e: type(e).__name__,
 )
 def test_nuestras_caidas_son_infra(exc):

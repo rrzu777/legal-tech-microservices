@@ -145,22 +145,50 @@ async def test_acquire_familia_bundle_releases_on_load_failure(monkeypatch):
     assert all(not s.busy for s in pool._slots)  # slot liberado
 
 
-def test_api_pick_familia_bundle_none_when_empty(monkeypatch):
-    from app.session_pool import APISessionPool
+def _api_pool():
+    """`Settings` de verdad, no un MagicMock.
 
-    settings = MagicMock(SESSION_POOL_SIZE=2, SESSION_MAX_AGE_S=1500, COOKIE_STORE_PATH="/tmp/x.json")
-    pool = APISessionPool(settings)
+    Estos dos tests construían el pool con `MagicMock(...)` sin fijar
+    `OJV_PROXY_URL`, así que ese atributo era un Mock auto-generado —o sea, no
+    `None`— y `self._proxy_mode` quedaba en `True` POR ACCIDENTE. Pasaban igual
+    porque su bundle ya traía `proxy_url`, pero nadie había elegido ese modo: un
+    mock hace pasar por configuración cualquier cosa, y con eso el test deja de
+    medir el código y pasa a medir el mock.
+    """
+    from app.session_pool import APISessionPool
+    from tests.helpers import api_settings
+
+    return APISessionPool(api_settings("/tmp/x.json"))
+
+
+def test_api_pick_familia_bundle_none_when_empty():
+    pool = _api_pool()
     pool._store = MagicMock()
     pool._store.load_all = MagicMock(return_value={})
     assert pool.pick_familia_bundle() is None
 
 
-def test_api_pick_familia_bundle_returns_bundle(monkeypatch):
-    from app.session_pool import APISessionPool
-
-    settings = MagicMock(SESSION_POOL_SIZE=2, SESSION_MAX_AGE_S=1500, COOKIE_STORE_PATH="/tmp/x.json")
-    pool = APISessionPool(settings)
+def test_api_pick_familia_bundle_returns_bundle():
+    pool = _api_pool()
     b = CookieBundle(cookies={"TSPD_101": "z"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
     pool._store = MagicMock()
     pool._store.load_all = MagicMock(return_value={"0": b})
     assert pool.pick_familia_bundle() is b
+
+
+def test_api_no_le_presta_a_familia_un_bundle_sin_proxy():
+    """El agujero que esta PR cierra, por el camino de Familia.
+
+    Un bundle sin `proxy_url` con el pool en modo proxy egresa por la IP del
+    datacenter — y acá encima con el login de Clave PJ montado encima.
+    `familia_bundle_or_alert` convierte el None en 503 (infra), que es lo
+    correcto: antes de #23 salía como `error_code="blocked"` con HTTP 200 y
+    terminaba sumándole fallas a la causa hasta suspenderla.
+    """
+    pool = _api_pool()
+    sin_proxy = CookieBundle(
+        cookies={"TSPD_101": "z"}, user_agent="UA", saved_at=0.0, proxy_url=None
+    )
+    pool._store = MagicMock()
+    pool._store.load_all = MagicMock(return_value={"0": sin_proxy})
+    assert pool.pick_familia_bundle() is None

@@ -3,15 +3,7 @@ from unittest.mock import MagicMock
 from app.cookie_store import CookieBundle
 
 
-class _FakeSession:
-    def __init__(self, adapter):
-        self.adapter = adapter
-
-    async def initialize(self):
-        pass
-
-    async def close(self):
-        pass
+from tests.helpers import FakeOJVSession as _FakeSession
 
 
 def test_acquire_injects_cookies_from_store(monkeypatch):
@@ -134,10 +126,21 @@ def test_acquire_round_robins_across_slot_bundles(monkeypatch):
     assert len(set(captured_proxies)) == 3
 
 
-def test_acquire_falls_back_to_no_proxy_when_store_empty(monkeypatch):
-    """When load_all() returns {} (worker hasn't minted any slot yet), acquire()
-    must still work, building the adapter with proxy=None (graceful
-    degradation to today's no-proxy behavior)."""
+def test_modo_legacy_sin_proxy_configurado_sigue_saliendo_directo(monkeypatch):
+    """SOLO en modo legacy (sin `OJV_PROXY_URL`) salir con proxy=None es correcto.
+
+    Este test se llamaba `..._falls_back_to_no_proxy_when_store_empty` y su
+    docstring decía "graceful degradation to today's no-proxy behavior". Dejó de
+    ser cierto, y era peligroso que lo dijera: con `OJV_PROXY_URL` configurado,
+    salir sin proxy egresa por la IP del datacenter, que F5 tiene soft-blockeada,
+    y el challenge vuelve con HTTP 200 — nuestra caída reportada como bloqueo de
+    OJV. Hoy eso levanta `NoUsableBundleError` (ver `test_pool_sin_proxy.py`).
+
+    El escenario que cubre —store vacío Y sin proxy configurado— sigue siendo
+    válido, pero lo que lo hace válido es el MODO, no el store. Quien buscara
+    "¿todavía existe el fallback a sin-proxy?" encontraba acá un test en verde
+    diciendo que sí.
+    """
     from app import session_pool as sp
     from app.session_pool import APISessionPool
     from app.config import Settings
