@@ -1,7 +1,3 @@
-import os
-import pytest
-
-
 class TestWorkerConfig:
     def test_loads_from_env(self, monkeypatch):
         monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
@@ -11,7 +7,7 @@ class TestWorkerConfig:
         monkeypatch.setenv("PJUD_BASE_URL", "https://ojv.pjud.cl")
 
         from worker.config import WorkerConfig
-        config = WorkerConfig()
+        config = WorkerConfig(_env_file=None)
 
         assert config.SUPABASE_URL == "https://test.supabase.co"
         assert config.SUPABASE_SERVICE_KEY == "eyJtest"
@@ -24,7 +20,7 @@ class TestWorkerConfig:
         monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
 
         from worker.config import WorkerConfig
-        config = WorkerConfig()
+        config = WorkerConfig(_env_file=None)
 
         assert config.WORKER_ID == "worker-1"
         assert config.POOL_SIZE == 1
