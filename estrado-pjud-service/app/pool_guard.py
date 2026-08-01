@@ -4,10 +4,14 @@ Dos, y las dos con el mismo enemigo: una ruta que contesta 200 con `blocked` o
 `found=False` cuando el que se cayó es este servicio. La app no tiene forma de
 distinguir eso de una respuesta real de OJV.
 
-`SessionPool.acquire()` puede lanzar: cuando no hay bundle F5 en el store cae a
-sin-proxy/sin-cookies y el `initialize()` contra OJV revienta. En las rutas esa
-excepción sale como 500, que es el contrato correcto —la app lo clasifica como
-`PjudInfraError` y NO le suma fallas a la causa—, pero salía sin dejar rastro:
+`SessionPool.acquire()` puede lanzar. Hasta hace poco lo hacía por accidente:
+sin bundle F5 caía a sin-proxy/sin-cookies y el `initialize()` contra OJV
+reventaba a veces. Hoy lanza a propósito —`NoUsableBundleError`— porque ese
+fallback egresaba por la IP del datacenter, que F5 tiene soft-blockeada, y las
+veces que NO reventaba eran peores: OJV contesta 200 con una página de challenge
+y la ruta la reportaba como bloqueo de OJV. En las rutas la excepción sale como
+500, que es el contrato correcto —la app lo clasifica como `PjudInfraError` y NO
+le suma fallas a la causa—, pero salía sin dejar rastro:
 
 - `api_metrics.record_request()` se llamaba DESPUÉS del acquire, así que el
   contador quedaba en cero;

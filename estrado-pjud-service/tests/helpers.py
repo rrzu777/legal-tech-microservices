@@ -1,6 +1,49 @@
 """Utilidades compartidas entre módulos de test."""
 
 
+class FakeOJVSession:
+    """Sesión que no habla con nadie. Estaba copiada en cinco archivos.
+
+    Espeja la superficie de `OJVSession` que el pool usa, y NADA más: un fake con
+    atributos que la clase real no tiene es lo que deja pasar un test contra algo
+    que no existe.
+    """
+
+    def __init__(self, adapter=None):
+        self.adapter = adapter
+        self.closed = False
+
+    async def initialize(self):
+        pass
+
+    async def close(self):
+        self.closed = True
+
+    @property
+    def age_seconds(self):
+        return 0.0
+
+
+def api_settings(store_path="/tmp/no-existe.json", *, proxy="http://u:p@residencial:9000"):
+    """`Settings` de verdad para construir un `APISessionPool`, nunca un MagicMock.
+
+    `APISessionPool.__init__` mira `OJV_PROXY_URL` para saber si está en modo
+    proxy. Con un MagicMock ese atributo es un Mock auto-generado —o sea, no
+    `None`— y el modo proxy queda activado POR ACCIDENTE: el test pasa a medir el
+    mock en vez del código.
+
+    `proxy=None` da el modo legacy, donde salir directo es lo previsto.
+    """
+    from app.config import Settings
+
+    return Settings(
+        API_KEY="t",
+        COOKIE_STORE_PATH=str(store_path),
+        OJV_PROXY_URL=proxy,
+        _env_file=None,
+    )
+
+
 def find_update_payload(mock_sb, **match):
     """Devuelve el primer payload de .update() que matchea todos los pares clave/valor.
 

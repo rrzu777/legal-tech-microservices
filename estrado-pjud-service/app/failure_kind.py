@@ -63,6 +63,21 @@ class EmptyResponseError(Exception):
     """
 
 
+class NoUsableBundleError(Exception):
+    """El pool no tiene ningún bundle F5 con el cual salir.
+
+    O el store está vacío (el worker todavía no minteó) o los bundles que hay no
+    traen `proxy_url`. Las dos son infra NUESTRA, y en las dos la única respuesta
+    correcta es no salir.
+
+    Antes de esto el pool caía a sin-proxy/sin-cookies y egresaba por la IP del
+    datacenter. Medido el 1 de agosto de 2026: por esa IP, OJV contesta HTTP 200
+    con una página de challenge de F5 de ~4900 bytes que `detect_blocked`
+    reconoce — o sea que nuestra decisión de salir sin proxy terminaba reportada
+    como "OJV nos bloqueó". Encima gasta reputación de la IP en cada intento.
+    """
+
+
 def classify_exception(e: BaseException) -> FailureKind:
     """De quién es la culpa de esta excepción."""
     if isinstance(e, httpx.HTTPStatusError):
@@ -72,9 +87,11 @@ def classify_exception(e: BaseException) -> FailureKind:
         return "case"
 
     # `httpx.TimeoutException` ya es `TransportError`; `TimeoutError` cubre el
-    # `asyncio.timeout` (que en 3.11+ es el mismo tipo) y `EmptyResponseError`
-    # entra por su cuenta.
-    if isinstance(e, (httpx.TransportError, TimeoutError, EmptyResponseError)):
+    # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError` y
+    # `NoUsableBundleError` entran por su cuenta.
+    if isinstance(
+        e, (httpx.TransportError, TimeoutError, EmptyResponseError, NoUsableBundleError)
+    ):
         return "infra"
 
     return "case"

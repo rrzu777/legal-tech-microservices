@@ -12,12 +12,18 @@ import pytest
 
 import worker.session_pool as wsp
 import app.session_pool as asp
+from app.failure_kind import NoUsableBundleError
 from app.minter import MintResult
 from app.cookie_store import CookieStore
 from worker.session_pool import SessionPool
 from app.session_pool import APISessionPool
+from tests.helpers import FakeOJVSession, api_settings
 
 DUMMY_BASE = "http://user123:pw_country-cl@geo.example.com:12321"
+
+
+def _api_settings(store_path):
+    return api_settings(store_path, proxy=DUMMY_BASE)
 
 
 def _worker_config(store_path, pool_size=3):
@@ -35,20 +41,7 @@ def _worker_config(store_path, pool_size=3):
     return c
 
 
-class _FakeSession:
-    def __init__(self, adapter=None):
-        self.adapter = adapter
-        self.closed = False
-
-    async def initialize(self):
-        pass
-
-    async def close(self):
-        self.closed = True
-
-    @property
-    def age_seconds(self):
-        return 0.0
+_FakeSession = FakeOJVSession
 
 
 @pytest.mark.asyncio
@@ -103,11 +96,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    settings = MagicMock()
-    settings.SESSION_POOL_SIZE = 2
-    settings.SESSION_MAX_AGE_S = 1500
-    settings.COOKIE_STORE_PATH = str(store_path)
-    api = APISessionPool(settings)
+    api = APISessionPool(_api_settings(store_path))
 
     # 3 acquires sin release => 3 sesiones nuevas, round-robin sobre los 3 bundles.
     for _ in range(3):
@@ -119,9 +108,20 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_api_falls_back_when_worker_never_minted(tmp_path, monkeypatch):
-    """Sin bundles en el store (worker aún no minteó), el API degrada a proxy=None
-    sin crashear."""
+async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkeypatch):
+    """Sin bundles en el store, el API NO degrada a proxy=None: se niega a salir.
+
+    Este test decía lo contrario —"degrada a proxy=None sin crashear"— y ese
+    "sin crashear" costaba caro. Medido en el VPS el 1 de agosto de 2026: por la
+    IP del datacenter, OJV contesta HTTP 200 con una página de challenge de F5 de
+    ~4900 bytes que `detect_blocked` reconoce, así que la ruta la reportaba como
+    `blocked`. O sea: NUESTRA decisión de salir sin proxy le llegaba al abogado
+    como "OJV bloqueó la consulta". Y de paso gastaba reputación de la IP en cada
+    intento.
+
+    El `NoUsableBundleError` está clasificado como infra, así que la ruta sale con
+    500 y la app lo lee como `PjudInfraError`: sin sumarle fallas a la causa.
+    """
     store_path = tmp_path / "empty.json"
     captured = []
 
@@ -132,10 +132,10 @@ async def test_api_falls_back_when_worker_never_minted(tmp_path, monkeypatch):
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    settings = MagicMock()
-    settings.SESSION_POOL_SIZE = 2
-    settings.SESSION_MAX_AGE_S = 1500
-    settings.COOKIE_STORE_PATH = str(store_path)
-    api = APISessionPool(settings)
-    await api.acquire()
-    assert captured == [None]
+    api = APISessionPool(_api_settings(store_path))
+
+    with pytest.raises(NoUsableBundleError):
+        await api.acquire()
+
+    # Ni siquiera llegó a construir un adapter: no hubo request a OJV.
+    assert captured == []
