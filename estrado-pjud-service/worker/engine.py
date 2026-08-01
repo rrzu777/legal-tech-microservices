@@ -10,6 +10,7 @@ import httpx
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
+from app.failure_kind import block_cause, classify_exception, reject_empty_body
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
 from app.parsers.anexo_parser import parse_anexo_list
@@ -126,6 +127,7 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
         session.search(comp_path, form_data),
         timeout=timeout,
     )
+    reject_empty_body(html, "search")
     if detect_blocked(html) or len(html.strip()) < 100:
         return {"found": False, "match_count": 0, "matches": [], "blocked": True, "error": None}
     matches = parse_search_results(html, competencia)
@@ -145,6 +147,7 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
         session.detail(comp_path, detail_key),
         timeout=timeout,
     )
+    reject_empty_body(html, "detail")
     if len(html.strip()) < 100 or detect_blocked(html):
         return {"metadata": {}, "movements": [], "litigantes": [], "blocked": True, "error": None}
     parsed = parse_detail(html)
@@ -359,29 +362,41 @@ class SyncEngine:
             logger.info("Synced case %s: %d new movements", case["case_number"], new_count)
             return {"success": True, "new_movements": new_count}
 
-        except (httpx.TransportError, asyncio.TimeoutError) as e:
-            # IP residencial caída/lenta o timeout de red = falla de INFRA, no de la causa.
-            # Se trata como bloqueo: re-mint del slot (session_healthy=False) SIN penalizar
-            # (sin _update_case_error, sin consecutive_sync_failures++). El circuit breaker global via
+        except Exception as e:
+            # Un solo `except`, clasificado, en vez de dos listas de tipos. La
+            # anterior era `(httpx.TransportError, asyncio.TimeoutError)`, y
+            # `httpx.HTTPStatusError` NO es `TransportError` —son hermanos bajo
+            # `HTTPError`—, así que un 503 de OJV se caía al `except Exception`
+            # de abajo: `_update_case_error`, contador++, y a las 10 la causa
+            # `suspended` por una tarde en que el portal de ellos estuvo caído.
+            # La app lo clasificaba bien desde la PR #55 (`pjudHttpError`); este
+            # lado no, y los dos escriben sobre las mismas filas.
+            kind = classify_exception(e)
+
+            if kind == "case":
+                msg = str(e)
+                logger.exception("Error syncing case %s", case["case_number"])
+                await self._finish_run(sync_run_id, started_at, "error", 0, msg)
+                await self._update_case_error(case, msg)
+                self._backoff.record_failure()
+                self._metrics.record_error()
+                return {"success": False, "new_movements": 0}
+
+            # infra u ojv: transitorio. Se trata como bloqueo —re-mint del slot
+            # (session_healthy=False) SIN penalizar: sin `_update_case_error`,
+            # sin `consecutive_sync_failures++`—. El circuit breaker global vía
             # _handle_blocked/record_blocked da la protección sistémica.
             session_healthy = False
-            msg = f"infra: {type(e).__name__}: {e}"
-            logger.warning("Infra error syncing case %s: %s", case["case_number"], msg)
+            msg = f"{kind}: {type(e).__name__}: {e}"
+            logger.warning("Fallo %s sincronizando causa %s: %s", kind, case["case_number"], msg)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
-            # "infra": el `msg` ya se llama a si mismo asi. Escribir "Acceso
-            # bloqueado por OJV" aca era acusar al Poder Judicial de un timeout
-            # de nuestra IP residencial.
-            await self._handle_blocked(case["id"], "infra", msg)
+            await self._handle_blocked(case["id"], kind, msg)
+            # "infra" fijo aunque `kind` pueda ser "ojv": el heartbeat del worker
+            # tiene dos baldes, `errors_infra_today` y `errors_case_today`, y la
+            # pregunta que responde es "¿esta falla es culpa de la causa?". Un
+            # bloqueo de OJV no lo es. Mandarlo al balde de causa por ser un
+            # tercer valor seria contarlo como lo contrario de lo que es.
             self._metrics.record_error("infra")
-            return {"success": False, "new_movements": 0}
-
-        except Exception as e:
-            msg = str(e)
-            logger.exception("Error syncing case %s", case["case_number"])
-            await self._finish_run(sync_run_id, started_at, "error", 0, msg)
-            await self._update_case_error(case, msg)
-            self._backoff.record_failure()
-            self._metrics.record_error()
             return {"success": False, "new_movements": 0}
 
         finally:
@@ -472,16 +487,31 @@ class SyncEngine:
             # consecutive_sync_failures (_handle_blocked), y marca el slot para re-mint
             # (healthy=False en el finally). str(e) preserva el detalle (los
             # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
-            except (FamiliaBlockedError, SessionError, TimeoutError, httpx.TransportError) as e:
+            # `httpx.HTTPStatusError` en la lista y no solo `TransportError`:
+            # son hermanos, no padre e hijo, asi que un 503 de OJV durante el
+            # login de Familia se caia al `except Exception` de mas afuera y
+            # terminaba penalizando la causa.
+            except (
+                FamiliaBlockedError,
+                SessionError,
+                TimeoutError,
+                httpx.TransportError,
+                httpx.HTTPStatusError,
+            ) as e:
                 session_healthy = False
                 msg = str(e) or "Timeout Familia sync"
-                # El unico `except` de los cinco call sites que mezcla las dos
-                # causas: `FamiliaBlockedError` ES el portal cortandonos, y las
-                # otras tres (sesion que no levanta, timeout, transporte) son
-                # nuestras. Agruparlas para el retry esta bien —las cuatro son
-                # transitorias y ninguna penaliza a la causa—; agruparlas para el
-                # mensaje seria volver a inventar la culpa.
-                cause = "ojv" if isinstance(e, FamiliaBlockedError) else "infra"
+                # El unico `except` de los call sites que mezcla las dos causas:
+                # `FamiliaBlockedError` ES el portal cortandonos, y las otras
+                # (sesion que no levanta, timeout, transporte) son nuestras.
+                # Agruparlas para el retry esta bien —todas son transitorias y
+                # ninguna penaliza a la causa—; agruparlas para el mensaje seria
+                # volver a inventar la culpa.
+                #
+                # `FamiliaBlockedError` va explicito y no dentro de
+                # `block_cause`: es una excepcion de dominio de Familia, y meter
+                # `app.familia.auth` dentro del clasificador le arrastraria ese
+                # grafo entero a las rutas de search y detail, que no lo usan.
+                cause = "ojv" if isinstance(e, FamiliaBlockedError) else block_cause(e)
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
                 await self._handle_blocked(case["id"], cause, msg)
                 self._metrics.record_error("infra")

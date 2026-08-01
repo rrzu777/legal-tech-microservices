@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 
-from tests.helpers import find_update_payload
+from tests.helpers import find_update_payload, http_status_error
 
 
 def _make_case(**overrides):
@@ -453,6 +453,74 @@ class TestSyncEngine:
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
 
     @pytest.mark.asyncio
+    async def test_sync_5xx_de_ojv_no_penaliza_y_se_le_atribuye_a_ojv(self):
+        """Un 503 de OJV NO puede suspender la causa.
+
+        `httpx.HTTPStatusError` no es `httpx.TransportError` —son hermanos bajo
+        `HTTPError`—, así que la lista vieja lo dejaba caer al `except Exception`
+        genérico: `_update_case_error`, contador++, y a las 10 la causa
+        `suspended` por una tarde en que el portal de ellos estuvo caído. La app
+        ya lo clasificaba bien (`pjudHttpError`, `status >= 500`) y los dos
+        servicios escriben sobre las mismas filas, así que el desenlace dependía
+        de cuál de los dos tomara la causa.
+        """
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error, \
+             patch.object(engine, "_handle_blocked", new_callable=AsyncMock) as mock_blocked:
+            mock_search.side_effect = http_status_error(503)
+            result = await engine.sync_case(_make_case())
+
+        assert result["success"] is False
+        mock_update_error.assert_not_called()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        # Y con la culpa donde corresponde: el 503 salió del servidor de ellos.
+        assert mock_blocked.await_args[0][1] == "ojv"
+
+    @pytest.mark.asyncio
+    async def test_sync_404_de_ojv_si_es_de_la_causa(self):
+        """El otro lado de la simetría: un 404 SÍ describe algo del pedido.
+
+        Sin este test, "no penalizar por HTTPStatusError" pasaría también con la
+        regla entera invertida —nada penalizaría nunca— y el techo de suspensión
+        quedaría muerto sin que nada lo dijera.
+        """
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = http_status_error(404)
+            result = await engine.sync_case(_make_case())
+
+        assert result["success"] is False
+        mock_update_error.assert_called_once()
+        mock_backoff.record_failure.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_cuerpo_vacio_es_infra_y_no_bloqueo_de_ojv(self):
+        """Cero bytes es el túnel cortándose, no el WAF de OJV.
+
+        Una página contentless de ~39 bytes SÍ es soft-block de F5 y sigue
+        contando como bloqueo (ver `test_returns_blocked_on_contentless_soft_block`);
+        cero bytes es la respuesta que no llegó, y cargársela a OJV le escribe al
+        abogado "bloqueado por OJV" cuando lo que hay que revisar es el proxy.
+        """
+        from app.failure_kind import EmptyResponseError
+        engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error, \
+             patch.object(engine, "_handle_blocked", new_callable=AsyncMock) as mock_blocked:
+            mock_search.side_effect = EmptyResponseError("search: OJV devolvio un cuerpo vacio")
+            result = await engine.sync_case(_make_case())
+
+        assert result["success"] is False
+        mock_update_error.assert_not_called()
+        assert mock_blocked.await_args[0][1] == "infra"
+
+    @pytest.mark.asyncio
     async def test_sync_generic_exception_still_penalizes(self):
         """Regression: a genuine unexpected bug (e.g. ValueError deep in
         parsing) is NOT an infra failure and must still go through the
@@ -874,6 +942,25 @@ class TestSearchPjudViaSession:
         assert result["blocked"] is False
 
     @pytest.mark.asyncio
+    async def test_cuerpo_de_cero_bytes_lanza_en_vez_de_reportar_bloqueo(self):
+        """La distinción con el test de abajo es de un byte y es deliberada.
+
+        ~39 bytes de esqueleto HTML es un soft-block de F5 medido. Cero bytes es
+        la respuesta que no llegó: cargársela a OJV le escribe al abogado
+        "bloqueado por OJV" cuando lo que hay que revisar es el proxy residencial.
+        Lanza para que `sync_case` la clasifique como infra por el mismo camino
+        que un `ProxyError`.
+        """
+        from app.failure_kind import EmptyResponseError
+        from worker.engine import search_pjud_via_session
+
+        mock_session = AsyncMock()
+        mock_session.search = AsyncMock(return_value="   ")
+
+        with pytest.raises(EmptyResponseError):
+            await search_pjud_via_session(mock_session, "civil", {"action": "search"}, 25.0)
+
+    @pytest.mark.asyncio
     async def test_returns_blocked_on_contentless_soft_block(self):
         """G1: an F5 soft-block returns a NON-empty but contentless page
         (`<html><head></head><body></body></html>`, ~39 bytes). detect_blocked
@@ -922,6 +1009,18 @@ class TestDetailPjudViaSession:
 
         assert result["blocked"] is False
         assert result["metadata"] == {"rol": "C-1234-2024"}
+
+    @pytest.mark.asyncio
+    async def test_detail_cuerpo_de_cero_bytes_lanza(self):
+        """Espejo del de `search`: cero bytes es infra, no bloqueo."""
+        from app.failure_kind import EmptyResponseError
+        from worker.engine import detail_pjud_via_session
+
+        mock_session = AsyncMock()
+        mock_session.detail = AsyncMock(return_value="")
+
+        with pytest.raises(EmptyResponseError):
+            await detail_pjud_via_session(mock_session, "civil", "eyJkey", 25.0)
 
     @pytest.mark.asyncio
     async def test_returns_blocked_on_short_response(self):

@@ -16,11 +16,18 @@ lado hay que cambiarlos del otro o la app deja de traducir lo que escribe el
 worker y el abogado ve el string crudo.
 """
 
-from typing import Literal
-
 from app.errors import safe_error
+# Una sola definicion de `BlockCause`, en `app/`: quien decide la causa es
+# `app.failure_kind` y quien escribe el texto es este modulo. Tenerla dos veces
+# dejaba que el clasificador devolviera un valor que el mensaje no contempla.
+from app.failure_kind import BlockCause
 
-BlockCause = Literal["ojv", "infra"]
+__all__ = [
+    "BlockCause",
+    "OJV_BLOCKED_ERROR",
+    "SERVICE_UNAVAILABLE_PREFIX",
+    "blocked_error_message",
+]
 
 # Tope de lo que se persiste. `last_sync_error` es TEXT y aguanta un traceback
 # entero, pero esta columna se RENDERIZA en la ficha y en el dashboard y sale por

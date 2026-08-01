@@ -2,7 +2,6 @@ import base64
 import json
 import logging
 
-import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
@@ -16,8 +15,8 @@ from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
-from app.alerting import maybe_alert
-from app.pool_guard import acquire_or_alert
+from app.failure_kind import reject_empty_body
+from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
 
 logger = logging.getLogger(__name__)
 
@@ -160,13 +159,26 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
 
         html = await session.detail(competencia_path(comp), detail_key)
 
-        if not html or len(html.strip()) < 100:
+        # Cuerpo de cero bytes: infra, no bloqueo. Una pagina contentless de ~39
+        # bytes SI es un soft-block de F5 (esta medido, y por eso el `len < 100`
+        # de abajo sigue contando como bloqueo), pero cero bytes es la respuesta
+        # que no llego. Sale por el `except` como 500 para que la app lo lea como
+        # nuestro.
+        reject_empty_body(html, "detail")
+
+        # `detect_blocked` ademas del largo, igual que hace `search` y que hace
+        # `detail_pjud_via_session` en el worker. Esta ruta miraba SOLO el largo,
+        # asi que un challenge F5 completo —varios KB de pagina con `bobcmn`—
+        # pasaba de largo, `parse_detail` no encontraba nada y la respuesta salia
+        # 200 con `blocked=False` y la causa vacia: el abogado veia un expediente
+        # sin movimientos en vez de un aviso de bloqueo. El worker tenia el test
+        # de esto (`test_detail_detects_f5_challenge`) y la ruta no.
+        if len(html.strip()) < 100 or detect_blocked(html):
             healthy = False
-            api_metrics.record_blocked("detail")
-            await maybe_alert(request)
+            await record_blocked_and_alert(request, "detail")
             logger.warning(
                 "Detail blocked for comp=%s — response length=%d, body=%r",
-                comp, len(html) if html else 0, (html or "")[:500],
+                comp, len(html), html[:500],
             )
             return DetailResponse(
                 metadata={}, movements=[], litigantes=[], libro=None, blocked=True,
@@ -199,12 +211,14 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         logger.exception("Detail fetch failed")
         healthy = False
         api_metrics.record_error("detail")
-        blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
-        if blocked:
-            api_metrics.record_blocked("detail")
-            await maybe_alert(request)
+        kind = await classify_and_alert(e, request, "detail")
+
+        # Mismo motivo que en `search`: una falla NUESTRA no puede salir con 200.
+        if kind == "infra":
+            raise
+
         return DetailResponse(
-            metadata={}, movements=[], litigantes=[], libro=None, blocked=blocked,
+            metadata={}, movements=[], litigantes=[], libro=None, blocked=kind == "ojv",
             error=safe_error(e),
         )
     finally:

@@ -3,6 +3,18 @@ import time
 from collections import deque
 
 
+def _blocked_rate(counts: dict[str, int]) -> float:
+    """La proporcion de bloqueos, definida UNA vez.
+
+    La leen el alerter (via `windowed_blocked_rate`) y `/api/v1/health` (via
+    `status`). Estaba escrita dos veces sobre los mismos numeros: si manana el
+    denominador cambiara —contar los `pool_failure`, por ejemplo— la alerta y el
+    panel dirian cosas distintas sin que nada fallara.
+    """
+    total = counts["request"]
+    return counts["blocked"] / total if total > 0 else 0.0
+
+
 class APIMetrics:
     """Thread-safe in-memory API metrics."""
 
@@ -19,6 +31,19 @@ class APIMetrics:
         cutoff = time.monotonic() - self._window_seconds
         while self._recent_events and self._recent_events[0][0] < cutoff:
             self._recent_events.popleft()
+
+    def _append_event(self, kind: str):
+        """Anota un evento en la ventana. Con el lock ya tomado.
+
+        Poda ANTES de anotar, y eso no es cosmetico: hasta ahora el unico que
+        podaba era el lector (`windowed_counts`), asi que la cola solo se
+        limpiaba si alguien consultaba. El escenario en que eso importa es
+        justo el peor: con el pool caido, `record_pool_failure` es el unico
+        recorder que corre, nadie lee, y la cola crecia sin techo mientras el
+        servicio no atendia a nadie. Es `popleft` amortizado O(1).
+        """
+        self._prune_old_events()
+        self._recent_events.append((time.monotonic(), kind))
 
     def reset(self):
         with self._lock:
@@ -37,11 +62,12 @@ class APIMetrics:
             self._counters["total_requests"] = self._counters.get("total_requests", 0) + 1
             key = f"{endpoint}_requests"
             self._counters[key] = self._counters.get(key, 0) + 1
-            self._recent_events.append((time.monotonic(), "request"))
+            self._append_event("request")
 
     def record_success(self, endpoint: str):
         with self._lock:
             self._last_successful_request = time.time()
+            self._append_event("success")
 
     def record_error(self, endpoint: str):
         with self._lock:
@@ -66,11 +92,16 @@ class APIMetrics:
             self._counters["total_pool_failures"] = (
                 self._counters.get("total_pool_failures", 0) + 1
             )
+            # También en la ventana, y no solo en el contador acumulado: el
+            # contador acumulado no se puede des-incrementar, así que un `status`
+            # derivado de él se quedaría en "down" para siempre después del
+            # primer fallo. Lo que dice si estamos rotos AHORA es la ventana.
+            self._append_event("pool_failure")
 
     def record_blocked(self, endpoint: str):
         with self._lock:
             self._counters["total_blocked"] = self._counters.get("total_blocked", 0) + 1
-            self._recent_events.append((time.monotonic(), "blocked"))
+            self._append_event("blocked")
 
     @property
     def last_successful_request(self) -> float | None:
@@ -79,13 +110,60 @@ class APIMetrics:
 
     def windowed_blocked_rate(self) -> float:
         """Blocked rate over the last N seconds (for alerting)."""
+        return _blocked_rate(self.windowed_counts())
+
+    def windowed_counts(self) -> dict[str, int]:
+        """Cuántos eventos de cada tipo hubo en la ventana."""
         with self._lock:
             self._prune_old_events()
-            if not self._recent_events:
-                return 0.0
-            total = sum(1 for _, t in self._recent_events if t == "request")
-            blocked = sum(1 for _, t in self._recent_events if t == "blocked")
-            return blocked / total if total > 0 else 0.0
+            counts = {"request": 0, "blocked": 0, "success": 0, "pool_failure": 0}
+            for _, kind in self._recent_events:
+                # Sin `if kind in counts`: los cuatro tipos que se appendean son
+                # estas cuatro claves, asi que la guardia solo podia esconder un
+                # tipo nuevo — desaparecerlo de la ventana en silencio en vez de
+                # reventar, que es el modo de falla que este trabajo elimina.
+                counts[kind] += 1
+            return counts
+
+    def status(self, blocked_rate_threshold: float) -> str:
+        """El estado del servicio, DERIVADO, para `/api/v1/health`.
+
+        Estaba hardcodeado en `"ok"`. El 31 de julio de 2026 esa constante decía
+        `ok` mientras la instancia llevaba 3 días y 18 horas devolviendo 500 a
+        todo, y un watchdog externo mira `.status` antes que cualquier contador.
+
+        Se calcula sobre la VENTANA de 5 minutos y no sobre los acumulados a
+        propósito. Los acumulados son monótonos: un `total_pool_failures > 0`
+        dejaría el servicio en "down" para siempre después del primer fallo, aun
+        recuperado. La ventana se limpia sola, así que esto responde "¿estamos
+        rotos ahora?" y no "¿estuvimos rotos alguna vez?".
+
+        El umbral entra por parámetro y no como constante de este módulo: el
+        alerter de Telegram ya compara `windowed_blocked_rate()` contra
+        `TELEGRAM_BLOCKED_RATE_THRESHOLD` (`app/config.py`), y un segundo número
+        acá dejaría a `/api/v1/health` diciendo "ok" mientras Telegram alerta.
+        Dos respuestas distintas a "¿estamos degradados?" leídas por el mismo
+        ops es exactamente el desacuerdo que este trabajo vino a cerrar.
+
+        Sin tráfico reciente devuelve `"ok"` y eso es deliberado: un servicio
+        ocioso no está roto, y esta función no puede distinguirlo de uno al que
+        nadie le habla porque el cron que lo llamaba está muerto. Detectar el
+        SILENCIO es trabajo del watchdog externo, que es el único que sabe cuánto
+        tráfico debería haber.
+        """
+        counts = self.windowed_counts()
+
+        if counts["request"] + counts["pool_failure"] == 0:
+            return "ok"
+        if counts["success"] == 0:
+            # Nos pidieron cosas y no servimos ni una. Es el estado del 31 de
+            # julio, y el único que ninguna métrica de PROPORCIÓN puede ver: el
+            # fallo ocurría antes de `record_request`, así que el denominador
+            # también era cero y el alerter salía temprano.
+            return "down"
+        if _blocked_rate(counts) >= blocked_rate_threshold:
+            return "degraded"
+        return "ok"
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -96,6 +174,9 @@ class APIMetrics:
                 "total_requests": total,
                 "search_requests": self._counters.get("search_requests", 0),
                 "detail_requests": self._counters.get("detail_requests", 0),
+                # Familia tiene contador propio: es la ruta que usan las causas
+                # con credencial del abogado, y no tenia ninguno.
+                "familia_requests": self._counters.get("familia_requests", 0),
                 "total_errors": self._counters.get("total_errors", 0),
                 "total_blocked": blocked,
                 "blocked_rate": blocked / total if total > 0 else 0.0,

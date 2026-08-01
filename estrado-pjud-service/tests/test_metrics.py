@@ -1,11 +1,12 @@
 """Tests for API metrics collection."""
 import pytest
 
+from app.config import Settings
+
 
 class TestAPIMetrics:
     def test_record_request_increments_counters(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         api_metrics.record_request("search")
         api_metrics.record_request("search")
@@ -18,7 +19,6 @@ class TestAPIMetrics:
 
     def test_record_error_increments_counters(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         api_metrics.record_error("search")
         api_metrics.record_blocked("detail")
@@ -29,7 +29,6 @@ class TestAPIMetrics:
 
     def test_blocked_rate_calculation(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         for _ in range(10):
             api_metrics.record_request("search")
@@ -43,7 +42,6 @@ class TestAPIMetrics:
 
     def test_snapshot_includes_uptime(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         snapshot = api_metrics.snapshot()
         assert "uptime_seconds" in snapshot
@@ -51,14 +49,12 @@ class TestAPIMetrics:
 
     def test_no_requests_blocked_rate_is_zero(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         snapshot = api_metrics.snapshot()
         assert snapshot["blocked_rate"] == 0.0
 
     def test_windowed_blocked_rate(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
 
         for _ in range(10):
             api_metrics.record_request("search")
@@ -70,7 +66,6 @@ class TestAPIMetrics:
 
     def test_windowed_rate_zero_when_empty(self):
         from app.metrics import api_metrics
-        api_metrics.reset()
         assert api_metrics.windowed_blocked_rate() == 0.0
 
 
@@ -148,3 +143,101 @@ class TestWorkerMetrics:
         meta = m.heartbeat_payload("running")["metadata"]
         assert meta["errors_infra_today"] == 0
         assert meta["errors_case_today"] == 0
+
+
+#: El mismo umbral que usa el alerter de Telegram, leído de la config real y no
+#: escrito a mano: el punto del parámetro es que el panel y la alerta no puedan
+#: tener dos números distintos, y un literal acá dejaría de verificar eso.
+_THRESHOLD = Settings.model_fields["TELEGRAM_BLOCKED_RATE_THRESHOLD"].default
+
+
+class TestStatusDerivado:
+    """El `status` de /api/v1/health, que estaba hardcodeado en "ok".
+
+    El 31 de julio de 2026 esa constante decía `ok` mientras la instancia
+    llevaba 3 días y 18 horas devolviendo 500 a todas las consultas. Un watchdog
+    externo mira `.status` antes que cualquier contador.
+    """
+
+    def test_sin_trafico_reciente_no_esta_roto(self):
+        from app.metrics import api_metrics
+
+        # Ocioso no es lo mismo que caído, y esta función no puede distinguir
+        # "nadie me llamó" de "el cron que me llamaba está muerto". Detectar el
+        # SILENCIO es del watchdog externo, que sabe cuánto tráfico debería haber.
+        assert api_metrics.status(_THRESHOLD) == "ok"
+
+    def test_el_pool_sin_sesion_y_cero_exitos_es_down(self):
+        from app.metrics import api_metrics
+
+        # El estado del 31 de julio, y el único que una detección por PROPORCIÓN
+        # no puede ver: el fallo ocurre ANTES de `record_request`, así que el
+        # denominador también queda en cero y el alerter sale temprano.
+        api_metrics.record_pool_failure("search")
+        api_metrics.record_pool_failure("detail")
+
+        assert api_metrics.status(_THRESHOLD) == "down"
+
+    def test_pedidos_sin_un_solo_exito_es_down(self):
+        from app.metrics import api_metrics
+
+        for _ in range(3):
+            api_metrics.record_request("search")
+            api_metrics.record_error("search")
+
+        assert api_metrics.status(_THRESHOLD) == "down"
+
+    def test_un_exito_reciente_lo_saca_de_down(self):
+        from app.metrics import api_metrics
+
+        api_metrics.record_pool_failure("search")
+        api_metrics.record_request("search")
+        api_metrics.record_success("search")
+
+        # La ventana se limpia sola: por eso el estado se deriva de ella y no de
+        # `total_pool_failures`, que es monótono y dejaría "down" para siempre.
+        assert api_metrics.status(_THRESHOLD) == "ok"
+
+    def test_la_mitad_bloqueada_es_degraded(self):
+        from app.metrics import api_metrics
+
+        for _ in range(4):
+            api_metrics.record_request("search")
+        api_metrics.record_success("search")
+        api_metrics.record_blocked("search")
+        api_metrics.record_blocked("search")
+
+        assert api_metrics.status(_THRESHOLD) == "degraded"
+
+    def test_bloqueos_sueltos_no_son_degraded(self):
+        from app.metrics import api_metrics
+
+        for _ in range(10):
+            api_metrics.record_request("search")
+        api_metrics.record_success("search")
+        api_metrics.record_blocked("search")
+
+        assert api_metrics.status(_THRESHOLD) == "ok"
+
+
+class TestFamiliaEnElSnapshot:
+    def test_familia_tiene_su_propio_contador(self):
+        """La ruta de Familia no tenía UNA sola llamada a `api_metrics`, así que
+        sus consultas no aparecían en ningún contador — y es la ruta que usan las
+        causas con credencial del abogado."""
+        from app.metrics import api_metrics
+
+        api_metrics.record_request("familia")
+        api_metrics.record_request("familia")
+
+        snapshot = api_metrics.snapshot()
+        assert snapshot["familia_requests"] == 2
+        assert snapshot["total_requests"] == 2
+
+    def test_familia_requests_llega_a_la_respuesta_de_health(self):
+        """Guarda contra el drop silencioso: `HealthResponse` se construye con
+        `**snapshot` y pydantic IGNORA las claves que el modelo no declara, así
+        que una métrica nueva puede quedar contada y nunca publicada."""
+        from app.models import HealthResponse
+
+        assert "familia_requests" in HealthResponse.model_fields

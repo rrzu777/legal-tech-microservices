@@ -4,6 +4,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+#: ⚠️ CONTRATO CROSS-REPO. Quien lo consume es `classifyFamiliaFailure`
+#: (`apps/web/src/lib/pjud/sync-error-patch.ts`, repo LegalTech), que traduce
+#: cada codigo a que hacer con la causa: `blocked` es OJV, `session_error` somos
+#: nosotros, `invalid_credentials` es terminal. Agregar un codigo aca sin
+#: agregarlo alla no rompe nada visible — la app lo manda al default y la causa
+#: sigue su curso—, asi que el test de `tests/test_familia_models.py` fija el
+#: conjunto para que el cambio no pase inadvertido.
 FamiliaErrorCode = Literal["invalid_credentials", "session_error", "no_cases", "parse_error", "blocked"]
 
 _MAX_CASES = 10

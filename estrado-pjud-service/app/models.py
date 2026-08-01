@@ -156,6 +156,7 @@ class HealthResponse(BaseModel):
     total_requests: int = 0
     search_requests: int = 0
     detail_requests: int = 0
+    familia_requests: int = 0
     total_errors: int = 0
     total_blocked: int = 0
     blocked_rate: float = Field(default=0.0, ge=0.0, le=1.0)

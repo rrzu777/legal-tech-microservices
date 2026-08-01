@@ -1,6 +1,5 @@
 import logging
 
-import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
@@ -11,8 +10,8 @@ from app.parsers.normalizer import parse_case_identifier, competencia_path, reso
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
-from app.alerting import maybe_alert
-from app.pool_guard import acquire_or_alert
+from app.failure_kind import reject_empty_body
+from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +48,14 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
         html = await session.search(comp_path, form_data)
 
+        # Cuerpo de cero bytes: infra, no bloqueo. Sale por el `except` de abajo
+        # como 500. Sin esto, `parse_search_results` de un cuerpo vacio devuelve
+        # [] y la app escribe "No encontrada en OJV — revisa el rol".
+        reject_empty_body(html, "search")
+
         if detect_blocked(html):
             healthy = False
-            api_metrics.record_blocked("search")
-            await maybe_alert(request)
+            await record_blocked_and_alert(request, "search")
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
@@ -77,12 +80,16 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         logger.exception("Search failed")
         healthy = False
         api_metrics.record_error("search")
-        blocked = isinstance(e, (httpx.TimeoutException, httpx.ConnectError))
-        if blocked:
-            api_metrics.record_blocked("search")
-            await maybe_alert(request)
+        kind = await classify_and_alert(e, request, "search")
+
+        # Mismo motivo que el `acquire_or_alert` de arriba: una falla NUESTRA no
+        # puede salir con 200. Es el 5xx lo que le dice a la app que clasifique
+        # esto como infra y no le sume una falla a la causa.
+        if kind == "infra":
+            raise
+
         return SearchResponse(
-            found=False, match_count=0, matches=[], blocked=blocked,
+            found=False, match_count=0, matches=[], blocked=kind == "ojv",
             error=safe_error(e),
             libro_used=None,
         )
