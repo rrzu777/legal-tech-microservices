@@ -15,10 +15,8 @@ def _bundle():
     return CookieBundle(cookies={"TSPD_101": "x"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
 
 
-def _make_engine(stub_update_error: bool = True):
-    """`stub_update_error=False` deja el `_update_case_error` de verdad, para los
-    tests que necesitan mirar el payload que sale a Supabase en vez de solo
-    verificar que se llamó."""
+def _make_engine(stub_update_error: bool = True, stub_terminal_error: bool = True):
+    """Permite dejar reales los writers cuyo payload necesita inspeccionar el test."""
     from worker.engine import SyncEngine
     pool = MagicMock()
     pool.acquire_familia_bundle = AsyncMock(return_value=(_bundle(), MagicMock()))
@@ -29,7 +27,8 @@ def _make_engine(stub_update_error: bool = True):
         config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
     )
     engine._finish_run = AsyncMock()
-    engine._terminal_error = AsyncMock()
+    if stub_terminal_error:
+        engine._terminal_error = AsyncMock()
     engine._handle_blocked = AsyncMock()
     if stub_update_error:
         engine._update_case_error = AsyncMock()
@@ -40,6 +39,20 @@ _CASE = {
     "id": "c1", "case_number": "C-100-2024", "law_firm_id": "lf1",
     "ojv_credential_id": "cred1", "consecutive_sync_failures": 0, "matter": "familia",
 }
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_suspends_instead_of_user_pausing():
+    engine = _make_engine(stub_terminal_error=False)
+
+    await engine._terminal_error("c1", "Credencial OJV inactiva o no encontrada")
+
+    payload = find_update_payload(engine._sb, tracking_status="suspended")
+    assert payload == {
+        "tracking_status": "suspended",
+        "last_sync_status": "error",
+        "last_sync_error": "Credencial OJV inactiva o no encontrada",
+    }
 
 
 @pytest.mark.asyncio
