@@ -5,6 +5,7 @@ import time
 import httpx
 
 from app.adapters.http_adapter import OJVHttpAdapter
+from app.failure_kind import MissingCsrfTokenError
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,16 @@ class OJVSession:
 
     async def detail(self, competencia_path: str, jwt_token: str) -> str:
         """Step 4: POST detail request and return decoded HTML."""
+        if not self.csrf_token:
+            # Sin token OJV contesta 405 con cero bytes — medido, ver
+            # `MissingCsrfTokenError`. Salir igual no consigue nada y encima
+            # gasta reputación de la IP residencial para cobrar un 405 seguro.
+            # Ahorra 1 de los 3 requests del intento, no los 3: `initialize()`
+            # ya gastó el GET de la página y el POST de sesión-invitado.
+            raise MissingCsrfTokenError(
+                f"sin token CSRF para el detalle de {competencia_path} "
+                "(el regex no matcheó en consultaUnificada.php)"
+            )
         path = f"/ADIR_871/{competencia_path}/modal/causa{competencia_path.capitalize()}.php"
         resp = await self._adapter.post(
             path,

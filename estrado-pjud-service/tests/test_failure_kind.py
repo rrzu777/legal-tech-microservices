@@ -11,9 +11,11 @@ import pytest
 
 from app.failure_kind import (
     EmptyResponseError,
+    MissingCsrfTokenError,
     NoUsableBundleError,
     block_cause,
     classify_exception,
+    slot_still_healthy,
 )
 from tests.helpers import http_status_error as _status, infra_exceptions
 
@@ -29,11 +31,30 @@ from tests.helpers import http_status_error as _status, infra_exceptions
         # que la excepción saldría como culpa de la causa y la ruta contestaría
         # 200 `found=False` — el mismo defecto, por la puerta de atrás.
         NoUsableBundleError("sin bundle vigente"),
+        # Sin token CSRF, OJV contesta 405 — y 405 cae en "case", o sea que la
+        # causa se comía el contador por un regex nuestro que dejó de matchear.
+        MissingCsrfTokenError("regex sin match"),
     ],
     ids=lambda e: type(e).__name__,
 )
 def test_nuestras_caidas_son_infra(exc):
     assert classify_exception(exc) == "infra"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [*infra_exceptions(), EmptyResponseError("cuerpo vacio"), NoUsableBundleError("sin bundle")],
+    ids=lambda e: type(e).__name__,
+)
+def test_lo_demas_si_re_mintea_el_slot(exc):
+    """La contracara de `slot_still_healthy`.
+
+    Un proxy caído o un bundle vencido SÍ se arreglan con una sesión nueva. Sin
+    esta lista, alguien podría hacer que la guardia del CSRF apagara el re-mint
+    para todo y ningún test se quejaría — y ahí el pool dejaría de recuperarse
+    solo de la falla para la que fue construido.
+    """
+    assert slot_still_healthy(exc) is False
 
 
 @pytest.mark.parametrize("code", [500, 502, 503, 504, 401, 403, 429])

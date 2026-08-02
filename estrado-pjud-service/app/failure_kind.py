@@ -78,6 +78,50 @@ class NoUsableBundleError(Exception):
     """
 
 
+class MissingCsrfTokenError(Exception):
+    """`detail()` no tiene token CSRF con el cual salir.
+
+    `initialize()` lo saca de `consultaUnificada.php` con un regex; si el markup
+    de PJUD cambia, el regex deja de matchear, la sesión se queda con
+    `csrf_token = None` y hasta acá eso era un WARNING en el log y nada más.
+
+    Medido contra OJV el 2 de agosto de 2026 (misma sesión, mismo JWT, variando
+    sólo el campo `token`): con el token real, HTTP 200 y 45 KB de expediente;
+    con `None`, con `""` y sin la clave, **HTTP 405 y cero bytes** las tres
+    veces. El token no es decorativo.
+
+    Y 405 no está en `_OJV_REJECTION_STATUSES`, así que el `HTTPStatusError` que
+    salía de ahí caía en "case": el único veredicto que le suma al contador de la
+    causa. Diez de esos y queda `suspended`, que es terminal — por un defecto
+    nuestro, detectable una etapa antes.
+
+    Lo levanta `detail()` y no `initialize()` a propósito: `search()` no manda el
+    token y funciona perfecto sin él, así que abortar el arranque apagaría
+    también la búsqueda, que no tiene el problema.
+    """
+
+
+def slot_still_healthy(e: BaseException) -> bool:
+    """¿El slot F5 sigue sirviendo pese a esta excepción?
+
+    Sólo tiene sentido preguntarlo en el camino infra/ojv de `sync_case`: ahí el
+    worker venía marcando `session_healthy = False` para todo, y eso dispara
+    re-mint del slot —cooldown de 30 s, Chromium y una IP sticky nueva—. Para un
+    proxy caído o un bloqueo de F5 eso es exactamente lo que hay que hacer.
+
+    Para `MissingCsrfTokenError` no: la página llegó entera por esa IP, y el
+    re-mint termina en `initialize()`, que corre el MISMO regex contra el MISMO
+    markup y devuelve otra sesión igual de muda. Sería un loop indefinido
+    quemando una IP residencial y 30 s por causa sin poder corregir nunca la
+    condición — el arreglo de atribución cambiando una factura por otra.
+
+    Es el mismo razonamiento que ya está escrito para `parse_suspect` en
+    `worker/engine.py`, que deja el slot sano a propósito porque ante drift de
+    página o de parser re-mintear no ayuda.
+    """
+    return isinstance(e, MissingCsrfTokenError)
+
+
 def classify_exception(e: BaseException) -> FailureKind:
     """De quién es la culpa de esta excepción."""
     if isinstance(e, httpx.HTTPStatusError):
@@ -87,10 +131,17 @@ def classify_exception(e: BaseException) -> FailureKind:
         return "case"
 
     # `httpx.TimeoutException` ya es `TransportError`; `TimeoutError` cubre el
-    # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError` y
-    # `NoUsableBundleError` entran por su cuenta.
+    # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError`,
+    # `NoUsableBundleError` y `MissingCsrfTokenError` entran por su cuenta.
     if isinstance(
-        e, (httpx.TransportError, TimeoutError, EmptyResponseError, NoUsableBundleError)
+        e,
+        (
+            httpx.TransportError,
+            TimeoutError,
+            EmptyResponseError,
+            NoUsableBundleError,
+            MissingCsrfTokenError,
+        ),
     ):
         return "infra"
 
