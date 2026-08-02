@@ -78,6 +78,29 @@ class NoUsableBundleError(Exception):
     """
 
 
+class MissingCsrfTokenError(Exception):
+    """`detail()` no tiene token CSRF con el cual salir.
+
+    `initialize()` lo saca de `consultaUnificada.php` con un regex; si el markup
+    de PJUD cambia, el regex deja de matchear, la sesión se queda con
+    `csrf_token = None` y hasta acá eso era un WARNING en el log y nada más.
+
+    Medido contra OJV el 2 de agosto de 2026 (misma sesión, mismo JWT, variando
+    sólo el campo `token`): con el token real, HTTP 200 y 45 KB de expediente;
+    con `None`, con `""` y sin la clave, **HTTP 405 y cero bytes** las tres
+    veces. El token no es decorativo.
+
+    Y 405 no está en `_OJV_REJECTION_STATUSES`, así que el `HTTPStatusError` que
+    salía de ahí caía en "case": el único veredicto que le suma al contador de la
+    causa. Diez de esos y queda `suspended`, que es terminal — por un defecto
+    nuestro, detectable una etapa antes.
+
+    Lo levanta `detail()` y no `initialize()` a propósito: `search()` no manda el
+    token y funciona perfecto sin él, así que abortar el arranque apagaría
+    también la búsqueda, que no tiene el problema.
+    """
+
+
 def classify_exception(e: BaseException) -> FailureKind:
     """De quién es la culpa de esta excepción."""
     if isinstance(e, httpx.HTTPStatusError):
@@ -87,10 +110,17 @@ def classify_exception(e: BaseException) -> FailureKind:
         return "case"
 
     # `httpx.TimeoutException` ya es `TransportError`; `TimeoutError` cubre el
-    # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError` y
-    # `NoUsableBundleError` entran por su cuenta.
+    # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError`,
+    # `NoUsableBundleError` y `MissingCsrfTokenError` entran por su cuenta.
     if isinstance(
-        e, (httpx.TransportError, TimeoutError, EmptyResponseError, NoUsableBundleError)
+        e,
+        (
+            httpx.TransportError,
+            TimeoutError,
+            EmptyResponseError,
+            NoUsableBundleError,
+            MissingCsrfTokenError,
+        ),
     ):
         return "infra"
 
