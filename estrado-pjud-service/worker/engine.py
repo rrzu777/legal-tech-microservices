@@ -10,7 +10,12 @@ import httpx
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.document_downloader import download_documents, download_single_document
-from app.failure_kind import block_cause, classify_exception, reject_empty_body
+from app.failure_kind import (
+    block_cause,
+    classify_exception,
+    reject_empty_body,
+    slot_still_healthy,
+)
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
 from app.parsers.anexo_parser import parse_anexo_list
@@ -386,9 +391,22 @@ class SyncEngine:
             # (session_healthy=False) SIN penalizar: sin `_update_case_error`,
             # sin `consecutive_sync_failures++`—. El circuit breaker global vía
             # _handle_blocked/record_blocked da la protección sistémica.
-            session_healthy = False
+            #
+            # La excepción es la falta de token CSRF, donde re-mintear no puede
+            # corregir nada y sale carísimo: ver `slot_still_healthy`.
+            session_healthy = slot_still_healthy(e)
             msg = f"{kind}: {type(e).__name__}: {e}"
-            logger.warning("Fallo %s sincronizando causa %s: %s", kind, case["case_number"], msg)
+            if session_healthy:
+                # Tiene que hacer ruido. Sin el re-mint esto falla barato, y
+                # barato + `logger.warning` = invisible hasta que alguien mire.
+                # El watchdog cuenta tracebacks (3 en una hora dispara alerta),
+                # así que `exception` es la señal que ya existe.
+                logger.exception(
+                    "Fallo %s sincronizando causa %s SIN re-mint del slot: %s",
+                    kind, case["case_number"], msg,
+                )
+            else:
+                logger.warning("Fallo %s sincronizando causa %s: %s", kind, case["case_number"], msg)
             await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
             await self._handle_blocked(case["id"], kind, msg)
             # "infra" fijo aunque `kind` pueda ser "ojv": el heartbeat del worker

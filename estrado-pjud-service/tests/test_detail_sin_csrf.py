@@ -1,87 +1,124 @@
 """Sin token CSRF, `detail()` no sale — y la falla es NUESTRA, no de la causa.
 
-Medido contra OJV el 2 de agosto de 2026, misma sesión y mismo JWT, cambiando
-sólo el campo `token` del POST a `causaCivil.php`:
+La medición contra OJV que sostiene todo esto (405 con cero bytes sin token, 200
+con expediente con token) está en el docstring de `MissingCsrfTokenError`; no se
+recopia acá para que no le pase lo que ya le pasó a la nota del token, que quedó
+repetida en tres lados y desactualizada en los tres.
 
-    token real          -> HTTP 200, 45.071 bytes, con movimientos
-    token=None          -> HTTP 405, 0 bytes
-    token=""            -> HTTP 405, 0 bytes
-    sin la clave token  -> HTTP 405, 0 bytes
-
-O sea: el token no es decorativo. Y 405 no está en `_OJV_REJECTION_STATUSES`, así
-que `classify_exception` lo mandaba a **"case"** — el único de los tres veredictos
-que le suma al contador de la causa. Diez de esos y la causa queda `suspended`,
-que es terminal, por un defecto que es cien por ciento nuestro y que se detecta
-una etapa antes, en `initialize()`.
-
-El regex de `initialize()` matchea hoy (medido el mismo día: 5 hits en la página
-de 186 KB), así que esto no es un incendio: es la trampa que queda armada para el
-día que PJUD cambie el markup. Justamente por eso el arreglo va acá y no en
-`initialize()`: `search()` no manda el token y anda perfecto sin él, así que
-hacer fallar el arranque apagaría también la búsqueda, que no tiene el problema.
+Lo único que agrega este archivo: el regex de `initialize()` matchea HOY —medido
+el 2 de agosto de 2026, 5 hits en la página de 186 KB—, así que esto no arregla
+ninguna caída en curso. Desarma la trampa para el día que PJUD cambie el markup.
 """
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
 import pytest
 
-from app.failure_kind import MissingCsrfTokenError, classify_exception
+from app.failure_kind import MissingCsrfTokenError, slot_still_healthy
 from app.session import OJVSession
+from tests.test_engine import _make_case, _mock_search_response
 
 
-class _AdapterQueSeQueja:
-    """Adapter que falla si alguien lo usa. La aserción es que NO se sale."""
+class _AdapterQueGraba:
+    """Graba cada POST y devuelve una respuesta real de httpx.
 
-    def __init__(self):
+    Graba en vez de levantar a propósito: afirmar por ausencia
+    (`assert adapter.posts == []`) es lo que impide que el día que alguien saque
+    la guardia el test siga pasando. Un fake que levanta `AssertionError` sale
+    por el `pytest.raises` y deja el assert inalcanzable. Misma convención que
+    `test_pool_sin_proxy.py`.
+    """
+
+    def __init__(self, cuerpo=b"<html>ok</html>"):
+        self._cuerpo = cuerpo
         self.posts = []
 
     async def post(self, path, **kwargs):
         self.posts.append((path, kwargs))
-        raise AssertionError("no se debería haber salido a OJV sin token CSRF")
-
-    async def close(self):
-        pass
+        # `httpx.Response` de verdad, no un stub: así el test de control ejerce
+        # el `raise_for_status()` y el `_decode()` reales de `detail()`.
+        return httpx.Response(
+            200, content=self._cuerpo, request=httpx.Request("POST", "https://ojv.test")
+        )
 
 
 @pytest.mark.parametrize("token", [None, ""], ids=["None", "cadena-vacia"])
 async def test_detail_sin_token_no_sale_a_la_calle(token):
-    adapter = _AdapterQueSeQueja()
+    adapter = _AdapterQueGraba()
     session = OJVSession(adapter)
     session.csrf_token = token
 
     with pytest.raises(MissingCsrfTokenError):
         await session.detail("civil", "jwt.de.mentira")
 
-    # Lo importante no es sólo que levante: es que no gastó un request. Salir
-    # igual quema reputación de la IP residencial para cobrar un 405 seguro.
     assert adapter.posts == []
 
 
 async def test_detail_con_token_manda_el_token_en_el_cuerpo():
     """Control: con token sí sale, y el token viaja donde OJV lo espera."""
-
-    class _AdapterQueGraba:
-        def __init__(self):
-            self.data = None
-
-        async def post(self, path, **kwargs):
-            self.data = kwargs.get("data")
-            return _RespuestaFalsa()
-
-    class _RespuestaFalsa:
-        status_code = 200
-        content = b"<html>ok</html>"
-
-        def raise_for_status(self):
-            pass
-
     adapter = _AdapterQueGraba()
     session = OJVSession(adapter)
     session.csrf_token = "a" * 32
 
     await session.detail("civil", "jwt.de.mentira")
 
-    assert adapter.data == {"dtaCausa": "jwt.de.mentira", "token": "a" * 32}
+    assert len(adapter.posts) == 1
+    _, kwargs = adapter.posts[0]
+    assert kwargs["data"] == {"dtaCausa": "jwt.de.mentira", "token": "a" * 32}
 
 
-def test_la_falta_de_token_es_infra_y_no_de_la_causa():
-    """El corazón del arreglo: sin esto el 405 salía como culpa de la causa."""
-    assert classify_exception(MissingCsrfTokenError("no se pudo extraer")) == "infra"
+def test_sin_token_el_slot_f5_no_se_re_mintea():
+    """El re-mint corre el mismo regex contra el mismo markup: no puede ayudar.
+
+    Sin esto el arreglo cambia una factura por otra — deja de suspender causas y
+    empieza a quemar una IP residencial y 30 s de cooldown por causa, para
+    siempre. La contracara la fija `test_failure_kind`: todo lo demás sí re-mintea.
+    """
+    assert slot_still_healthy(MissingCsrfTokenError("no se pudo extraer")) is True
+
+
+@pytest.mark.asyncio
+async def test_el_worker_no_re_mintea_el_slot_ni_penaliza_la_causa():
+    """El cableado, no sólo el predicado.
+
+    `sync_case` traduce el veredicto en dos efectos que se deciden en lugares
+    distintos —`release(healthy=...)` y `_update_case_error`— y el predicado
+    suelto no prueba que estén bien conectados. Este test es el que se rompe si
+    alguien vuelve a poner `session_healthy = False` fijo en ese branch.
+    """
+    from worker.engine import SyncEngine
+
+    mock_session = AsyncMock()
+    mock_pool = AsyncMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_session)
+    mock_pool.release = AsyncMock()
+    mock_pool.enforce_global_rate_limit = AsyncMock()
+
+    mock_sb = MagicMock()
+    chain = MagicMock()
+    mock_sb.from_.return_value = chain
+    for metodo in ("insert", "select", "single", "update", "eq"):
+        getattr(chain, metodo).return_value = chain
+    chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
+
+    engine = SyncEngine(
+        pool=mock_pool,
+        supabase=mock_sb,
+        notifier=AsyncMock(),
+        metrics=MagicMock(),
+        backoff=MagicMock(),
+        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+    )
+
+    with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+         patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
+         patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+        mock_search.return_value = _mock_search_response()
+        mock_detail.side_effect = MissingCsrfTokenError("el regex no matcheo")
+        result = await engine.sync_case(_make_case())
+
+    assert result["success"] is False
+    mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+    # Y sigue sin ser culpa de la causa: eso es lo que evita el `suspended`.
+    mock_update_error.assert_not_called()

@@ -101,6 +101,27 @@ class MissingCsrfTokenError(Exception):
     """
 
 
+def slot_still_healthy(e: BaseException) -> bool:
+    """¿El slot F5 sigue sirviendo pese a esta excepción?
+
+    Sólo tiene sentido preguntarlo en el camino infra/ojv de `sync_case`: ahí el
+    worker venía marcando `session_healthy = False` para todo, y eso dispara
+    re-mint del slot —cooldown de 30 s, Chromium y una IP sticky nueva—. Para un
+    proxy caído o un bloqueo de F5 eso es exactamente lo que hay que hacer.
+
+    Para `MissingCsrfTokenError` no: la página llegó entera por esa IP, y el
+    re-mint termina en `initialize()`, que corre el MISMO regex contra el MISMO
+    markup y devuelve otra sesión igual de muda. Sería un loop indefinido
+    quemando una IP residencial y 30 s por causa sin poder corregir nunca la
+    condición — el arreglo de atribución cambiando una factura por otra.
+
+    Es el mismo razonamiento que ya está escrito para `parse_suspect` en
+    `worker/engine.py`, que deja el slot sano a propósito porque ante drift de
+    página o de parser re-mintear no ayuda.
+    """
+    return isinstance(e, MissingCsrfTokenError)
+
+
 def classify_exception(e: BaseException) -> FailureKind:
     """De quién es la culpa de esta excepción."""
     if isinstance(e, httpx.HTTPStatusError):
