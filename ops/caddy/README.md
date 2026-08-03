@@ -34,30 +34,40 @@ El orden importa: el unit de uvicorn NO puede pasar a `127.0.0.1` hasta que
 Vercel deje de usar la IP pelada, porque `deploy.sh` reinicia los servicios
 en cada deploy y un unit adelantado corta producción en el próximo deploy.
 
-1. **[hecho por provision/ops]** `apt-get install caddy`, `ufw allow 80,443/tcp`,
-   Caddyfile instalado. Caddy reintenta la emisión del cert solo hasta que
-   exista el DNS; mientras tanto uvicorn sigue en `0.0.0.0:8000` y nada cambia
-   para Vercel.
-2. **[usuario, Cloudflare]** Crear el A record: `estrado` →
+1. **[manual, ssh — provision NO hace esto, solo lo reporta]**
+   `apt-get install caddy` y `ufw allow 80/tcp && ufw allow 443/tcp`. Sin la
+   regla de ufw, el paso 3 falla con un curl que no conecta y se confunde con
+   un problema de DNS o de cert.
+2. **[provision]** Correr `ops/provision.sh` → instala el Caddyfile y recarga
+   caddy. Caddy reintenta la emisión del cert solo hasta que exista el DNS;
+   mientras tanto uvicorn sigue en `0.0.0.0:8000` y nada cambia para Vercel.
+3. **[usuario, Cloudflare]** Crear el A record: `estrado` →
    `207.180.198.177`, **modo "DNS only" (nube gris)**. Con la nube naranja el
    desafío HTTP-01 no llega y el cert no se emite.
-3. **[verificación]** `curl -s https://estrado.juristrack.cl/api/v1/health`
-   devuelve 200 con JSON. Si da error de TLS, esperar ~1 min (Caddy reintenta
-   la emisión) y mirar `journalctl -u caddy`.
-4. **[usuario, Vercel]** `PJUD_SERVICE_BASE_URL=https://estrado.juristrack.cl`
+4. **[verificación]** Primero `dig +short estrado.juristrack.cl` → tiene que
+   dar `207.180.198.177`; si devuelve IPs de Cloudflare (104.x/172.x), el
+   record quedó en nube naranja — ese es el diagnóstico instantáneo, sin
+   esperar a ACME. Después `curl -s https://estrado.juristrack.cl/api/v1/health`
+   → 200 con JSON. Si da error de TLS, esperar ~1 min (Caddy reintenta la
+   emisión) y mirar `journalctl -u caddy`.
+5. **[usuario, Vercel]** `PJUD_SERVICE_BASE_URL=https://estrado.juristrack.cl`
    (sin puerto) + redeploy. Verificar un flujo real: crear/refrescar una causa.
-5. **[PR de cutover, después del paso 4]** Cambiar el unit
-   `ops/systemd/estrado-pjud.service` a `--host 127.0.0.1`, correr
-   provision.sh + `systemctl restart estrado-pjud`, y borrar las reglas ufw
-   del 8000 (`ufw status numbered` → borrar las tres: Anywhere, v6 y la de
-   Tailscale, que queda muerta con el bind a localhost). Verificar que el
-   health por HTTPS sigue 200 y que `ss -tlnp` ya no muestra `0.0.0.0:8000`.
+6. **[PR de cutover, después del paso 5]** Cambiar el unit
+   `ops/systemd/estrado-pjud.service` a
+   `--host 127.0.0.1 --proxy-headers --forwarded-allow-ips 127.0.0.1`
+   (sin `--proxy-headers`, uvicorn loguea `127.0.0.1` como cliente de TODO
+   request y se pierde la IP real que hoy sale en el journal — la medición de
+   scanners de este mismo README salió de ahí), correr provision.sh +
+   `systemctl restart estrado-pjud`, y borrar las reglas ufw del 8000
+   (`ufw status numbered` → borrar las tres: Anywhere, v6 y la de Tailscale,
+   que queda muerta con el bind a localhost). Verificar que el health por
+   HTTPS sigue 200 y que `ss -tlnp` ya no muestra `0.0.0.0:8000`.
 
 ## Rollback
 
-- Antes del paso 5: no hay nada que revertir — uvicorn sigue expuesto como
+- Antes del paso 6: no hay nada que revertir — uvicorn sigue expuesto como
   siempre y Vercel puede volver a la URL vieja con solo revertir la env var.
-- Después del paso 5: revertir el unit a `--host 0.0.0.0`, `systemctl
+- Después del paso 6: revertir el unit a `--host 0.0.0.0`, `systemctl
   daemon-reload && systemctl restart estrado-pjud`, `ufw allow 8000/tcp`, y
   apuntar `PJUD_SERVICE_BASE_URL` de vuelta a la IP. Cada paso es
   independiente del resto.

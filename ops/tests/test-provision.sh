@@ -26,6 +26,9 @@ expect_contains() {
 expect_missing() {
   printf '%s' "$2" | grep -qF -- "$3" && bad "$1 (contiene '$3' y no debería)" || ok "$1"
 }
+expect_same_file() { # <nombre> <esperado> <actual>
+  cmp -s "$2" "$3" && ok "$1" || bad "$1 (los archivos difieren)"
+}
 
 setup() { # setup <nombre> — repo falso completo y sano
   local base="$TMP/$1"
@@ -45,11 +48,13 @@ setup() { # setup <nombre> — repo falso completo y sano
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
-  # caddy: espejo del Caddyfile en el repo falso, binario stub y destino propio
+  # caddy: espejo del Caddyfile en el repo falso, binario stub y destino
+  # propio. El stub puede estar vacío: provision solo lo mira con
+  # `command -v`, nunca lo ejecuta (la recarga va por systemctl).
   cp -R "$OPS_DIR/caddy" "$REPO/ops/caddy"
   CADDYF="$base/caddy-etc/Caddyfile"
   CADDY_BIN="$base/caddy-stub"
-  printf '#!/bin/bash\nexit 0\n' > "$CADDY_BIN"
+  touch "$CADDY_BIN"
   chmod +x "$CADDY_BIN"
 }
 
@@ -74,11 +79,14 @@ expect_eq "instaló todos los archivos (incluido el drop-in)" "$N_DST" "$N_SRC"
 expect_contains "habilita las 4 units derivadas del espejo (sin slice ni drop-in)" "$(cat "$LOG_SYSCTL")" \
   "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
 expect_contains "lo dice" "$OUT" "OK:"
+expect_same_file "instaló el Caddyfile del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
+expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
 
-echo "== segunda corrida: idempotente, sin daemon-reload"
+echo "== segunda corrida: idempotente, sin daemon-reload ni recarga de caddy"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "sigue habiendo UN daemon-reload (no re-instaló)" "$(reloads)" "1"
+expect_eq "sigue habiendo UNA recarga de caddy" "$(caddy_reloads)" "1"
 expect_contains "lo dice" "$OUT" "units al día"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"
@@ -86,34 +94,14 @@ echo "# drift manual" >> "$SYSD/estrado-pjud.service"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "segundo daemon-reload por el cambio" "$(reloads)" "2"
-if cmp -s "$REPO/ops/systemd/estrado-pjud.service" "$SYSD/estrado-pjud.service"; then
-  ok "el destino volvió a ser el del repo"
-else
-  bad "el destino quedó con el drift"
-fi
+expect_same_file "el destino volvió a ser el del repo" "$REPO/ops/systemd/estrado-pjud.service" "$SYSD/estrado-pjud.service"
 
-echo "== caddy: Caddyfile instalado y recargado en la primera corrida"
-setup caddyfresh; run_prov
-expect_eq "exit 0" "$RC" "0"
-if cmp -s "$REPO/ops/caddy/Caddyfile" "$CADDYF"; then
-  ok "el destino es el del repo"
-else
-  bad "el destino no es el del repo"
-fi
-expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
-run_prov
-expect_eq "idempotente: sigue habiendo una sola recarga" "$(caddy_reloads)" "1"
-
-echo "== caddy: Caddyfile editado a mano en el destino se pisa y recarga"
+echo "== Caddyfile editado a mano en el destino: se pisa y recarga"
 echo "# drift manual" >> "$CADDYF"
 run_prov
 expect_eq "exit 0" "$RC" "0"
-expect_eq "segunda recarga por el drift" "$(caddy_reloads)" "2"
-if cmp -s "$REPO/ops/caddy/Caddyfile" "$CADDYF"; then
-  ok "el destino volvió a ser el del repo"
-else
-  bad "el destino quedó con el drift"
-fi
+expect_eq "segunda recarga de caddy por el drift" "$(caddy_reloads)" "2"
+expect_same_file "el Caddyfile volvió a ser el del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
 
 echo "== caddy: binario ausente = receta y exit 1"
 setup nocaddy; rm "$CADDY_BIN"; run_prov

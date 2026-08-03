@@ -17,8 +17,9 @@
 #   - systemctl enable de las cuatro units
 #
 # Qué NO cubre: el crontab y /opt/estrado-cron (eso es ops/cron/deploy-cron.sh
-# + el procedimiento del crontab.snapshot), las reglas de ufw (ops/caddy/
-# README.md, paso 5), y los VALORES de los secretos.
+# + el procedimiento del crontab.snapshot), el paquete caddy y las reglas de
+# ufw (manuales: ops/caddy/README.md, pasos 1 y 6), y los VALORES de los
+# secretos.
 #
 # Sale 0 solo si el VPS quedó completo. Inyectable por entorno para probarlo
 # en el laptop (ver ops/tests/test-provision.sh): PROV_REPO_DIR,
