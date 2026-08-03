@@ -77,6 +77,22 @@ nuevas_claves() { # <slug de estado> <claves separadas por saltos de línea>
   printf '%s\n' "$claves" | sin_vacias > "$estado"
 }
 
+# La firma anti-spam de un chequeo keyed: hash corto del conjunto ACTUAL de claves
+# (el archivo que `nuevas_claves` acaba de reescribir), vacío si no hay ninguna.
+# El tag del chequeo tiene que llevar este hash Y entrar a SIG aunque la condición
+# ya esté avisada. Las dos mitades se pagaron por separado:
+#   (a) con un tag fijo, una causa NUEVA dentro de la ventana de 3h produce la
+#       MISMA firma que la alerta anterior, el cooldown se la come, y como
+#       `nuevas_claves` ya la marcó como vista, esa alerta se pierde PARA SIEMPRE;
+#   (b) si el tag sale de SIG cuando la condición persiste ya avisada, cualquier
+#       OTRA anomalía persistente (disco, memoria) cambia la firma en la corrida
+#       siguiente y se reenvía a los 15 min en vez de a las 3h. Mismo principio
+#       que el drift del crontab (chequeo 10), que ya hacía las dos cosas.
+firma_estado() { # <slug de estado>
+  local f="$WD_STATE_DIR/estrado-wd-$1"
+  { [ -s "$f" ] && md5sum < "$f" | cut -c1-8; } || true
+}
+
 # Lo mismo, para causas: devuelve los `case_number` de las que matchean el filtro y
 # no estaban antes. Alerta por causa y no por cantidad, que es lo que permite bajar
 # los umbrales sin inundar el canal.
@@ -133,8 +149,16 @@ MEMAVAIL=$(free -m | awk '/^Mem:/{print $7}')
 #
 # `suspended` y `error` avisan por CAUSA, sin umbral de cantidad; `blocked` sigue
 # pidiendo 3. La diferencia no es de estilo, está medida — ver cada bloque.
-SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended") || sin_datos suspended "las causas suspendidas"
-[ -n "${SUSP// }" ] && add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended"
+if SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended"); then
+  FIRMA_SUSP=$(firma_estado suspended)
+  if [ -n "${SUSP// }" ]; then
+    add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended:$FIRMA_SUSP"
+  elif [ -n "$FIRMA_SUSP" ]; then
+    SIG+="suspended:$FIRMA_SUSP;"
+  fi
+else
+  sin_datos suspended "las causas suspendidas"
+fi
 
 # De `>= 3` a una sola causa. Los tres motivos, con los números del 2026-08-01:
 #
@@ -150,8 +174,16 @@ SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended") || sin_datos susp
 #       fabrica un punto ciego. Ese dedup ya existía tres líneas más arriba.
 #
 # Hoy hay 0 causas en `error`, así que bajarlo no cuesta una sola alerta nueva.
-ERR=$(nuevas_causas track-err "tracking_status=eq.error") || sin_datos track-err "las causas en error"
-[ -n "${ERR// }" ] && add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." "track-err"
+if ERR=$(nuevas_causas track-err "tracking_status=eq.error"); then
+  FIRMA_ERR=$(firma_estado track-err)
+  if [ -n "${ERR// }" ]; then
+    add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." "track-err:$FIRMA_ERR"
+  elif [ -n "$FIRMA_ERR" ]; then
+    SIG+="track-err:$FIRMA_ERR;"
+  fi
+else
+  sin_datos track-err "las causas en error"
+fi
 
 # `blocked` se queda en 3, y esto es lo contrario de (a): acá el umbral alto está
 # bien y bajarlo sería el error. Medido el 2026-08-01: 10 de las 15 causas activas
@@ -343,7 +375,13 @@ else
     # Lo que lo cerraría de raíz es que /api/v1/health exponga el commit desplegado y
     # que esto lo compare contra HEAD: un solo chequeo para cualquier drift repo↔VPS,
     # que es la misma familia del `crontab.snapshot` que puede divergir en silencio.
-    [ -n "${NUEVA_CEGUERA// }" ] && add "La API no expone total_pool_failures: corre código anterior al #21, así que el chequeo del pool está CIEGO. Se destraba reiniciando estrado-pjud.service — corta las sesiones OJV en curso, hacerlo a conciencia." "pool-metric-missing"
+    if [ -n "${NUEVA_CEGUERA// }" ]; then
+      add "La API no expone total_pool_failures: corre código anterior al #21, así que el chequeo del pool está CIEGO. Se destraba reiniciando estrado-pjud.service — corta las sesiones OJV en curso, hacerlo a conciencia." "pool-metric-missing"
+    else
+      # Persiste ya avisada: a la firma igual, por (b) de `firma_estado`. Acá no
+      # hace falta hash — la clave posible es una sola, el conjunto es binario.
+      SIG+="pool-metric-missing;"
+    fi
   elif [ "$POOL_FAIL" -gt 0 ] 2>/dev/null; then
     # El uptime va en el mensaje porque el contador se resetea con el proceso: sin él,
     # una falla vieja y una tormenta de hace diez minutos se leen igual.
