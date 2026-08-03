@@ -50,6 +50,18 @@ estrena directorio de estado a propósito: el cooldown anti-spam se evalúa **an
 así que con estado compartido dos tests seguidos que produzcan la misma firma se pisan y el segundo
 falla por algo que no estaba probando.
 
+## Backups
+
+Dos scripts, deliberadamente separados:
+
+- `hermes-backup.sh` (3:30 UTC): estado de Hermes (`/home/hermes/.hermes`), **con** offsite a R2
+  si hay creds — no contiene secretos de Estrado.
+- `estrado-backup.sh` (3:45 UTC): el estado NO-git de Estrado — `.env`, cookie store F5, crontab
+  vivo, `/etc/estrado-cron.env`, logrotate. Rota 7 en `/root/estrado-backups`, modo 600. **Sin
+  offsite a propósito** — la justificación completa (y el runbook contra pérdida total del VPS)
+  vive en el header del propio script. Escribe su resumen en `/var/log/estrado-cron.log` y sale
+  con 1 si alguna fuente falta.
+
 ## Chequeos del watchdog
 
 | # | Qué mira | Umbral |
@@ -64,6 +76,7 @@ falla por algo que no estaba probando.
 | 8 | `next_sync_at` vencido | 1 causa, 2h |
 | 9 | `/api/v1/health`: no contesta, o `total_pool_failures > 0` | por evento |
 | 10 | Crontab de root vs `crontab.snapshot` (líneas ejecutables) | por drift distinto |
+| 11 | Backup `estrado-*.tar.gz`: existe, fresco y con peso | 26h · 1KB |
 
 Los umbrales no son estilo: cada uno tiene al lado, en el script, los números de producción que lo
 justifican. `blocked` se queda en 3 porque el bloqueo **es** el backoff funcionando (10 de las 15

@@ -31,6 +31,10 @@ cat > "$TMP/www/sano.json" <<'EOF'
 EOF
 SANO="http://127.0.0.1:$PORT/sano.json"
 
+# Backup fresco y con peso: el chequeo 11 calla salvo en sus tests.
+mkdir -p "$TMP/backups-sanos"
+head -c 2048 /dev/zero > "$TMP/backups-sanos/estrado-20990101-000000.tar.gz"
+
 # Crontab "vivo" y snapshot idénticos: el chequeo 10 calla salvo en sus tests.
 printf '0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders\n' > "$TMP/crontab-base"
 
@@ -47,6 +51,7 @@ run() {
   DRY_RUN=1 WD_STATE_DIR="$st" CRON_LOG="$1" API_HEALTH_URL="${2:-$SANO}" \
     WD_CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-$TMP/crontab-base}" \
     WD_CRONTAB_LIVE_FILE="${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}" \
+    WD_BACKUP_DIR="${WD_BACKUP_DIR:-$TMP/backups-sanos}" \
     bash "$WD" 2>/dev/null
 }
 
@@ -138,6 +143,14 @@ echo "== chequeo 7: el log recién rotado NO es silencio =="
 printf '%s /api/cron/task-reminders - HTTP 200\n' "$HOY" > "$TMP/rot.log.1"
 OUT=$(run "$TMP/rot.log")
 expect_missing "lee el .1 cuando el actual está vacío" "$OUT" "cron-silent"
+
+echo "== chequeo 7: la linea diaria del backup NO tapa el silencio de la app =="
+cat > "$TMP/solo-backup.log" <<EOF
+$VIEJO /api/cron/task-reminders - HTTP 200
+$HOY estrado-backup: /root/estrado-backups/estrado-x.tar.gz (8.0K)
+EOF
+OUT=$(run "$TMP/solo-backup.log")
+expect_contains "backup fresco + crons viejos = silencio igual" "$OUT" "cron-silent"
 
 echo "== chequeo 7: silencio de verdad, con rotado viejo =="
 : > "$TMP/viejo.log"
@@ -264,6 +277,24 @@ echo "== chequeo 10: crontab vivo ilegible no es drift =="
 OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-vivo-no-existe" run "$BASE")
 expect_contains "leer y fallar se avisa como fallo" "$OUT" "crontab-live-unreadable"
 expect_missing "y NO se disfraza de drift"          "$OUT" "crontab-drift"
+
+echo "== chequeo 11: el backup como artefacto =="
+OUT=$(WD_BACKUP_DIR="$TMP/backups-vacios" run "$BASE")
+expect_contains "sin ningún tar: alerta" "$OUT" "backup-missing"
+
+mkdir -p "$TMP/backups-viejos"
+head -c 2048 /dev/zero > "$TMP/backups-viejos/estrado-20260101-000000.tar.gz"
+touch -d '-30 hours' "$TMP/backups-viejos/estrado-20260101-000000.tar.gz"
+OUT=$(WD_BACKUP_DIR="$TMP/backups-viejos" run "$BASE")
+expect_contains "tar de 30h: alerta por viejo" "$OUT" "backup-stale"
+
+mkdir -p "$TMP/backups-flacos"
+head -c 100 /dev/zero > "$TMP/backups-flacos/estrado-20990101-000000.tar.gz"
+OUT=$(WD_BACKUP_DIR="$TMP/backups-flacos" run "$BASE")
+expect_contains "tar de 100 bytes: alerta por vacío" "$OUT" "backup-empty"
+
+OUT=$(run "$BASE")
+expect_missing "tar fresco y con peso: silencio" "$OUT" "backup-"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

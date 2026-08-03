@@ -50,6 +50,8 @@
 */15 * * * * /opt/estrado-cron/estrado-watchdog.sh >/dev/null 2>&1
 # Hermes: backup diario de memoria/config (3:30 UTC, rota 7, offsite R2 si hay creds)
 30 3 * * * /opt/estrado-cron/hermes-backup.sh >/dev/null 2>&1
+# Estrado: backup diario del estado no-git (.env, cookies F5, crontab; 3:45 UTC, rota 7, SIN offsite a propósito)
+45 3 * * * /opt/estrado-cron/estrado-backup.sh >> /var/log/estrado-cron.log 2>&1
 
 # Estrado: purga de estudios eliminados + recordatorio a 3 dias
 # OJO: cron corre en hora LOCAL del VPS (Europe/Berlin), NO en UTC. 14:00 Berlin = 12:00 UTC = 08:00 Chile (invierno).
