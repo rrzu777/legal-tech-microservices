@@ -296,6 +296,42 @@ expect_contains "tar de 100 bytes: alerta por vacío" "$OUT" "backup-empty"
 OUT=$(run "$BASE")
 expect_missing "tar fresco y con peso: silencio" "$OUT" "backup-"
 
+# --- Firma del cooldown en los chequeos keyed --------------------------------
+echo "== firma del cooldown: una causa nueva dentro de la ventana NO se pierde =="
+# El tag de los chequeos keyed lleva el hash del conjunto ACTUAL de claves. Con un
+# tag fijo ("suspended" a secas), la causa B suspendida 20 min después de la causa A
+# produce la MISMA firma que la alerta de A, el cooldown se la come, y como
+# `nuevas_causas` ya la marcó como vista, la alerta de B no sale NUNCA.
+# El Supabase falso es el http.server del harness: python ignora el query string,
+# así que /sb/rest/v1/cases contesta a cualquier filtro (suspended y track-err ven
+# las mismas causas — acá no molesta, y permite testear los dos tags de una).
+mkdir -p "$TMP/www/sb/rest/v1"
+printf 'SUPABASE_URL=http://127.0.0.1:%s/sb\nSUPABASE_SERVICE_KEY=fake-para-el-test\n' "$PORT" > "$TMP/sb.env"
+printf '[{"id":"aaaa-1111","case_number":"C-111-2026"}]\n' > "$TMP/www/sb/rest/v1/cases"
+WDS_SIG=$(mktemp -d "$TMP/wds-sig-XXXXXX")
+OUT=$(WDS="$WDS_SIG" WD_ENV="$TMP/sb.env" run "$BASE")
+expect_contains "la primera causa avisa"              "$OUT" "C-111-2026"
+expect_contains "el tag de suspended lleva el hash"   "$OUT" "suspended:"
+expect_contains "el de track-err tambien"             "$OUT" "track-err:"
+printf '[{"id":"aaaa-1111","case_number":"C-111-2026"},{"id":"bbbb-2222","case_number":"C-222-2026"}]\n' > "$TMP/www/sb/rest/v1/cases"
+OUT=$(WDS="$WDS_SIG" WD_ENV="$TMP/sb.env" run "$BASE")
+expect_contains "la segunda, DENTRO del cooldown, tambien avisa" "$OUT" "C-222-2026"
+
+echo "== firma del cooldown: lo que persiste ya avisado no re-spamea =="
+# La otra mitad: la condición keyed que persiste (deduplicada) tiene que seguir
+# ENTRANDO a la firma. Si sale, cualquier anomalía que se re-agrega cada corrida
+# (en este entorno falso: count-fail y el heartbeat) cambia la firma y el mismo
+# estado se reenvía a los 15 min en vez de a las 3h.
+OUT=$(WDS="$WDS_SIG" WD_ENV="$TMP/sb.env" run "$BASE")
+expect_missing "mismo estado, dentro del cooldown: silencio total" "$OUT" "ANOMALIES:"
+
+echo "== firma del cooldown: pool-metric-missing persistente tampoco re-spamea =="
+WDS_SIG2=$(mktemp -d "$TMP/wds-sig2-XXXXXX")
+OUT=$(WDS="$WDS_SIG2" WD_ENV="$TMP/sb.env" run "$BASE" "http://127.0.0.1:$PORT/viejo.json")
+expect_contains "primera corrida: el chequeo ciego avisa" "$OUT" "pool-metric-missing"
+OUT=$(WDS="$WDS_SIG2" WD_ENV="$TMP/sb.env" run "$BASE" "http://127.0.0.1:$PORT/viejo.json")
+expect_missing "persiste: silencio total" "$OUT" "ANOMALIES:"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
