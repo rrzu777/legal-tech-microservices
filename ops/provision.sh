@@ -8,6 +8,8 @@
 # Qué cubre:
 #   - ops/systemd/** → /etc/systemd/system/** (instala solo lo que difiere;
 #     daemon-reload únicamente si algo cambió)
+#   - ops/caddy/Caddyfile → /etc/caddy/Caddyfile (reload de caddy solo si
+#     cambió; si el paquete caddy falta, receta y exit 1 — ops/caddy/README.md)
 #   - .env presente y con TODAS las variables de ops/env.inventory (compara
 #     NOMBRES; los valores nunca se leen ni se imprimen)
 #   - venv, usuarios de las units y /opt/legaltech-monitoring (los scripts de
@@ -15,12 +17,14 @@
 #   - systemctl enable de las cuatro units
 #
 # Qué NO cubre: el crontab y /opt/estrado-cron (eso es ops/cron/deploy-cron.sh
-# + el procedimiento del crontab.snapshot), y los VALORES de los secretos.
+# + el procedimiento del crontab.snapshot), el paquete caddy y las reglas de
+# ufw (manuales: ops/caddy/README.md, pasos 1 y 6), y los VALORES de los
+# secretos.
 #
 # Sale 0 solo si el VPS quedó completo. Inyectable por entorno para probarlo
 # en el laptop (ver ops/tests/test-provision.sh): PROV_REPO_DIR,
 # PROV_SYSTEMD_DIR, PROV_SYSTEMCTL, PROV_ENV_FILE, PROV_REQUIRED_USERS,
-# PROV_MONITORING_DIR.
+# PROV_MONITORING_DIR, PROV_CADDY_BIN, PROV_CADDYFILE_DEST.
 set -euo pipefail
 
 main() {
@@ -31,6 +35,9 @@ main() {
   local required_users="${PROV_REQUIRED_USERS:-estrado www-data}"
   local monitoring_dir="${PROV_MONITORING_DIR:-/opt/legaltech-monitoring}"
   local cron_dir="${PROV_CRON_DIR:-/opt/estrado-cron}"
+  local caddy_bin="${PROV_CADDY_BIN:-caddy}"
+  local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
+  local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
   local src="$repo_dir/ops/systemd"
   local changed=0 rc=0 rel dest
 
@@ -39,8 +46,8 @@ main() {
   # dice "no falta nada" — o sea que un PROV_REPO_DIR malo o un checkout a
   # medias (el escenario exacto de una reconstrucción) imprimiría "todo OK"
   # sin haber verificado NADA. La ausencia no es señal.
-  if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ]; then
-    echo "ABORTA: no existe $src o $repo_dir/ops/env.inventory — ¿PROV_REPO_DIR o checkout incompletos?" >&2
+  if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ] || [ ! -r "$caddyfile_src" ]; then
+    echo "ABORTA: falta $src, $repo_dir/ops/env.inventory o $caddyfile_src — ¿PROV_REPO_DIR o checkout incompletos?" >&2
     exit 1
   fi
 
@@ -61,6 +68,32 @@ main() {
     "$systemctl_bin" daemon-reload
   else
     echo "units al día"
+  fi
+
+  # --- caddy: TLS delante de la API (ops/caddy/README.md) ------------------
+  if ! command -v "$caddy_bin" >/dev/null 2>&1; then
+    echo "FALTA caddy (apt-get install caddy) — sin él la API queda sin TLS delante." >&2
+    rc=1
+  elif ! cmp -s "$caddyfile_src" "$caddyfile_dest"; then
+    # Validar ANTES de instalar. Sin esto, un Caddyfile roto llegaba a /etc y
+    # un `reload || restart` ciego hacía lo peor posible: el reload gracioso
+    # de Caddy rechaza el config inválido y SIGUE sirviendo el viejo (diseño,
+    # zero-downtime), y el restart de "fallback" mataba ese proceso sano
+    # contra el mismo archivo roto — Caddy caído por decisión nuestra.
+    if ! "$caddy_bin" validate --config "$caddyfile_src" --adapter caddyfile >/dev/null 2>&1; then
+      echo "INVÁLIDO: $caddyfile_src no pasa \`caddy validate\` — no se toca $caddyfile_dest." >&2
+      rc=1
+    else
+      echo "==> instala Caddyfile"
+      mkdir -p "$(dirname "$caddyfile_dest")"
+      install -m 644 "$caddyfile_src" "$caddyfile_dest"
+      # reload solo tiene sentido con la unit andando; parada, se levanta.
+      if "$systemctl_bin" is-active --quiet caddy; then
+        "$systemctl_bin" reload caddy
+      else
+        "$systemctl_bin" start caddy
+      fi
+    fi
   fi
 
   # --- .env: nombres, jamás valores --------------------------------------

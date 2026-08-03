@@ -26,6 +26,9 @@ expect_contains() {
 expect_missing() {
   printf '%s' "$2" | grep -qF -- "$3" && bad "$1 (contiene '$3' y no debería)" || ok "$1"
 }
+expect_same_file() { # <nombre> <esperado> <actual>
+  cmp -s "$2" "$3" && ok "$1" || bad "$1 (los archivos difieren)"
+}
 
 setup() { # setup <nombre> — repo falso completo y sano
   local base="$TMP/$1"
@@ -45,16 +48,26 @@ setup() { # setup <nombre> — repo falso completo y sano
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
+  # caddy: espejo del Caddyfile en el repo falso, binario stub y destino
+  # propio. El stub SÍ se ejecuta (`caddy validate` corre antes de instalar):
+  # exit 0 = config válido; el test del Caddyfile roto lo pisa con exit 1.
+  cp -R "$OPS_DIR/caddy" "$REPO/ops/caddy"
+  CADDYF="$base/caddy-etc/Caddyfile"
+  CADDY_BIN="$base/caddy-stub"
+  printf '#!/bin/bash\nexit 0\n' > "$CADDY_BIN"
+  chmod +x "$CADDY_BIN"
 }
 
 run_prov() {
   OUT=$(PROV_REPO_DIR="$REPO" PROV_SYSTEMD_DIR="$SYSD" PROV_SYSTEMCTL="$SYSCTL" \
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
-        PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" bash "$PROV" 2>&1)
+        PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
+        PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
 }
 
 reloads() { grep -c '^daemon-reload' "$LOG_SYSCTL" || true; }
+caddy_reloads() { grep -c '^reload caddy' "$LOG_SYSCTL" || true; }
 
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
@@ -66,11 +79,14 @@ expect_eq "instaló todos los archivos (incluido el drop-in)" "$N_DST" "$N_SRC"
 expect_contains "habilita las 4 units derivadas del espejo (sin slice ni drop-in)" "$(cat "$LOG_SYSCTL")" \
   "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
 expect_contains "lo dice" "$OUT" "OK:"
+expect_same_file "instaló el Caddyfile del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
+expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
 
-echo "== segunda corrida: idempotente, sin daemon-reload"
+echo "== segunda corrida: idempotente, sin daemon-reload ni recarga de caddy"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "sigue habiendo UN daemon-reload (no re-instaló)" "$(reloads)" "1"
+expect_eq "sigue habiendo UNA recarga de caddy" "$(caddy_reloads)" "1"
 expect_contains "lo dice" "$OUT" "units al día"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"
@@ -78,11 +94,49 @@ echo "# drift manual" >> "$SYSD/estrado-pjud.service"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "segundo daemon-reload por el cambio" "$(reloads)" "2"
-if cmp -s "$REPO/ops/systemd/estrado-pjud.service" "$SYSD/estrado-pjud.service"; then
-  ok "el destino volvió a ser el del repo"
+expect_same_file "el destino volvió a ser el del repo" "$REPO/ops/systemd/estrado-pjud.service" "$SYSD/estrado-pjud.service"
+
+echo "== Caddyfile editado a mano en el destino: se pisa y recarga"
+echo "# drift manual" >> "$CADDYF"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_eq "segunda recarga de caddy por el drift" "$(caddy_reloads)" "2"
+expect_same_file "el Caddyfile volvió a ser el del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
+
+echo "== caddy: binario ausente = receta y exit 1"
+setup nocaddy; rm "$CADDY_BIN"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "receta" "$OUT" "apt-get install caddy"
+expect_eq "sin binario no se recarga nada" "$(caddy_reloads)" "0"
+
+echo "== caddy: Caddyfile que no valida NO llega a /etc ni reinicia nada"
+# El reload gracioso de Caddy rechaza un config inválido y sigue sirviendo el
+# viejo; un restart de fallback contra el archivo roto mataría ese proceso
+# sano. Por eso se valida ANTES de instalar y un config roto no toca nada.
+setup caddyroto
+printf '#!/bin/bash\nexit 1\n' > "$CADDY_BIN"   # `caddy validate` que rechaza
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "lo dice" "$OUT" "no pasa"
+if [ -e "$CADDYF" ]; then
+  bad "el Caddyfile roto NO debe instalarse"
 else
-  bad "el destino quedó con el drift"
+  ok "el Caddyfile roto no se instaló"
 fi
+expect_eq "y no se recarga ni reinicia caddy" "$(grep -cE '^(reload|restart|start) caddy' "$LOG_SYSCTL" || true)" "0"
+
+echo "== caddy: con la unit parada se levanta en vez de recargar"
+setup caddyparado
+printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = is-active ] && exit 1\nexit 0\n' "$LOG_SYSCTL" > "$SYSCTL"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_contains "la levanta" "$(cat "$LOG_SYSCTL")" "start caddy"
+expect_eq "sin recarga sobre unit parada" "$(caddy_reloads)" "0"
+
+echo "== caddy: Caddyfile ausente del repo = checkout a medias, aborta"
+setup nocaddyfile; rm "$REPO/ops/caddy/Caddyfile"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "aborta con causa" "$OUT" "ABORTA"
 
 echo "== .env incompleto: nombra lo que falta, JAMÁS un valor, exit 1"
 setup envgap
