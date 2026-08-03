@@ -165,3 +165,8 @@ class HealthResponse(BaseModel):
     # se incrementan más adelante en el request, así que en ese escenario quedan
     # en cero y el health se ve sano.
     total_pool_failures: int = 0
+    # El complemento del anterior: `total_pool_failures` cuenta cuando NO quedaba
+    # ningún bundle sano; esto cuenta cuando había uno más y el reintento por
+    # otra IP residencial salvó la consulta. Sin los dos, un pool con 2 de 3
+    # bundles quemados se ve igual que uno sano, porque la app recibió su 200.
+    total_bundle_retries: int = 0
