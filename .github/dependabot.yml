@@ -1,0 +1,27 @@
+# Dependabot para el microservicio. OJO: este repo NO tiene CI — el gate real
+# es el deploy (`ops/deploy.sh` corre pytest EN el VPS antes de reiniciar nada
+# y revierte si falla). Un PR de Dependabot acá se mergea leído, no en verde:
+# mirar el changelog y confiar en que el deploy gate ataja lo que rompa.
+#
+# minor+patch agrupados; majors individuales. Lunes hora chilena.
+#
+# requirements.txt es el manifiesto CANÓNICO (ops/deploy.sh instala de ahí);
+# uv.lock es best-effort local y el ecosistema pip NO lo toca — si usás uv,
+# regenerálo después de un bump. La mayoría de deps usa rangos >=, así que
+# este entry genera pocos PRs (pins exactos como playwright== y security
+# alerts, principalmente).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/estrado-pjud-service"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 5
+    groups:
+      minor-y-patch:
+        update-types:
+          - "minor"
+          - "patch"
