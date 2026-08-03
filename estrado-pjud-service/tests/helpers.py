@@ -1,5 +1,7 @@
 """Utilidades compartidas entre módulos de test."""
 
+from unittest.mock import MagicMock
+
 
 class FakeOJVSession:
     """Sesión que no habla con nadie. Estaba copiada en cinco archivos.
@@ -24,6 +26,50 @@ class FakeOJVSession:
         return 0.0
 
 
+class AdapterQueGraba:
+    """Adapter que anota cada request y devuelve `httpx.Response` de verdad.
+
+    Graba en vez de levantar a propósito: afirmar por ausencia
+    (`assert adapter.posts == []`) es lo que impide que el día que alguien saque
+    una guardia el test siga pasando. Un fake que levanta `AssertionError` sale
+    por el `pytest.raises` y deja el assert inalcanzable.
+
+    Y `httpx.Response` de verdad, no un stub, para que los tests ejerciten el
+    `raise_for_status()` y el `_decode()` reales de `OJVSession`.
+
+    `posts` guarda `(path, kwargs)` —no sólo el path— porque hay tests que
+    afirman sobre el cuerpo enviado. Estaba duplicada, con este mismo nombre y
+    dos formas distintas de `posts`, en `test_detail_sin_csrf` y en
+    `test_challenge_en_initialize`.
+    """
+
+    def __init__(self, *, html_get: str = "<html>ok</html>", cuerpo_post: bytes = b"<html>ok</html>"):
+        self._html_get = html_get
+        self._cuerpo_post = cuerpo_post
+        self.gets: list[str] = []
+        self.posts: list[tuple[str, dict]] = []
+
+    async def get(self, path, **kwargs):
+        import httpx
+
+        self.gets.append(path)
+        return httpx.Response(
+            200,
+            content=self._html_get.encode("utf-8"),
+            request=httpx.Request("GET", f"https://ojv.test{path}"),
+        )
+
+    async def post(self, path, **kwargs):
+        import httpx
+
+        self.posts.append((path, kwargs))
+        return httpx.Response(
+            200,
+            content=self._cuerpo_post,
+            request=httpx.Request("POST", f"https://ojv.test{path}"),
+        )
+
+
 def api_settings(store_path="/tmp/no-existe.json", *, proxy="http://u:p@residencial:9000"):
     """`Settings` de verdad para construir un `APISessionPool`, nunca un MagicMock.
 
@@ -42,6 +88,52 @@ def api_settings(store_path="/tmp/no-existe.json", *, proxy="http://u:p@residenc
         OJV_PROXY_URL=proxy,
         _env_file=None,
     )
+
+
+def cookie_bundle(tag, *, proxy_url="http://u:p@sticky:1"):
+    """Un `CookieBundle` de test. Estaba escrito en tres archivos."""
+    import time
+
+    from app.cookie_store import CookieBundle
+
+    return CookieBundle(
+        cookies={"TSPD_101": f"tok-{tag}"},
+        user_agent=f"UA-{tag}",
+        saved_at=time.time(),
+        proxy_url=proxy_url,
+    )
+
+
+def pool_con_store(monkeypatch, bundles, *, proxy="http://u:p@residencial:9000", session_cls=None):
+    """`APISessionPool` con el store mockeado y el adapter/sesión falsos.
+
+    Devuelve `(pool, capturados)`; `capturados` acumula los kwargs con los que se
+    construyó cada adapter — que es donde se ve por qué IP salió cada intento, y
+    si salió sin proxy.
+
+    `session_cls` deja guionar `initialize()` (ver `_sesion_guionada` en
+    `test_challenge_en_initialize`); por defecto la sesión muda de siempre.
+
+    El patrón estaba copiado en cuatro archivos de test. Que sea uno solo importa
+    porque la firma de `OJVHttpAdapter` y el nombre de `_store` son justo lo que
+    cambia cuando se toca el pool.
+    """
+    from app import session_pool as sp
+    from app.session_pool import APISessionPool
+
+    pool = APISessionPool(api_settings(proxy=proxy))
+    pool._store = MagicMock()
+    pool._store.load_all.return_value = bundles
+
+    capturados = []
+
+    def fake_adapter(s, proxy=None, user_agent=None, cookies=None):
+        capturados.append({"proxy": proxy, "user_agent": user_agent, "cookies": cookies})
+        return MagicMock()
+
+    monkeypatch.setattr(sp, "OJVHttpAdapter", fake_adapter)
+    monkeypatch.setattr(sp, "OJVSession", session_cls or FakeOJVSession)
+    return pool, capturados
 
 
 def find_update_payload(mock_sb, **match):

@@ -5,7 +5,12 @@ import time
 import httpx
 
 from app.adapters.http_adapter import OJVHttpAdapter
-from app.failure_kind import MissingCsrfTokenError
+from app.failure_kind import (
+    BlockedInitialPageError,
+    MissingCsrfTokenError,
+    reject_empty_body,
+)
+from app.parsers.search_parser import detect_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,28 @@ class OJVSession:
         resp = await self._adapter.get("/consultaUnificada.php")
         resp.raise_for_status()
         html = _decode(resp)
+
+        # Cero bytes ANTES del detector de bloqueo, como en los otros cuatro
+        # call sites: `detect_blocked("")` devuelve True, así que sin esta línea
+        # el túnel cortándose se reportaría como challenge de F5 — la conflación
+        # exacta contra la que advierte `EmptyResponseError`, y que sostuvo el
+        # outage de dos meses y medio.
+        reject_empty_body(html, "pagina inicial")
+
+        # El challenge de F5 sale con HTTP 200, así que `raise_for_status()` lo
+        # deja pasar: si no se mira el CUERPO, una sesión bloqueada sigue de
+        # largo y el bloqueo recién aparece en el POST de abajo, disfrazado de
+        # error de transporte. Ver `BlockedInitialPageError`.
+        if detect_blocked(html):
+            raise BlockedInitialPageError(
+                f"la página inicial vino bloqueada ({len(resp.content)} bytes)"
+            )
+
+        # El largo se loguea SIEMPRE, no sólo al fallar: la diferencia entre la
+        # página buena y el challenge son 186.008 bytes contra 4.901, y no
+        # tenerlo escrito es lo que obligó a reconstruir el incidente a partir
+        # de diez días de journal.
+        logger.info("Página inicial OK (%d bytes)", len(resp.content))
 
         m = _CSRF_RE.search(html)
         if m:

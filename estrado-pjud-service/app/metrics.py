@@ -98,6 +98,30 @@ class APIMetrics:
             # primer fallo. Lo que dice si estamos rotos AHORA es la ventana.
             self._append_event("pool_failure")
 
+    def record_bundle_retry(self):
+        """`acquire()` tuvo que rotar de bundle porque el anterior no servía.
+
+        Sin esto el reintento apaga su propio instrumento: un pool con 2 de 3
+        bundles quemados le contesta 200 a la app y se ve en `/api/v1/health`
+        IDÉNTICO a uno sano, porque `record_pool_failure` sólo cuenta cuando se
+        agotaron TODOS. La única huella sería un `logger.warning` que nadie
+        agrega — y fallar barato y mudo es cómo esta falla duró diez días.
+
+        Es además el instrumento que le queda a la hipótesis abierta del sticky
+        lifetime (un bundle que sobrevive a su IP): si es cierta, estos eventos
+        se agrupan por edad de bundle, y agrupar es imposible sobre un contador
+        que sólo existe cuando ya fallaron los tres.
+
+        Acumulado y NO en la ventana, al revés que `record_pool_failure`: la
+        ventana alimenta el `status` de `/health`, y esto no es un estado
+        degradado —la consulta se sirvió— sino la tasa de bundles quemados.
+        Meterlo en la ventana marcaría "down" a un servicio que contesta bien.
+        """
+        with self._lock:
+            self._counters["total_bundle_retries"] = (
+                self._counters.get("total_bundle_retries", 0) + 1
+            )
+
     def record_blocked(self, endpoint: str):
         with self._lock:
             self._counters["total_blocked"] = self._counters.get("total_blocked", 0) + 1
@@ -184,6 +208,10 @@ class APIMetrics:
                 # externo es el unico que puede ver un servicio que no atiende:
                 # el alerter de adentro solo corre cuando entra un request.
                 "total_pool_failures": self._counters.get("total_pool_failures", 0),
+                # El complemento del anterior: `total_pool_failures` cuenta
+                # cuando NO quedaba ningún bundle sano, esto cuenta cuando había
+                # uno más. Sin los dos, un pool degradado y uno sano se ven igual.
+                "total_bundle_retries": self._counters.get("total_bundle_retries", 0),
             }
 
 

@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from app.failure_kind import (
+    BlockedInitialPageError,
     EmptyResponseError,
     MissingCsrfTokenError,
     NoUsableBundleError,
@@ -34,6 +35,11 @@ from tests.helpers import http_status_error as _status, infra_exceptions
         # Sin token CSRF, OJV contesta 405 — y 405 cae en "case", o sea que la
         # causa se comía el contador por un regex nuestro que dejó de matchear.
         MissingCsrfTokenError("regex sin match"),
+        # El challenge de F5 en la página inicial: lo que rechazan es la IP con
+        # la que salimos, no la causa. Sale con HTTP 200, así que sin excepción
+        # propia se colaba y reaparecía como error de transporte dos requests
+        # después.
+        BlockedInitialPageError("challenge en consultaUnificada"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -43,7 +49,15 @@ def test_nuestras_caidas_son_infra(exc):
 
 @pytest.mark.parametrize(
     "exc",
-    [*infra_exceptions(), EmptyResponseError("cuerpo vacio"), NoUsableBundleError("sin bundle")],
+    [
+        *infra_exceptions(),
+        EmptyResponseError("cuerpo vacio"),
+        NoUsableBundleError("sin bundle"),
+        # La contracara exacta de `MissingCsrfTokenError`, que sí deja el slot
+        # sano: acá el re-mint cambia la IP sticky, y la IP es justo lo que F5
+        # rechazó.
+        BlockedInitialPageError("challenge en consultaUnificada"),
+    ],
     ids=lambda e: type(e).__name__,
 )
 def test_lo_demas_si_re_mintea_el_slot(exc):
