@@ -30,8 +30,19 @@ main() {
   local env_file="${PROV_ENV_FILE:-$repo_dir/estrado-pjud-service/.env}"
   local required_users="${PROV_REQUIRED_USERS:-estrado www-data}"
   local monitoring_dir="${PROV_MONITORING_DIR:-/opt/legaltech-monitoring}"
+  local cron_dir="${PROV_CRON_DIR:-/opt/estrado-cron}"
   local src="$repo_dir/ops/systemd"
   local changed=0 rc=0 rel dest
+
+  # Las fuentes se validan ANTES de usarlas: un `while read` alimentado por un
+  # `cd` que falla itera cero veces y sale 0, y un `comm` con un lado vacío
+  # dice "no falta nada" — o sea que un PROV_REPO_DIR malo o un checkout a
+  # medias (el escenario exacto de una reconstrucción) imprimiría "todo OK"
+  # sin haber verificado NADA. La ausencia no es señal.
+  if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ]; then
+    echo "ABORTA: no existe $src o $repo_dir/ops/env.inventory — ¿PROV_REPO_DIR o checkout incompletos?" >&2
+    exit 1
+  fi
 
   # --- units: instalar solo lo que difiere -------------------------------
   while IFS= read -r rel; do
@@ -57,7 +68,7 @@ main() {
     echo "FALTA $env_file (modo 600). Variables requeridas en ops/env.inventory; los valores se reponen desde el gestor de secretos." >&2
     rc=1
   else
-    local missing
+    local missing extra
     missing=$(comm -23 \
       <(grep -vE '^#|^$' "$repo_dir/ops/env.inventory" | sort) \
       <(cut -d= -f1 "$env_file" | grep -vE '^#|^$' | sort))
@@ -65,6 +76,17 @@ main() {
       echo "Variables FALTANTES en $env_file (solo nombres):" >&2
       echo "$missing" >&2
       rc=1
+    fi
+    # El reverso, como WARNING sin tocar rc: variables que el .env real tiene
+    # y el inventario no. Es el modo de falla clásico de un snapshot — alguien
+    # agrega una var a mano y la próxima reconstrucción la pierde en silencio
+    # mientras provision dice "completo".
+    extra=$(comm -13 \
+      <(grep -vE '^#|^$' "$repo_dir/ops/env.inventory" | sort) \
+      <(cut -d= -f1 "$env_file" | grep -vE '^#|^$' | sort))
+    if [ -n "$extra" ]; then
+      echo "OJO: el .env tiene variables que ops/env.inventory no lista (agregalas al inventario o una reconstrucción las pierde):"
+      echo "$extra"
     fi
   fi
 
@@ -89,8 +111,20 @@ main() {
     rc=1
   fi
 
-  "$systemctl_bin" enable estrado-pjud.service estrado-pjud-worker.service \
-    legaltech-monitor.service legaltech-resource-tracker.service
+  # --- cron instalado (el contenido del crontab lo vigila el watchdog #10) --
+  if [ ! -f "$cron_dir/run-cron.sh" ]; then
+    echo "FALTA $cron_dir/run-cron.sh — un VPS reconstruido sin los crons revive el silencio de los 120 días. Correr ops/cron/deploy-cron.sh desde el laptop e instalar crontab.snapshot a mano (ver ops/cron/README.md)." >&2
+    rc=1
+  fi
+
+  # La lista de units a habilitar se deriva de los archivos del espejo (los
+  # .service de primer nivel; el slice no es enable-able y el drop-in no es
+  # unit): agregar una unit al espejo no exige acordarse de una segunda lista.
+  local enable_units=()
+  while IFS= read -r rel; do
+    enable_units+=("$rel")
+  done < <(cd "$src" && find . -maxdepth 1 -name '*.service' -type f | sed 's|^\./||' | sort)
+  "$systemctl_bin" enable "${enable_units[@]}"
 
   if [ "$rc" -eq 0 ]; then
     echo "OK: units instaladas y habilitadas, .env completo, venv y usuarios presentes."

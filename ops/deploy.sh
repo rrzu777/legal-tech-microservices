@@ -34,8 +34,9 @@ main() {
   local repo_dir="${DEPLOY_REPO_DIR:-/opt/legal-tech-microservices}"
   local service_dir="$repo_dir/estrado-pjud-service"
   # Mismo default que API_HEALTH_URL en ops/cron/estrado-watchdog.sh; si el
-  # endpoint se mueve, hay que tocar los dos (la fuente única es parte del
-  # trabajo de ops/provision, no de este script).
+  # endpoint se mueve, hay que tocar los dos. Fuente única evaluada al armar
+  # provision y descartada: contextos distintos (deploy on-box vs cron) y un
+  # archivo compartido sería una pieza más que puede faltar.
   local health_url="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8000/api/v1/health}"
   local health_retries="${DEPLOY_HEALTH_RETRIES:-60}"
   local health_sleep="${DEPLOY_HEALTH_SLEEP:-1}"
