@@ -21,6 +21,7 @@ import pytest
 
 from app.failure_kind import (
     BlockedInitialPageError,
+    EmptyResponseError,
     MissingCsrfTokenError,
     new_egress_may_help,
 )
@@ -60,6 +61,27 @@ async def test_challenge_corta_antes_del_post():
 
     assert adapter.gets == ["/consultaUnificada.php"]
     assert adapter.posts == [], "no debe gastar el POST contra una sesión ya bloqueada"
+
+
+@pytest.mark.asyncio
+async def test_cuerpo_vacio_no_se_reporta_como_challenge():
+    """Cero bytes es el túnel cortándose, no un bloqueo — y se distinguen.
+
+    `detect_blocked("")` devuelve True, así que sin `reject_empty_body` primero
+    nuestra caída de red saldría escrita como challenge de F5. Los otros cuatro
+    call sites ya ordenan los dos chequeos así; éste era el que faltaba.
+
+    Hoy las dos excepciones caen en "infra", o sea que la app ve lo mismo. Lo
+    que cambia es lo que queda escrito para el que diagnostique — que es todo el
+    punto de esta PR.
+    """
+    adapter = AdapterQueGraba(html_get="")
+    session = OJVSession(adapter)
+
+    with pytest.raises(EmptyResponseError):
+        await session.initialize()
+
+    assert adapter.posts == []
 
 
 @pytest.mark.asyncio
@@ -156,7 +178,8 @@ async def test_el_reintento_queda_contado(monkeypatch):
     que nadie agrega: el reintento apagaría el instrumento que mide la falla que
     vino a tapar.
     """
-    api_metrics.reset()
+    # Sin `reset()` manual: `conftest._reset_metrics` es autouse y ya corre
+    # antes de cada test.
     pool, _ = pool_con_store(
         monkeypatch,
         _bundles(3),
@@ -166,7 +189,6 @@ async def test_el_reintento_queda_contado(monkeypatch):
     await pool.acquire()
 
     assert api_metrics.snapshot()["total_bundle_retries"] == 1
-    api_metrics.reset()
 
 
 @pytest.mark.asyncio

@@ -90,8 +90,11 @@ class APISessionPool:
         # mientras 3 de los 4 `/api/v1/search` autenticados se caian. Misma tasa
         # de fallo por intento; lo que cambiaba era el segundo intento.
         #
-        # En modo legacy no hay bundles y se sale por la IP del host: un solo
-        # intento, porque reintentar por la misma IP no compra nada.
+        # El `max(1, ...)` es para el store vacío en modo legacy: ahí no hay
+        # bundle, `_rotate` devuelve None y se sale por la IP del host, y ese
+        # camino igual necesita su intento. Ojo: legacy NO implica store vacío
+        # —los bundles sobreviven a un deploy que apague `OJV_PROXY_URL`, y
+        # `_usable` los acepta a todos—, así que ahí también puede haber varios.
         intentos = max(1, len(utilizables))
         limite = time.monotonic() + _RETRY_BUDGET_S
         for intento in range(1, intentos + 1):
