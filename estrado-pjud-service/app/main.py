@@ -8,6 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
 from app.rate_limit import limiter
+from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.routes import health, search, detail, familia
 from app.session_pool import APISessionPool
 
@@ -42,8 +43,17 @@ def create_app() -> FastAPI:
 
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
+    # El filter va en el HANDLER raíz, no en un logger puntual: por ahí pasan
+    # los records de app.* y de toda lib que propague — cada línea emitida
+    # dentro de un request lleva el X-Request-ID que mandó la app (o el acuñado
+    # acá). uvicorn.access queda afuera (handler propio, propagate=False).
+    # El isinstance-check: los tests llaman create_app() varias veces y sin él
+    # se apilan filters duplicados en el mismo handler.
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, RequestIdFilter) for f in handler.filters):
+            handler.addFilter(RequestIdFilter())
 
     app = FastAPI(
         title="estrado-pjud-service",
@@ -54,6 +64,7 @@ def create_app() -> FastAPI:
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health.router)
     app.include_router(search.router)
