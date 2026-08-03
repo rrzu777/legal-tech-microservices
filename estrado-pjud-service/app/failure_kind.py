@@ -78,12 +78,16 @@ class NoUsableBundleError(Exception):
     """
 
 
-class BlockedInitialPageError(Exception):
-    """La primera página de la sesión vino con el challenge de F5.
+class BlockedPageError(Exception):
+    """Una página que debía traer contenido vino con el challenge de F5.
 
-    `initialize()` abre `/consultaUnificada.php` para juntar cookies y token. Si
-    esa página está bloqueada la sesión ya nació inservible — pero el bloqueo no
-    se veía: sale con **HTTP 200**, así que `raise_for_status()` lo deja pasar.
+    El caso fundante es `initialize()`: abre `/consultaUnificada.php` para
+    juntar cookies y token, y si esa página está bloqueada la sesión ya nació
+    inservible — pero el bloqueo no se veía: sale con **HTTP 200**, así que
+    `raise_for_status()` lo deja pasar. `fetch_anexo_list()` tiene la misma
+    forma con otro desenlace: el challenge no matchea ninguna tabla, el parser
+    devuelve lista vacía y los anexos de ese folio se pierden EN SILENCIO como
+    "No anexo files found".
 
     Medido en el VPS el 3 de agosto de 2026 (una corrida, `www-data`, config
     real): por la IP del datacenter la GET da 200 con 4.901 bytes, sin token,
@@ -130,7 +134,7 @@ class MissingCsrfTokenError(Exception):
     token y funciona perfecto sin él, así que abortar el arranque apagaría
     también la búsqueda, que no tiene el problema.
 
-    Desde `BlockedInitialPageError`, esto significa SÓLO drift de regex: la otra
+    Desde `BlockedPageError`, esto significa SÓLO drift de regex: la otra
     forma de quedarse sin token —que la página fuera un challenge— se corta antes,
     en `initialize()`. El veredicto opuesto que eso les da está en
     `slot_still_healthy`, que es donde se decide.
@@ -151,7 +155,7 @@ def slot_still_healthy(e: BaseException) -> bool:
     quemando una IP residencial y 30 s por causa sin poder corregir nunca la
     condición — el arreglo de atribución cambiando una factura por otra.
 
-    `BlockedInitialPageError` NO está acá, y es la contracara exacta: el re-mint
+    `BlockedPageError` NO está acá, y es la contracara exacta: el re-mint
     cambia la IP sticky, y la IP es justo lo que F5 rechazó. Página entera sin
     token = drift, no re-mintear; página de challenge = IP quemada, re-mintear.
 
@@ -197,7 +201,7 @@ def classify_exception(e: BaseException) -> FailureKind:
 
     # `httpx.TimeoutException` ya es `TransportError`; `TimeoutError` cubre el
     # `asyncio.timeout` (que en 3.11+ es el mismo tipo), y `EmptyResponseError`,
-    # `NoUsableBundleError`, `MissingCsrfTokenError` y `BlockedInitialPageError`
+    # `NoUsableBundleError`, `MissingCsrfTokenError` y `BlockedPageError`
     # entran por su cuenta.
     if isinstance(
         e,
@@ -207,7 +211,7 @@ def classify_exception(e: BaseException) -> FailureKind:
             EmptyResponseError,
             NoUsableBundleError,
             MissingCsrfTokenError,
-            BlockedInitialPageError,
+            BlockedPageError,
         ),
     ):
         return "infra"

@@ -6,7 +6,7 @@ import httpx
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.failure_kind import (
-    BlockedInitialPageError,
+    BlockedPageError,
     MissingCsrfTokenError,
     reject_empty_body,
 )
@@ -72,9 +72,9 @@ class OJVSession:
         # El challenge de F5 sale con HTTP 200, así que `raise_for_status()` lo
         # deja pasar: si no se mira el CUERPO, una sesión bloqueada sigue de
         # largo y el bloqueo recién aparece en el POST de abajo, disfrazado de
-        # error de transporte. Ver `BlockedInitialPageError`.
+        # error de transporte. Ver `BlockedPageError`.
         if detect_blocked(html):
-            raise BlockedInitialPageError(
+            raise BlockedPageError(
                 f"la página inicial vino bloqueada ({len(resp.content)} bytes)"
             )
 
@@ -156,7 +156,20 @@ class OJVSession:
             headers=_AJAX_HEADERS,
         )
         resp.raise_for_status()
-        return _decode(resp)
+        html = _decode(resp)
+
+        # Mismo par de chequeos que el resto del ciclo de vida (cero bytes
+        # ANTES del detector, ver initialize()). Éste era el único paso con
+        # cuerpo HTML que lo devolvía sin mirarlo: un challenge acá no matchea
+        # ninguna tabla, `parse_anexo_list` devuelve lista vacía y los anexos
+        # del folio se pierden como "No anexo files found" — indistinguible
+        # del caso real de un folio sin anexos.
+        reject_empty_body(html, "anexo")
+        if detect_blocked(html):
+            raise BlockedPageError(
+                f"la lista de anexos vino bloqueada ({len(resp.content)} bytes)"
+            )
+        return html
 
     async def download_document(self, path: str, token: str, param_name: str = "dtaDoc") -> httpx.Response:
         """Download a document from PJUD using the form action path + token."""

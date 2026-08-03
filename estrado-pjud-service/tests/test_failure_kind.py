@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from app.failure_kind import (
-    BlockedInitialPageError,
+    BlockedPageError,
     EmptyResponseError,
     MissingCsrfTokenError,
     NoUsableBundleError,
@@ -39,7 +39,7 @@ from tests.helpers import http_status_error as _status, infra_exceptions
         # la que salimos, no la causa. Sale con HTTP 200, así que sin excepción
         # propia se colaba y reaparecía como error de transporte dos requests
         # después.
-        BlockedInitialPageError("challenge en consultaUnificada"),
+        BlockedPageError("challenge en consultaUnificada"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -56,7 +56,7 @@ def test_nuestras_caidas_son_infra(exc):
         # La contracara exacta de `MissingCsrfTokenError`, que sí deja el slot
         # sano: acá el re-mint cambia la IP sticky, y la IP es justo lo que F5
         # rechazó.
-        BlockedInitialPageError("challenge en consultaUnificada"),
+        BlockedPageError("challenge en consultaUnificada"),
     ],
     ids=lambda e: type(e).__name__,
 )

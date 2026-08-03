@@ -2,7 +2,7 @@
 
 La medición del VPS que sostiene todo esto —la tabla de bytes por IP, los tres
 500 del journal, y que la excepción del transporte no identifica la causa— está
-en el docstring de `BlockedInitialPageError`. No se recopia acá, por lo mismo
+en el docstring de `BlockedPageError`. No se recopia acá, por lo mismo
 que dice `test_detail_sin_csrf`: repetida en tres lados, se desactualiza en los
 tres.
 
@@ -11,7 +11,7 @@ Lo propio de este archivo: lo estable es la PÁGINA. `detect_blocked` la reconoc
 slots residenciales), mientras que el mismo hecho salió como `RemoteProtocolError`
 en producción y como `ReadError` en la medición.
 
-Dónde vive cada afirmación: que `BlockedInitialPageError` sea infra y que SÍ
+Dónde vive cada afirmación: que `BlockedPageError` sea infra y que SÍ
 re-mintee el slot se afirma en los parametrize canónicos de `test_failure_kind`,
 que son el inventario único de las dos tablas.
 """
@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from app.failure_kind import (
-    BlockedInitialPageError,
+    BlockedPageError,
     EmptyResponseError,
     MissingCsrfTokenError,
     new_egress_may_help,
@@ -56,7 +56,7 @@ async def test_challenge_corta_antes_del_post():
     adapter = AdapterQueGraba(html_get=_CHALLENGE)
     session = OJVSession(adapter)
 
-    with pytest.raises(BlockedInitialPageError):
+    with pytest.raises(BlockedPageError):
         await session.initialize()
 
     assert adapter.gets == ["/consultaUnificada.php"]
@@ -96,7 +96,7 @@ async def test_pagina_real_inicializa_normal():
     assert [p for p, _ in adapter.posts] == ["/includes/sesion-invitado.php"]
 
 
-@pytest.mark.parametrize("exc", infra_exceptions() + [BlockedInitialPageError("challenge")])
+@pytest.mark.parametrize("exc", infra_exceptions() + [BlockedPageError("challenge")])
 def test_otro_egreso_ayuda_ante_infra(exc):
     """Si la culpa es nuestra y el re-mint ayuda, otro bundle es otra IP."""
     assert new_egress_may_help(exc) is True
@@ -158,7 +158,7 @@ async def test_reintenta_por_otro_bundle_y_sale_vivo(monkeypatch):
     pool, capturados = pool_con_store(
         monkeypatch,
         _bundles(3),
-        session_cls=_sesion_guionada([BlockedInitialPageError("challenge"), None]),
+        session_cls=_sesion_guionada([BlockedPageError("challenge"), None]),
     )
 
     await pool.acquire()
@@ -183,7 +183,7 @@ async def test_el_reintento_queda_contado(monkeypatch):
     pool, _ = pool_con_store(
         monkeypatch,
         _bundles(3),
-        session_cls=_sesion_guionada([BlockedInitialPageError("challenge"), None]),
+        session_cls=_sesion_guionada([BlockedPageError("challenge"), None]),
     )
 
     await pool.acquire()
@@ -202,10 +202,10 @@ async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
     pool, capturados = pool_con_store(
         monkeypatch,
         _bundles(3),
-        session_cls=_sesion_guionada([BlockedInitialPageError("challenge")] * 3),
+        session_cls=_sesion_guionada([BlockedPageError("challenge")] * 3),
     )
 
-    with pytest.raises(BlockedInitialPageError):
+    with pytest.raises(BlockedPageError):
         await pool.acquire()
 
     assert len(capturados) == 3, "un intento por bundle, ni uno más"
