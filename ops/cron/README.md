@@ -40,8 +40,10 @@ scp ops/cron/estrado-watchdog.sh ops/cron/tests/test-watchdog.sh legaltech-vps:/
 ssh legaltech-vps 'chmod +x /tmp/test-watchdog.sh && /tmp/test-watchdog.sh /tmp/estrado-watchdog.sh'
 ```
 
-El watchdog acepta cuatro variables para poder probarlo sin efectos: `DRY_RUN=1` (imprime lo que
-habría alertado y no llama ni a Luna ni a Telegram), `CRON_LOG`, `WD_STATE_DIR` y `API_HEALTH_URL`.
+El watchdog acepta estas variables para poder probarlo sin efectos: `DRY_RUN=1` (imprime lo que
+habría alertado y no llama ni a Luna ni a Telegram), `CRON_LOG`, `WD_STATE_DIR`, `API_HEALTH_URL`,
+`WD_CRONTAB_SNAPSHOT` y `WD_CRONTAB_LIVE_FILE` (fixtures del chequeo 10; sin la segunda lee
+`crontab -l` de verdad).
 
 Los tests levantan un `python3 -m http.server` en un puerto alto para el chequeo 9. Cada corrida
 estrena directorio de estado a propósito: el cooldown anti-spam se evalúa **antes** del `DRY_RUN`,
@@ -61,6 +63,7 @@ falla por algo que no estaba probando.
 | 7 | Log de los crons de la app (lee el rotado también) | silencio 24h · último HTTP ≠ 200 |
 | 8 | `next_sync_at` vencido | 1 causa, 2h |
 | 9 | `/api/v1/health`: no contesta, o `total_pool_failures > 0` | por evento |
+| 10 | Crontab de root vs `crontab.snapshot` (líneas ejecutables) | por drift distinto |
 
 Los umbrales no son estilo: cada uno tiene al lado, en el script, los números de producción que lo
 justifican. `blocked` se queda en 3 porque el bloqueo **es** el backoff funcionando (10 de las 15
