@@ -31,6 +31,9 @@ cat > "$TMP/www/sano.json" <<'EOF'
 EOF
 SANO="http://127.0.0.1:$PORT/sano.json"
 
+# Crontab "vivo" y snapshot idénticos: el chequeo 10 calla salvo en sus tests.
+printf '0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders\n' > "$TMP/crontab-base"
+
 # Cada corrida estrena directorio de estado. No es prolijidad: el cooldown anti-spam
 # de 3h se evalúa ANTES del `if DRY_RUN`, así que dos tests seguidos que produzcan la
 # misma firma hacen que el segundo salga vacío y falle por una razón que no tiene nada
@@ -41,7 +44,10 @@ SANO="http://127.0.0.1:$PORT/sano.json"
 # sola vez y necesitan que el estado sobreviva entre corridas.
 run() {
   local st="${WDS:-$(mktemp -d "$TMP/run-XXXXXX")}"
-  DRY_RUN=1 WD_STATE_DIR="$st" CRON_LOG="$1" API_HEALTH_URL="${2:-$SANO}" bash "$WD" 2>/dev/null
+  DRY_RUN=1 WD_STATE_DIR="$st" CRON_LOG="$1" API_HEALTH_URL="${2:-$SANO}" \
+    WD_CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-$TMP/crontab-base}" \
+    WD_CRONTAB_LIVE_FILE="${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}" \
+    bash "$WD" 2>/dev/null
 }
 
 expect_contains() { # <nombre> <salida> <texto esperado>
@@ -217,6 +223,47 @@ if grep -qF "$FAKE_ID" "$CAIDO/estrado-wd-suspended"; then
 else
   echo "  FAIL NO borra el estado de 'ya avisado' — el archivo quedó sin el ID previo"; FAIL=$((FAIL+1))
 fi
+
+echo "== chequeo 10: crontab drift =="
+cat > "$TMP/ct-snap" <<'EOF'
+# comentario que no cuenta
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
+
+0 12 * * * /opt/estrado-cron/estrado-digest.sh >/dev/null 2>&1
+EOF
+cat > "$TMP/ct-igual" <<'EOF'
+0 12 * * *   /opt/estrado-cron/estrado-digest.sh >/dev/null 2>&1
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
+EOF
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$BASE")
+expect_missing "comentarios, espaciado y orden no son drift" "$OUT" "crontab"
+
+cat > "$TMP/ct-drift" <<'EOF'
+0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
+EOF
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
+expect_contains "linea ejecutable que falta = drift" "$OUT" "crontab-drift"
+expect_contains "el diff muestra la linea faltante"  "$OUT" "estrado-digest.sh"
+
+echo "== chequeo 10: el mismo drift avisa una sola vez, la recaida re-avisa =="
+WDS_CT=$(mktemp -d "$TMP/wds-ct-XXXXXX")
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
+expect_contains "primera vez: avisa" "$OUT" "crontab-drift"
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
+expect_missing "mismo drift: silencio" "$OUT" "crontab-drift"
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$BASE")
+expect_missing "drift resuelto: silencio" "$OUT" "crontab-drift"
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
+expect_contains "recaida: vuelve a avisar" "$OUT" "crontab-drift"
+
+echo "== chequeo 10: snapshot ilegible =="
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-no-existe" run "$BASE")
+expect_contains "snapshot ilegible: avisa la ceguera" "$OUT" "crontab-snapshot-missing"
+
+echo "== chequeo 10: crontab vivo ilegible no es drift =="
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-vivo-no-existe" run "$BASE")
+expect_contains "leer y fallar se avisa como fallo" "$OUT" "crontab-live-unreadable"
+expect_missing "y NO se disfraza de drift"          "$OUT" "crontab-drift"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
