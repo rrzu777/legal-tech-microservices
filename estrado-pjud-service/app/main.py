@@ -8,6 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
 from app.rate_limit import limiter
+from app.request_id import RequestIdFilter, request_id_middleware
 from app.routes import health, search, detail, familia
 from app.session_pool import APISessionPool
 
@@ -42,8 +43,13 @@ def create_app() -> FastAPI:
 
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s [rid=%(rid)s]: %(message)s",
     )
+    # El filter va en el HANDLER raíz, no en un logger puntual: por ahí pasan
+    # los records de app.*, uvicorn y libs, así cada línea emitida dentro de un
+    # request lleva el X-Request-ID que mandó la app (o el acuñado acá).
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RequestIdFilter())
 
     app = FastAPI(
         title="estrado-pjud-service",
@@ -54,6 +60,7 @@ def create_app() -> FastAPI:
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.middleware("http")(request_id_middleware)
 
     app.include_router(health.router)
     app.include_router(search.router)
