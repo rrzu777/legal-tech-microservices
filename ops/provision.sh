@@ -75,11 +75,25 @@ main() {
     echo "FALTA caddy (apt-get install caddy) — sin él la API queda sin TLS delante." >&2
     rc=1
   elif ! cmp -s "$caddyfile_src" "$caddyfile_dest"; then
-    echo "==> instala Caddyfile"
-    mkdir -p "$(dirname "$caddyfile_dest")"
-    install -m 644 "$caddyfile_src" "$caddyfile_dest"
-    # reload de una unit parada falla; en ese caso se levanta.
-    "$systemctl_bin" reload caddy || "$systemctl_bin" restart caddy
+    # Validar ANTES de instalar. Sin esto, un Caddyfile roto llegaba a /etc y
+    # un `reload || restart` ciego hacía lo peor posible: el reload gracioso
+    # de Caddy rechaza el config inválido y SIGUE sirviendo el viejo (diseño,
+    # zero-downtime), y el restart de "fallback" mataba ese proceso sano
+    # contra el mismo archivo roto — Caddy caído por decisión nuestra.
+    if ! "$caddy_bin" validate --config "$caddyfile_src" --adapter caddyfile >/dev/null 2>&1; then
+      echo "INVÁLIDO: $caddyfile_src no pasa \`caddy validate\` — no se toca $caddyfile_dest." >&2
+      rc=1
+    else
+      echo "==> instala Caddyfile"
+      mkdir -p "$(dirname "$caddyfile_dest")"
+      install -m 644 "$caddyfile_src" "$caddyfile_dest"
+      # reload solo tiene sentido con la unit andando; parada, se levanta.
+      if "$systemctl_bin" is-active --quiet caddy; then
+        "$systemctl_bin" reload caddy
+      else
+        "$systemctl_bin" start caddy
+      fi
+    fi
   fi
 
   # --- .env: nombres, jamás valores --------------------------------------

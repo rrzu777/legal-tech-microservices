@@ -49,12 +49,12 @@ setup() { # setup <nombre> — repo falso completo y sano
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
   # caddy: espejo del Caddyfile en el repo falso, binario stub y destino
-  # propio. El stub puede estar vacío: provision solo lo mira con
-  # `command -v`, nunca lo ejecuta (la recarga va por systemctl).
+  # propio. El stub SÍ se ejecuta (`caddy validate` corre antes de instalar):
+  # exit 0 = config válido; el test del Caddyfile roto lo pisa con exit 1.
   cp -R "$OPS_DIR/caddy" "$REPO/ops/caddy"
   CADDYF="$base/caddy-etc/Caddyfile"
   CADDY_BIN="$base/caddy-stub"
-  touch "$CADDY_BIN"
+  printf '#!/bin/bash\nexit 0\n' > "$CADDY_BIN"
   chmod +x "$CADDY_BIN"
 }
 
@@ -108,6 +108,30 @@ setup nocaddy; rm "$CADDY_BIN"; run_prov
 expect_eq "exit 1" "$RC" "1"
 expect_contains "receta" "$OUT" "apt-get install caddy"
 expect_eq "sin binario no se recarga nada" "$(caddy_reloads)" "0"
+
+echo "== caddy: Caddyfile que no valida NO llega a /etc ni reinicia nada"
+# El reload gracioso de Caddy rechaza un config inválido y sigue sirviendo el
+# viejo; un restart de fallback contra el archivo roto mataría ese proceso
+# sano. Por eso se valida ANTES de instalar y un config roto no toca nada.
+setup caddyroto
+printf '#!/bin/bash\nexit 1\n' > "$CADDY_BIN"   # `caddy validate` que rechaza
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "lo dice" "$OUT" "no pasa"
+if [ -e "$CADDYF" ]; then
+  bad "el Caddyfile roto NO debe instalarse"
+else
+  ok "el Caddyfile roto no se instaló"
+fi
+expect_eq "y no se recarga ni reinicia caddy" "$(grep -cE '^(reload|restart|start) caddy' "$LOG_SYSCTL" || true)" "0"
+
+echo "== caddy: con la unit parada se levanta en vez de recargar"
+setup caddyparado
+printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = is-active ] && exit 1\nexit 0\n' "$LOG_SYSCTL" > "$SYSCTL"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_contains "la levanta" "$(cat "$LOG_SYSCTL")" "start caddy"
+expect_eq "sin recarga sobre unit parada" "$(caddy_reloads)" "0"
 
 echo "== caddy: Caddyfile ausente del repo = checkout a medias, aborta"
 setup nocaddyfile; rm "$REPO/ops/caddy/Caddyfile"; run_prov
