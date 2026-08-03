@@ -54,3 +54,11 @@
 # Estrado: purga de estudios eliminados + recordatorio a 3 dias
 # OJO: cron corre en hora LOCAL del VPS (Europe/Berlin), NO en UTC. 14:00 Berlin = 12:00 UTC = 08:00 Chile (invierno).
 0 14 * * * /opt/estrado-cron/run-cron.sh /api/cron/purge-deleted-firms
+
+# Cola de emails con reintentos y comunicaciones OJV al cliente. Estas tres
+# líneas corrían en el VPS SIN estar en el snapshot — las encontró el chequeo
+# 10 en su primer dry-run (2026-08-03); ver la regla: el snapshot es la
+# fuente de verdad y un cron sin historia en git es drift.
+*/10 * * * * /opt/estrado-cron/run-cron.sh /api/cron/email-retries
+30 12 * * * /opt/estrado-cron/run-cron.sh /api/cron/credential-request-reminders
+15 14 1 * * /opt/estrado-cron/run-cron.sh /api/cron/credential-transparency-emails
