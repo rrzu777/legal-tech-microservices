@@ -1,0 +1,1073 @@
+{
+  "components": {
+    "schemas": {
+      "CandidateMatch": {
+        "properties": {
+          "caratulado": {
+            "title": "Caratulado",
+            "type": "string"
+          },
+          "fecha_ingreso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha Ingreso"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "rol": {
+            "title": "Rol",
+            "type": "string"
+          },
+          "tribunal": {
+            "title": "Tribunal",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "rol",
+          "tribunal",
+          "caratulado",
+          "fecha_ingreso"
+        ],
+        "title": "CandidateMatch",
+        "type": "object"
+      },
+      "CaseMetadata": {
+        "properties": {
+          "abogado_suspendido": {
+            "default": "",
+            "title": "Abogado Suspendido",
+            "type": "string"
+          },
+          "caratulado": {
+            "default": "",
+            "title": "Caratulado",
+            "type": "string"
+          },
+          "estado_administrativo": {
+            "default": "",
+            "title": "Estado Administrativo",
+            "type": "string"
+          },
+          "estado_procesal": {
+            "default": "",
+            "title": "Estado Procesal",
+            "type": "string"
+          },
+          "etapa": {
+            "default": "",
+            "title": "Etapa",
+            "type": "string"
+          },
+          "fecha": {
+            "default": "",
+            "title": "Fecha",
+            "type": "string"
+          },
+          "libro": {
+            "default": "",
+            "title": "Libro",
+            "type": "string"
+          },
+          "naturaleza_recurso": {
+            "default": "",
+            "title": "Naturaleza Recurso",
+            "type": "string"
+          },
+          "numero_oficio": {
+            "default": "",
+            "title": "Numero Oficio",
+            "type": "string"
+          },
+          "procedimiento": {
+            "default": "",
+            "title": "Procedimiento",
+            "type": "string"
+          },
+          "recurso": {
+            "default": "",
+            "title": "Recurso",
+            "type": "string"
+          },
+          "rol": {
+            "default": "",
+            "title": "Rol",
+            "type": "string"
+          },
+          "ruc": {
+            "default": "",
+            "title": "Ruc",
+            "type": "string"
+          },
+          "tabla": {
+            "default": "",
+            "title": "Tabla",
+            "type": "string"
+          },
+          "tipo": {
+            "default": "",
+            "title": "Tipo",
+            "type": "string"
+          },
+          "tribunal": {
+            "default": "",
+            "title": "Tribunal",
+            "type": "string"
+          },
+          "ubicacion": {
+            "default": "",
+            "title": "Ubicacion",
+            "type": "string"
+          }
+        },
+        "title": "CaseMetadata",
+        "type": "object"
+      },
+      "DetailRequest": {
+        "properties": {
+          "case_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Number"
+          },
+          "competencia": {
+            "anyOf": [
+              {
+                "enum": [
+                  "suprema",
+                  "apelaciones",
+                  "civil",
+                  "laboral",
+                  "penal",
+                  "cobranza"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Competencia"
+          },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "detail_key": {
+            "title": "Detail Key",
+            "type": "string"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          }
+        },
+        "required": [
+          "detail_key"
+        ],
+        "title": "DetailRequest",
+        "type": "object"
+      },
+      "DetailResponse": {
+        "properties": {
+          "blocked": {
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "certificado_disponible": {
+            "default": false,
+            "title": "Certificado Disponible",
+            "type": "boolean"
+          },
+          "ebook_token": {
+            "default": "",
+            "title": "Ebook Token",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "exhortos": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Exhortos",
+            "type": "array"
+          },
+          "incompetencia": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Incompetencia",
+            "type": "array"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "litigantes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Litigante"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Litigantes"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseMetadata"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "movements": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Movement"
+                },
+                "type": "array"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Movements"
+          },
+          "suprema_docs": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Suprema Docs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metadata",
+          "movements",
+          "litigantes",
+          "blocked",
+          "error"
+        ],
+        "title": "DetailResponse",
+        "type": "object"
+      },
+      "DocumentoAdicional": {
+        "description": "Additional document form found in the Doc column (e.g. certificate).",
+        "properties": {
+          "param": {
+            "title": "Param",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "token",
+          "param"
+        ],
+        "title": "DocumentoAdicional",
+        "type": "object"
+      },
+      "FamiliaCaseFilter": {
+        "properties": {
+          "rit": {
+            "title": "Rit",
+            "type": "string"
+          },
+          "year": {
+            "title": "Year",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rit",
+          "year"
+        ],
+        "title": "FamiliaCaseFilter",
+        "type": "object"
+      },
+      "FamiliaCaso": {
+        "properties": {
+          "caratulado": {
+            "title": "Caratulado",
+            "type": "string"
+          },
+          "estado": {
+            "title": "Estado",
+            "type": "string"
+          },
+          "fecha_ingreso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha Ingreso"
+          },
+          "materia": {
+            "title": "Materia",
+            "type": "string"
+          },
+          "rit": {
+            "title": "Rit",
+            "type": "string"
+          },
+          "tribunal": {
+            "title": "Tribunal",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rit",
+          "tribunal",
+          "caratulado",
+          "materia",
+          "estado"
+        ],
+        "title": "FamiliaCaso",
+        "type": "object"
+      },
+      "FamiliaSyncRequest": {
+        "properties": {
+          "auth_type": {
+            "default": "clave_pj",
+            "enum": [
+              "clave_pj",
+              "clave_unica"
+            ],
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "cases": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FamiliaCaseFilter"
+            },
+            "maxItems": 10,
+            "title": "Cases",
+            "type": "array"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "rut": {
+            "title": "Rut",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rut",
+          "password"
+        ],
+        "title": "FamiliaSyncRequest",
+        "type": "object"
+      },
+      "FamiliaSyncResponse": {
+        "properties": {
+          "casos": {
+            "items": {
+              "$ref": "#/components/schemas/FamiliaCaso"
+            },
+            "title": "Casos",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "invalid_credentials",
+                  "session_error",
+                  "no_cases",
+                  "parse_error",
+                  "blocked"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "casos"
+        ],
+        "title": "FamiliaSyncResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "blocked_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Blocked Rate",
+            "type": "number"
+          },
+          "detail_requests": {
+            "default": 0,
+            "title": "Detail Requests",
+            "type": "integer"
+          },
+          "familia_requests": {
+            "default": 0,
+            "title": "Familia Requests",
+            "type": "integer"
+          },
+          "last_successful_request": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Successful Request"
+          },
+          "search_requests": {
+            "default": 0,
+            "title": "Search Requests",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "total_blocked": {
+            "default": 0,
+            "title": "Total Blocked",
+            "type": "integer"
+          },
+          "total_bundle_retries": {
+            "default": 0,
+            "title": "Total Bundle Retries",
+            "type": "integer"
+          },
+          "total_errors": {
+            "default": 0,
+            "title": "Total Errors",
+            "type": "integer"
+          },
+          "total_pool_failures": {
+            "default": 0,
+            "title": "Total Pool Failures",
+            "type": "integer"
+          },
+          "total_requests": {
+            "default": 0,
+            "title": "Total Requests",
+            "type": "integer"
+          },
+          "uptime_seconds": {
+            "title": "Uptime Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "last_successful_request",
+          "uptime_seconds"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "Litigante": {
+        "properties": {
+          "nombre": {
+            "title": "Nombre",
+            "type": "string"
+          },
+          "persona": {
+            "default": "",
+            "title": "Persona",
+            "type": "string"
+          },
+          "rol": {
+            "title": "Rol",
+            "type": "string"
+          },
+          "rut": {
+            "title": "Rut",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rol",
+          "rut",
+          "nombre"
+        ],
+        "title": "Litigante",
+        "type": "object"
+      },
+      "Movement": {
+        "properties": {
+          "anexo_func": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anexo Func"
+          },
+          "anexo_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anexo Token"
+          },
+          "cuaderno": {
+            "title": "Cuaderno",
+            "type": "string"
+          },
+          "descripcion": {
+            "title": "Descripcion",
+            "type": "string"
+          },
+          "documento_param": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Documento Param"
+          },
+          "documento_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Documento Token"
+          },
+          "documento_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Documento Url"
+          },
+          "documentos_adicionales": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/DocumentoAdicional"
+            },
+            "title": "Documentos Adicionales",
+            "type": "array"
+          },
+          "estado": {
+            "default": "",
+            "title": "Estado",
+            "type": "string"
+          },
+          "etapa": {
+            "title": "Etapa",
+            "type": "string"
+          },
+          "fecha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha"
+          },
+          "foja": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Foja"
+          },
+          "folio": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folio"
+          },
+          "sala": {
+            "default": "",
+            "title": "Sala",
+            "type": "string"
+          },
+          "tramite": {
+            "title": "Tramite",
+            "type": "string"
+          }
+        },
+        "required": [
+          "folio",
+          "cuaderno",
+          "etapa",
+          "tramite",
+          "descripcion",
+          "fecha",
+          "foja",
+          "documento_url"
+        ],
+        "title": "Movement",
+        "type": "object"
+      },
+      "SearchRequest": {
+        "properties": {
+          "case_number": {
+            "title": "Case Number",
+            "type": "string"
+          },
+          "case_type": {
+            "title": "Case Type",
+            "type": "string"
+          },
+          "competencia": {
+            "enum": [
+              "suprema",
+              "apelaciones",
+              "civil",
+              "laboral",
+              "penal",
+              "cobranza"
+            ],
+            "title": "Competencia",
+            "type": "string"
+          },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          }
+        },
+        "required": [
+          "case_type",
+          "case_number",
+          "competencia"
+        ],
+        "title": "SearchRequest",
+        "type": "object"
+      },
+      "SearchResponse": {
+        "properties": {
+          "blocked": {
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "found": {
+            "title": "Found",
+            "type": "boolean"
+          },
+          "libro_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro Used"
+          },
+          "match_count": {
+            "title": "Match Count",
+            "type": "integer"
+          },
+          "matches": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateMatch"
+            },
+            "title": "Matches",
+            "type": "array"
+          }
+        },
+        "required": [
+          "found",
+          "match_count",
+          "matches",
+          "blocked",
+          "error"
+        ],
+        "title": "SearchResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "estrado-pjud-service",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/detail": {
+      "post": {
+        "operationId": "case_detail_api_v1_detail_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DetailRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Case Detail",
+        "tags": [
+          "detail"
+        ]
+      }
+    },
+    "/api/v1/familia/sync": {
+      "post": {
+        "operationId": "familia_sync_api_v1_familia_sync_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FamiliaSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FamiliaSyncResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Familia Sync",
+        "tags": [
+          "familia"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/v1/search": {
+      "post": {
+        "operationId": "search_case_api_v1_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Search Case",
+        "tags": [
+          "search"
+        ]
+      }
+    }
+  }
+}
