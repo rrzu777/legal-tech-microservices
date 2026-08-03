@@ -1,0 +1,26 @@
+[Unit]
+Description=Estrado PJUD Sync Worker
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=estrado
+Group=estrado
+WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
+ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/python -m worker
+Restart=always
+RestartSec=10
+WatchdogSec=300
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/legal-tech-microservices/estrado-pjud-service/logs
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

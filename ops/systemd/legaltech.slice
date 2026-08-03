@@ -1,0 +1,8 @@
+[Unit]
+Description=LegalTech High Priority Slice
+Before=slices.target
+
+[Slice]
+CPUWeight=1000
+MemoryMax=10737418240
+MemoryHigh=8589934592
