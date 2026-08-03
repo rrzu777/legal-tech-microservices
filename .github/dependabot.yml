@@ -4,6 +4,12 @@
 # mirar el changelog y confiar en que el deploy gate ataja lo que rompa.
 #
 # minor+patch agrupados; majors individuales. Lunes hora chilena.
+#
+# requirements.txt es el manifiesto CANÓNICO (ops/deploy.sh instala de ahí);
+# uv.lock es best-effort local y el ecosistema pip NO lo toca — si usás uv,
+# regenerálo después de un bump. La mayoría de deps usa rangos >=, así que
+# este entry genera pocos PRs (pins exactos como playwright== y security
+# alerts, principalmente).
 version: 2
 updates:
   - package-ecosystem: "pip"
