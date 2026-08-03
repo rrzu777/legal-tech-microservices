@@ -9,7 +9,7 @@ set -euo pipefail
 HOST="${1:-legaltech-vps}"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAMP=$(date +%Y%m%d%H%M)
-SCRIPTS=(estrado-watchdog.sh estrado-digest.sh hermes-backup.sh run-cron.sh)
+SCRIPTS=(estrado-watchdog.sh estrado-digest.sh estrado-backup.sh hermes-backup.sh run-cron.sh)
 
 # Guarda: nunca desplegar (ni haber commiteado) un secreto.
 if grep -rqE '(eyJ[A-Za-z0-9_-]{20,}|[0-9a-f]{40,})' "$SRC"/*.sh; then

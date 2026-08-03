@@ -238,7 +238,14 @@ else
   CRON_FILES+=("$CRON_LOG")
   CRON_CUTOFF=$(date -d '-24 hours' '+%Y-%m-%d %H:%M')
   CRON_RECENT=$(awk -v c="$CRON_CUTOFF" 'substr($0,1,16) >= c' "${CRON_FILES[@]}" 2>/dev/null || true)
-  if [ -z "${CRON_RECENT// }" ]; then
+  # El silencio se mide SOLO sobre las líneas HTTP de run-cron.sh: al log
+  # también escribe estrado-backup.sh (su resumen diario), y una línea fresca
+  # cualquiera taparía el caso "run-cron.sh roto con el resto del crontab
+  # vivo" — el backup seguiría escribiendo y el silencio de la app pasaría
+  # por sano.
+  CRON_RECENT_HTTP=$(printf '%s
+' "$CRON_RECENT" | grep -F ' - HTTP ' || true)
+  if [ -z "${CRON_RECENT_HTTP// }" ]; then
     # El piso normal son ~7 corridas por día (eran ~10 hasta que se borró
     # stale-sync-recovery, que corría 4 veces). Cero en 24h no es "poca carga": es el
     # crontab borrado, run-cron.sh sin permiso de ejecución o el disco lleno. Este es
@@ -252,7 +259,7 @@ else
     # sigue dentro de la ventana de 24h. Un endpoint roto de verdad falla también en
     # su última corrida, y los que corren una vez al día tienen esa única corrida
     # como la última, así que igual se atrapan.
-    CRON_BAD=$(printf '%s\n' "$CRON_RECENT" | grep -F ' - HTTP ' \
+    CRON_BAD=$(printf '%s\n' "$CRON_RECENT_HTTP" \
                 | awk '{ultimo[$3] = $NF} END {for (e in ultimo) if (ultimo[e] != 200) print e, ultimo[e]}' \
                 | sort || true)
     if [ -n "${CRON_BAD// }" ]; then
@@ -399,6 +406,25 @@ else
     # Drift resuelto: limpiar el estado para que una recaída vuelva a avisar.
     nuevas_claves crontab-drift "" >/dev/null
   fi
+  fi
+fi
+
+# 11. El backup del estado no-git (estrado-backup.sh, diario 3:45 UTC): que
+#     exista, que sea de hoy y que no sea un tar vacío. El script ya corta con
+#     exit 1 si algo falla, pero nadie mira exit codes de cron — lo que sí se
+#     puede mirar es el ARTEFACTO: un tar fresco y con peso, o una alerta.
+#     26h = 24 de cadencia + 2 de gracia, igual que el criterio del chequeo 8.
+BACKUP_DIR="${WD_BACKUP_DIR:-/root/estrado-backups}"
+BACKUP_NEWEST=$(ls -1t "$BACKUP_DIR"/estrado-*.tar.gz 2>/dev/null | head -1 || true)
+if [ -z "$BACKUP_NEWEST" ]; then
+  add "No hay ningún backup estrado-*.tar.gz en $BACKUP_DIR — estrado-backup.sh no corrió nunca o borra lo que produce." "backup-missing"
+else
+  BACKUP_AGE_H=$(( ( $(date +%s) - $(stat -c %Y "$BACKUP_NEWEST") ) / 3600 ))
+  BACKUP_SIZE=$(stat -c %s "$BACKUP_NEWEST")
+  if [ "$BACKUP_AGE_H" -gt 26 ]; then
+    add "El backup más nuevo ($BACKUP_NEWEST) tiene ${BACKUP_AGE_H}h (>26): estrado-backup.sh dejó de producir." "backup-stale"
+  elif [ "$BACKUP_SIZE" -lt 1024 ]; then
+    add "El backup más nuevo ($BACKUP_NEWEST) pesa ${BACKUP_SIZE} bytes: un tar vacío no restaura nada." "backup-empty"
   fi
 fi
 
