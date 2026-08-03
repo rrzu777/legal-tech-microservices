@@ -65,6 +65,10 @@ COOLDOWN="${WD_COOLDOWN:-10800}"   # 3h: no re-alertar la MISMA anomalía dentro
 # eso el filtro va con nombre en vez de repetir `grep -v '^$'` cinco veces.
 sin_vacias() { grep -v '^$' || true; }
 
+# Normaliza un crontab a sus líneas ejecutables: fuera comentarios y blancos,
+# espaciado colapsado, orden estable. Lo usa el chequeo 10.
+lineas_ejecutables() { grep -vE '^[[:space:]]*(#|$)' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | sort; }
+
 nuevas_claves() { # <slug de estado> <claves separadas por saltos de línea>
   local estado="$WD_STATE_DIR/estrado-wd-$1" claves
   claves=$(printf '%s\n' "$2" | sin_vacias | sort)
@@ -356,7 +360,6 @@ rm -f "$API_BODY"
 #     recae— vuelve a avisar. `nuevas_claves` se llama también con el drift
 #     resuelto, para que la resolución limpie el estado; ver el chequeo 9.
 CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-/opt/legal-tech-microservices/ops/cron/crontab.snapshot}"
-lineas_ejecutables() { grep -vE '^[[:space:]]*(#|$)' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | sort; }
 if [ ! -r "$CRONTAB_SNAPSHOT" ]; then
   add "No puedo leer $CRONTAB_SNAPSHOT — el chequeo de drift del crontab queda ciego." "crontab-snapshot-missing"
 else
@@ -373,7 +376,7 @@ else
     CRON_DRIFT=$(diff <(printf '%s\n' "$CRON_ESPERADO") <(printf '%s\n' "$CRON_VIVO") | grep -E '^[<>]' | head -12 || true)
     DRIFT_HASH=$(printf '%s' "$CRON_DRIFT" | md5sum | cut -c1-8)
     NUEVO_DRIFT=$(nuevas_claves crontab-drift "drift:$DRIFT_HASH")
-    [ -n "${NUEVO_DRIFT// }" ] && add "El crontab de root NO coincide con ops/cron/crontab.snapshot (< falta en el VPS, > sobra en el VPS):"$'\n'"$CRON_DRIFT"$'\n'"    Si el snapshot es el correcto: revisar las líneas > y luego \`crontab /opt/legal-tech-microservices/ops/cron/crontab.snapshot\`. Si el VPS es el correcto: actualizar el snapshot en git." "crontab-drift:$DRIFT_HASH"
+    [ -n "${NUEVO_DRIFT// }" ] && add "El crontab de root NO coincide con ops/cron/crontab.snapshot (< falta en el VPS, > sobra en el VPS):"$'\n'"$CRON_DRIFT"$'\n'"    Si el snapshot es el correcto: revisar las líneas > y luego \`crontab $CRONTAB_SNAPSHOT\`. Si el VPS es el correcto: actualizar el snapshot en git." "crontab-drift:$DRIFT_HASH"
   else
     # Drift resuelto: limpiar el estado para que una recaída vuelva a avisar.
     nuevas_claves crontab-drift "" >/dev/null

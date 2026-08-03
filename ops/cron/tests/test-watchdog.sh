@@ -235,32 +235,30 @@ cat > "$TMP/ct-igual" <<'EOF'
 0 12 * * *   /opt/estrado-cron/estrado-digest.sh >/dev/null 2>&1
 0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
 EOF
-printf '%s /api/cron/task-reminders - HTTP 200\n' "$HOY" > "$TMP/ct.log"
-OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$TMP/ct.log")
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$BASE")
 expect_missing "comentarios, espaciado y orden no son drift" "$OUT" "crontab"
 
 cat > "$TMP/ct-drift" <<'EOF'
 0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders
 EOF
-OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$TMP/ct.log")
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
 expect_contains "linea ejecutable que falta = drift" "$OUT" "crontab-drift"
 expect_contains "el diff muestra la linea faltante"  "$OUT" "estrado-digest.sh"
 
 echo "== chequeo 10: el mismo drift avisa una sola vez, la recaida re-avisa =="
 WDS_CT=$(mktemp -d "$TMP/wds-ct-XXXXXX")
-OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$TMP/ct.log")
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
 expect_contains "primera vez: avisa" "$OUT" "crontab-drift"
-OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$TMP/ct.log")
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
 expect_missing "mismo drift: silencio" "$OUT" "crontab-drift"
-OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$TMP/ct.log")
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-igual" run "$BASE")
 expect_missing "drift resuelto: silencio" "$OUT" "crontab-drift"
-OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$TMP/ct.log")
+OUT=$(WDS="$WDS_CT" WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-drift" run "$BASE")
 expect_contains "recaida: vuelve a avisar" "$OUT" "crontab-drift"
 
 echo "== chequeo 10: snapshot ilegible =="
-OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-no-existe" run "$TMP/ct.log")
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-no-existe" run "$BASE")
 expect_contains "snapshot ilegible: avisa la ceguera" "$OUT" "crontab-snapshot-missing"
-
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
