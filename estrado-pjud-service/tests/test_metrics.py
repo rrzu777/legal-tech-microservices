@@ -241,3 +241,23 @@ class TestFamiliaEnElSnapshot:
         from app.models import HealthResponse
 
         assert "familia_requests" in HealthResponse.model_fields
+
+    def test_todo_el_snapshot_llega_a_la_respuesta_de_health(self):
+        """La guarda de arriba, pero para TODA clave presente y futura.
+
+        Fijar los campos de a uno no escala: la de `familia_requests` ya existía
+        y aun así `total_bundle_retries` se mergeó contado y dropeado — llegó al
+        VPS y `/api/v1/health` no lo mostraba. Una guarda por campo sólo cubre
+        los campos que alguien se acordó de agregar, que es justo el caso que no
+        falla.
+
+        Se compara contra el snapshot REAL y no contra una lista escrita a mano,
+        para que agregar un contador y olvidarse del modelo falle acá.
+        """
+        from app.metrics import api_metrics
+        from app.models import HealthResponse
+
+        faltantes = set(api_metrics.snapshot()) - set(HealthResponse.model_fields)
+        assert faltantes == set(), (
+            f"contadas y nunca publicadas (pydantic las descarta en silencio): {faltantes}"
+        )
