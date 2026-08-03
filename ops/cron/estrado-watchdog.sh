@@ -39,8 +39,13 @@ conteo_supera() { # <valor de cnt> <umbral> <tag> <qué se contaba>
 
 ANOMALIES=""
 SIG=""
-# add <texto humano> <tag estable para firma anti-spam>
-add() { ANOMALIES+="- $1"$'\n'; SIG+="${2:-x};"; }
+# add <texto humano> [tag estable para firma anti-spam]
+# Tag "" EXPLÍCITO = el mensaje no aporta a la firma: lo usan los chequeos keyed,
+# cuya entrada a SIG la hace `sig_keyed` con el conjunto completo de claves.
+# Omitir el tag (descuido) sigue aportando "x": una anomalía sin etiquetar que
+# aparece o desaparece tiene que perturbar la firma igual, o el cooldown de otra
+# alerta se la come.
+add() { local tag="${2-x}"; ANOMALIES+="- $1"$'\n'; SIG+="${tag:+$tag;}"; }
 # Rutas inyectables para poder testear el script sin tocar el estado real ni
 # mandar nada a Telegram. Ver ops/cron/tests/test-watchdog.sh.
 WD_STATE_DIR="${WD_STATE_DIR:-/var/tmp}"
@@ -65,6 +70,12 @@ COOLDOWN="${WD_COOLDOWN:-10800}"   # 3h: no re-alertar la MISMA anomalía dentro
 # eso el filtro va con nombre en vez de repetir `grep -v '^$'` cinco veces.
 sin_vacias() { grep -v '^$' || true; }
 
+# Hash corto (8 hex) de stdin. Lo usan la firma de los chequeos keyed y el hash
+# del drift del crontab: si alguna vez cambia el largo o el algoritmo, cambia
+# para todos — dos reglas de hash conviviendo en el mismo archivo serían
+# invisibles porque ambas "andan".
+hash8() { md5sum | cut -c1-8; }
+
 # Normaliza un crontab a sus líneas ejecutables: fuera comentarios y blancos,
 # espaciado colapsado, orden estable. Lo usa el chequeo 10.
 lineas_ejecutables() { grep -vE '^[[:space:]]*(#|$)' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | sort; }
@@ -77,20 +88,32 @@ nuevas_claves() { # <slug de estado> <claves separadas por saltos de línea>
   printf '%s\n' "$claves" | sin_vacias > "$estado"
 }
 
-# La firma anti-spam de un chequeo keyed: hash corto del conjunto ACTUAL de claves
-# (el archivo que `nuevas_claves` acaba de reescribir), vacío si no hay ninguna.
-# El tag del chequeo tiene que llevar este hash Y entrar a SIG aunque la condición
-# ya esté avisada. Las dos mitades se pagaron por separado:
-#   (a) con un tag fijo, una causa NUEVA dentro de la ventana de 3h produce la
-#       MISMA firma que la alerta anterior, el cooldown se la come, y como
-#       `nuevas_claves` ya la marcó como vista, esa alerta se pierde PARA SIEMPRE;
-#   (b) si el tag sale de SIG cuando la condición persiste ya avisada, cualquier
-#       OTRA anomalía persistente (disco, memoria) cambia la firma en la corrida
-#       siguiente y se reenvía a los 15 min en vez de a las 3h. Mismo principio
-#       que el drift del crontab (chequeo 10), que ya hacía las dos cosas.
+# Hash corto del conjunto ACTUAL de claves de un estado keyed (el archivo que
+# `nuevas_claves` acaba de reescribir), vacío si el conjunto está vacío.
 firma_estado() { # <slug de estado>
   local f="$WD_STATE_DIR/estrado-wd-$1"
-  { [ -s "$f" ] && md5sum < "$f" | cut -c1-8; } || true
+  [ -s "$f" ] && hash8 < "$f" || true
+}
+
+# La entrada a la firma anti-spam de un chequeo keyed: el conjunto ACTUAL
+# no-vacío entra a SIG SIEMPRE, haya alertado esta corrida o no. Las dos mitades
+# se pagaron por separado antes de que esto existiera:
+#   (a) el tag lleva el hash de las claves: con un tag fijo, una causa NUEVA
+#       dentro de la ventana de 3h producía la MISMA firma que la alerta
+#       anterior, el cooldown se la comía, y como `nuevas_claves` ya la había
+#       marcado como vista, esa alerta se perdía PARA SIEMPRE;
+#   (b) la condición que persiste ya avisada (deduplicada) sigue entrando a SIG:
+#       si saliera, cualquier OTRA anomalía persistente (disco, memoria)
+#       cambiaría la firma en la corrida siguiente y se reenviaría a los 15 min
+#       en vez de a las 3h.
+# Llamar SIEMPRE justo después de `nuevas_claves`/`nuevas_causas`, que son
+# quienes reescriben el archivo que `firma_estado` lee; el mensaje va aparte,
+# con `add "<texto>" ""` solo cuando hay claves nuevas.
+sig_keyed() { # <slug de estado>
+  local f
+  f=$(firma_estado "$1")
+  [ -n "$f" ] && SIG+="$1:$f;"
+  true
 }
 
 # Lo mismo, para causas: devuelve los `case_number` de las que matchean el filtro y
@@ -150,12 +173,8 @@ MEMAVAIL=$(free -m | awk '/^Mem:/{print $7}')
 # `suspended` y `error` avisan por CAUSA, sin umbral de cantidad; `blocked` sigue
 # pidiendo 3. La diferencia no es de estilo, está medida — ver cada bloque.
 if SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended"); then
-  FIRMA_SUSP=$(firma_estado suspended)
-  if [ -n "${SUSP// }" ]; then
-    add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." "suspended:$FIRMA_SUSP"
-  elif [ -n "$FIRMA_SUSP" ]; then
-    SIG+="suspended:$FIRMA_SUSP;"
-  fi
+  sig_keyed suspended
+  [ -n "${SUSP// }" ] && add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." ""
 else
   sin_datos suspended "las causas suspendidas"
 fi
@@ -175,12 +194,8 @@ fi
 #
 # Hoy hay 0 causas en `error`, así que bajarlo no cuesta una sola alerta nueva.
 if ERR=$(nuevas_causas track-err "tracking_status=eq.error"); then
-  FIRMA_ERR=$(firma_estado track-err)
-  if [ -n "${ERR// }" ]; then
-    add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." "track-err:$FIRMA_ERR"
-  elif [ -n "$FIRMA_ERR" ]; then
-    SIG+="track-err:$FIRMA_ERR;"
-  fi
+  sig_keyed track-err
+  [ -n "${ERR// }" ] && add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." ""
 else
   sin_datos track-err "las causas en error"
 fi
@@ -362,7 +377,8 @@ else
   # Llamarla solo en la rama mala dejaba la clave pegada para siempre, y entonces un
   # contador que volvía y más tarde desaparecía de nuevo ya no avisaba. Lo agarró el
   # test "si desaparece de nuevo, vuelve a avisar", no yo.
-  NUEVA_CEGUERA=$(nuevas_claves api-sin-pool-metric "$FALTA_METRICA")
+  NUEVA_CEGUERA=$(nuevas_claves pool-metric-missing "$FALTA_METRICA")
+  sig_keyed pool-metric-missing
   if [ -n "$FALTA_METRICA" ]; then
     # El contador lo agregó el PR #21 y la instancia desplegada puede ser anterior
     # (los contadores viven en memoria: hasta que el proceso no reinicie, la clave no
@@ -375,13 +391,7 @@ else
     # Lo que lo cerraría de raíz es que /api/v1/health exponga el commit desplegado y
     # que esto lo compare contra HEAD: un solo chequeo para cualquier drift repo↔VPS,
     # que es la misma familia del `crontab.snapshot` que puede divergir en silencio.
-    if [ -n "${NUEVA_CEGUERA// }" ]; then
-      add "La API no expone total_pool_failures: corre código anterior al #21, así que el chequeo del pool está CIEGO. Se destraba reiniciando estrado-pjud.service — corta las sesiones OJV en curso, hacerlo a conciencia." "pool-metric-missing"
-    else
-      # Persiste ya avisada: a la firma igual, por (b) de `firma_estado`. Acá no
-      # hace falta hash — la clave posible es una sola, el conjunto es binario.
-      SIG+="pool-metric-missing;"
-    fi
+    [ -n "${NUEVA_CEGUERA// }" ] && add "La API no expone total_pool_failures: corre código anterior al #21, así que el chequeo del pool está CIEGO. Se destraba reiniciando estrado-pjud.service — corta las sesiones OJV en curso, hacerlo a conciencia." ""
   elif [ "$POOL_FAIL" -gt 0 ] 2>/dev/null; then
     # El uptime va en el mensaje porque el contador se resetea con el proceso: sin él,
     # una falla vieja y una tormenta de hace diez minutos se leen igual.
@@ -430,16 +440,10 @@ else
     # snapshot no lo conoce. Las dos direcciones importan: la primera es un
     # deploy a medias, la segunda es un cron fantasma sin historia en git.
     CRON_DRIFT=$(diff <(printf '%s\n' "$CRON_ESPERADO") <(printf '%s\n' "$CRON_VIVO") | grep -E '^[<>]' | head -12 || true)
-    DRIFT_HASH=$(printf '%s' "$CRON_DRIFT" | md5sum | cut -c1-8)
+    DRIFT_HASH=$(printf '%s' "$CRON_DRIFT" | hash8)
     NUEVO_DRIFT=$(nuevas_claves crontab-drift "drift:$DRIFT_HASH")
-    if [ -z "${NUEVO_DRIFT// }" ]; then
-      # El drift persistente ya avisado no re-arma el mensaje, pero SÍ entra a
-      # la firma del cooldown: si desapareciera de SIG, cualquier OTRA anomalía
-      # persistente (disco, memoria) cambiaría de firma en la corrida siguiente
-      # y se reenviaría a los 15 min en vez de a las 3h.
-      SIG+="crontab-drift:$DRIFT_HASH;"
-    fi
-    [ -n "${NUEVO_DRIFT// }" ] && add "El crontab de root NO coincide con ops/cron/crontab.snapshot (< falta en el VPS, > sobra en el VPS):"$'\n'"$CRON_DRIFT"$'\n'"    Si el snapshot es el correcto: revisar las líneas > y luego \`crontab $CRONTAB_SNAPSHOT\`. Si el VPS es el correcto: actualizar el snapshot en git." "crontab-drift:$DRIFT_HASH"
+    sig_keyed crontab-drift
+    [ -n "${NUEVO_DRIFT// }" ] && add "El crontab de root NO coincide con ops/cron/crontab.snapshot (< falta en el VPS, > sobra en el VPS):"$'\n'"$CRON_DRIFT"$'\n'"    Si el snapshot es el correcto: revisar las líneas > y luego \`crontab $CRONTAB_SNAPSHOT\`. Si el VPS es el correcto: actualizar el snapshot en git." ""
   else
     # Drift resuelto: limpiar el estado para que una recaída vuelva a avisar.
     nuevas_claves crontab-drift "" >/dev/null
