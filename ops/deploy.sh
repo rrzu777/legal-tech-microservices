@@ -10,9 +10,9 @@
 #   1. árbol limpio        — desplegar sobre ediciones a mano es la receta del drift
 #   2. ff-only a origin/main — si divergió, alguien tocó el checkout: abortar
 #   3. pytest EN el VPS    — el laptop no prueba el .env ni el Python del VPS
-#   4. restart de las DOS units por separado (el clasificador de la sesión de
-#      Claude bloquea compuestos por ssh; acá da igual, pero una unit que falla
-#      no debe impedir el restart de la otra en el rollback)
+#   4. restart de las dos units en UNA invocación: systemd encola ambos jobs a
+#      la vez (ventana de corte = max, no suma) y una unit que falla no impide
+#      el intento de la otra
 #   5. health con reintentos — la API tarda en levantar; un curl inmediato da
 #      falso negativo
 #
@@ -21,8 +21,9 @@
 # Si 5 falla: código al SHA anterior + restart de nuevo + health de nuevo.
 #
 # Todo es inyectable por entorno para poder probarlo en un laptop con stubs
-# (ver ops/tests/test-deploy.sh): REPO_DIR, SYSTEMCTL, HEALTH_URL,
-# HEALTH_RETRIES, HEALTH_SLEEP.
+# (ver ops/tests/test-deploy.sh). Prefijo DEPLOY_ a propósito: un HEALTH_URL o
+# SYSTEMCTL genérico exportado en el entorno de root redirigiría la verificación
+# sin que nadie lo pida.
 set -euo pipefail
 
 # Envuelto en main(): bash lee los scripts por pedazos mientras los ejecuta, y
@@ -30,12 +31,15 @@ set -euo pipefail
 # está parseado antes de ejecutar nada; la versión nueva recién rige en la
 # próxima corrida.
 main() {
-  local repo_dir="${REPO_DIR:-/opt/legal-tech-microservices}"
+  local repo_dir="${DEPLOY_REPO_DIR:-/opt/legal-tech-microservices}"
   local service_dir="$repo_dir/estrado-pjud-service"
-  local health_url="${HEALTH_URL:-http://localhost:8000/api/v1/health}"
-  local health_retries="${HEALTH_RETRIES:-12}"
-  local health_sleep="${HEALTH_SLEEP:-5}"
-  local systemctl_bin="${SYSTEMCTL:-systemctl}"
+  # Mismo default que API_HEALTH_URL en ops/cron/estrado-watchdog.sh; si el
+  # endpoint se mueve, hay que tocar los dos (la fuente única es parte del
+  # trabajo de ops/provision, no de este script).
+  local health_url="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8000/api/v1/health}"
+  local health_retries="${DEPLOY_HEALTH_RETRIES:-60}"
+  local health_sleep="${DEPLOY_HEALTH_SLEEP:-1}"
+  local systemctl_bin="${DEPLOY_SYSTEMCTL:-systemctl}"
   local services=(estrado-pjud.service estrado-pjud-worker.service)
 
   cd "$repo_dir"
@@ -48,7 +52,7 @@ main() {
   local prev
   prev=$(git rev-parse HEAD)
 
-  git fetch origin
+  git fetch origin main
   if [ "$(git rev-parse origin/main)" = "$prev" ]; then
     echo "Ya al día ($(git rev-parse --short HEAD)); nada que desplegar."
     exit 0
@@ -72,12 +76,12 @@ main() {
     exit 1
   fi
 
-  restart_services "$systemctl_bin" "${services[@]}"
+  "$systemctl_bin" restart "${services[@]}"
 
   if ! wait_health "$health_url" "$health_retries" "$health_sleep"; then
     echo "HEALTH FALLÓ tras el restart: rollback a $prev" >&2
     git reset --hard "$prev"
-    restart_services "$systemctl_bin" "${services[@]}"
+    "$systemctl_bin" restart "${services[@]}"
     if wait_health "$health_url" "$health_retries" "$health_sleep"; then
       echo "Rollback OK: el VPS quedó en $prev y sano. El deploy NO entró." >&2
     else
@@ -94,15 +98,16 @@ main() {
     fi
   done
 
-  echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta, units activas."
-}
+  # El trap que ya mordió una vez ("mergear crontab.snapshot no cambia nada en
+  # el VPS"): este deploy avanza las FUENTES de ops/cron/ pero los instalados
+  # en /opt/estrado-cron no se actualizan solos. Sin este aviso, un fix del
+  # watchdog "desplegado" puede no estar corriendo — la clase de falla de los
+  # 120 días que ops/ existe para impedir.
+  if ! git diff --quiet "$prev"..HEAD -- ops/cron; then
+    echo "OJO: ops/cron cambió en este rango; lo instalado en /opt/estrado-cron NO se actualiza solo — corré ops/cron/deploy-cron.sh desde el laptop."
+  fi
 
-restart_services() {
-  local systemctl_bin="$1"; shift
-  local unit
-  for unit in "$@"; do
-    "$systemctl_bin" restart "$unit"
-  done
+  echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta, units activas."
 }
 
 wait_health() {
@@ -111,7 +116,7 @@ wait_health() {
     if curl -fsS -m 5 "$url" >/dev/null 2>&1; then
       return 0
     fi
-    [ "$i" -lt "$retries" ] && sleep "$sleep_s"
+    sleep "$sleep_s"
   done
   return 1
 }
