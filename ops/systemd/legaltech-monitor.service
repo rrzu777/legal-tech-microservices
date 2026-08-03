@@ -1,0 +1,29 @@
+[Unit]
+Description=LegalTech Critical Monitor
+After=network.target estrado-pjud.service
+PartOf=legaltech.slice
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/legaltech-monitoring
+ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/monitor.py
+
+# Heredar slice de alta prioridad
+Slice=legaltech.slice
+
+# Límites
+MemoryMax=512M
+CPUQuota=50%
+
+# Auto-restart
+Restart=always
+RestartSec=10
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=legaltech-monitor
+
+[Install]
+WantedBy=multi-user.target

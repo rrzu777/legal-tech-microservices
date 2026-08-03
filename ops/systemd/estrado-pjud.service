@@ -1,0 +1,36 @@
+[Unit]
+Description=Estrado PJUD Scraper Service (HIGH PRIORITY)
+After=network.target
+PartOf=legaltech.slice
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
+
+Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin
+EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
+
+ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+Slice=legaltech.slice
+
+MemoryMax=4294967296
+MemoryHigh=3221225472
+CPUQuota=200%
+CPUWeight=500
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=estrado-pjud
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/legal-tech-microservices/estrado-pjud-service
+
+[Install]
+WantedBy=multi-user.target
