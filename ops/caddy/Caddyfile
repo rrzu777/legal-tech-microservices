@@ -1,0 +1,20 @@
+# TLS delante de la API de Estrado (uvicorn en 127.0.0.1:8000).
+# Espejo de /etc/caddy/Caddyfile — lo instala ops/provision.sh, que recarga
+# caddy solo si esto cambió. Editar acá, nunca en /etc directo.
+#
+# El único vhost es el subdominio: un scanner que llega por IP pelada o con
+# otro Host no matchea ningún site y Caddy le corta la conexión sin que el
+# request toque Python. Hoy TODO el tráfico externo del puerto 8000 son
+# probes de scanners (medido 14 días de journal: cero hits legítimos, y dos
+# de esos probes sacaron 500 de /api/v1/search).
+#
+# El certificado es Let's Encrypt automático (HTTP-01 por el puerto 80), así
+# que el DNS de estrado.juristrack.cl tiene que apuntar DIRECTO al VPS:
+# Cloudflare en modo "DNS only" (nube gris) — detrás del proxy naranja el
+# desafío no llega y la emisión falla. Renovación automática ~30 días antes
+# de vencer; no hay nada que operar.
+#
+# Cutover completo (quién hace qué y en qué orden): ops/caddy/README.md.
+estrado.juristrack.cl {
+	reverse_proxy 127.0.0.1:8000
+}

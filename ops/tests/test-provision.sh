@@ -45,16 +45,24 @@ setup() { # setup <nombre> — repo falso completo y sano
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
+  # caddy: espejo del Caddyfile en el repo falso, binario stub y destino propio
+  cp -R "$OPS_DIR/caddy" "$REPO/ops/caddy"
+  CADDYF="$base/caddy-etc/Caddyfile"
+  CADDY_BIN="$base/caddy-stub"
+  printf '#!/bin/bash\nexit 0\n' > "$CADDY_BIN"
+  chmod +x "$CADDY_BIN"
 }
 
 run_prov() {
   OUT=$(PROV_REPO_DIR="$REPO" PROV_SYSTEMD_DIR="$SYSD" PROV_SYSTEMCTL="$SYSCTL" \
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
-        PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" bash "$PROV" 2>&1)
+        PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
+        PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
 }
 
 reloads() { grep -c '^daemon-reload' "$LOG_SYSCTL" || true; }
+caddy_reloads() { grep -c '^reload caddy' "$LOG_SYSCTL" || true; }
 
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
@@ -83,6 +91,40 @@ if cmp -s "$REPO/ops/systemd/estrado-pjud.service" "$SYSD/estrado-pjud.service";
 else
   bad "el destino quedó con el drift"
 fi
+
+echo "== caddy: Caddyfile instalado y recargado en la primera corrida"
+setup caddyfresh; run_prov
+expect_eq "exit 0" "$RC" "0"
+if cmp -s "$REPO/ops/caddy/Caddyfile" "$CADDYF"; then
+  ok "el destino es el del repo"
+else
+  bad "el destino no es el del repo"
+fi
+expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
+run_prov
+expect_eq "idempotente: sigue habiendo una sola recarga" "$(caddy_reloads)" "1"
+
+echo "== caddy: Caddyfile editado a mano en el destino se pisa y recarga"
+echo "# drift manual" >> "$CADDYF"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_eq "segunda recarga por el drift" "$(caddy_reloads)" "2"
+if cmp -s "$REPO/ops/caddy/Caddyfile" "$CADDYF"; then
+  ok "el destino volvió a ser el del repo"
+else
+  bad "el destino quedó con el drift"
+fi
+
+echo "== caddy: binario ausente = receta y exit 1"
+setup nocaddy; rm "$CADDY_BIN"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "receta" "$OUT" "apt-get install caddy"
+expect_eq "sin binario no se recarga nada" "$(caddy_reloads)" "0"
+
+echo "== caddy: Caddyfile ausente del repo = checkout a medias, aborta"
+setup nocaddyfile; rm "$REPO/ops/caddy/Caddyfile"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "aborta con causa" "$OUT" "ABORTA"
 
 echo "== .env incompleto: nombra lo que falta, JAMÁS un valor, exit 1"
 setup envgap
