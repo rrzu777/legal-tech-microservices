@@ -5,7 +5,7 @@ from collections import deque
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
-from app.failure_kind import NoUsableBundleError
+from app.failure_kind import NoUsableBundleError, new_egress_may_help
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -56,25 +56,53 @@ class APISessionPool:
 
         # No valid session available — create outside the lock to avoid blocking
         logger.info("Creating new API session")
-        bundle = self._pick_bundle()
-        if bundle is None and self._proxy_mode:
+        utilizables = self._usable_bundles()
+        if not utilizables and self._proxy_mode:
             # Sin bundle con proxy NO se sale — ver `NoUsableBundleError`.
             raise NoUsableBundleError(
                 "no hay bundle F5 con proxy residencial (el worker no minteo)"
             )
-        adapter = OJVHttpAdapter(
-            self._settings,
-            proxy=bundle.proxy_url if bundle else None,
-            user_agent=bundle.user_agent if bundle else None,
-            cookies=bundle.cookies if bundle else None,
-        )
-        session = OJVSession(adapter)
-        try:
-            await session.initialize()
-        except Exception:
-            await session.close()
-            raise
-        return session
+
+        # Un intento por bundle: como `_rotate` avanza el round-robin, cada
+        # vuelta sale por una IP residencial distinta, y en `len(utilizables)`
+        # vueltas se probaron todas sin repetir ninguna.
+        #
+        # Que hiciera UN intento y devolviera 500 es la otra mitad del incidente:
+        # el worker, con estos MISMOS bundles, reintenta hasta `MINT_MAX_RETRIES`
+        # veces con IP nueva, y por eso juntó ~50 sesiones sanas en 10 dias
+        # mientras 3 de los 4 `/api/v1/search` autenticados se caian. Misma tasa
+        # de fallo por intento; lo que cambiaba era el segundo intento.
+        #
+        # En modo legacy no hay bundles y se sale por la IP del host: un solo
+        # intento, porque reintentar por la misma IP no compra nada.
+        intentos = max(1, len(utilizables))
+        for intento in range(1, intentos + 1):
+            bundle = self._rotate(utilizables)
+            adapter = OJVHttpAdapter(
+                self._settings,
+                proxy=bundle.proxy_url if bundle else None,
+                user_agent=bundle.user_agent if bundle else None,
+                cookies=bundle.cookies if bundle else None,
+            )
+            session = OJVSession(adapter)
+            try:
+                await session.initialize()
+                return session
+            except Exception as e:
+                await session.close()
+                if intento >= intentos or not new_egress_may_help(e):
+                    # `raise` pelado: preserva la excepción y su traceback, que
+                    # es lo que `acquire_or_alert` clasifica y loguea.
+                    raise
+                logger.warning(
+                    "Sesión API fallida por este bundle (intento %d/%d: %s: %s); "
+                    "reintento por otra IP residencial",
+                    intento, intentos, type(e).__name__, e,
+                )
+
+        # Inalcanzable: el for sale por `return` o por `raise`. Está para que un
+        # refactor que rompa esa invariante falle acá y no devolviendo None.
+        raise AssertionError("acquire() salió del loop sin sesión ni excepción")
 
     def _usable(self, bundle: CookieBundle) -> bool:
         """¿Con este bundle se puede salir a la calle?
@@ -124,9 +152,21 @@ class APISessionPool:
         invitación a salir sin proxy: `acquire()` lo convierte en
         `NoUsableBundleError`.
         """
-        # `sorted` sobre los items conserva el orden por slot id, que es lo que
-        # hace estable el round-robin.
-        utilizables = [b for _, b in sorted(self._store.load_all().items()) if self._usable(b)]
+        return self._rotate(self._usable_bundles())
+
+    def _usable_bundles(self) -> list[CookieBundle]:
+        """Los bundles del store con los que sí se puede salir, por slot.
+
+        `sorted` sobre los items conserva el orden por slot id, que es lo que
+        hace estable el round-robin. Separado de `_rotate` porque `acquire()`
+        necesita la LISTA —para saber cuántos intentos le quedan— y no sólo el
+        próximo; leer el store una vez por intento sería releer el archivo en el
+        camino caliente para obtener lo mismo.
+        """
+        return [b for _, b in sorted(self._store.load_all().items()) if self._usable(b)]
+
+    def _rotate(self, utilizables: list[CookieBundle]) -> CookieBundle | None:
+        """El próximo bundle del round-robin, o None si la lista está vacía."""
         if not utilizables:
             return None
         elegido = utilizables[self._rr_index % len(utilizables)]
