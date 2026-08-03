@@ -66,7 +66,15 @@ main() {
   # rollback llegara a fallar por deps, es intervención manual igual.
   if ! git diff --quiet "$prev"..HEAD -- estrado-pjud-service/requirements.txt; then
     echo "==> requirements.txt cambió: pip install"
-    "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"
+    # Guardado: sin esto, un pip fallido (red, conflicto de versiones) moría
+    # por set -e con HEAD ya avanzado, y la corrida siguiente veía
+    # HEAD == origin/main y decía "Ya al día" sin haber desplegado nada.
+    # Con el reset, reintentar el deploy es simplemente volver a correrlo.
+    if ! "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"; then
+      echo "PIP FALLÓ: código de vuelta a $prev; los servicios no se tocaron." >&2
+      git reset --hard "$prev"
+      exit 1
+    fi
   fi
 
   echo "==> pytest en el VPS"
@@ -76,18 +84,15 @@ main() {
     exit 1
   fi
 
-  "$systemctl_bin" restart "${services[@]}"
+  # El restart también va guardado: puede fallar él mismo (ExecStartPre, env
+  # que falta, StartLimitBurst ya gastado) y con set -e eso se salteaba el
+  # rollback entero — justo la red de seguridad que este script promete.
+  if ! "$systemctl_bin" restart "${services[@]}"; then
+    rollback_and_exit "systemctl restart FALLÓ"
+  fi
 
   if ! wait_health "$health_url" "$health_retries" "$health_sleep"; then
-    echo "HEALTH FALLÓ tras el restart: rollback a $prev" >&2
-    git reset --hard "$prev"
-    "$systemctl_bin" restart "${services[@]}"
-    if wait_health "$health_url" "$health_retries" "$health_sleep"; then
-      echo "Rollback OK: el VPS quedó en $prev y sano. El deploy NO entró." >&2
-    else
-      echo "El rollback TAMPOCO sana — intervención manual YA (journalctl -u ${services[0]})" >&2
-    fi
-    exit 1
+    rollback_and_exit "HEALTH FALLÓ tras el restart"
   fi
 
   local unit
@@ -108,6 +113,21 @@ main() {
   fi
 
   echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta, units activas."
+}
+
+# Lee los locals de main() (scoping dinámico de bash): prev, systemctl_bin,
+# services, health_*. Deja el código en $prev e intenta revivir los servicios;
+# si ni el restart ni el health del rollback sanan, lo dice y pide manos.
+rollback_and_exit() { # rollback_and_exit <motivo>
+  echo "$1: rollback a $prev" >&2
+  git reset --hard "$prev"
+  if "$systemctl_bin" restart "${services[@]}" \
+    && wait_health "$health_url" "$health_retries" "$health_sleep"; then
+    echo "Rollback OK: el VPS quedó en $prev y sano. El deploy NO entró." >&2
+  else
+    echo "El rollback TAMPOCO sana — intervención manual YA (journalctl -u ${services[0]})" >&2
+  fi
+  exit 1
 }
 
 wait_health() {

@@ -60,8 +60,8 @@ setup() { # setup <nombre> — deja ORIGIN, REPO, LOG_SYSCTL, LOG_PIP, SYSCTL
   local venv="$REPO/estrado-pjud-service/.venv/bin"
   mkdir -p "$venv"
   printf '#!/bin/bash\nexit "${FAKE_PYTEST_EXIT:-0}"\n' > "$venv/python"
-  printf '#!/bin/bash\necho "$@" >> "%s"\n' "$LOG_PIP" > "$venv/pip"
-  printf '#!/bin/bash\necho "$@" >> "%s"\nexit 0\n' "$LOG_SYSCTL" > "$base/systemctl"
+  printf '#!/bin/bash\necho "$@" >> "%s"\nexit "${FAKE_PIP_EXIT:-0}"\n' "$LOG_PIP" > "$venv/pip"
+  printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = restart ]; then exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nexit 0\n' "$LOG_SYSCTL" > "$base/systemctl"
   chmod +x "$venv/python" "$venv/pip" "$base/systemctl"
   : > "$LOG_SYSCTL"; : > "$LOG_PIP"
   SYSCTL="$base/systemctl"
@@ -149,6 +149,28 @@ setup deps; avanza_origin estrado-pjud-service/requirements.txt; health_ok
 run_deploy
 expect_eq "exit 0" "$RC" "0"
 expect_contains "instaló deps" "$(cat "$LOG_PIP")" "install"
+
+echo "== pip falla: código vuelve, sin restarts, y el reintento sí entra"
+setup pipfail; avanza_origin estrado-pjud-service/requirements.txt; health_ok
+PREV=$(sha_repo)
+FAKE_PIP_EXIT=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo (sin esto la corrida siguiente diría Ya al día sin desplegar)" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "lo dice" "$OUT" "PIP FALLÓ"
+run_deploy
+expect_eq "el reintento despliega (exit 0)" "$RC" "0"
+expect_eq "y avanza HEAD" "$(sha_repo)" "$(sha_origin)"
+
+echo "== systemctl restart falla: rollback igual, con diagnóstico y no un stacktrace de set -e"
+setup restartfail; avanza_origin; health_ok
+PREV=$(sha_repo)
+FAKE_SYSTEMCTL_EXIT=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "intentó la ronda de ida y la de rollback" "$(restarts)" "2"
+expect_contains "nombra la causa" "$OUT" "systemctl restart FALLÓ"
+expect_contains "y pide manos porque el rollback tampoco levantó" "$OUT" "TAMPOCO sana"
 
 echo "== ops/cron cambió: el deploy avisa que lo instalado no se actualiza solo"
 setup cron; avanza_origin ops/cron/estrado-watchdog.sh; health_ok
