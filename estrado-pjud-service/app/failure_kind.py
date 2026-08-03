@@ -131,9 +131,9 @@ class MissingCsrfTokenError(Exception):
     también la búsqueda, que no tiene el problema.
 
     Desde `BlockedInitialPageError`, esto significa SÓLO drift de regex: la otra
-    forma de quedarse sin token —que la página fuera un challenge— ahora se corta
-    en `initialize()`. Por eso el veredicto de `slot_still_healthy` es opuesto
-    para las dos: acá el re-mint no puede corregir nada, allá es la corrección.
+    forma de quedarse sin token —que la página fuera un challenge— se corta antes,
+    en `initialize()`. El veredicto opuesto que eso les da está en
+    `slot_still_healthy`, que es donde se decide.
     """
 
 
@@ -176,6 +176,13 @@ def new_egress_may_help(e: BaseException) -> bool:
     devolvía 500. El worker, con los mismos bundles, reintenta hasta
     `MINT_MAX_RETRIES` veces con IP nueva — y ésa es toda la diferencia entre sus
     ~50 sesiones sanas en 10 días y los 3 de 4 `/api/v1/search` que se cayeron.
+
+    ⚠️ Hoy la regla la obedece UN solo loop. `worker/session_pool.py::_mint_slot`
+    reintenta sobre un `except Exception` pelado, así que un 5xx de OJV durante
+    el minteo le quema `MINT_MAX_RETRIES` IPs para cobrar el mismo no — que es
+    justo lo que esto dice que no hay que hacer. Es preexistente y cambiarlo
+    merece su propia medición; queda anotado para que nadie lea este predicado
+    como si ya rigiera en los dos lados.
     """
     return classify_exception(e) == "infra" and not slot_still_healthy(e)
 

@@ -17,35 +17,13 @@ import pytest
 
 from app.failure_kind import MissingCsrfTokenError, slot_still_healthy
 from app.session import OJVSession
+from tests.helpers import AdapterQueGraba
 from tests.test_engine import _make_case, _mock_search_response
-
-
-class _AdapterQueGraba:
-    """Graba cada POST y devuelve una respuesta real de httpx.
-
-    Graba en vez de levantar a propósito: afirmar por ausencia
-    (`assert adapter.posts == []`) es lo que impide que el día que alguien saque
-    la guardia el test siga pasando. Un fake que levanta `AssertionError` sale
-    por el `pytest.raises` y deja el assert inalcanzable. Misma convención que
-    `test_pool_sin_proxy.py`.
-    """
-
-    def __init__(self, cuerpo=b"<html>ok</html>"):
-        self._cuerpo = cuerpo
-        self.posts = []
-
-    async def post(self, path, **kwargs):
-        self.posts.append((path, kwargs))
-        # `httpx.Response` de verdad, no un stub: así el test de control ejerce
-        # el `raise_for_status()` y el `_decode()` reales de `detail()`.
-        return httpx.Response(
-            200, content=self._cuerpo, request=httpx.Request("POST", "https://ojv.test")
-        )
 
 
 @pytest.mark.parametrize("token", [None, ""], ids=["None", "cadena-vacia"])
 async def test_detail_sin_token_no_sale_a_la_calle(token):
-    adapter = _AdapterQueGraba()
+    adapter = AdapterQueGraba()
     session = OJVSession(adapter)
     session.csrf_token = token
 
@@ -57,7 +35,7 @@ async def test_detail_sin_token_no_sale_a_la_calle(token):
 
 async def test_detail_con_token_manda_el_token_en_el_cuerpo():
     """Control: con token sí sale, y el token viaja donde OJV lo espera."""
-    adapter = _AdapterQueGraba()
+    adapter = AdapterQueGraba()
     session = OJVSession(adapter)
     session.csrf_token = "a" * 32
 

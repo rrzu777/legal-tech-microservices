@@ -17,53 +17,15 @@ re-mintea cuando procesa causas, habria fabricado la caida que decia prevenir.
 """
 
 import asyncio
-from unittest.mock import MagicMock
-
 import pytest
 
-from app.cookie_store import CookieBundle
 from app.failure_kind import NoUsableBundleError
-from tests.helpers import FakeOJVSession, api_settings
-
-
-def _pool(monkeypatch, bundles, *, proxy="http://u:p@residencial:9000"):
-    """Pool con el store mockeado y el adapter/session falsos.
-
-    Devuelve (pool, capturados); `capturados` acumula los kwargs con los que se
-    construyo el adapter — que es donde se ve si salio con proxy o sin el.
-    """
-    from app import session_pool as sp
-    from app.session_pool import APISessionPool
-
-    pool = APISessionPool(api_settings(proxy=proxy))
-    pool._store = MagicMock()
-    pool._store.load_all.return_value = bundles
-
-    capturados = []
-
-    def fake_adapter(s, proxy=None, user_agent=None, cookies=None):
-        capturados.append({"proxy": proxy, "user_agent": user_agent, "cookies": cookies})
-        return MagicMock()
-
-    monkeypatch.setattr(sp, "OJVHttpAdapter", fake_adapter)
-    monkeypatch.setattr(sp, "OJVSession", FakeOJVSession)
-    return pool, capturados
-
-
-def _bundle(tag, *, proxy_url="http://u:p@sticky:1"):
-    import time
-
-    return CookieBundle(
-        cookies={"TSPD_101": f"tok-{tag}"},
-        user_agent=f"UA-{tag}",
-        saved_at=time.time(),
-        proxy_url=proxy_url,
-    )
+from tests.helpers import cookie_bundle, pool_con_store
 
 
 class TestNuncaSalirSinProxy:
     def test_con_proxy_configurado_y_store_vacio_no_sale_a_la_calle(self, monkeypatch):
-        pool, capturados = _pool(monkeypatch, {})
+        pool, capturados = pool_con_store(monkeypatch, {})
 
         with pytest.raises(NoUsableBundleError):
             asyncio.run(pool.acquire())
@@ -79,7 +41,7 @@ class TestNuncaSalirSinProxy:
         # por un worker que corrio sin OJV_PROXY_URL. Ese bundle pasaba el filtro,
         # `acquire()` no lo veia como None, y el adapter salia con proxy=None —
         # o sea por la IP del datacenter, con cookies y todo.
-        pool, capturados = _pool(monkeypatch, {"0": _bundle("sin-proxy", proxy_url=None)})
+        pool, capturados = pool_con_store(monkeypatch, {"0": cookie_bundle("sin-proxy", proxy_url=None)})
 
         with pytest.raises(NoUsableBundleError):
             asyncio.run(pool.acquire())
@@ -88,7 +50,7 @@ class TestNuncaSalirSinProxy:
     def test_un_proxy_url_vacio_tampoco_sirve(self, monkeypatch):
         # `""` es tan inservible como `None` y egresa igual por la IP del
         # datacenter, pero pasa un chequeo escrito como `is not None`.
-        pool, capturados = _pool(monkeypatch, {"0": _bundle("vacio", proxy_url="")})
+        pool, capturados = pool_con_store(monkeypatch, {"0": cookie_bundle("vacio", proxy_url="")})
 
         with pytest.raises(NoUsableBundleError):
             asyncio.run(pool.acquire())
@@ -97,12 +59,12 @@ class TestNuncaSalirSinProxy:
     def test_saltea_el_inutilizable_y_se_queda_con_el_bueno(self, monkeypatch):
         # El descarte va ANTES del round-robin: rotar sobre todos entregaba el
         # inutilizable una de cada N veces, o sea un fallo intermitente.
-        pool, _ = _pool(
+        pool, _ = pool_con_store(
             monkeypatch,
             {
-                "0": _bundle("malo0", proxy_url=None),
-                "1": _bundle("bueno"),
-                "2": _bundle("malo2", proxy_url=None),
+                "0": cookie_bundle("malo0", proxy_url=None),
+                "1": cookie_bundle("bueno"),
+                "2": cookie_bundle("malo2", proxy_url=None),
             },
         )
         for _ in range(6):
@@ -116,12 +78,12 @@ class TestNuncaSalirSinProxy:
         # utilizables y uno inservible en el medio, así que se ve que el
         # round-robin sigue repartiendo el egreso entre las IPs residenciales
         # —que es para lo que existe— y no colapsó al filtrar.
-        pool, _ = _pool(
+        pool, _ = pool_con_store(
             monkeypatch,
             {
-                "0": _bundle("a", proxy_url="http://u:p@sticky-a:1"),
-                "1": _bundle("malo", proxy_url=None),
-                "2": _bundle("b", proxy_url="http://u:p@sticky-b:1"),
+                "0": cookie_bundle("a", proxy_url="http://u:p@sticky-a:1"),
+                "1": cookie_bundle("malo", proxy_url=None),
+                "2": cookie_bundle("b", proxy_url="http://u:p@sticky-b:1"),
             },
         )
         elegidos = [pool._pick_bundle().proxy_url for _ in range(4)]
@@ -135,7 +97,7 @@ class TestNuncaSalirSinProxy:
     def test_sin_proxy_configurado_se_conserva_el_modo_legacy(self, monkeypatch):
         # Deploy sin OJV_PROXY_URL: salir directo es el comportamiento previsto,
         # no un fallback. Sin esta rama el fix tumbaria ese modo entero.
-        pool, capturados = _pool(monkeypatch, {}, proxy=None)
+        pool, capturados = pool_con_store(monkeypatch, {}, proxy=None)
 
         asyncio.run(pool.acquire())
 
@@ -145,7 +107,7 @@ class TestNuncaSalirSinProxy:
     def test_un_bundle_con_proxy_si_se_usa(self, monkeypatch):
         # El control. Sin esto, "nunca entrega nada" pasaria todos los tests de
         # arriba y el pool quedaria inutilizado sin que nada avise.
-        pool, capturados = _pool(monkeypatch, {"0": _bundle("bueno")})
+        pool, capturados = pool_con_store(monkeypatch, {"0": cookie_bundle("bueno")})
 
         asyncio.run(pool.acquire())
 

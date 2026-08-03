@@ -1,14 +1,31 @@
 import asyncio
 import logging
+import time
 from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
 from app.failure_kind import NoUsableBundleError, new_egress_may_help
+from app.metrics import api_metrics
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
+
+#: Cuánto tiempo puede gastar `acquire()` antes de dejar de EMPEZAR reintentos.
+#:
+#: No es un timeout: no cancela el intento en curso, sólo decide si vale la pena
+#: arrancar el siguiente. Cancelar a mitad de un `initialize()` dejaría la sesión
+#: colgada, y el corte por adentro ya lo pone `httpx.Timeout(30.0)` del adapter.
+#:
+#: Existe porque el reintento vive en el camino de una request HTTP con un
+#: abogado esperando, no en un job de fondo como el del worker. `ReadTimeout` y
+#: `ConnectTimeout` pasan el filtro de `new_egress_may_help` —y hacen bien, otra
+#: IP puede andar—, pero son justo los lentos: 3 bundles x (GET + POST) x 30 s
+#: son hasta 3 minutos donde antes se fallaba en 60. Con este presupuesto, un
+#: primer intento que se cuelga los 30 s ya no arranca un segundo, y uno que
+#: falla rápido —el challenge cortó en ~3 s— deja lugar para los otros bundles.
+_RETRY_BUDGET_S = 20.0
 
 
 class APISessionPool:
@@ -76,6 +93,7 @@ class APISessionPool:
         # En modo legacy no hay bundles y se sale por la IP del host: un solo
         # intento, porque reintentar por la misma IP no compra nada.
         intentos = max(1, len(utilizables))
+        limite = time.monotonic() + _RETRY_BUDGET_S
         for intento in range(1, intentos + 1):
             bundle = self._rotate(utilizables)
             adapter = OJVHttpAdapter(
@@ -90,19 +108,21 @@ class APISessionPool:
                 return session
             except Exception as e:
                 await session.close()
-                if intento >= intentos or not new_egress_may_help(e):
+                agotado = time.monotonic() >= limite
+                if intento >= intentos or agotado or not new_egress_may_help(e):
                     # `raise` pelado: preserva la excepción y su traceback, que
                     # es lo que `acquire_or_alert` clasifica y loguea.
                     raise
+                # Antes del reintento, no después: si el proceso se cae en la
+                # vuelta siguiente, el bundle quemado igual quedó contado.
+                api_metrics.record_bundle_retry()
                 logger.warning(
                     "Sesión API fallida por este bundle (intento %d/%d: %s: %s); "
                     "reintento por otra IP residencial",
                     intento, intentos, type(e).__name__, e,
                 )
 
-        # Inalcanzable: el for sale por `return` o por `raise`. Está para que un
-        # refactor que rompa esa invariante falle acá y no devolviendo None.
-        raise AssertionError("acquire() salió del loop sin sesión ni excepción")
+        raise RuntimeError("unreachable")  # el loop retorna o re-lanza
 
     def _usable(self, bundle: CookieBundle) -> bool:
         """¿Con este bundle se puede salir a la calle?
