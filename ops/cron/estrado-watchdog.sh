@@ -342,6 +342,44 @@ else
 fi
 rm -f "$API_BODY"
 
+# 10. Drift del crontab de root contra ops/cron/crontab.snapshot.
+#     `deploy-cron.sh` instala los SCRIPTS pero NO escribe el crontab — es una
+#     decisión (nunca pisar en automático lo que agenda a root), y su precio es
+#     que mergear un cambio del snapshot no cambia nada en el VPS. Ya pasó: el
+#     propio snapshot se mergeó con líneas nuevas y hubo que acordarse de
+#     instalarlo a mano. Este chequeo convierte ese "acordarse" en alerta.
+#
+#     Se comparan solo las líneas EJECUTABLES (fuera comentarios y blancos, y
+#     el espaciado normalizado): un comentario nuevo en el snapshot no es
+#     drift. Se avisa una vez por drift DISTINTO (la firma lleva el hash del
+#     diff): el mismo drift no repite cada 3h, pero si cambia —o se arregla y
+#     recae— vuelve a avisar. `nuevas_claves` se llama también con el drift
+#     resuelto, para que la resolución limpie el estado; ver el chequeo 9.
+CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-/opt/legal-tech-microservices/ops/cron/crontab.snapshot}"
+lineas_ejecutables() { grep -vE '^[[:space:]]*(#|$)' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | sort; }
+if [ ! -r "$CRONTAB_SNAPSHOT" ]; then
+  add "No puedo leer $CRONTAB_SNAPSHOT — el chequeo de drift del crontab queda ciego." "crontab-snapshot-missing"
+else
+  if [ -n "${WD_CRONTAB_LIVE_FILE:-}" ]; then
+    CRON_VIVO=$(lineas_ejecutables < "$WD_CRONTAB_LIVE_FILE")
+  else
+    CRON_VIVO=$(crontab -l 2>/dev/null | lineas_ejecutables)
+  fi
+  CRON_ESPERADO=$(lineas_ejecutables < "$CRONTAB_SNAPSHOT")
+  if [ "$CRON_VIVO" != "$CRON_ESPERADO" ]; then
+    # `< ` = está en el snapshot y falta en el VPS; `> ` = corre en el VPS y el
+    # snapshot no lo conoce. Las dos direcciones importan: la primera es un
+    # deploy a medias, la segunda es un cron fantasma sin historia en git.
+    CRON_DRIFT=$(diff <(printf '%s\n' "$CRON_ESPERADO") <(printf '%s\n' "$CRON_VIVO") | grep -E '^[<>]' | head -12 || true)
+    DRIFT_HASH=$(printf '%s' "$CRON_DRIFT" | md5sum | cut -c1-8)
+    NUEVO_DRIFT=$(nuevas_claves crontab-drift "drift:$DRIFT_HASH")
+    [ -n "${NUEVO_DRIFT// }" ] && add "El crontab de root NO coincide con ops/cron/crontab.snapshot (< falta en el VPS, > sobra en el VPS):"$'\n'"$CRON_DRIFT"$'\n'"    Si el snapshot es el correcto: revisar las líneas > y luego \`crontab /opt/legal-tech-microservices/ops/cron/crontab.snapshot\`. Si el VPS es el correcto: actualizar el snapshot en git." "crontab-drift:$DRIFT_HASH"
+  else
+    # Drift resuelto: limpiar el estado para que una recaída vuelva a avisar.
+    nuevas_claves crontab-drift "" >/dev/null
+  fi
+fi
+
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
 
