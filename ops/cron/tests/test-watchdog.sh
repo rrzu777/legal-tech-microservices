@@ -260,6 +260,11 @@ echo "== chequeo 10: snapshot ilegible =="
 OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-no-existe" run "$BASE")
 expect_contains "snapshot ilegible: avisa la ceguera" "$OUT" "crontab-snapshot-missing"
 
+echo "== chequeo 10: crontab vivo ilegible no es drift =="
+OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-vivo-no-existe" run "$BASE")
+expect_contains "leer y fallar se avisa como fallo" "$OUT" "crontab-live-unreadable"
+expect_missing "y NO se disfraza de drift"          "$OUT" "crontab-drift"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
