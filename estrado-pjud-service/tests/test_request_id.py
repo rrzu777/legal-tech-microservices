@@ -7,10 +7,9 @@ logs de Vercel con el journal a mano por timestamp. Lo que se pinnea acá:
 - header ausente o inválido → se acuña uno (el request necesita identidad
   igual), y el inválido JAMÁS llega al log: va derecho a la línea de journal
   y un valor con \\n inyectaría entradas falsas
-- el rid vuelve en la respuesta y está disponible vía contextvar DENTRO del
-  request (que es lo que el filter estampa en cada línea)
-- fuera de un request el contextvar vuelve a "-" (los logs del arranque no
-  heredan el rid del último request atendido)
+- el rid vuelve en la respuesta, está en el contextvar DENTRO del request
+  (que es lo que el filter estampa en cada línea), y se limpia al salir
+- create_app() REAL registra el middleware (mini-app no basta para eso)
 """
 
 import logging
@@ -19,15 +18,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.request_id import (
+    LOG_FORMAT,
     REQUEST_ID_HEADER,
     RequestIdFilter,
+    RequestIdMiddleware,
     normalize_request_id,
-    request_id_middleware,
     request_id_var,
 )
 
 app = FastAPI()
-app.middleware("http")(request_id_middleware)
+
+logged = logging.getLogger("app.test_request_id")
 
 
 @app.get("/echo")
@@ -35,6 +36,13 @@ async def echo():
     return {"rid": request_id_var.get()}
 
 
+@app.get("/loguea")
+async def loguea():
+    logged.info("adentro")
+    return {}
+
+
+app.add_middleware(RequestIdMiddleware)
 client = TestClient(app)
 
 
@@ -73,12 +81,39 @@ class TestMiddleware:
         client.get("/echo", headers={REQUEST_ID_HEADER: "rid-que-no-debe-quedar"})
         assert request_id_var.get() == "-"
 
+    def test_una_capa_asgi_exterior_no_ve_el_rid_tras_la_respuesta(self):
+        # El observador real del reset: una capa ASGI MÁS exterior corre en la
+        # misma task (el middleware es ASGI puro, sin task por capa), así que
+        # su código post-respuesta vería el rid del request sin el finally.
+        visto: dict[str, str] = {}
+
+        class Sonda:
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                await self.app(scope, receive, send)
+                visto["despues"] = request_id_var.get()
+
+        exterior = FastAPI()
+
+        @exterior.get("/x")
+        async def x():
+            return {"rid": request_id_var.get()}
+
+        exterior.add_middleware(RequestIdMiddleware)
+        exterior.add_middleware(Sonda)  # agregado después = más exterior
+
+        resp = TestClient(exterior).get("/x", headers={REQUEST_ID_HEADER: "rid-interior-1"})
+        assert resp.json()["rid"] == "rid-interior-1"  # adentro sí se vio
+        assert visto["despues"] == "-"  # afuera ya no
+
 
 class TestCableado:
     """Contra create_app() REAL: que el middleware esté registrado de verdad.
 
     Los tests de arriba usan una mini-app; si alguien borrara la línea de
-    app.middleware() en main.py, seguirían verdes. Éste no.
+    add_middleware en main.py, seguirían verdes. Éste no.
     """
 
     def test_health_devuelve_el_request_id(self, monkeypatch):
@@ -105,36 +140,24 @@ class TestFilter:
             request_id_var.reset(token)
         assert record.rid == "rid-en-curso-123"
 
-    def test_fuera_de_request_el_record_lleva_guion(self):
-        record = logging.LogRecord("app.x", logging.INFO, "f.py", 1, "msg", None, None)
-        RequestIdFilter().filter(record)
-        assert record.rid == "-"
-
     def test_el_formato_del_main_renderiza(self):
-        # El format de create_app usa %(rid)s: si el filter no corriera, el
-        # handler explotaría con KeyError en cada línea. Se prueba el par.
+        # LOG_FORMAT usa %(rid)s: si el filter no corriera, el handler
+        # explotaría con KeyError en cada línea. Se prueba el par real
+        # (el formato se importa, no se copia — copiado seguiría verde
+        # aunque el de producción driftara).
         record = logging.LogRecord("app.x", logging.INFO, "f.py", 1, "hola", None, None)
         RequestIdFilter().filter(record)
-        out = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s [rid=%(rid)s]: %(message)s"
-        ).format(record)
+        out = logging.Formatter(LOG_FORMAT).format(record)
         assert "[rid=-]: hola" in out
 
     def test_una_linea_emitida_dentro_del_request_lleva_el_rid(self, caplog):
-        caplog.handler.addFilter(RequestIdFilter())
-
-        logged = logging.getLogger("app.test_request_id")
-
-        @app.get("/loguea")
-        async def loguea():
-            logged.info("adentro")
-            return {}
-
+        filtro = RequestIdFilter()
+        caplog.handler.addFilter(filtro)
         try:
             with caplog.at_level(logging.INFO, logger="app.test_request_id"):
                 client.get("/loguea", headers={REQUEST_ID_HEADER: "rid-visible-en-log"})
         finally:
-            caplog.handler.removeFilter(caplog.handler.filters[-1])
+            caplog.handler.removeFilter(filtro)
 
         rids = [r.rid for r in caplog.records if r.name == "app.test_request_id"]
         assert rids == ["rid-visible-en-log"]
