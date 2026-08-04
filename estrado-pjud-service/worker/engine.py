@@ -421,8 +421,16 @@ class SyncEngine:
             if session:
                 await self._pool.release(session, healthy=session_healthy)
 
-    async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
-        """Fetch decrypted credential from Vercel internal endpoint."""
+    async def _call_app_internal(
+        self, method: str, path: str, what: str
+    ) -> httpx.Response | None:
+        """Una request a la API interna de la app, o `None` si no salio.
+
+        La configuracion y el bearer son propiedad del cliente, no de cada
+        endpoint: esta es la superficie por donde viaja todo hecho de credencial
+        entre los dos servicios, y cuando eran dos copias ya trataban distinto un
+        no-200. `what` es solo para el log.
+        """
         url = self._config.VERCEL_APP_URL
         key = self._config.INTERNAL_CREDENTIALS_API_KEY
         if not url or not key:
@@ -430,17 +438,42 @@ class SyncEngine:
             return None
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{url}/api/internal/credentials/{credential_id}/decrypt",
-                    headers={"Authorization": f"Bearer {key}"},
+                resp = await client.request(
+                    method, f"{url}{path}", headers={"Authorization": f"Bearer {key}"}
                 )
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("Decrypt endpoint returned %d for credential %s", resp.status_code, credential_id)
-            return None
+            if resp.status_code != 200:
+                logger.warning("%s returned %d (%s)", what, resp.status_code, path)
+            return resp
         except Exception:
-            logger.exception("Failed to fetch decrypted credential %s", credential_id)
+            logger.exception("%s failed (%s)", what, path)
             return None
+
+    async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
+        """Fetch decrypted credential from Vercel internal endpoint."""
+        resp = await self._call_app_internal(
+            "GET", f"/api/internal/credentials/{credential_id}/decrypt", "Decrypt endpoint"
+        )
+        return resp.json() if resp is not None and resp.status_code == 200 else None
+
+    async def _report_invalid_credential(self, credential_id: str) -> None:
+        """Tell the app that OJV rejected this credential.
+
+        El worker es el que ve el veredicto y el unico que puede reportarlo: la
+        app no reintenta la causa (queda `suspended`, que es terminal), asi que
+        su propio camino no vuelve a pasar por aca nunca. Sin este aviso la
+        credencial se quedaba con badge verde "Activa" mientras N causas
+        quedaban suspendidas sin motivo visible.
+
+        No devuelve nada y no cambia el destino de la causa: la causa ya se
+        marco terminal antes de llamar. Un fallo de red aca no puede convertir
+        un veredicto en un reintento — por eso `_call_app_internal` se traga sus
+        propias excepciones.
+        """
+        await self._call_app_internal(
+            "POST",
+            f"/api/internal/credentials/{credential_id}/invalidate",
+            "Invalidate endpoint",
+        )
 
     async def _sync_familia_case(self, case: dict, sync_run_id: str | None, started_at: datetime) -> dict:
         credential_id = case.get("ojv_credential_id")
@@ -494,6 +527,10 @@ class SyncEngine:
                             # la IP está sana, se libera healthy=True.
                             await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
                             await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
+                            # El veredicto va TAMBIEN a la credencial, no solo a
+                            # la causa: es lo que el abogado tiene que arreglar,
+                            # y la app no tiene otra forma de enterarse.
+                            await self._report_invalid_credential(credential_id)
                             return {"success": False, "new_movements": 0}
 
                         html = await session.search_familia(
