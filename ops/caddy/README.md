@@ -48,8 +48,23 @@ en cada deploy y un unit adelantado corta producción en el próximo deploy.
    dar `207.180.198.177`; si devuelve IPs de Cloudflare (104.x/172.x), el
    record quedó en nube naranja — ese es el diagnóstico instantáneo, sin
    esperar a ACME. Después `curl -s https://estrado.juristrack.cl/api/v1/health`
-   → 200 con JSON. Si da error de TLS, esperar ~1 min (Caddy reintenta la
-   emisión) y mirar `journalctl -u caddy`.
+   → 200 con JSON.
+
+   Si el TLS falla con `alert internal error`, Caddy no tiene certificado.
+   **Antes de sospechar del DNS, reiniciá caddy**: cada emisión fallida
+   agranda su backoff (1 h → 3 h → 6 h…), así que si el A record se creó
+   *después* de que Caddy ya intentó —el caso normal, porque el paso 2 va
+   antes que el 3— el próximo intento puede estar a horas de distancia y el
+   dominio se ve roto con el DNS ya correcto. `systemctl restart caddy`
+   resetea el contador y emite en segundos. El journal lo dice literal:
+   `"msg":"will retry" … "retrying_in":21600`. Esperar "~1 min" es falso y
+   costó una sesión de diagnóstico.
+
+   ⚠️ El emisor de respaldo **no existe**: ZeroSSL contesta
+   `caddy_legacy_user_removed (code 2977)` a la pre-registración anónima, así
+   que la única fuente de certificados es Let's Encrypt. Si nos pega un rate
+   limit o se cae, no hay segundo camino; el arreglo sería configurar un EAB
+   de ZeroSSL, y no está hecho.
 5. **[usuario, Vercel]** `PJUD_SERVICE_BASE_URL=https://estrado.juristrack.cl`
    (sin puerto) + redeploy. Verificar un flujo real: crear/refrescar una causa.
 6. **[PR de cutover, después del paso 5]** Cambiar el unit
@@ -58,10 +73,18 @@ en cada deploy y un unit adelantado corta producción en el próximo deploy.
    (sin `--proxy-headers`, uvicorn loguea `127.0.0.1` como cliente de TODO
    request y se pierde la IP real que hoy sale en el journal — la medición de
    scanners de este mismo README salió de ahí), correr provision.sh +
-   `systemctl restart estrado-pjud`, y borrar las reglas ufw del 8000
-   (`ufw status numbered` → borrar las tres: Anywhere, v6 y la de Tailscale,
-   que queda muerta con el bind a localhost). Verificar que el health por
-   HTTPS sigue 200 y que `ss -tlnp` ya no muestra `0.0.0.0:8000`.
+   `systemctl restart estrado-pjud`, y borrar las tres reglas ufw del 8000
+   (la pública, su gemela v6, y la de Tailscale, que queda muerta con el bind
+   a localhost). **Borralas por especificación, no por número**: `ufw delete`
+   con un índice renumera todo lo que sigue, y la segunda borra pega en la
+   regla equivocada. Verificar que el health por HTTPS sigue 200 y que
+   `ss -lntp` ya no muestra `0.0.0.0:8000`.
+
+   La prueba que cierra el cutover no es el health por HTTPS —ese lo contesta
+   Caddy aunque Vercel siga apuntando a la IP vieja— sino que **la app llegue**
+   con el 8000 ya cerrado: disparar un sync real y ver subir `total_requests`
+   en `/api/v1/health`. Con el bind en localhost, ese contador solo puede
+   moverse por Caddy.
 
 ## Rollback
 

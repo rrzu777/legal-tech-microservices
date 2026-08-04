@@ -11,7 +11,18 @@ WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
 Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin
 EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
 
-ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Solo localhost: el único que entra es Caddy (443, TLS) — ops/caddy/README.md.
+#
+# Los dos flags de proxy son EXPLÍCITOS, no correctivos: uvicorn 0.41 ya trae
+# proxy_headers=True y forwarded_allow_ips resuelto a "127.0.0.1", así que sin
+# ellos el comportamiento sería el mismo. Van escritos porque de eso depende
+# que request.client.host sea la IP real del cliente y no la de Caddy, y de
+# ahí salen dos cosas: la clave del rate limiting (app/rate_limit.py usa
+# get_remote_address) y la IP que loguea el journal —el instrumento con el que
+# se midió que el 100% del tráfico externo del 8000 eran scanners—. El default
+# de forwarded_allow_ips además lo pisa la env FORWARDED_ALLOW_IPS, y este
+# unit carga un EnvironmentFile: escribirlo acá lo deja fuera de ese alcance.
+ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
 
 Slice=legaltech.slice
 
