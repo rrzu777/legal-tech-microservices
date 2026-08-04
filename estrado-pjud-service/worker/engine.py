@@ -442,6 +442,39 @@ class SyncEngine:
             logger.exception("Failed to fetch decrypted credential %s", credential_id)
             return None
 
+    async def _report_invalid_credential(self, credential_id: str) -> None:
+        """Tell the app that OJV rejected this credential.
+
+        El worker es el que ve el veredicto y el unico que puede reportarlo: la
+        app no reintenta la causa (queda `suspended`, que es terminal), asi que
+        su propio camino no vuelve a pasar por aca nunca. Sin este aviso la
+        credencial se quedaba con badge verde "Activa" mientras N causas
+        quedaban suspendidas sin motivo visible.
+
+        No devuelve nada y no cambia el destino de la causa: la causa ya se
+        marco terminal antes de llamar. Un fallo de red aca no puede convertir
+        un veredicto en un reintento.
+        """
+        url = self._config.VERCEL_APP_URL
+        key = self._config.INTERNAL_CREDENTIALS_API_KEY
+        if not url or not key:
+            logger.error("VERCEL_APP_URL or INTERNAL_CREDENTIALS_API_KEY not configured")
+            return
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{url}/api/internal/credentials/{credential_id}/invalidate",
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Invalidate endpoint returned %d for credential %s",
+                    resp.status_code,
+                    credential_id,
+                )
+        except Exception:
+            logger.exception("Failed to report invalid credential %s", credential_id)
+
     async def _sync_familia_case(self, case: dict, sync_run_id: str | None, started_at: datetime) -> dict:
         credential_id = case.get("ojv_credential_id")
         if not credential_id:
@@ -494,6 +527,10 @@ class SyncEngine:
                             # la IP está sana, se libera healthy=True.
                             await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
                             await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
+                            # El veredicto va TAMBIEN a la credencial, no solo a
+                            # la causa: es lo que el abogado tiene que arreglar,
+                            # y la app no tiene otra forma de enterarse.
+                            await self._report_invalid_credential(credential_id)
                             return {"success": False, "new_movements": 0}
 
                         html = await session.search_familia(

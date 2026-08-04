@@ -1,6 +1,7 @@
 """Control-flow de _sync_familia_case tras el rework: guard clave_unica,
 préstamo de bundle, y anti-apagón (block/timeout no penalizan)."""
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -15,7 +16,12 @@ def _bundle():
     return CookieBundle(cookies={"TSPD_101": "x"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
 
 
-def _make_engine(stub_update_error: bool = True, stub_terminal_error: bool = True):
+def _make_engine(
+    stub_update_error: bool = True,
+    stub_terminal_error: bool = True,
+    stub_report_invalid: bool = True,
+    config=None,
+):
     """Permite dejar reales los writers cuyo payload necesita inspeccionar el test."""
     from worker.engine import SyncEngine
     pool = MagicMock()
@@ -24,7 +30,7 @@ def _make_engine(stub_update_error: bool = True, stub_terminal_error: bool = Tru
     engine = SyncEngine(
         pool=pool, supabase=MagicMock(), notifier=MagicMock(),
         metrics=MagicMock(), backoff=MagicMock(),
-        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+        config=config or MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
     )
     engine._finish_run = AsyncMock()
     if stub_terminal_error:
@@ -32,6 +38,10 @@ def _make_engine(stub_update_error: bool = True, stub_terminal_error: bool = Tru
     engine._handle_blocked = AsyncMock()
     if stub_update_error:
         engine._update_case_error = AsyncMock()
+    # Por defecto stub: sale de la maquina. Un `MagicMock` de config da una URL
+    # truthy, asi que sin esto cada test del login pegaria de verdad.
+    if stub_report_invalid:
+        engine._report_invalid_credential = AsyncMock()
     return engine
 
 
@@ -151,8 +161,45 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
     assert result["success"] is False
     engine._terminal_error.assert_awaited_once()
     engine._handle_blocked.assert_not_awaited()
+    # El veredicto va tambien a la CREDENCIAL. Sin esto la causa quedaba
+    # suspendida y la credencial seguia con badge verde "Activa" en la app: el
+    # abogado veia N causas muertas y nada que le dijera que la contrasena era
+    # el problema. Y este es el unico camino que llega — la app no reintenta
+    # una causa `suspended`, asi que su propio cableado no vuelve a pasar.
+    engine._report_invalid_credential.assert_awaited_once_with("cred1")
     _, kwargs = engine._pool.release_familia_bundle.call_args
     assert kwargs.get("healthy") is True  # credencial inválida NO es culpa de la IP
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [FamiliaBlockedError("F5"), SessionError("no levanto la sesion")],
+    ids=["bloqueo_de_ojv", "caida_nuestra"],
+)
+async def test_solo_el_rechazo_reporta_la_credencial(monkeypatch, exc):
+    """El riesgo del cableado, del otro lado.
+
+    Reportar por cualquier falla del login le corta el sync a TODAS las causas
+    de esa credencial y le manda un mail al abogado pidiendole que cambie una
+    contrasena que esta bien. Un bundle F5 caido es nuestro, no suyo.
+    """
+    import worker.engine as eng
+
+    engine = _make_engine()
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
+    )
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(side_effect=exc)
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    await engine._sync_familia_case(_CASE, None, MagicMock())
+
+    engine._report_invalid_credential.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -242,3 +289,66 @@ async def test_el_error_familia_incrementa_el_contador_de_la_causa(monkeypatch, 
         f"Con la causa en 7 el error tiene que dejarla en 8, no en "
         f"{error_update['consecutive_sync_failures']}."
     )
+
+
+class TestReportInvalidCredential:
+    """El aviso a la app: es lo unico que convierte el veredicto en algo que el
+    abogado puede ver y arreglar."""
+
+    @staticmethod
+    def _engine(url="https://app.test", key="k"):
+        return _make_engine(
+            stub_report_invalid=False,
+            config=SimpleNamespace(
+                OJV_TIMEOUT_S=25,
+                R2_ENABLED=False,
+                VERCEL_APP_URL=url,
+                INTERNAL_CREDENTIALS_API_KEY=key,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_postea_a_la_ruta_interna_con_el_bearer(self):
+        engine = self._engine()
+        with patch("worker.engine.httpx.AsyncClient") as mock_client:
+            instance = mock_client.return_value
+            instance.post = AsyncMock(return_value=MagicMock(status_code=200))
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+
+            await engine._report_invalid_credential("cred1")
+
+        args, kwargs = instance.post.call_args
+        assert args[0] == "https://app.test/api/internal/credentials/cred1/invalidate"
+        assert kwargs["headers"]["Authorization"] == "Bearer k"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url,key",
+        [("", "k"), ("https://app.test", "")],
+        ids=["sin_url", "sin_api_key"],
+    )
+    async def test_sin_configuracion_no_sale_ninguna_request(self, url, key):
+        engine = self._engine(url=url, key=key)
+        with patch("worker.engine.httpx.AsyncClient") as mock_client:
+            await engine._report_invalid_credential("cred1")
+        mock_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_un_fallo_de_red_no_se_propaga(self):
+        """La causa ya se marco terminal antes de llamar acá.
+
+        Si esta excepcion escapara, se llevaria puesto el `return` que cierra el
+        camino y la falla saldria por el `except Exception` de mas afuera —o
+        sea, un veredicto de credencial reclasificado como error transitorio,
+        que es exactamente lo que la serie de atribucion vino a arreglar.
+        """
+        import httpx
+
+        engine = self._engine()
+        with patch("worker.engine.httpx.AsyncClient") as mock_client:
+            instance = mock_client.return_value
+            instance.__aenter__ = AsyncMock(side_effect=httpx.ConnectError("boom"))
+            instance.__aexit__ = AsyncMock(return_value=False)
+
+            await engine._report_invalid_credential("cred1")  # no levanta
