@@ -171,35 +171,16 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
     assert kwargs.get("healthy") is True  # credencial inválida NO es culpa de la IP
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "exc",
-    [FamiliaBlockedError("F5"), SessionError("no levanto la sesion")],
-    ids=["bloqueo_de_ojv", "caida_nuestra"],
-)
-async def test_solo_el_rechazo_reporta_la_credencial(monkeypatch, exc):
-    """El riesgo del cableado, del otro lado.
-
-    Reportar por cualquier falla del login le corta el sync a TODAS las causas
-    de esa credencial y le manda un mail al abogado pidiendole que cambie una
-    contrasena que esta bien. Un bundle F5 caido es nuestro, no suyo.
-    """
-    import worker.engine as eng
-
-    engine = _make_engine()
-    engine._get_decrypted_credential = AsyncMock(
-        return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
-    )
-
-    fake_session = AsyncMock()
-    fake_session.login = AsyncMock(side_effect=exc)
-    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
-    fake_session.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
-
-    await engine._sync_familia_case(_CASE, None, MagicMock())
-
-    engine._report_invalid_credential.assert_not_awaited()
+# NO hay un test "un bloqueo F5 NO reporta la credencial", aunque sea la
+# invariante que mas importa: reportar por una caida NUESTRA le corta el sync a
+# todas las causas de esa credencial y le manda al abogado un mail pidiendole
+# que cambie una contrasena que esta bien. Es que ese test no puede fallar.
+# `FamiliaBlockedError` y `SessionError` los atrapa el `except` de mas afuera y
+# retornan mucho antes de que se evalue el `except InvalidCredentialsError`, asi
+# que el assert pasaria hasta con el reporte atornillado. Una guarda que no
+# puede fallar es peor que ninguna: da confianza sin cubrir nada. Lo que de
+# verdad fija ese `return` son `test_login_block_does_not_penalize_and_remints`
+# y `test_session_error_no_le_echa_la_culpa_al_portal`, arriba.
 
 
 @pytest.mark.asyncio
