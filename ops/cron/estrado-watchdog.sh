@@ -470,6 +470,38 @@ else
   fi
 fi
 
+# 12. El bind de uvicorn sigue en localhost (cutover TLS, ops/caddy/README.md).
+#     El pytest del repo ancla el .service EN GIT; esto ancla la MÁQUINA, que
+#     es otra cosa. Tres caminos por los que el repo puede estar bien y el VPS
+#     expuesto: provision.sh nunca corrió después del merge, alguien editó
+#     /etc a mano, o el VPS volvió de un snapshot viejo. Ninguno rompe nada
+#     visible —la API contesta igual— y el único síntoma sería el journal
+#     llenándose de scanners otra vez. Mismo espíritu que el chequeo 10: hay
+#     que medir la máquina, no el archivo que dice cómo debería ser.
+#
+#     Silencio deliberado cuando NADIE escucha en el 8000: eso es la API
+#     caída, y el chequeo 9 ya lo alerta con mejor diagnóstico. Dos alertas
+#     para el mismo hecho es fatiga, no cobertura.
+SS_BIN="${WD_SS_BIN:-ss}"
+if [ -n "${WD_SS_OUTPUT_FILE:-}" ]; then
+  SS_RAW=$(cat "$WD_SS_OUTPUT_FILE" 2>/dev/null); SS_ST=$?
+else
+  SS_RAW=$("$SS_BIN" -lnt 2>/dev/null); SS_ST=$?
+fi
+if [ "$SS_ST" -ne 0 ] || [ -z "${SS_RAW// }" ]; then
+  # Leer y fallar ≠ leer vacío, igual que en el chequeo 10: sin esta rama un
+  # `ss` ausente se disfraza de "nadie escucha" y el chequeo calla justo
+  # cuando dejó de poder ver.
+  add "No pude leer los sockets en escucha (\`$SS_BIN -lnt\`) — el chequeo del bind de la API quedó ciego, no sano." "api-bind-ilegible"
+else
+  BIND_8000=$(printf '%s\n' "$SS_RAW" | awk '$1 == "LISTEN" { print $4 }' | grep -E ':8000$' || true)
+  # Solo loopback es aceptable: al 8000 únicamente debe entrar Caddy.
+  BIND_EXPUESTO=$(printf '%s\n' "$BIND_8000" | grep -vE '^(127\.0\.0\.1|\[::1\]):8000$' | grep -v '^$' || true)
+  if [ -n "${BIND_EXPUESTO// }" ]; then
+    add "uvicorn escucha en $(printf '%s' "$BIND_EXPUESTO" | tr '\n' ' ')— el 8000 volvió a estar abierto a internet y la API key viaja en HTTP plano. Esperado: solo 127.0.0.1:8000 detrás de Caddy. Correr provision.sh y \`systemctl restart estrado-pjud\`." "api-bind-expuesto"
+  fi
+fi
+
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
 

@@ -38,6 +38,16 @@ head -c 2048 /dev/zero > "$TMP/backups-sanos/estrado-20990101-000000.tar.gz"
 # Crontab "vivo" y snapshot idénticos: el chequeo 10 calla salvo en sus tests.
 printf '0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders\n' > "$TMP/crontab-base"
 
+# Sockets en escucha con el cutover ya aplicado: el chequeo 12 calla salvo en
+# sus tests. Es fixture y no `ss` de verdad a propósito — estos tests corren EN
+# el VPS, y leer el bind real ataría su resultado al estado del despliegue.
+cat > "$TMP/ss-sano" <<'EOF'
+State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port
+LISTEN 0      4096        127.0.0.1:8000        0.0.0.0:*
+LISTEN 0      4096                *:443               *:*
+LISTEN 0      128           0.0.0.0:22          0.0.0.0:*
+EOF
+
 # Cada corrida estrena directorio de estado. No es prolijidad: el cooldown anti-spam
 # de 3h se evalúa ANTES del `if DRY_RUN`, así que dos tests seguidos que produzcan la
 # misma firma hacen que el segundo salga vacío y falle por una razón que no tiene nada
@@ -51,6 +61,7 @@ run() {
   DRY_RUN=1 WD_STATE_DIR="$st" CRON_LOG="$1" API_HEALTH_URL="${2:-$SANO}" \
     WD_CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-$TMP/crontab-base}" \
     WD_CRONTAB_LIVE_FILE="${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}" \
+    WD_SS_OUTPUT_FILE="${WD_SS_OUTPUT_FILE:-$TMP/ss-sano}" \
     WD_BACKUP_DIR="${WD_BACKUP_DIR:-$TMP/backups-sanos}" \
     bash "$WD" 2>/dev/null
 }
@@ -331,6 +342,41 @@ OUT=$(WDS="$WDS_SIG2" WD_ENV="$TMP/sb.env" run "$BASE" "http://127.0.0.1:$PORT/v
 expect_contains "primera corrida: el chequeo ciego avisa" "$OUT" "pool-metric-missing"
 OUT=$(WDS="$WDS_SIG2" WD_ENV="$TMP/sb.env" run "$BASE" "http://127.0.0.1:$PORT/viejo.json")
 expect_missing "persiste: silencio total" "$OUT" "ANOMALIES:"
+
+echo "== chequeo 12: el bind de uvicorn no puede volver a internet =="
+# El fixture sano ya se usa en TODAS las corridas de arriba, así que el silencio
+# en el caso bueno está probado por construcción; igual se afirma explícito.
+OUT=$(run "$BASE")
+expect_missing "127.0.0.1:8000 no alerta" "$OUT" "api-bind-expuesto"
+
+sed 's/127\.0\.0\.1:8000/0.0.0.0:8000/' "$TMP/ss-sano" > "$TMP/ss-expuesto"
+OUT=$(WD_SS_OUTPUT_FILE="$TMP/ss-expuesto" run "$BASE")
+expect_contains "0.0.0.0:8000 alerta"        "$OUT" "api-bind-expuesto"
+expect_contains "y dice qué bind encontró"   "$OUT" "0.0.0.0:8000"
+
+# El v6 pelado es el que se olvida: el unit puede estar en 127.0.0.1 y una regla
+# vieja dejar el `[::]` escuchando. Tiene que alertar igual.
+sed 's/127\.0\.0\.1:8000/[::]:8000/' "$TMP/ss-sano" > "$TMP/ss-v6"
+OUT=$(WD_SS_OUTPUT_FILE="$TMP/ss-v6" run "$BASE")
+expect_contains "[::]:8000 tambien alerta" "$OUT" "api-bind-expuesto"
+
+# ::1 es loopback: no alerta. Si esto fallara, el chequeo estaría gritando por
+# una configuración correcta, que es la forma más rápida de que lo ignoren.
+sed 's/127\.0\.0\.1:8000/[::1]:8000/' "$TMP/ss-sano" > "$TMP/ss-v6-loopback"
+OUT=$(WD_SS_OUTPUT_FILE="$TMP/ss-v6-loopback" run "$BASE")
+expect_missing "[::1]:8000 es loopback, no alerta" "$OUT" "api-bind-expuesto"
+
+echo "== chequeo 12: nadie en el 8000 es cosa del chequeo 9, no de este =="
+grep -v ':8000' "$TMP/ss-sano" > "$TMP/ss-sin-api"
+OUT=$(WD_SS_OUTPUT_FILE="$TMP/ss-sin-api" run "$BASE")
+expect_missing "API caída: este chequeo calla" "$OUT" "api-bind-expuesto"
+
+echo "== chequeo 12: leer y fallar no es lo mismo que no encontrar nada =="
+# Sin esta distinción un `ss` ausente se disfraza de "no hay nada expuesto" y el
+# chequeo pasa de medir a mentir. Mismo principio que el crontab ilegible.
+OUT=$(WD_SS_OUTPUT_FILE="$TMP/no-existe-este-archivo" run "$BASE")
+expect_contains "avisa que quedó ciego" "$OUT" "api-bind-ilegible"
+expect_missing  "y no dice que está sano" "$OUT" "api-bind-expuesto"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
