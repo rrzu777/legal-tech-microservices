@@ -312,14 +312,14 @@ class TestReportInvalidCredential:
         engine = self._engine()
         with patch("worker.engine.httpx.AsyncClient") as mock_client:
             instance = mock_client.return_value
-            instance.post = AsyncMock(return_value=MagicMock(status_code=200))
+            instance.request = AsyncMock(return_value=MagicMock(status_code=200))
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
 
             await engine._report_invalid_credential("cred1")
 
-        args, kwargs = instance.post.call_args
-        assert args[0] == "https://app.test/api/internal/credentials/cred1/invalidate"
+        args, kwargs = instance.request.call_args
+        assert args == ("POST", "https://app.test/api/internal/credentials/cred1/invalidate")
         assert kwargs["headers"]["Authorization"] == "Bearer k"
 
     @pytest.mark.asyncio
