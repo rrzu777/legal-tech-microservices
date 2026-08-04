@@ -11,7 +11,12 @@ WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
 Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin
 EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
 
-ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Solo localhost: el único que entra es Caddy (443, TLS) — ops/caddy/README.md.
+# --proxy-headers sin --forwarded-allow-ips es inerte: uvicorn ignora los
+# X-Forwarded-* de un peer no confiable, y el journal loguearía 127.0.0.1 como
+# cliente de TODO request. La medición de scanners que justificó este cutover
+# salió justamente de esas IPs, así que perderlas es perder el instrumento.
+ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
 
 Slice=legaltech.slice
 
