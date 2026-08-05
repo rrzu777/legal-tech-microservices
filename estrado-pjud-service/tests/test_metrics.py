@@ -144,6 +144,49 @@ class TestWorkerMetrics:
         assert meta["errors_infra_today"] == 0
         assert meta["errors_case_today"] == 0
 
+    @pytest.mark.asyncio
+    async def test_un_fallo_de_heartbeat_no_tumba_al_worker(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock, Mock
+
+        import worker.metrics as metrics_module
+
+        m = self._make(pool=self._fake_pool())
+        run_query = AsyncMock(side_effect=RuntimeError("Supabase temporal"))
+        notify = Mock()
+        monkeypatch.setattr(metrics_module, "run_query", run_query)
+        monkeypatch.setattr(metrics_module, "notify_watchdog", notify)
+
+        with caplog.at_level("ERROR", logger="worker.metrics"):
+            sent = await m.send_heartbeat()
+
+        assert sent is False
+        notify.assert_not_called()
+        assert "Heartbeat failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_exitoso_notifica_a_systemd(self, monkeypatch):
+        from unittest.mock import AsyncMock, Mock
+
+        import worker.metrics as metrics_module
+
+        m = self._make(pool=self._fake_pool())
+        run_query = AsyncMock()
+        notify = Mock()
+        monkeypatch.setattr(metrics_module, "run_query", run_query)
+        monkeypatch.setattr(metrics_module, "notify_watchdog", notify)
+
+        assert await m.send_heartbeat() is True
+        notify.assert_called_once_with()
+
+    def test_el_loop_principal_no_publica_heartbeats_en_paralelo(self):
+        """Metrics._heartbeat_loop es el unico propietario del heartbeat."""
+        from pathlib import Path
+
+        main_source = (
+            Path(__file__).parents[1].joinpath("worker", "__main__.py").read_text()
+        )
+        assert ".send_heartbeat(" not in main_source
+
 
 #: El mismo umbral que usa el alerter de Telegram, leído de la config real y no
 #: escrito a mano: el punto del parámetro es que el panel y la alerta no puedan

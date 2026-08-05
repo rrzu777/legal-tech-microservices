@@ -191,7 +191,6 @@ async def main():
 
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
-                await metrics.send_heartbeat()
                 await maybe_alert_bandwidth(config, bandwidth_alert_state)
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
@@ -205,7 +204,6 @@ async def main():
             await process_batch(batch, engine, concurrency, shutdown_event, backoff)
 
             await scheduler.release_batch(case_ids)
-            await metrics.send_heartbeat()
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
 
     finally:
