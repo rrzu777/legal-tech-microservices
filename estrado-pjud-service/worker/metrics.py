@@ -79,22 +79,31 @@ class Metrics:
             },
         }
 
-    async def send_heartbeat(self):
-        await run_query(
-            self._sb.from_("sync_worker_heartbeats").upsert(
-                self.heartbeat_payload("running"),
-                on_conflict="worker_id",
+    async def send_heartbeat(self) -> bool:
+        """Publica telemetria sin convertir una falla externa en una caida.
+
+        El heartbeat es best-effort: systemd ya reinicia el proceso si la señal
+        permanece ausente, pero un 400/5xx transitorio de Supabase no debe
+        interrumpir el trabajo judicial ni escapar al loop principal.
+        """
+        try:
+            await run_query(
+                self._sb.from_("sync_worker_heartbeats").upsert(
+                    self.heartbeat_payload("running"),
+                    on_conflict="worker_id",
+                )
             )
-        )
+        except Exception:
+            logger.exception("Heartbeat failed")
+            return False
+
         notify_watchdog()
         logger.debug("Heartbeat sent")
+        return True
 
     async def _heartbeat_loop(self):
         while True:
-            try:
-                await self.send_heartbeat()
-            except Exception:
-                logger.exception("Heartbeat failed")
+            await self.send_heartbeat()
             await asyncio.sleep(self._config.HEARTBEAT_INTERVAL_S)
 
     def start(self):

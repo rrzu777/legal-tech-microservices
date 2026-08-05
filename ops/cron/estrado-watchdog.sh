@@ -223,7 +223,7 @@ if [ -n "$HB_TS" ] && [ "$HB_TS" != "[]" ]; then
   fi
 fi
 
-# 5. Errores reales del worker en la última hora. Tres trampas, las tres pisadas:
+# 5. Errores reales del worker en la última hora. Cuatro trampas, las cuatro pisadas:
 #    (a) `-p err` no sirve: el worker sale por stdout vía xvfb-run, así que TODO entra
 #        como PRIORITY=6 (info). El chequeo devolvía 0 líneas en 7 días habiendo 40 errores.
 #    (b) `grep -i` tampoco: las URLs de PostgREST llevan `tracking_status=in.(active,
@@ -233,8 +233,18 @@ fi
 #        conocido del proxy residencial, se auto-cura (lo dice el propio mensaje: "usando
 #        la sesión existente") y ya se decidió que va como número en el digest, no como
 #        ping. Sin ese ruido quedan 0 errores en 24h, así que 3 en una hora es señal.
-JERR=$(journalctl -u estrado-pjud.service -u estrado-pjud-worker.service --since "-1 hour" --no-pager 2>/dev/null \
-        | grep -E '"level": "(ERROR|CRITICAL)"|Traceback' \
+#    (d) Un traceback multilínea es CONTEXTO de un evento, no eventos adicionales.
+#        Contar tanto la línea JSON ERROR como cada `Traceback` convirtió una sola
+#        excepción en tres errores. La fuente de verdad son los eventos JSON.
+worker_journal() {
+  if [ -n "${WD_JOURNAL_FILE:-}" ]; then
+    cat "$WD_JOURNAL_FILE" 2>/dev/null || true
+  else
+    journalctl -u estrado-pjud.service -u estrado-pjud-worker.service --since "-1 hour" --no-pager 2>/dev/null || true
+  fi
+}
+JERR=$(worker_journal \
+        | grep -E '"level": "(ERROR|CRITICAL)"' \
         | grep -vE 'Refresh de slot [0-9]+ fall' || true)
 JERR_N=$(printf '%s' "$JERR" | grep -c . || true)
 if [ "${JERR_N:-0}" -ge 3 ]; then

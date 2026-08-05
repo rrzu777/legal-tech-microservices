@@ -38,6 +38,10 @@ head -c 2048 /dev/zero > "$TMP/backups-sanos/estrado-20990101-000000.tar.gz"
 # Crontab "vivo" y snapshot idénticos: el chequeo 10 calla salvo en sus tests.
 printf '0 11 * * * /opt/estrado-cron/run-cron.sh /api/cron/task-reminders\n' > "$TMP/crontab-base"
 
+# El journal real del VPS no debe volver no deterministas todos los tests. Los
+# casos del chequeo 5 inyectan sus propios eventos debajo.
+: > "$TMP/journal-sano"
+
 # Sockets en escucha con el cutover ya aplicado: el chequeo 12 calla salvo en
 # sus tests. Es fixture y no `ss` de verdad a propósito — estos tests corren EN
 # el VPS, y leer el bind real ataría su resultado al estado del despliegue.
@@ -63,6 +67,7 @@ run() {
     WD_CRONTAB_LIVE_FILE="${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}" \
     WD_SS_OUTPUT_FILE="${WD_SS_OUTPUT_FILE:-$TMP/ss-sano}" \
     WD_BACKUP_DIR="${WD_BACKUP_DIR:-$TMP/backups-sanos}" \
+    WD_JOURNAL_FILE="${WD_JOURNAL_FILE:-$TMP/journal-sano}" \
     bash "$WD" 2>/dev/null
 }
 
@@ -288,6 +293,24 @@ echo "== chequeo 10: crontab vivo ilegible no es drift =="
 OUT=$(WD_CRONTAB_SNAPSHOT="$TMP/ct-snap" WD_CRONTAB_LIVE_FILE="$TMP/ct-vivo-no-existe" run "$BASE")
 expect_contains "leer y fallar se avisa como fallo" "$OUT" "crontab-live-unreadable"
 expect_missing "y NO se disfraza de drift"          "$OUT" "crontab-drift"
+
+echo "== chequeo 5: cuenta eventos, no líneas del traceback =="
+cat > "$TMP/journal-un-evento.log" <<'EOF'
+Aug 05 worker: {"level": "ERROR", "msg": "Heartbeat failed", "exception": "Traceback (most recent call last)"}
+Aug 05 worker: Traceback (most recent call last):
+Aug 05 worker: Traceback (most recent call last):
+EOF
+OUT=$(WD_JOURNAL_FILE="$TMP/journal-un-evento.log" run "$BASE")
+expect_missing "un evento con traceback no cruza el umbral" "$OUT" "journal-err"
+
+cat > "$TMP/journal-tres-eventos.log" <<'EOF'
+Aug 05 worker: {"level": "ERROR", "msg": "fallo uno"}
+Aug 05 worker: {"level": "CRITICAL", "msg": "fallo dos"}
+Aug 05 worker: {"level": "ERROR", "msg": "fallo tres"}
+EOF
+OUT=$(WD_JOURNAL_FILE="$TMP/journal-tres-eventos.log" run "$BASE")
+expect_contains "tres eventos estructurados sí alertan" "$OUT" "3 errores del worker"
+expect_contains "la firma identifica el chequeo"        "$OUT" "journal-err"
 
 echo "== chequeo 11: el backup como artefacto =="
 OUT=$(WD_BACKUP_DIR="$TMP/backups-vacios" run "$BASE")
