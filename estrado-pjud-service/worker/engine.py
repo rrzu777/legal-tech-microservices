@@ -119,9 +119,14 @@ _MOVEMENT_IDENTITY_FIELDS = (
     "descripcion",
     "etapa",
     "foja",
-    "sala",
-    "estado",
 )
+
+_PRIMARY_DOCUMENT_FIELDS = (
+    "documento_url",
+    "documento_token",
+    "documento_param",
+)
+_ANEXO_FIELDS = ("anexo_func", "anexo_token")
 
 
 def _movement_identity(movement: dict) -> tuple:
@@ -155,6 +160,50 @@ def _build_movement_external_key(case_number: str, movement: dict) -> str:
     return f"pjud:null:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _copy_movement(movement: dict) -> dict:
+    copied = dict(movement)
+    copied["documentos_adicionales"] = [
+        dict(document)
+        for document in movement.get("documentos_adicionales", [])
+    ]
+    return copied
+
+
+def _prefer_complete_group(target: dict, source: dict, fields: tuple[str, ...]) -> None:
+    """Copy one linked metadata group only when the source is more complete.
+
+    URL/token/param and anexo function/token are paired values. Filling them
+    independently can manufacture a credential combination PJUD never emitted.
+    """
+    target_score = sum(bool(target.get(field)) for field in fields)
+    source_score = sum(bool(source.get(field)) for field in fields)
+    if source_score <= target_score:
+        return
+    for field in fields:
+        target[field] = source.get(field)
+
+
+def _merge_movement_metadata(target: dict, source: dict) -> None:
+    """Keep the richest document metadata from duplicate logical movements."""
+    _prefer_complete_group(target, source, _PRIMARY_DOCUMENT_FIELDS)
+    _prefer_complete_group(target, source, _ANEXO_FIELDS)
+
+    additional = target.setdefault("documentos_adicionales", [])
+    seen_documents = {
+        (document.get("url"), document.get("token"), document.get("param"))
+        for document in additional
+    }
+    for document in source.get("documentos_adicionales", []):
+        identity = (
+            document.get("url"),
+            document.get("token"),
+            document.get("param"),
+        )
+        if identity not in seen_documents:
+            additional.append(dict(document))
+            seen_documents.add(identity)
+
+
 def _prepare_pjud_movements(
     case: dict,
     movements: list[dict],
@@ -162,19 +211,29 @@ def _prepare_pjud_movements(
     log_undated: bool,
 ) -> list[tuple[dict, str]]:
     """Filter invalid rows, collapse logical duplicates and assign persisted keys."""
-    dated: list[dict] = []
+    prepared: list[tuple[dict, str]] = []
     skipped_count = 0
-    seen_identities: set[tuple] = set()
+    identity_indexes: dict[tuple, int] = {}
+    base_key_occurrences: dict[str, int] = {}
 
     for movement in movements:
         if not movement.get("fecha"):
             skipped_count += 1
             continue
+
+        base_key = _build_movement_external_key(case["case_number"], movement)
+        occurrence = base_key_occurrences.get(base_key, 0) + 1
+        base_key_occurrences[base_key] = occurrence
+
         identity = _movement_identity(movement)
-        if identity in seen_identities:
+        existing_index = identity_indexes.get(identity)
+        if existing_index is not None:
+            _merge_movement_metadata(prepared[existing_index][0], movement)
             continue
-        seen_identities.add(identity)
-        dated.append(movement)
+
+        external_key = base_key if occurrence == 1 else f"{base_key}#{occurrence}"
+        identity_indexes[identity] = len(prepared)
+        prepared.append((_copy_movement(movement), external_key))
 
     if skipped_count and log_undated:
         logger.warning(
@@ -186,12 +245,7 @@ def _prepare_pjud_movements(
             },
         )
 
-    base_keys = [
-        _build_movement_external_key(case["case_number"], movement)
-        for movement in dated
-    ]
-    keys = _dedupe_movement_keys(base_keys)
-    return list(zip(dated, keys))
+    return prepared
 
 
 def search_params_from_case(case: dict) -> dict:

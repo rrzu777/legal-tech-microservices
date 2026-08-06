@@ -1319,6 +1319,61 @@ class TestHelperFunctions:
         assert len(first_key) == 74
 
     @pytest.mark.asyncio
+    async def test_two_syncs_with_mutable_status_keep_key_and_do_not_renotify(self):
+        from worker.engine import _prepare_pjud_movements
+
+        engine, _, _, notifier, *_ = _make_engine()
+        case = _make_case()
+        base_movement = {
+            "folio": None,
+            "cuaderno": "Principal",
+            "fecha": "2024-05-01",
+            "tramite": "Resolución",
+            "descripcion": "Provee demanda",
+            "etapa": "Discusión",
+            "foja": None,
+            "sala": "Primera",
+            "estado": "Pendiente",
+        }
+        first_detail = _mock_detail_response()
+        first_detail["movements"] = [base_movement]
+        second_detail = _mock_detail_response()
+        second_detail["movements"] = [{
+            **base_movement,
+            "sala": "Segunda",
+            "estado": "Firmado",
+        }]
+        seen_keys: set[str] = set()
+        keys_by_sync: list[list[str]] = []
+
+        async def fake_db_upsert(current_case, detail):
+            keys = [
+                key
+                for _, key in _prepare_pjud_movements(
+                    current_case, detail["movements"], log_undated=True,
+                )
+            ]
+            keys_by_sync.append(keys)
+            new_keys = [key for key in keys if key not in seen_keys]
+            seen_keys.update(keys)
+            return len(new_keys)
+
+        with patch("worker.engine.search_pjud_via_session", new=AsyncMock(
+                 return_value=_mock_search_response()
+             )), \
+             patch("worker.engine.detail_pjud_via_session", new=AsyncMock(
+                 side_effect=[first_detail, second_detail]
+             )), \
+             patch.object(engine, "_upsert_movements", side_effect=fake_db_upsert):
+            first_result = await engine.sync_case(case)
+            second_result = await engine.sync_case(case)
+
+        assert keys_by_sync[0] == keys_by_sync[1]
+        assert first_result["new_movements"] == 1
+        assert second_result["new_movements"] == 0
+        notifier.notify_new_movements.assert_awaited_once_with(case, 1)
+
+    @pytest.mark.asyncio
     async def test_upsert_movements_undated_only_returns_zero_without_db_calls(self):
         engine, _, mock_sb, *_ = _make_engine()
         detail = {"movements": [{
@@ -1394,6 +1449,67 @@ class TestHelperFunctions:
         rows = mock_sb.from_.return_value.upsert.call_args[0][0]
         assert len(rows) == 1
         assert "#" not in rows[0]["external_movement_key"]
+
+    @pytest.mark.asyncio
+    async def test_logical_duplicate_still_consumes_historical_folio_suffix(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        first = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Primera", "etapa": "",
+        }
+        different = {**first, "tramite": "Escrito", "descripcion": "Segunda"}
+
+        await engine._upsert_movements(
+            _make_case(),
+            {"movements": [first, dict(first), different]},
+        )
+
+        rows = mock_sb.from_.return_value.upsert.call_args.args[0]
+        assert [row["external_movement_key"] for row in rows] == [
+            "C-1234-2024:Principal:5",
+            "C-1234-2024:Principal:5#3",
+        ]
+
+    def test_logical_duplicates_merge_document_metadata_conservatively(self):
+        from worker.engine import _prepare_pjud_movements
+
+        incomplete = {
+            "folio": None, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee", "etapa": "",
+            "documento_url": None, "documento_token": None,
+            "documentos_adicionales": [{
+                "url": "/cert-a", "token": "cert-a-token", "param": "dtaCert",
+            }],
+            "anexo_func": None, "anexo_token": None,
+        }
+        complete = {
+            **incomplete,
+            "documento_url": "/documento",
+            "documento_token": "document-token",
+            "documento_param": "dtaDoc",
+            "documentos_adicionales": [
+                {"url": "/cert-a", "token": "cert-a-token", "param": "dtaCert"},
+                {"url": "/cert-b", "token": "cert-b-token", "param": "dtaCert"},
+            ],
+            "anexo_func": "anexoSolicitudCivil",
+            "anexo_token": "anexo-token",
+        }
+
+        prepared = _prepare_pjud_movements(
+            _make_case(), [incomplete, complete], log_undated=True,
+        )
+
+        assert len(prepared) == 1
+        merged, _ = prepared[0]
+        assert merged["documento_url"] == "/documento"
+        assert merged["documento_token"] == "document-token"
+        assert merged["documento_param"] == "dtaDoc"
+        assert merged["documentos_adicionales"] == [
+            {"url": "/cert-a", "token": "cert-a-token", "param": "dtaCert"},
+            {"url": "/cert-b", "token": "cert-b-token", "param": "dtaCert"},
+        ]
+        assert merged["anexo_func"] == "anexoSolicitudCivil"
+        assert merged["anexo_token"] == "anexo-token"
 
     @pytest.mark.asyncio
     async def test_document_writeback_uses_insert_key_and_skips_undated_movements(self):
