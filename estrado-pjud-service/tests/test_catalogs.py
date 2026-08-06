@@ -8,6 +8,14 @@ from app.catalogs import CatalogResult, CatalogService, parse_html_options, pars
 from app.failure_kind import BlockedPageError
 from app.session import OJVSession
 from tests.helpers import AdapterQueGraba
+from scripts import refresh_catalog_snapshot as refresh
+
+
+def test_snapshot_refresh_accepts_the_exact_current_17_court_codes():
+    assert refresh.COURT_CODES == {
+        "10", "11", "15", "20", "25", "30", "35", "40", "45", "46",
+        "50", "55", "56", "60", "61", "90", "91",
+    }
 
 
 def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text():

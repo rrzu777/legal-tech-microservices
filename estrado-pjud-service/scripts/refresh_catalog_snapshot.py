@@ -14,6 +14,7 @@ from app.session_pool import APISessionPool
 
 FIRST_INSTANCE_COMPETENCIAS = ("apelaciones", "civil", "laboral", "penal", "cobranza")
 BOOK_YEARS = range(2022, 2027)
+COURT_CODES = {"10", "11", "15", "20", "25", "30", "35", "40", "45", "46", "50", "55", "56", "60", "61", "90", "91"}
 
 
 def _record(result: CatalogResult) -> dict[str, object]:
@@ -28,9 +29,10 @@ async def build_snapshot() -> dict[str, object]:
     service = CatalogService(pool, snapshot={})
     try:
         courts = await service.courts(1)
-        if courts.source != "live" or len(courts.options) != 18:
+        codes = {court["code"] for court in courts.options}
+        if courts.source != "live" or codes != COURT_CODES:
             raise RuntimeError(
-                f"Expected 18 live courts for tipo_busqueda=1, got {len(courts.options)}"
+                f"Expected official court codes {sorted(COURT_CODES)}, got {sorted(codes)}"
             )
 
         snapshot: dict[str, object] = {
