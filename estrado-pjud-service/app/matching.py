@@ -60,6 +60,46 @@ def matches_requested_candidate(candidate: CandidateMatch, req: SearchRequest) -
     return matches_requested_identifier(candidate.rol, req)
 
 
+def matches_requested_context(
+    candidate: CandidateMatch,
+    req: SearchRequest,
+    *,
+    effective_book_code: str | None = None,
+) -> bool:
+    """Require every canonical v2 identity component known by the request."""
+    if not matches_requested_candidate(candidate, req):
+        return False
+
+    if req.competencia == "suprema":
+        return True
+
+    if candidate.corte_code is None:
+        return False
+    if req.corte is not None and candidate.corte_code != req.corte:
+        return False
+
+    if req.competencia == "apelaciones":
+        if req.search_mode == "appeals_resource":
+            return (
+                candidate.tribunal_code is None
+                and candidate.libro_code == req.libro
+            )
+        return (
+            candidate.tribunal_code is not None
+            and (req.tribunal is None or candidate.tribunal_code == req.tribunal)
+            and candidate.libro_code is None
+        )
+
+    if candidate.tribunal_code is None:
+        return False
+    if req.tribunal is not None and candidate.tribunal_code != req.tribunal:
+        return False
+    expected_book = req.libro or effective_book_code
+    if expected_book is not None:
+        return candidate.libro_code == expected_book
+    return candidate.libro_code is None
+
+
 def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) -> bool:
     """Legacy identifier-only matcher retained for worker compatibility.
 
@@ -121,14 +161,26 @@ def build_search_response(
     libro_used: str | None = None,
 ) -> SearchResponse:
     """Build the one search-response shape used by all successful searches."""
-    ranked = rank_matches(matches, request)
-    exact = [
-        candidate
-        for candidate in matches
-        if matches_requested_candidate(candidate, request)
-    ]
+    effective_book_code = (
+        libro_used
+        if request.competencia not in {"suprema", "apelaciones"}
+        and request.case_type != "ruc"
+        else None
+    )
+    eligible = (
+        [
+            candidate
+            for candidate in matches
+            if matches_requested_context(
+                candidate, request, effective_book_code=effective_book_code,
+            )
+        ]
+        if request.contract_version == 2
+        else matches
+    )
+    ranked = rank_matches(eligible, request)
 
-    if not matches:
+    if not eligible:
         status = "not_found"
         found = False
     elif request.contract_version == 1:
@@ -136,7 +188,7 @@ def build_search_response(
         # behavior while adding an informational, compatible status.
         status = "found"
         found = True
-    elif len(exact) == 1:
+    elif len(eligible) == 1:
         status = "found"
         found = True
     else:

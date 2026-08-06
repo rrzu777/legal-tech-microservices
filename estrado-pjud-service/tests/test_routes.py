@@ -134,10 +134,17 @@ class TestHealth:
 
 class TestSearch:
     def test_v2_penal_ruc_search_returns_ruc_and_confirms_its_matching_candidate(self, client):
+        from app.catalogs import CatalogService
         from app.routes import search as search_route
 
         mock_session = _make_mock_session(search_html="<html>resultados</html>")
-        client.app.state.session_pool = _make_mock_pool(mock_session)
+        pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = pool
+        client.app.state.catalog_service = CatalogService(pool, snapshot={
+            "tribunals": {"penal:90:1": {"options": [
+                {"code": "321", "label": "Juzgado de Garantía"},
+            ]}},
+        })
         raw_match = [{
             "key": "fresh-ruc-jwt",
             "rol": "O-999-2025",
@@ -165,37 +172,30 @@ class TestSearch:
         assert response.json()["status"] == "found"
         assert response.json()["matches"][0]["ruc"] == "2500100001-5"
 
-    @pytest.mark.asyncio
-    async def test_court_label_resolution_requires_one_official_catalog_code(self):
-        from app.catalogs import CatalogResult
-        from app.routes.search import resolve_corte_code
+    def test_court_label_resolution_requires_one_official_catalog_code(self):
+        from app.catalogs import CatalogService
 
-        catalog_service = MagicMock()
-        catalog_service.courts = AsyncMock(return_value=CatalogResult(
-            options=[
+        catalog_service = CatalogService(MagicMock(), snapshot={
+            "courts": {"1": {"options": [
                 {"code": "91", "label": "C.A. de San Miguel"},
                 {"code": "90", "label": "C.A. de San Miguel"},
-            ],
-            source="snapshot",
-            fetched_at="2026-08-05T00:00:00+00:00",
-        ))
+            ]}},
+        })
 
-        code = await resolve_corte_code(catalog_service, " C.A. DE SAN MIGUEL ")
-
-        assert code is None
+        assert catalog_service.resolve_loaded_court(" C.A. DE SAN MIGUEL ") is None
 
     def test_v2_appeals_search_resolves_result_court_once_for_ranking(self, client):
-        from app.catalogs import CatalogResult
+        from app.catalogs import CatalogService
         from app.routes import search as search_route
 
         mock_session = _make_mock_session(search_html="<html>resultados</html>")
-        client.app.state.session_pool = _make_mock_pool(mock_session)
-        catalog_service = MagicMock()
-        catalog_service.courts = AsyncMock(return_value=CatalogResult(
-            options=[{"code": "91", "label": "C.A. de San Miguel"}],
-            source="snapshot",
-            fetched_at="2026-08-05T00:00:00+00:00",
-        ))
+        pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = pool
+        catalog_service = CatalogService(pool, snapshot={
+            "courts": {"1": {"options": [
+                {"code": "91", "label": "C.A. de San Miguel"},
+            ]}},
+        })
         client.app.state.catalog_service = catalog_service
         raw_match = [{
             "key": "fresh-jwt",
@@ -225,7 +225,6 @@ class TestSearch:
 
         assert response.status_code == 200
         assert response.json()["matches"][0]["corte_code"] == 91
-        catalog_service.courts.assert_awaited_once_with()
 
     def test_v2_search_parser_value_error_is_upstream_changed(self, client):
         """Markup parser drift is not a missing case or an internal 5xx."""
@@ -250,39 +249,23 @@ class TestSearch:
         assert response.status_code == 200
         assert response.json()["status"] == "upstream_changed"
 
-    @pytest.mark.asyncio
-    async def test_tribunal_label_resolution_requires_one_official_catalog_code(self):
-        from app.catalogs import CatalogResult
-        from app.models import SearchRequest
-        from app.routes.search import resolve_tribunal_code
+    def test_tribunal_label_resolution_requires_one_official_catalog_code(self):
+        from app.catalogs import CatalogService
 
-        request = SearchRequest(
-            contract_version=2,
-            case_type="rol",
-            case_number="C-1234-2024",
-            competencia="civil",
-            corte=90,
-            tribunal=321,
-        )
-        catalog_service = MagicMock()
-        catalog_service.tribunals = AsyncMock(return_value=CatalogResult(
-            options=[
+        catalog_service = CatalogService(MagicMock(), snapshot={
+            "tribunals": {"civil:90:1": {"options": [
                 {"code": "321", "label": "2º Juzgado Civil de Santiago"},
                 {"code": "999", "label": "2º Juzgado Civil de Santiago"},
-            ],
-            source="snapshot",
-            fetched_at="2026-08-05T00:00:00+00:00",
-        ))
+            ]}},
+        })
 
-        code = await resolve_tribunal_code(
-            catalog_service, request, "  2º JUZGADO CIVIL DE SANTIAGO  "
-        )
-
-        assert code is None
+        assert catalog_service.resolve_loaded_tribunal(
+            "civil", "  2º JUZGADO CIVIL DE SANTIAGO  ", corte=90,
+        ) is None
 
     def test_v2_search_threads_canonical_fields_and_caps_ranked_matches(self, client):
         """v2 sends the canonical form once and exposes only its requested page."""
-        from app.catalogs import CatalogResult
+        from app.catalogs import CatalogService
         from app.routes import search as search_route
 
         raw_matches = [
@@ -296,16 +279,23 @@ class TestSearch:
             for index in range(11)
         ]
         mock_session = _make_mock_session(search_html="<html>resultados</html>")
-        client.app.state.session_pool = _make_mock_pool(mock_session)
-        catalog_service = MagicMock()
-        catalog_service.tribunals = AsyncMock(return_value=CatalogResult(
-            options=[
-                {"code": str(321 if index == 0 else 400 + index), "label": f"{index + 1}º Juzgado Civil de Santiago"}
-                for index in range(11)
-            ],
-            source="snapshot",
-            fetched_at="2026-08-05T00:00:00+00:00",
-        ))
+        pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = pool
+        generated = "2026-08-06T00:00:00+00:00"
+        catalog_service = CatalogService(pool, snapshot={
+            "generated_at": generated,
+            "tribunals": {"civil:90:1": {
+                "fetched_at": generated,
+                "options": [
+                    {"code": str(321 + index), "label": f"{index + 1}º Juzgado Civil de Santiago"}
+                    for index in range(11)
+                ],
+            }},
+            "books": {"civil:90:2024": {
+                "fetched_at": generated,
+                "options": [{"code": "C", "label": "C"}],
+            }},
+        })
         client.app.state.catalog_service = catalog_service
 
         with patch.object(search_route, "parse_search_results", return_value=raw_matches):
@@ -316,8 +306,7 @@ class TestSearch:
                     "case_type": "rol",
                     "case_number": "C-1234-2024",
                     "competencia": "civil",
-                    "corte": 90,
-                    "tribunal": 321,
+                    "allow_broad": True,
                     "max_matches": 10,
                 },
                 headers=AUTH,
@@ -330,10 +319,9 @@ class TestSearch:
         assert len(body["matches"]) == 10
         assert body["truncated"] is True
         assert body["matches"][0]["tribunal_code"] == 321
-        catalog_service.tribunals.assert_awaited_once_with("civil", 90)
         form = mock_session.search.call_args.args[1]
-        assert form["conCorte"] == "90"
-        assert form["conTribunal"] == "321"
+        assert form["conCorte"] == "0"
+        assert form["conTribunal"] == "0"
 
     def test_v2_search_marks_unparseable_non_empty_upstream_response(self, client):
         """PJUD markup drift must not be reported as a missing case."""
@@ -359,15 +347,15 @@ class TestSearch:
         assert response.json()["status"] == "upstream_changed"
         assert response.json()["found"] is False
 
-    def test_v2_search_keeps_valid_results_when_optional_catalog_resolution_fails(self, client):
-        """A ranking hint must never turn a parsed PJUD result into not-found."""
+    def test_v2_search_fails_closed_when_required_catalog_resolution_fails(self, client):
+        """A parsed v2 result without canonical codes is upstream drift, not confirmable."""
+        from app.catalogs import CatalogService
         from app.routes import search as search_route
 
         mock_session = _make_mock_session(search_html="<html>resultados</html>")
-        client.app.state.session_pool = _make_mock_pool(mock_session)
-        catalog_service = MagicMock()
-        catalog_service.tribunals = AsyncMock(side_effect=RuntimeError("catalog unavailable"))
-        client.app.state.catalog_service = catalog_service
+        pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = pool
+        client.app.state.catalog_service = CatalogService(pool, snapshot={})
         raw_match = [{
             "key": "key-1",
             "rol": "C-1234-2024",
@@ -391,8 +379,8 @@ class TestSearch:
             )
 
         assert response.status_code == 200
-        assert response.json()["status"] == "found"
-        assert response.json()["matches"][0]["tribunal_code"] is None
+        assert response.json()["status"] == "upstream_changed"
+        assert response.json()["matches"] == []
 
     def test_v2_search_classifies_read_timeout_as_pjud_timeout(self, client):
         """A portal timeout remains recoverable and is not a v2 not-found result."""

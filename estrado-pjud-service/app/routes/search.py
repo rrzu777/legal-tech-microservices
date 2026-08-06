@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
 from app.rate_limit import limiter
-from app.catalogs import CatalogResult, resolve_catalog_code
+from app.catalogs import normalize_catalog_label
 from app.matching import build_search_response, is_definitive_not_found
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
@@ -21,24 +21,85 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["search"])
 
 
-async def resolve_tribunal_code(
-    catalog_service, request: SearchRequest, tribunal_label: str
-) -> int | None:
-    """Map a result label only when the official catalog has one exact label."""
-    if catalog_service is None or request.corte is None or not tribunal_label.strip():
-        return None
-    result: CatalogResult = await catalog_service.tribunals(
-        request.competencia, request.corte
-    )
-    return resolve_catalog_code(result.options, tribunal_label)
+class CanonicalCatalogResolutionError(ValueError):
+    """A parsed v2 row cannot be tied to one loaded official identity."""
 
 
-async def resolve_corte_code(catalog_service, corte_label: str) -> int | None:
-    """Map a result court label only when the official courts catalog is unique."""
-    if catalog_service is None or not corte_label.strip():
-        return None
-    result: CatalogResult = await catalog_service.courts()
-    return resolve_catalog_code(result.options, corte_label)
+def _enrich_v2_candidates(
+    matches: list[CandidateMatch],
+    req: SearchRequest,
+    *,
+    anno: int | None,
+    book_code: str | None,
+    catalog_service,
+) -> None:
+    """Mutate parsed candidates with canonical snapshot/cache identity only."""
+    if req.competencia == "suprema":
+        for match in matches:
+            match.corte_code = None
+            match.tribunal_code = None
+        return
+    if catalog_service is None:
+        raise CanonicalCatalogResolutionError("catalog service is unavailable")
+
+    if req.competencia == "apelaciones":
+        if req.search_mode == "appeals_resource":
+            for match in matches:
+                court_code = catalog_service.resolve_loaded_court(match.corte or "")
+                if court_code is None or match.libro_code is None:
+                    raise CanonicalCatalogResolutionError(
+                        "appeal court or book is unresolved"
+                    )
+                match.corte_code = court_code
+                match.tribunal_code = None
+            return
+
+        for match in matches:
+            court_code = (
+                catalog_service.resolve_loaded_court(match.corte)
+                if match.corte
+                else req.corte
+            )
+            identity = catalog_service.resolve_loaded_tribunal(
+                req.competencia, match.tribunal, corte=req.corte,
+            )
+            if court_code is None or identity is None:
+                raise CanonicalCatalogResolutionError(
+                    "first-instance territorial identity is unresolved"
+                )
+            match.corte_code = court_code
+            match.tribunal_code = identity.tribunal_code
+        return
+
+    for match in matches:
+        identity = catalog_service.resolve_loaded_tribunal(
+            req.competencia, match.tribunal, corte=req.corte,
+        )
+        if identity is None:
+            raise CanonicalCatalogResolutionError("tribunal identity is unresolved")
+        match.corte_code = identity.court_code
+        match.tribunal_code = identity.tribunal_code
+
+        if book_code is None:
+            continue
+        if anno is None:
+            raise CanonicalCatalogResolutionError("book year is unavailable")
+        official_book = catalog_service.resolve_loaded_book(
+            req.competencia, book_code, anno, corte=identity.court_code,
+        )
+        if official_book is None:
+            raise CanonicalCatalogResolutionError("book identity is unresolved")
+        if match.libro_code is None and match.libro is None:
+            match.libro_code = official_book["code"]
+            match.libro = official_book["label"]
+        elif (
+            match.libro_code is None
+            and normalize_catalog_label(match.libro or "")
+            == normalize_catalog_label(official_book["label"])
+        ):
+            match.libro_code = official_book["code"]
+        elif match.libro_code == official_book["code"] and match.libro is None:
+            match.libro = official_book["label"]
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -109,40 +170,27 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 status="upstream_changed",
             )
 
-        if req.contract_version == 2 and req.corte is not None:
-            resolved_labels: dict[str, int | None] = {}
-            catalog_service = getattr(request.app.state, "catalog_service", None)
-            if catalog_service is not None:
-                court_codes: dict[str, int | None] = {}
-                try:
-                    if any(match.corte for match in matches):
-                        courts: CatalogResult = await catalog_service.courts()
-                        for match in matches:
-                            if match.corte and match.corte not in court_codes:
-                                court_codes[match.corte] = resolve_catalog_code(
-                                    courts.options, match.corte
-                                )
-                            if match.corte:
-                                match.corte_code = court_codes[match.corte]
-                    if req.tribunal is not None:
-                        catalog: CatalogResult = await catalog_service.tribunals(
-                            req.competencia, req.corte
-                        )
-                    else:
-                        catalog = None
-                except Exception:
-                    # Codes influence ranking only.  A catalog outage must not
-                    # erase an already parsed PJUD result or turn it into a
-                    # false `not_found`; unresolved candidates remain explicit.
-                    logger.warning("Tribunal catalog unavailable; returning unranked codes", exc_info=True)
-                else:
-                    if catalog is not None:
-                        for match in matches:
-                            if match.tribunal not in resolved_labels:
-                                resolved_labels[match.tribunal] = resolve_catalog_code(
-                                    catalog.options, match.tribunal
-                                )
-                            match.tribunal_code = resolved_labels[match.tribunal]
+        if req.contract_version == 2:
+            try:
+                _enrich_v2_candidates(
+                    matches,
+                    req,
+                    anno=int(parsed["anno"]) if parsed["anno"] else None,
+                    book_code=(
+                        req.libro or libro_used
+                        if req.competencia not in {"suprema", "apelaciones"}
+                        and req.case_type != "ruc"
+                        else None
+                    ),
+                    catalog_service=getattr(request.app.state, "catalog_service", None),
+                )
+            except CanonicalCatalogResolutionError:
+                logger.warning("Loaded PJUD catalog could not resolve search identity")
+                return SearchResponse(
+                    found=False, match_count=0, matches=[], blocked=False,
+                    error="PJUD search identity could not be resolved", libro_used=None,
+                    status="upstream_changed",
+                )
 
         api_metrics.record_success("search")
 

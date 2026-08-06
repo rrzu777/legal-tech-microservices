@@ -245,6 +245,38 @@ class CatalogService:
         }
         return await self._get("tribunals", params, f"{competencia}:{corte}:{tipo_busqueda}")
 
+    def resolve_loaded_court(self, court_label: str) -> int | None:
+        """Resolve one court from snapshot/cache memory without pool I/O."""
+        courts = self._snapshot.get("courts")
+        record = courts.get("1") if isinstance(courts, dict) else None
+        options = (
+            _snapshot_options(record.get("options"))
+            if isinstance(record, dict)
+            else []
+        )
+        cached = self._cache.get("courts:1")
+        if cached is not None:
+            options = cached.options
+        return resolve_catalog_code(options, court_label)
+
+    def resolve_loaded_book(
+        self, competencia: str, book_code: str, anno: int, *, corte: int
+    ) -> dict[str, str] | None:
+        """Resolve one official book in a known court/year from local memory."""
+        snapshot_key = f"{competencia}:{corte}:{anno}"
+        books = self._snapshot.get("books")
+        record = books.get(snapshot_key) if isinstance(books, dict) else None
+        options = (
+            _snapshot_options(record.get("options"))
+            if isinstance(record, dict)
+            else []
+        )
+        cached = self._cache.get(f"books:{snapshot_key}")
+        if cached is not None:
+            options = cached.options
+        matches = [option for option in options if option["code"] == book_code]
+        return dict(matches[0]) if len(matches) == 1 else None
+
     def resolve_loaded_tribunal(
         self, competencia: str, tribunal_label: str, *, corte: int | None = None
     ) -> TribunalIdentity | None:

@@ -124,6 +124,55 @@ def test_loaded_snapshot_fails_closed_when_label_maps_to_two_courts():
     assert service.resolve_loaded_tribunal("civil", "juzgado duplicado") is None
 
 
+def test_loaded_snapshot_resolves_one_court_without_pool_io():
+    """HTTP search must resolve appeal rows locally while its only slot is busy."""
+    pool = MagicMock()
+    service = CatalogService(
+        pool,
+        snapshot={
+            "generated_at": "2026-08-06T00:00:00+00:00",
+            "courts": {
+                "1": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [
+                        {"code": "90", "label": "C.A. de Santiago"},
+                        {"code": "91", "label": "C.A. de San Miguel"},
+                    ],
+                }
+            },
+        },
+    )
+
+    assert service.resolve_loaded_court(" c.a. DE santiago ") == 90
+    pool.acquire.assert_not_called()
+
+
+def test_loaded_snapshot_resolves_canonical_book_label_for_request_context():
+    """Catches inventing a Penal book label instead of using the official snapshot."""
+    pool = MagicMock()
+    service = CatalogService(
+        pool,
+        snapshot={
+            "generated_at": "2026-08-06T00:00:00+00:00",
+            "books": {
+                "penal:90:2025": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [
+                        {"code": "1", "label": "Ordinaria"},
+                        {"code": "2", "label": "Exhorto"},
+                    ],
+                }
+            },
+        },
+    )
+
+    assert service.resolve_loaded_book("penal", "1", 2025, corte=90) == {
+        "code": "1",
+        "label": "Ordinaria",
+    }
+    pool.acquire.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_catalog_uses_nonempty_live_value_for_24_hour_cache(monkeypatch):
     """Catches refetching every request instead of keeping the live catalog for its TTL."""
