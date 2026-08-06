@@ -11,7 +11,7 @@ from app.models import (
 )
 from app.parsers.detail_parser import parse_detail
 from app.parsers.form_builder import build_search_form_data
-from app.matching import matches_requested_identifier
+from app.matching import is_definitive_not_found, matches_requested_identifier
 from app.parsers.normalizer import competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
@@ -87,6 +87,11 @@ async def _search_for_fresh_jwt(session, comp: str, req: DetailRequest) -> str |
         raise UpstreamChangedError("detail affinity search parser rejected PJUD response") from exc
 
     if not matches:
+        if is_definitive_not_found(html):
+            # This is a valid affinity search with a definitive absence.  It
+            # deliberately returns None so the caller emits the normal 409
+            # correlation outcome while retaining the healthy PJUD session.
+            return None
         raise UpstreamChangedError("detail affinity search returned non-empty unparseable PJUD response")
 
     exact = [

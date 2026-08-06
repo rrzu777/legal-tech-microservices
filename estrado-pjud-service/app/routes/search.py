@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from app.auth import verify_api_key
 from app.rate_limit import limiter
 from app.catalogs import CatalogResult
-from app.matching import build_search_response, normalize_label
+from app.matching import build_search_response, is_definitive_not_found, normalize_label
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import competencia_path, parse_search_identifier, resolve_libro
@@ -57,17 +57,6 @@ def _resolve_catalog_code_from_options(
         if normalize_label(option["label"]) == normalized_label and option["code"].isdigit()
     }
     return int(codes.pop()) if len(codes) == 1 else None
-
-
-def _is_definitive_not_found(html: str) -> bool:
-    """Only PJUD's explicit no-results message is a trustworthy empty result."""
-    normalized = normalize_label(html)
-    return any(marker in normalized for marker in (
-        "NO SE ENCONTRARON CAUSAS",
-        "NO SE ENCONTRARON RESULTADOS",
-        "NO EXISTEN CAUSAS",
-        "SIN RESULTADOS",
-    ))
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -131,7 +120,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             raise
         matches = [CandidateMatch(**m) for m in raw_matches]
 
-        if req.contract_version == 2 and not matches and not _is_definitive_not_found(html):
+        if req.contract_version == 2 and not matches and not is_definitive_not_found(html):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=False,
                 error="PJUD search response could not be parsed", libro_used=None,

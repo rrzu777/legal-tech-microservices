@@ -20,6 +20,17 @@ def normalize_identifier(value: str) -> str:
     return normalize_label(value)
 
 
+def is_definitive_not_found(html: str) -> bool:
+    """Recognize PJUD's explicit no-results messages across Search and Detail."""
+    normalized = normalize_label(html)
+    return any(marker in normalized for marker in (
+        "NO SE ENCONTRARON CAUSAS",
+        "NO SE ENCONTRARON RESULTADOS",
+        "NO EXISTEN CAUSAS",
+        "SIN RESULTADOS",
+    ))
+
+
 @dataclass(frozen=True)
 class RankedMatches:
     total: int

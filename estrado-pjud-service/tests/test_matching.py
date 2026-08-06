@@ -1,4 +1,4 @@
-from app.matching import build_search_response, normalize_label, rank_matches
+from app.matching import build_search_response, is_definitive_not_found, normalize_label, rank_matches
 from app.models import CandidateMatch, SearchRequest
 
 
@@ -112,3 +112,8 @@ def test_appeals_ranking_uses_resolved_court_and_official_book_code():
     ranked = rank_matches([wrong_affinity, requested_affinity], request)
 
     assert ranked.matches[0].key == "key-002"
+
+
+def test_explicit_pjud_no_results_is_not_parser_drift():
+    assert is_definitive_not_found("<div>No se encontraron causas</div>") is True
+    assert is_definitive_not_found("<div>markup desconocido</div>") is False

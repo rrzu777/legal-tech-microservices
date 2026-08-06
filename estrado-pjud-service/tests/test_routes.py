@@ -648,6 +648,29 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    def test_detail_affinity_explicit_not_found_is_valid_409_and_keeps_session_healthy(self, client):
+        mock_session = _make_mock_session(
+            search_html="<div>No se encontraron causas</div>",
+            detail_html=_load("detail_Civil_C_1234_2024.html"),
+        )
+        mock_pool = _make_mock_pool(mock_session)
+        client.app.state.session_pool = mock_pool
+
+        response = client.post(
+            "/api/v1/detail",
+            json={
+                "detail_key": "caller-jwt-without-data",
+                "competencia": "civil",
+                "case_type": "rol",
+                "case_number": "C-1234-2024",
+            },
+            headers=AUTH,
+        )
+
+        assert response.status_code == 409
+        mock_session.detail.assert_not_awaited()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+
     @pytest.mark.parametrize("search_html", [
         " ",
         '<html><script>window["bobcmn"] = "1"</script></html>',
