@@ -7,6 +7,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
+from app.logging_redaction import install_secret_redaction
 from app.rate_limit import limiter
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.catalogs import CatalogService
@@ -53,9 +54,16 @@ def create_app() -> FastAPI:
     # acá). uvicorn.access queda afuera (handler propio, propagate=False).
     # El isinstance-check: los tests llaman create_app() varias veces y sin él
     # se apilan filters duplicados en el mismo handler.
-    for handler in logging.getLogger().handlers:
+    root_handlers = logging.getLogger().handlers
+    for handler in root_handlers:
         if not any(isinstance(f, RequestIdFilter) for f in handler.filters):
             handler.addFilter(RequestIdFilter())
+    # httpx registra la URL mediante args diferidos y Telegram lleva el token
+    # dentro del path. Redactamos la línea final en el handler raíz: conserva
+    # método/host/endpoint y rid, pero el valor configurado nunca llega al
+    # journal. El helper es idempotente porque create_app se llama más de una
+    # vez en tests y en algunos servidores.
+    install_secret_redaction(root_handlers, (settings.TELEGRAM_BOT_TOKEN,))
 
     app = FastAPI(
         title="estrado-pjud-service",
