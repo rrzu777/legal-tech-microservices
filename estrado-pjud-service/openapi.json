@@ -7,6 +7,28 @@
             "title": "Caratulado",
             "type": "string"
           },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "corte_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte Code"
+          },
           "fecha_ingreso": {
             "anyOf": [
               {
@@ -22,6 +44,28 @@
             "title": "Key",
             "type": "string"
           },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "libro_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro Code"
+          },
           "rol": {
             "title": "Rol",
             "type": "string"
@@ -29,6 +73,17 @@
           "tribunal": {
             "title": "Tribunal",
             "type": "string"
+          },
+          "tribunal_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal Code"
           }
         },
         "required": [
@@ -1000,6 +1055,24 @@
             },
             "title": "Matches",
             "type": "array"
+          },
+          "status": {
+            "default": "not_found",
+            "enum": [
+              "found",
+              "not_found",
+              "needs_disambiguation",
+              "pjud_blocked",
+              "pjud_timeout",
+              "upstream_changed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
           }
         },
         "required": [

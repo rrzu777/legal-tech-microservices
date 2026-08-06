@@ -133,6 +133,197 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
+    @pytest.mark.asyncio
+    async def test_tribunal_label_resolution_requires_one_official_catalog_code(self):
+        from app.catalogs import CatalogResult
+        from app.models import SearchRequest
+        from app.routes.search import resolve_tribunal_code
+
+        request = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="C-1234-2024",
+            competencia="civil",
+            corte=90,
+            tribunal=321,
+        )
+        catalog_service = MagicMock()
+        catalog_service.tribunals = AsyncMock(return_value=CatalogResult(
+            options=[
+                {"code": "321", "label": "2º Juzgado Civil de Santiago"},
+                {"code": "999", "label": "2º Juzgado Civil de Santiago"},
+            ],
+            source="snapshot",
+            fetched_at="2026-08-05T00:00:00+00:00",
+        ))
+
+        code = await resolve_tribunal_code(
+            catalog_service, request, "  2º JUZGADO CIVIL DE SANTIAGO  "
+        )
+
+        assert code is None
+
+    def test_v2_search_threads_canonical_fields_and_caps_ranked_matches(self, client):
+        """v2 sends the canonical form once and exposes only its requested page."""
+        from app.catalogs import CatalogResult
+        from app.routes import search as search_route
+
+        raw_matches = [
+            {
+                "key": f"key-{index:03d}",
+                "rol": "C-1234-2024",
+                "tribunal": f"{index + 1}º Juzgado Civil de Santiago",
+                "caratulado": f"Parte {index}",
+                "fecha_ingreso": "2024-01-01",
+            }
+            for index in range(11)
+        ]
+        mock_session = _make_mock_session(search_html="<html>resultados</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        catalog_service = MagicMock()
+        catalog_service.tribunals = AsyncMock(return_value=CatalogResult(
+            options=[
+                {"code": str(321 if index == 0 else 400 + index), "label": f"{index + 1}º Juzgado Civil de Santiago"}
+                for index in range(11)
+            ],
+            source="snapshot",
+            fetched_at="2026-08-05T00:00:00+00:00",
+        ))
+        client.app.state.catalog_service = catalog_service
+
+        with patch.object(search_route, "parse_search_results", return_value=raw_matches):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                    "max_matches": 10,
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "needs_disambiguation"
+        assert body["match_count"] == 11
+        assert len(body["matches"]) == 10
+        assert body["truncated"] is True
+        assert body["matches"][0]["tribunal_code"] == 321
+        catalog_service.tribunals.assert_awaited_once_with("civil", 90)
+        form = mock_session.search.call_args.args[1]
+        assert form["conCorte"] == "90"
+        assert form["conTribunal"] == "321"
+
+    def test_v2_search_marks_unparseable_non_empty_upstream_response(self, client):
+        """PJUD markup drift must not be reported as a missing case."""
+        from app.routes import search as search_route
+
+        mock_session = _make_mock_session(search_html="<html>nuevo markup PJUD</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        with patch.object(search_route, "parse_search_results", return_value=[]):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "upstream_changed"
+        assert response.json()["found"] is False
+
+    def test_v2_search_keeps_valid_results_when_optional_catalog_resolution_fails(self, client):
+        """A ranking hint must never turn a parsed PJUD result into not-found."""
+        from app.routes import search as search_route
+
+        mock_session = _make_mock_session(search_html="<html>resultados</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        catalog_service = MagicMock()
+        catalog_service.tribunals = AsyncMock(side_effect=RuntimeError("catalog unavailable"))
+        client.app.state.catalog_service = catalog_service
+        raw_match = [{
+            "key": "key-1",
+            "rol": "C-1234-2024",
+            "tribunal": "2º Juzgado Civil de Santiago",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2024-01-01",
+        }]
+
+        with patch.object(search_route, "parse_search_results", return_value=raw_match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "found"
+        assert response.json()["matches"][0]["tribunal_code"] is None
+
+    def test_v2_search_classifies_read_timeout_as_pjud_timeout(self, client):
+        """A portal timeout remains recoverable and is not a v2 not-found result."""
+        mock_session = _make_mock_session()
+        mock_session.search = AsyncMock(side_effect=httpx.ReadTimeout("OJV timed out"))
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+
+        response = client.post(
+            "/api/v1/search",
+            json={
+                "contract_version": 2,
+                "case_type": "rol",
+                "case_number": "C-1234-2024",
+                "competencia": "civil",
+                "corte": 90,
+                "tribunal": 321,
+            },
+            headers=AUTH,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "pjud_timeout"
+        assert body["found"] is False
+        assert body["blocked"] is False
+
+    def test_v2_search_classifies_waf_as_pjud_blocked(self, client):
+        mock_session = _make_mock_session(search_html='<script>window["bobcmn"] = "1"</script>')
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+
+        response = client.post(
+            "/api/v1/search",
+            json={
+                "contract_version": 2,
+                "case_type": "rol",
+                "case_number": "C-1234-2024",
+                "competencia": "civil",
+                "corte": 90,
+                "tribunal": 321,
+            },
+            headers=AUTH,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "pjud_blocked"
+        assert body["blocked"] is True
+
     def test_search_returns_matches(self, client):
         """POST /api/v1/search returns found=True with parsed matches."""
         html = _load("search_Civil_C_1234_2024.html")
@@ -372,6 +563,59 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    @pytest.mark.asyncio
+    async def test_detail_affinity_accepts_unique_appeals_resource_with_book_prefix(self):
+        from app.models import DetailRequest
+        from app.routes import detail as detail_route
+
+        request = DetailRequest(
+            detail_key="caller-jwt-without-data",
+            contract_version=2,
+            case_type="rol",
+            case_number="4490-2025",
+            competencia="apelaciones",
+            corte=90,
+            libro="34",
+            search_mode="appeals_resource",
+        )
+        session = _make_mock_session(search_html="<html>resultados</html>")
+        with patch.object(detail_route, "parse_search_results", return_value=[{
+            "key": "fresh-appeals-jwt",
+            "rol": "Protección-4490-2025",
+            "tribunal": "C.A. de Santiago",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2025-01-01",
+        }]):
+            fresh_key = await detail_route._search_for_fresh_jwt(session, "apelaciones", request)
+
+        assert fresh_key == "fresh-appeals-jwt"
+
+    def test_detail_rejects_uncorrelated_fresh_jwt_instead_of_using_caller_token(self, client):
+        """A fresh search must prove it found the requested detail candidate."""
+        from app.routes import detail as detail_route
+
+        mock_session = _make_mock_session(search_html="<html>resultados</html>", detail_html=_load("detail_Civil_C_1234_2024.html"))
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        with patch.object(detail_route, "parse_search_results", return_value=[{
+            "key": "unrelated-jwt",
+            "rol": "C-9999-2024",
+            "tribunal": "1º Juzgado Civil",
+            "caratulado": "Otra causa",
+            "fecha_ingreso": "2024-01-01",
+        }]):
+            response = client.post(
+                "/api/v1/detail",
+                json={
+                    "detail_key": "caller-jwt-without-data",
+                    "competencia": "civil",
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 409
+        mock_session.detail.assert_not_awaited()
     # A minimal JWT-shaped string whose payload decodes to {"competencia": "civil"}
     # base64url('{"typ":"JWT","alg":"HS256"}') . base64url('{"competencia":"civil"}') . sig
     _CIVIL_JWT = (

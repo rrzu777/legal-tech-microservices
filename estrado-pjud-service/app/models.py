@@ -5,6 +5,14 @@ from pydantic import BaseModel, Field, model_validator
 
 COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
 SearchMode = Literal["supreme_resource", "appeals_resource", "first_instance"]
+SearchStatus = Literal[
+    "found",
+    "not_found",
+    "needs_disambiguation",
+    "pjud_blocked",
+    "pjud_timeout",
+    "upstream_changed",
+]
 
 _NUMERO_ANNO_RE = re.compile(r"^\d+-\d{4}$")
 _RIT_IDENTIFIER_RE = re.compile(r"^[^-]+-\d+-\d{4}$")
@@ -156,6 +164,14 @@ class CandidateMatch(BaseModel):
     tribunal: str
     caratulado: str
     fecha_ingreso: str | None
+    # PJUD's result rows usually expose labels, not stable catalog codes.  The
+    # search route enriches these only when the official catalog has one unique
+    # normalized match; values are never guessed from display text.
+    tribunal_code: int | None = None
+    corte: str | None = None
+    corte_code: int | None = None
+    libro: str | None = None
+    libro_code: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -165,6 +181,10 @@ class SearchResponse(BaseModel):
     blocked: bool
     error: str | None
     libro_used: str | None = None
+    # Additive v2 rollout fields.  The legacy quartet above keeps its exact
+    # semantics until JurisTrack has switched to the canonical contract.
+    status: SearchStatus = "not_found"
+    truncated: bool = False
 
 
 class DetailRequest(BaseModel):

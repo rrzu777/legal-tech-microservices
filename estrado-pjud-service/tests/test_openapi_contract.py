@@ -28,8 +28,12 @@ def test_el_snapshot_esta_al_dia():
 # tabla de failure_kind: así un cambio rompedor falla ACÁ, en el CI-de-deploy
 # del micro, sin depender de que alguien copie el snapshot a la app.
 CONSUMED = {
-    "SearchResponse": ["found", "match_count", "matches", "blocked", "error"],
-    "CandidateMatch": ["key", "caratulado", "fecha_ingreso", "tribunal"],
+    "SearchResponse": [
+        "found", "match_count", "matches", "blocked", "error", "status", "truncated",
+    ],
+    "CandidateMatch": [
+        "key", "caratulado", "fecha_ingreso", "tribunal", "tribunal_code",
+    ],
     "DetailResponse": [
         "metadata", "movements", "litigantes", "ebook_token",
         "certificado_disponible", "suprema_docs", "exhortos", "incompetencia",
