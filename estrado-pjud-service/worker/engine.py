@@ -41,6 +41,7 @@ _BLOCK_DURATION_S = 3600  # 1 hour
 # lo más 1 por hora, para no spamear Telegram ante un drift global del parser.
 _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
+_MOVEMENT_PAGE_SIZE = 1_000
 
 
 class InvalidCanonicalIdentityError(ValueError):
@@ -143,7 +144,7 @@ def _movement_identity(movement: dict) -> tuple:
         else _PRESENT_FOLIO_DEDUPE_FIELDS
     )
     return (
-        folio,
+        _normalize_movement_identity_part(folio),
         *(
             _normalize_movement_identity_part(movement.get(field))
             for field in fields
@@ -152,13 +153,40 @@ def _movement_identity(movement: dict) -> tuple:
 
 
 def _normalize_movement_identity_part(value) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = unicodedata.normalize(
+        "NFKC", str("" if value is None else value)
+    )
     normalized = _CANONICAL_WHITESPACE_RE.sub(" ", normalized)
     if normalized.startswith(" "):
         normalized = normalized[1:]
     if normalized.endswith(" "):
         normalized = normalized[:-1]
     return normalized
+
+
+def _movement_sort_key(movement: dict) -> tuple[int, str]:
+    """Keep the primary row first and make sibling suffixes order-independent."""
+    has_primary_fields = bool(
+        _normalize_movement_identity_part(movement.get("tramite"))
+        or _normalize_movement_identity_part(movement.get("etapa"))
+    )
+    encoded_identity = json.dumps(
+        list(_movement_identity(movement)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (0 if has_primary_fields else 1, hashlib.sha256(encoded_identity).hexdigest())
+
+
+def _is_movement_key_for_base(key: str, base_key: str) -> bool:
+    if key == base_key:
+        return True
+    suffix = key[len(base_key):] if key.startswith(base_key) else ""
+    return suffix.startswith("#") and suffix[1:].isdigit()
+
+
+def _external_key_rank(key: str, base_key: str) -> int:
+    return 1 if key == base_key else int(key[len(base_key) + 1:])
 
 
 def _build_movement_external_key(case_number: str, movement: dict) -> str:
@@ -232,12 +260,11 @@ def _prepare_pjud_movements(
     movements: list[dict],
     *,
     log_undated: bool,
+    existing_movements: list[dict] | None = None,
 ) -> list[tuple[dict, str]]:
     """Filter invalid rows, collapse logical duplicates and assign persisted keys."""
-    prepared: list[tuple[dict, str]] = []
     skipped_count = 0
-    identity_indexes: dict[tuple, int] = {}
-    base_key_occurrences: dict[str, int] = {}
+    groups: dict[str, dict[tuple, dict]] = {}
 
     for movement in movements:
         if not movement.get("fecha"):
@@ -245,18 +272,13 @@ def _prepare_pjud_movements(
             continue
 
         base_key = _build_movement_external_key(case["case_number"], movement)
-        occurrence = base_key_occurrences.get(base_key, 0) + 1
-        base_key_occurrences[base_key] = occurrence
-
         identity = _movement_identity(movement)
-        existing_index = identity_indexes.get(identity)
-        if existing_index is not None:
-            _merge_movement_metadata(prepared[existing_index][0], movement)
+        group = groups.setdefault(base_key, {})
+        existing = group.get(identity)
+        if existing is not None:
+            _merge_movement_metadata(existing, movement)
             continue
-
-        external_key = base_key if occurrence == 1 else f"{base_key}#{occurrence}"
-        identity_indexes[identity] = len(prepared)
-        prepared.append((_copy_movement(movement), external_key))
+        group[identity] = _copy_movement(movement)
 
     if skipped_count and log_undated:
         logger.warning(
@@ -267,6 +289,47 @@ def _prepare_pjud_movements(
                 "skipped_count": skipped_count,
             },
         )
+
+    existing_keys_by_identity: dict[tuple[str, tuple], list[str]] = {}
+    reserved_keys_by_base: dict[str, set[str]] = {}
+    for existing in existing_movements or []:
+        external_key = existing.get("external_movement_key")
+        raw_payload = existing.get("raw_payload")
+        if not external_key or not isinstance(raw_payload, dict):
+            continue
+        base_key = _build_movement_external_key(case["case_number"], raw_payload)
+        if not _is_movement_key_for_base(external_key, base_key):
+            continue
+        identity_key = (base_key, _movement_identity(raw_payload))
+        existing_keys_by_identity.setdefault(identity_key, []).append(external_key)
+        reserved_keys_by_base.setdefault(base_key, set()).add(external_key)
+
+    prepared: list[tuple[dict, str]] = []
+    for base_key, group in groups.items():
+        logical_movements = sorted(group.values(), key=_movement_sort_key)
+        reserved_keys = reserved_keys_by_base.get(base_key, set())
+        assigned_keys: set[str] = set()
+        for movement in logical_movements:
+            identity_key = (base_key, _movement_identity(movement))
+            historical_key = next((
+                key
+                for key in sorted(
+                    existing_keys_by_identity.get(identity_key, []),
+                    key=lambda value: _external_key_rank(value, base_key),
+                )
+                if key not in assigned_keys
+            ), None)
+            external_key = historical_key
+            if external_key is None:
+                suffix = 1
+                while True:
+                    candidate = base_key if suffix == 1 else f"{base_key}#{suffix}"
+                    suffix += 1
+                    if candidate not in reserved_keys and candidate not in assigned_keys:
+                        external_key = candidate
+                        break
+            assigned_keys.add(external_key)
+            prepared.append((movement, external_key))
 
     return prepared
 
@@ -1085,9 +1148,16 @@ class SyncEngine:
         if not movements:
             return 0
 
-        prepared = _prepare_pjud_movements(case, movements, log_undated=True)
-        if not prepared:
+        preliminary = _prepare_pjud_movements(case, movements, log_undated=True)
+        if not preliminary:
             return 0
+        existing_movements = await self._load_existing_movements(case["id"])
+        prepared = _prepare_pjud_movements(
+            case,
+            movements,
+            log_undated=False,
+            existing_movements=existing_movements,
+        )
 
         rows = []
         for mov, external_key in prepared:
@@ -1160,9 +1230,16 @@ class SyncEngine:
         if not movements:
             return
 
-        prepared = _prepare_pjud_movements(case, movements, log_undated=False)
-        if not prepared:
+        preliminary = _prepare_pjud_movements(case, movements, log_undated=False)
+        if not preliminary:
             return
+        existing_movements = await self._load_existing_movements(case["id"])
+        prepared = _prepare_pjud_movements(
+            case,
+            movements,
+            log_undated=False,
+            existing_movements=existing_movements,
+        )
         movements = [movement for movement, _ in prepared]
         movement_keys = [external_key for _, external_key in prepared]
 
@@ -1308,6 +1385,23 @@ class SyncEngine:
 
         except Exception:
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
+
+    async def _load_existing_movements(self, case_id: str) -> list[dict]:
+        movements: list[dict] = []
+        start = 0
+        while True:
+            response = await run_query(
+                self._sb.from_("case_movements")
+                .select("id,external_movement_key,raw_payload")
+                .eq("case_id", case_id)
+                .order("id")
+                .range(start, start + _MOVEMENT_PAGE_SIZE - 1)
+            )
+            page = response.data if isinstance(response.data, list) else []
+            movements.extend(page)
+            if len(page) < _MOVEMENT_PAGE_SIZE:
+                return movements
+            start += _MOVEMENT_PAGE_SIZE
 
     async def _finish_run(self, run_id, started_at, status, new_movements, error=None):
         if not run_id:
