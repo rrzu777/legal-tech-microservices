@@ -52,6 +52,8 @@ CONSUMED = {
     ],
     "FamiliaSyncResponse": ["ok", "casos", "error_code", "error"],
     "FamiliaCaso": ["rit", "tribunal", "caratulado", "materia", "estado", "fecha_ingreso"],
+    "CatalogResponse": ["options", "source", "fetched_at"],
+    "CatalogOption": ["code", "label"],
 }
 
 
@@ -59,7 +61,10 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
     # Anti-rot del snapshot mismo: si openapi() dejara de emitir schemas, el
     # test de arriba pasaría con un archivo vacío-consistente.
     spec = json.loads(OUT.read_text())
-    for path in ["/api/v1/search", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync"]:
+    for path in [
+        "/api/v1/search", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
+        "/api/v1/catalogs/courts", "/api/v1/catalogs/tribunals", "/api/v1/catalogs/books",
+    ]:
         assert path in spec["paths"], f"el contrato perdió {path}"
 
     schemas = spec["components"]["schemas"]
