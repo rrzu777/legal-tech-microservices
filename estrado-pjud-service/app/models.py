@@ -69,15 +69,20 @@ def _validate_v2_search_contract(
     if competencia == "apelaciones":
         if case_type != "rol" or not _NUMERO_ANNO_RE.fullmatch(case_number):
             raise ValueError("v2 apelaciones requires rol with case_number numero-año")
-        if corte is None or libro is None:
-            raise ValueError("v2 apelaciones requires corte and libro")
+        if corte is None:
+            raise ValueError("v2 apelaciones requires corte")
         if search_mode not in {"appeals_resource", "first_instance"}:
             raise ValueError("v2 apelaciones requires a valid search_mode")
         if search_mode == "appeals_resource":
+            if libro is None:
+                raise ValueError("appeals_resource requires libro")
             if tribunal is not None or allow_broad:
                 raise ValueError("appeals_resource does not accept tribunal or allow_broad")
-        elif tribunal is None and not allow_broad:
-            raise ValueError("first_instance requires tribunal unless allow_broad is true")
+        else:
+            if libro is not None:
+                raise ValueError("first_instance does not accept libro")
+            if tribunal is None and not allow_broad:
+                raise ValueError("first_instance requires tribunal unless allow_broad is true")
         return libro
 
     if search_mode is not None:

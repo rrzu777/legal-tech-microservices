@@ -79,7 +79,7 @@ def build_search_form_data(
         })
     elif competencia == "suprema":
         form_data["conTipoBus"] = "0"
-    else:
+    elif not (competencia == "apelaciones" and search_mode == "first_instance"):
         form_data["conTipoCausa"] = effective_libro
 
     return form_data

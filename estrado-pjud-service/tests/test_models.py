@@ -63,10 +63,27 @@ class TestCanonicalSearchRequestV2:
             competencia="apelaciones",
             corte=90,
             tribunal=1234,
-            libro="31",
             search_mode="first_instance",
         )
         assert origin.tribunal == 1234
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_first_instance_rejects_libro(self, request_type):
+        fields = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "340-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "tribunal": 1234,
+            "libro": "31",
+            "search_mode": "first_instance",
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        with pytest.raises(ValidationError):
+            request_type(**fields)
 
     def test_v2_appeals_rejects_invalid_mode_fields(self):
         with pytest.raises(ValidationError):
@@ -268,7 +285,6 @@ class TestCanonicalSearchRequestV2:
             competencia="apelaciones",
             corte=90,
             tribunal=123,
-            libro="31",
             search_mode="first_instance",
             max_matches=25,
         )

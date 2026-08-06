@@ -83,6 +83,7 @@ class TestBuildSearchFormData:
         assert form["conCorte"] == "0"
         assert form["conTribunal"] == "0"
         assert form["conTipoBusApe"] == "1"
+        assert "conTipoCausa" not in form
 
     def test_unknown_libro_logs_warning(self, caplog):
         """Unknown libro value logs a warning but doesn't raise."""
@@ -144,3 +145,16 @@ class TestBuildSearchFormData:
         assert form["conCorte"] == "90"
         assert form["conTribunal"] == "123"
         assert form["conTipoBusApe"] == "1"
+        assert "conTipoCausa" not in form
+
+    def test_appeals_resource_keeps_libro_filter(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="340-2025",
+            corte=90,
+            libro="31",
+            search_mode="appeals_resource",
+        )
+        assert form["conTipoBusApe"] == "0"
+        assert form["conTipoCausa"] == "PENAL"
