@@ -1295,28 +1295,71 @@ class TestHelperFunctions:
 
         assert key == "C-1234-2024:Principal:5"
 
-    def test_null_folio_key_is_stable_bounded_and_content_derived(self):
+    def test_null_folio_key_matches_canonical_cross_repo_vector(self):
         from worker.engine import _build_movement_external_key
 
         first = {
+            "folio": None,
+            "cuaderno": "Ｐrincipal",
+            "fecha": " 2024-05-01 ",
+            "tramite": "Resolucio\u0301n",
+            "descripcion": " Provee\u00a0  demanda ",
+            "etapa": "Discusión",
+            "foja": None,
+            "sala": "Primera",
+            "estado": "Pendiente",
+            "documento_url": "/documento",
+            "documento_token": "jwt-1",
+            "anexo_func": "anexoSolicitudCivil",
+            "anexo_token": "jwt-2",
+        }
+        second = {**first, "descripcion": "Provee contestación"}
+
+        first_key = _build_movement_external_key("C-1234-2024", first)
+
+        assert first_key == (
+            "pjud:null-folio:"
+            "233b28b1647858c30529573ec89896d993ce6e22723d3fe73d053c3f7f65a84a"
+        )
+        assert first_key == _build_movement_external_key("C-1234-2024", dict(first))
+        assert first_key != _build_movement_external_key("C-1234-2024", second)
+        assert len(first_key) == 80
+
+    def test_null_folio_key_ignores_all_mutable_and_document_fields(self):
+        from worker.engine import _build_movement_external_key
+
+        movement = {
             "folio": None,
             "cuaderno": "Principal",
             "fecha": "2024-05-01",
             "tramite": "Resolución",
             "descripcion": "Provee demanda",
             "etapa": "Discusión",
-            "foja": None,
-            "sala": "",
-            "estado": "",
+            "foja": 1,
+            "sala": "Primera",
+            "estado": "Pendiente",
+            "documento_url": "/doc-a",
+            "documento_token": "token-a",
+            "documentos_adicionales": [{"url": "/cert-a", "token": "cert-a"}],
+            "anexo_func": "anexoSolicitudCivil",
+            "anexo_token": "anexo-a",
         }
-        second = {**first, "descripcion": "Provee contestación"}
+        changed = {
+            **movement,
+            "etapa": "Cumplimiento",
+            "foja": 99,
+            "sala": "Segunda",
+            "estado": "Firmado",
+            "documento_url": "/doc-b",
+            "documento_token": "token-b",
+            "documentos_adicionales": [{"url": "/cert-b", "token": "cert-b"}],
+            "anexo_func": "anexoCausaCivil",
+            "anexo_token": "anexo-b",
+        }
 
-        first_key = _build_movement_external_key("C-1234-2024", first)
-
-        assert first_key == _build_movement_external_key("C-1234-2024", dict(first))
-        assert first_key != _build_movement_external_key("C-1234-2024", second)
-        assert first_key.startswith("pjud:null:")
-        assert len(first_key) == 74
+        assert _build_movement_external_key(
+            "C-1234-2024", movement,
+        ) == _build_movement_external_key("C-1234-2024", changed)
 
     @pytest.mark.asyncio
     async def test_two_syncs_with_mutable_status_keep_key_and_do_not_renotify(self):

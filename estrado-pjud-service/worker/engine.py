@@ -3,7 +3,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, date
 
@@ -113,13 +115,12 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
 
 _MOVEMENT_IDENTITY_FIELDS = (
     "folio",
-    "cuaderno",
     "fecha",
+    "cuaderno",
     "tramite",
     "descripcion",
-    "etapa",
-    "foja",
 )
+_NULL_FOLIO_KEY_FIELDS = ("fecha", "cuaderno", "tramite", "descripcion")
 
 _PRIMARY_DOCUMENT_FIELDS = (
     "documento_url",
@@ -131,7 +132,19 @@ _ANEXO_FIELDS = ("anexo_func", "anexo_token")
 
 def _movement_identity(movement: dict) -> tuple:
     """Return the stable PJUD fields that identify one logical movement."""
-    return tuple(movement.get(field) for field in _MOVEMENT_IDENTITY_FIELDS)
+    return (
+        movement.get("folio"),
+        *(
+            _normalize_movement_identity_part(movement.get(field))
+            for field in _MOVEMENT_IDENTITY_FIELDS
+            if field != "folio"
+        ),
+    )
+
+
+def _normalize_movement_identity_part(value) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _build_movement_external_key(case_number: str, movement: dict) -> str:
@@ -145,19 +158,15 @@ def _build_movement_external_key(case_number: str, movement: dict) -> str:
         )
 
     identity = {
-        "case_number": case_number,
-        **{
-            field: movement.get(field)
-            for field in _MOVEMENT_IDENTITY_FIELDS
-        },
+        field: _normalize_movement_identity_part(movement.get(field))
+        for field in _NULL_FOLIO_KEY_FIELDS
     }
     encoded = json.dumps(
         identity,
         ensure_ascii=False,
         separators=(",", ":"),
-        sort_keys=True,
     ).encode("utf-8")
-    return f"pjud:null:{hashlib.sha256(encoded).hexdigest()}"
+    return f"pjud:null-folio:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _copy_movement(movement: dict) -> dict:
