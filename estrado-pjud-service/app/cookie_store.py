@@ -3,8 +3,24 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
-DEFAULT_COOKIE_STORE_PATH = "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json"
+DEFAULT_COOKIE_STORE_PATH = "/var/lib/estrado-pjud/cookies.json"
+PRODUCTION_CHECKOUT = Path("/opt/legal-tech-microservices")
+
+
+def validate_cookie_store_path(value: str) -> str:
+    """Fail closed if production would persist runtime state inside Git."""
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("COOKIE_STORE_PATH must be absolute and outside the git checkout")
+    lexical = Path(os.path.normpath(value))
+    normalized = path.resolve(strict=False)
+    if lexical.is_relative_to(PRODUCTION_CHECKOUT) or normalized.is_relative_to(
+        PRODUCTION_CHECKOUT.resolve(strict=False)
+    ):
+        raise ValueError("COOKIE_STORE_PATH must be absolute and outside the git checkout")
+    return value
 
 
 @dataclass
@@ -13,6 +29,7 @@ class CookieBundle:
     user_agent: str
     saved_at: float
     proxy_url: str | None = None
+    proxy_token: str | None = None
 
     @property
     def age_seconds(self) -> float:
@@ -38,12 +55,9 @@ class CookieStore:
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(payload, f)
-            # El worker (User=estrado) escribe el store; el servicio API
-            # (User=www-data) lo lee. mkstemp crea 0600 → hacerlo legible por
-            # ambos. Los cookies TSPD son de baja sensibilidad (tokens anti-bot
-            # + sesión invitado, no credenciales). Revisar si Familia (sesión
-            # autenticada) llega a persistirse acá.
-            os.chmod(tmp, 0o644)
+            # El worker (User/Group=estrado) escribe; la API (www-data con
+            # SupplementaryGroups=estrado) lee. Nunca exponer cookies al resto.
+            os.chmod(tmp, 0o640)
             os.replace(tmp, self._path)
         except BaseException:
             if os.path.exists(tmp):
@@ -81,7 +95,7 @@ class CookieStore:
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(payload, f)
-            os.chmod(tmp, 0o644)
+            os.chmod(tmp, 0o640)
             os.replace(tmp, self._path)
         except BaseException:
             if os.path.exists(tmp):
@@ -106,14 +120,17 @@ class CookieStore:
         slot_id,
         cookies: dict[str, str],
         user_agent: str,
-        proxy_url: str | None,
+        proxy_token: str | None,
     ) -> None:
         slot_key = str(slot_id)
         slots = self._read_all_raw()
         slots[slot_key] = {
             "cookies": cookies,
             "user_agent": user_agent,
-            "proxy_url": proxy_url,
+            # Persistir el URL completo filtraba usuario/password del proveedor.
+            # El API reconstruye el URL sticky desde su OJV_PROXY_URL secreto y
+            # este token opaco; un store robado no alcanza para usar el proxy.
+            "proxy_token": proxy_token,
             "saved_at": time.time(),
         }
         self._write_all(slots)
@@ -130,7 +147,10 @@ class CookieStore:
                     cookies=data["cookies"],
                     user_agent=data["user_agent"],
                     saved_at=data["saved_at"],
-                    proxy_url=data.get("proxy_url"),
+                    # Deliberadamente ignoramos proxy_url del esquema legacy:
+                    # nunca volver a cargar credenciales persistidas en disco.
+                    proxy_url=None,
+                    proxy_token=data.get("proxy_token"),
                 )
             except (KeyError, TypeError):
                 continue

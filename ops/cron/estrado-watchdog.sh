@@ -10,6 +10,7 @@ set -a; . "$ENV"; set +a
 API="${SUPABASE_URL%/}/rest/v1"
 AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
 NOW=$(date -u +%Y-%m-%dT%H:%M:%S)
+SYSTEMCTL="${WD_SYSTEMCTL:-systemctl}"
 
 # Devuelve el conteo, o VACÍO si no se pudo consultar. Devolvía 0 en ese caso, y eso
 # es la misma enfermedad que el resto del archivo viene a curar: una consulta que
@@ -155,8 +156,22 @@ nuevas_causas() { # <slug de estado> <filtro postgrest sobre cases>
 #    systemd lo da por activo — con el worker detenido, el 4 se saltea entero y hasta
 #    hoy no quedaba nadie mirando.
 #    Ojo: `active` es condición necesaria y no suficiente. Ver el chequeo 9.
-systemctl is-active --quiet estrado-pjud.service || add "estrado-pjud.service (API PJUD) NO está activo." "api-down"
-systemctl is-active --quiet estrado-pjud-worker.service || add "estrado-pjud-worker.service (worker de sync) NO está activo: ninguna causa se sincroniza hasta que vuelva." "worker-down"
+"$SYSTEMCTL" is-active --quiet estrado-pjud.service || add "estrado-pjud.service (API PJUD) NO está activo." "api-down"
+WORKER_ENABLED_STATE=$("$SYSTEMCTL" is-enabled estrado-pjud-worker.service 2>/dev/null || true)
+case "$WORKER_ENABLED_STATE" in
+  enabled)
+    "$SYSTEMCTL" is-active --quiet estrado-pjud-worker.service \
+      || add "estrado-pjud-worker.service debía correr pero NO está activo: ninguna causa se sincroniza hasta que vuelva." "worker-down"
+    ;;
+  disabled)
+    if "$SYSTEMCTL" is-active --quiet estrado-pjud-worker.service; then
+      add "estrado-pjud-worker.service está activo aunque el gate lo dejó disabled: detenerlo antes de consumir proxy." "worker-gate-violated"
+    fi
+    ;;
+  *)
+    add "No pude confirmar si estrado-pjud-worker.service está enabled o disabled (estado: ${WORKER_ENABLED_STATE:-sin respuesta})." "worker-state-unknown"
+    ;;
+esac
 
 # 2. Disco y memoria
 DISK=$(df / | awk 'NR==2{gsub("%","",$5); print $5}')
@@ -218,7 +233,7 @@ if [ -n "$HB_TS" ] && [ "$HB_TS" != "[]" ]; then
   HB_EPOCH=$(date -u -d "$HB_TS" +%s 2>/dev/null || echo 0)
   AGE_MIN=$(( ( $(date -u +%s) - HB_EPOCH ) / 60 ))
   # Solo alerta si el worker systemd está activo pero el heartbeat es viejo (>30 min)
-  if systemctl is-active --quiet estrado-pjud-worker.service && [ "$AGE_MIN" -gt 30 ]; then
+  if "$SYSTEMCTL" is-active --quiet estrado-pjud-worker.service && [ "$AGE_MIN" -gt 30 ]; then
     add "Worker activo pero último heartbeat hace ${AGE_MIN} min (>30)." "hb-stale"
   fi
 fi

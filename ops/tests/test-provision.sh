@@ -41,6 +41,8 @@ setup() { # setup <nombre> — repo falso completo y sano
   cp "$OPS_DIR/env.inventory" "$REPO/ops/env.inventory"
   # .env completo: cada nombre del inventario con un valor de mentira
   grep -vE '^#|^$' "$REPO/ops/env.inventory" | sed 's/$/=valor-secreto-falso/' > "$ENVF"
+  sed -i.bak 's|^COOKIE_STORE_PATH=.*|COOKIE_STORE_PATH=/var/lib/estrado-pjud/cookies.json|' "$ENVF"
+  rm "$ENVF.bak"
   touch "$REPO/estrado-pjud-service/.venv/bin/python"
   chmod +x "$REPO/estrado-pjud-service/.venv/bin/python"
   touch "$MON/monitor.py" "$MON/resource-tracker.py"
@@ -62,6 +64,7 @@ run_prov() {
   OUT=$(PROV_REPO_DIR="$REPO" PROV_SYSTEMD_DIR="$SYSD" PROV_SYSTEMCTL="$SYSCTL" \
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
         PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
+        PROV_ENABLE_PJUD_WORKER="${PROV_ENABLE_PJUD_WORKER:-0}" \
         PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
 }
@@ -76,8 +79,10 @@ expect_eq "un daemon-reload" "$(reloads)" "1"
 N_SRC=$(find "$OPS_DIR/systemd" -type f | wc -l | tr -d ' ')
 N_DST=$(find "$SYSD" -type f | wc -l | tr -d ' ')
 expect_eq "instaló todos los archivos (incluido el drop-in)" "$N_DST" "$N_SRC"
-expect_contains "habilita las 4 units derivadas del espejo (sin slice ni drop-in)" "$(cat "$LOG_SYSCTL")" \
-  "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
+expect_contains "habilita las 3 units seguras y deja el worker bajo gate explícito" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
+expect_missing "no habilita el worker por defecto" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud-worker.service"
 expect_contains "lo dice" "$OUT" "OK:"
 expect_same_file "instaló el Caddyfile del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
 expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
@@ -88,6 +93,13 @@ expect_eq "exit 0" "$RC" "0"
 expect_eq "sigue habiendo UN daemon-reload (no re-instaló)" "$(reloads)" "1"
 expect_eq "sigue habiendo UNA recarga de caddy" "$(caddy_reloads)" "1"
 expect_contains "lo dice" "$OUT" "units al día"
+
+echo "== habilitación del worker: requiere flag explícito"
+setup workeroptin
+PROV_ENABLE_PJUD_WORKER=1 run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_contains "habilita worker sólo con opt-in" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"
 echo "# drift manual" >> "$SYSD/estrado-pjud.service"
@@ -151,6 +163,15 @@ echo "== .env ausente: lo dice y exit 1"
 setup noenv; rm "$ENVF"; run_prov
 expect_eq "exit 1" "$RC" "1"
 expect_contains "lo dice" "$OUT" "FALTA"
+
+echo "== cookie store dentro del checkout: falla cerrado sin imprimir el valor"
+setup cookiestore
+sed -i.bak 's|^COOKIE_STORE_PATH=.*|COOKIE_STORE_PATH=./.cookies.json|' "$ENVF"
+rm "$ENVF.bak"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "exige el StateDirectory compartido" "$OUT" "/var/lib/estrado-pjud/cookies.json"
+expect_missing "no imprime el path inseguro" "$OUT" "./.cookies.json"
 
 echo "== venv ausente: lo dice y exit 1"
 setup novenv; rm "$REPO/estrado-pjud-service/.venv/bin/python"; run_prov

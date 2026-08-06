@@ -265,9 +265,9 @@ async def test_no_proxy_fallback_mints_without_proxy(monkeypatch):
     for call in fake_store.save_slot.call_args_list:
         _, kwargs = call
         args = call.args
-        # save_slot(slot_id, cookies, user_agent, proxy_url) — proxy_url is last
-        proxy_url_arg = kwargs.get("proxy_url", args[-1] if args else None)
-        assert proxy_url_arg is None
+        # save_slot(slot_id, cookies, user_agent, proxy_token) — token is last
+        proxy_token_arg = kwargs.get("proxy_token", args[-1] if args else None)
+        assert proxy_token_arg is None
 
 
 @pytest.mark.asyncio

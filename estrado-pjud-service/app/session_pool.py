@@ -11,6 +11,7 @@ from app.cookie_store import CookieBundle, CookieStore
 from app.failure_kind import NoUsableBundleError, new_egress_may_help
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy import build_sticky_proxy_url
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 
@@ -233,7 +234,23 @@ class APISessionPool:
         próximo; leer el store una vez por intento sería releer el archivo en el
         camino caliente para obtener lo mismo.
         """
-        return [b for _, b in sorted(self._store.load_all().items()) if self._usable(b)]
+        bundles: list[CookieBundle] = []
+        for _, bundle in sorted(self._store.load_all().items()):
+            if self._proxy_mode and bundle.proxy_token:
+                bundle = CookieBundle(
+                    cookies=bundle.cookies,
+                    user_agent=bundle.user_agent,
+                    saved_at=bundle.saved_at,
+                    proxy_url=build_sticky_proxy_url(
+                        self._settings.OJV_PROXY_URL,
+                        bundle.proxy_token,
+                        self._settings.OJV_PROXY_STICKY_LIFETIME,
+                    ),
+                    proxy_token=bundle.proxy_token,
+                )
+            if self._usable(bundle):
+                bundles.append(bundle)
+        return bundles
 
     def _rotate(self, utilizables: list[CookieBundle]) -> CookieBundle | None:
         """El próximo bundle del round-robin, o None si la lista está vacía."""

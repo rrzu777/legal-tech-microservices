@@ -202,7 +202,7 @@ class SessionPool:
                 )
                 await asyncio.sleep(delay)
 
-        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, proxy_url)
+        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, token)
 
         old_session = slot.session
         slot.token = token
@@ -329,6 +329,17 @@ class SessionPool:
             logger.exception("load_slot falló para slot %d (Familia)", slot.index)
             await self._return_slot(slot, healthy=True)
             raise
+        if bundle is not None:
+            # El store persiste sólo el token sticky, nunca la credencial. En el
+            # worker ya tenemos el URL reconstruido en memoria para este mismo
+            # slot; adjuntarlo conserva el invariante cookie <-> IP de Familia.
+            bundle = CookieBundle(
+                cookies=bundle.cookies,
+                user_agent=bundle.user_agent,
+                saved_at=bundle.saved_at,
+                proxy_url=slot.proxy_url,
+                proxy_token=bundle.proxy_token,
+            )
         return bundle, slot
 
     async def release_familia_bundle(

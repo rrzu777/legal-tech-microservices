@@ -6,6 +6,7 @@ PartOf=legaltech.slice
 [Service]
 Type=simple
 User=www-data
+SupplementaryGroups=estrado
 WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
 
 Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin

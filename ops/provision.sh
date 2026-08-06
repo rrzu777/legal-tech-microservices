@@ -14,7 +14,7 @@
 #     NOMBRES; los valores nunca se leen ni se imprimen)
 #   - venv, usuarios de las units y /opt/legaltech-monitoring (los scripts de
 #     monitoreo NO viven en este repo — solo se avisa si faltan)
-#   - systemctl enable de las cuatro units
+#   - systemctl enable de las units; el worker requiere opt-in explícito
 #
 # Qué NO cubre: el crontab y /opt/estrado-cron (eso es ops/cron/deploy-cron.sh
 # + el procedimiento del crontab.snapshot), el paquete caddy y las reglas de
@@ -38,6 +38,7 @@ main() {
   local caddy_bin="${PROV_CADDY_BIN:-caddy}"
   local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
   local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
+  local enable_pjud_worker="${PROV_ENABLE_PJUD_WORKER:-0}"
   local src="$repo_dir/ops/systemd"
   local changed=0 rc=0 rel dest
 
@@ -101,7 +102,7 @@ main() {
     echo "FALTA $env_file (modo 600). Variables requeridas en ops/env.inventory; los valores se reponen desde el gestor de secretos." >&2
     rc=1
   else
-    local missing extra
+    local missing extra cookie_store_value
     missing=$(comm -23 \
       <(grep -vE '^#|^$' "$repo_dir/ops/env.inventory" | sort) \
       <(cut -d= -f1 "$env_file" | grep -vE '^#|^$' | sort))
@@ -120,6 +121,11 @@ main() {
     if [ -n "$extra" ]; then
       echo "OJO: el .env tiene variables que ops/env.inventory no lista (agregalas al inventario o una reconstrucción las pierde):"
       echo "$extra"
+    fi
+    cookie_store_value=$(awk -F= '$1 == "COOKIE_STORE_PATH" {print substr($0, index($0, "=") + 1); exit}' "$env_file")
+    if [ "$cookie_store_value" != "/var/lib/estrado-pjud/cookies.json" ]; then
+      echo "COOKIE_STORE_PATH debe ser /var/lib/estrado-pjud/cookies.json para usar el StateDirectory privado compartido; no se muestra el valor actual." >&2
+      rc=1
     fi
   fi
 
@@ -155,12 +161,16 @@ main() {
   # unit): agregar una unit al espejo no exige acordarse de una segunda lista.
   local enable_units=()
   while IFS= read -r rel; do
+    if [ "$rel" = "estrado-pjud-worker.service" ] \
+      && [ "$enable_pjud_worker" != "1" ]; then
+      continue
+    fi
     enable_units+=("$rel")
   done < <(cd "$src" && find . -maxdepth 1 -name '*.service' -type f | sed 's|^\./||' | sort)
   "$systemctl_bin" enable "${enable_units[@]}"
 
   if [ "$rc" -eq 0 ]; then
-    echo "OK: units instaladas y habilitadas, .env completo, venv y usuarios presentes."
+    echo "OK: units instaladas; worker sólo habilitado con PROV_ENABLE_PJUD_WORKER=1; .env completo, venv y usuarios presentes."
   else
     echo "INCOMPLETO: resolver lo listado arriba y volver a correr (es idempotente)." >&2
   fi
