@@ -29,3 +29,18 @@ class TestWorkerConfig:
         assert config.SESSION_MAX_AGE_S == 1500
         assert config.OJV_TIMEOUT_S == 25
         assert config.RATE_LIMIT_MS == 2500
+
+    def test_rejects_cookie_store_inside_production_checkout(self, monkeypatch):
+        import pytest
+
+        monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
+        monkeypatch.setenv(
+            "COOKIE_STORE_PATH",
+            "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json",
+        )
+
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match="outside the git checkout"):
+            WorkerConfig(_env_file=None)

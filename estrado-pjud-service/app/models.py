@@ -313,6 +313,7 @@ class DetailResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     last_successful_request: str | None
+    pjud_available: bool = True
     uptime_seconds: int
     total_requests: int = 0
     search_requests: int = 0

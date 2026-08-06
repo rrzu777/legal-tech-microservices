@@ -17,6 +17,9 @@ from pydantic import BaseModel
 
 from app.parsers.normalizer import competencia_code
 from app.parsers.search_parser import detect_blocked
+from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import is_proxy_cost_control_error
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
 
@@ -210,11 +213,13 @@ class CatalogService:
         snapshot: dict | None = None,
         snapshot_path: Path = _SNAPSHOT_PATH,
         now: Callable[[], datetime] | None = None,
+        proxy_usage=None,
     ):
         self._pool = session_pool
         self._snapshot = snapshot if snapshot is not None else self._load_snapshot(snapshot_path)
         self._cache: dict[str, _CacheEntry] = {}
         self._now = now or (lambda: datetime.now(UTC))
+        self._proxy_usage = proxy_usage or DISABLED_PROXY_USAGE
 
     @staticmethod
     def _load_snapshot(path: Path) -> dict:
@@ -361,6 +366,8 @@ class CatalogService:
             if not options:
                 raise CatalogContentError(f"PJUD returned no usable {catalog} options")
         except Exception as exc:
+            if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
+                raise
             logger.warning(
                 "Catalog live fetch failed; using snapshot (catalog=%s, error=%s)",
                 catalog,
@@ -398,39 +405,42 @@ class CatalogService:
         session = await self._pool.acquire()
         healthy = True
         try:
-            if catalog == "courts":
-                rows = await session.catalog_json(
-                    "/combosJSON/leeCorte.php",
-                    {"tipoBusqueda": params["tipo_busqueda"]},
-                )
-                options = parse_json_options(rows, "COD_CORTE", "GLS_CORTE")
-            elif catalog == "tribunals":
-                rows = await session.catalog_json(
-                    "/combosJSON/leeTrib.php",
-                    {
+            # Reserve immediately before the catalog call. Pool acquisition can
+            # mint for tens of seconds and has its own separately metered scope.
+            async with self._proxy_usage.track(operation="catalog"):
+                if catalog == "courts":
+                    rows = await session.catalog_json(
+                        "/combosJSON/leeCorte.php",
+                        {"tipoBusqueda": params["tipo_busqueda"]},
+                    )
+                    options = parse_json_options(rows, "COD_CORTE", "GLS_CORTE")
+                elif catalog == "tribunals":
+                    rows = await session.catalog_json(
+                        "/combosJSON/leeTrib.php",
+                        {
+                            "codCompetencia": str(competencia_code(params["competencia"])),
+                            "codCorte": params["corte"],
+                            "tipoBusqueda": params["tipo_busqueda"],
+                        },
+                    )
+                    options = parse_json_options(rows, "COD_TRIBUNAL", "GLS_TRIBUNAL")
+                elif catalog == "books":
+                    data = {
                         "codCompetencia": str(competencia_code(params["competencia"])),
-                        "codCorte": params["corte"],
-                        "tipoBusqueda": params["tipo_busqueda"],
-                    },
-                )
-                options = parse_json_options(rows, "COD_TRIBUNAL", "GLS_TRIBUNAL")
-            elif catalog == "books":
-                data = {
-                    "codCompetencia": str(competencia_code(params["competencia"])),
-                    "codAnho": params["anno"],
-                }
-                if "corte" in params:
-                    data["codCorte"] = params["corte"]
-                html = await session.catalog_html("/ADIR_871/json/cmbTipos.php", data)
-                if detect_blocked(html):
+                        "codAnho": params["anno"],
+                    }
+                    if "corte" in params:
+                        data["codCorte"] = params["corte"]
+                    html = await session.catalog_html("/ADIR_871/json/cmbTipos.php", data)
+                    if detect_blocked(html):
+                        healthy = False
+                    options = parse_html_options(html)
+                else:
+                    raise ValueError(f"Unknown catalog {catalog!r}")
+                if not options:
                     healthy = False
-                options = parse_html_options(html)
-            else:
-                raise ValueError(f"Unknown catalog {catalog!r}")
-            if not options:
-                healthy = False
-                raise CatalogContentError(f"PJUD returned invalid {catalog} catalog")
-            return options
+                    raise CatalogContentError(f"PJUD returned invalid {catalog} catalog")
+                return options
         except Exception:
             # A malformed, empty or WAF response is bound to this OJV session;
             # returning it to the pool would make the next catalog request reuse

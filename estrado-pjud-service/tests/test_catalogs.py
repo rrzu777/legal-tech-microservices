@@ -188,6 +188,36 @@ async def test_catalog_uses_nonempty_live_value_for_24_hour_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_catalog_runs_inside_durable_proxy_usage_operation():
+    session = MagicMock()
+    session.catalog_json = AsyncMock(return_value=[{
+        "COD_CORTE": "90", "GLS_CORTE": "C.A. de Santiago",
+    }])
+    pool = MagicMock()
+    pool.acquire = AsyncMock(return_value=session)
+    pool.release = AsyncMock()
+    tracked = []
+
+    class Tracker:
+        def track(self, **kwargs):
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def scope():
+                tracked.append(kwargs)
+                yield MagicMock()
+
+            return scope()
+
+    service = CatalogService(pool, snapshot={}, proxy_usage=Tracker())
+
+    result = await service.courts()
+
+    assert result.source == "live"
+    assert tracked == [{"operation": "catalog"}]
+
+
+@pytest.mark.asyncio
 async def test_empty_live_value_is_not_cached_or_used_as_a_catalog():
     """Catches overwriting a healthy catalog with PJUD's empty/challenge response."""
     service = CatalogService(

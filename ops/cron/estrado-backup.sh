@@ -28,7 +28,7 @@ mkdir -p "$STAGE"
 
 # El cookie store vive donde diga el .env (COOKIE_STORE_PATH pisa el default;
 # buscarlo en una ruta fija ya nos mandó una vez a una conclusión falsa).
-COOKIE_STORE_PATH=$(set -a; . "$SERVICE_DIR/.env" 2>/dev/null; set +a; printf '%s' "${COOKIE_STORE_PATH:-$SERVICE_DIR/.cookies.json}")
+COOKIE_STORE_PATH=$(set -a; . "$SERVICE_DIR/.env" 2>/dev/null; set +a; printf '%s' "${COOKIE_STORE_PATH:-/var/lib/estrado-pjud/cookies.json}")
 
 # Cada fuente se copia si existe; las que falten se anotan en MISSING para que
 # el resumen final lo diga en vez de fallar en silencio.

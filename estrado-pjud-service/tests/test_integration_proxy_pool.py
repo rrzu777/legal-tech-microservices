@@ -71,18 +71,24 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     pool = SessionPool(_worker_config(store_path, pool_size=3))
     await pool.initialize()
 
-    # El store REAL quedó con 3 bundles, cada uno con su proxy_url sticky distinto.
+    # El store REAL guarda sólo tokens opacos; jamás credenciales del proxy.
     bundles = CookieStore(str(store_path)).load_all()
     assert len(bundles) == 3
-    worker_proxies = {b.proxy_url for b in bundles.values()}
-    assert len(worker_proxies) == 3  # 3 IPs distintas (tokens distintos)
-    for pu in worker_proxies:
-        assert pu.startswith("http://user123:pw_country-cl_session-")
-        assert pu.endswith("_lifetime-1h@geo.example.com:12321")
+    worker_tokens = {b.proxy_token for b in bundles.values()}
+    assert len(worker_tokens) == 3
+    raw_store = store_path.read_text()
+    assert "user123" not in raw_store
+    assert "pw_country" not in raw_store
     # cookies distintas por slot (cada slot minteó lo suyo)
     assert {tuple(b.cookies.items()) for b in bundles.values()} == {
         (("TSPD_101", "cookie0"),), (("TSPD_101", "cookie1"),), (("TSPD_101", "cookie2"),),
     }
+
+    familia_bundle, familia_slot = await pool.acquire_familia_bundle()
+    assert familia_bundle.proxy_url == familia_slot.proxy_url
+    assert "user123" in familia_bundle.proxy_url
+    assert "user123" not in store_path.read_text()
+    await pool.release_familia_bundle(familia_slot)
 
     await pool.close_all()
 
@@ -96,7 +102,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    api = APISessionPool(_api_settings(store_path))
+    api = APISessionPool(_api_settings(store_path), allow_uncontrolled_proxy=True)
 
     # 3 acquires sin release => 3 sesiones nuevas, round-robin sobre los 3 bundles.
     for _ in range(3):
@@ -104,7 +110,10 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
 
     # El API egresó EXACTAMENTE por los proxy_url que minteó el worker: invariante
     # cookie<->IP respetado entre procesos.
-    assert set(captured_proxies) == worker_proxies
+    assert len(set(captured_proxies)) == 3
+    for proxy_url in captured_proxies:
+        assert proxy_url.startswith("http://user123:pw_country-cl_session-")
+        assert proxy_url.endswith("_lifetime-1h@geo.example.com:12321")
 
 
 @pytest.mark.asyncio
@@ -132,7 +141,7 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    api = APISessionPool(_api_settings(store_path))
+    api = APISessionPool(_api_settings(store_path), allow_uncontrolled_proxy=True)
 
     with pytest.raises(NoUsableBundleError):
         await api.acquire()

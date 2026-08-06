@@ -2,6 +2,8 @@ import asyncio
 import logging
 import random
 import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from app.adapters.http_adapter import OJVHttpAdapter
@@ -9,6 +11,8 @@ from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
+from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 from worker.config import WorkerConfig
 
@@ -48,7 +52,7 @@ class SessionPool:
     afecta una request en vuelo de otra corrutina sobre OTRO slot.
     """
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig, proxy_usage=None, proxy_control=None):
         self._config = config
         self._proxy_base = config.OJV_PROXY_URL
         self._sticky_lifetime = config.OJV_PROXY_STICKY_LIFETIME
@@ -78,6 +82,34 @@ class SessionPool:
         self._last_global_request: float = 0.0
         self._global_min_delay: float = 1.2
         self._store = CookieStore(config.COOKIE_STORE_PATH)
+        self._proxy_usage = proxy_usage
+        self._proxy_control = proxy_control
+
+    async def _persist_cost_failure(self, exc: BaseException) -> None:
+        if self._proxy_control is None:
+            return
+        if is_proxy_billing_error(exc):
+            await self._proxy_control.trip_billing_exhausted()
+        elif isinstance(exc, ProxyUsagePersistenceError):
+            await self._proxy_control.pause_telemetry_unavailable()
+        elif (
+            isinstance(exc, ProxyBudgetExceededError)
+            and exc.blocking_scope == "global"
+        ):
+            await self._proxy_control.refresh()
+
+    @asynccontextmanager
+    async def _mint_usage_scope(self, slot: _Slot, attempt: int):
+        if self._proxy_usage is None or not self._proxy_base:
+            yield None
+            return
+        async with self._proxy_usage.track(
+            operation="mint",
+            transaction_key=f"slot:{slot.index}:attempt:{attempt}:{uuid.uuid4()}",
+        ) as usage:
+            if attempt > 1:
+                usage.retry_count += 1
+            yield usage
 
     @property
     def effective_pool_size(self) -> int:
@@ -121,28 +153,29 @@ class SessionPool:
             new_session = None
             self.mint_attempts += 1
             try:
-                if self._proxy_base:
-                    token = generate_session_token()
-                    proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
-                    minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
-                else:
-                    minter = CookieMinter(self._config.PJUD_BASE_URL)
+                async with self._mint_usage_scope(slot, attempt):
+                    if self._proxy_base:
+                        token = generate_session_token()
+                        proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
+                        minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
+                    else:
+                        minter = CookieMinter(self._config.PJUD_BASE_URL)
 
-                creds = await minter.mint()
+                    creds = await minter.mint()
 
-                settings = Settings(
-                    API_KEY="unused-by-worker",
-                    OJV_BASE_URL=self._config.PJUD_BASE_URL,
-                    RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
-                )
-                adapter = OJVHttpAdapter(
-                    settings,
-                    proxy=proxy_url,
-                    user_agent=creds.user_agent,
-                    cookies=creds.cookies,
-                )
-                new_session = OJVSession(adapter)
-                await new_session.initialize()
+                    settings = Settings(
+                        API_KEY="unused-by-worker",
+                        OJV_BASE_URL=self._config.PJUD_BASE_URL,
+                        RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
+                    )
+                    adapter = OJVHttpAdapter(
+                        settings,
+                        proxy=proxy_url,
+                        user_agent=creds.user_agent,
+                        cookies=creds.cookies,
+                    )
+                    new_session = OJVSession(adapter)
+                    await new_session.initialize()
                 break
             except Exception as exc:
                 self.mint_failures += 1
@@ -153,7 +186,11 @@ class SessionPool:
                         await new_session.close()
                     except Exception:
                         logger.debug("No se pudo cerrar la sesion fallida del slot %d", slot.index)
-                if attempt >= attempts:
+                if (
+                    is_proxy_billing_error(exc)
+                    or isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError))
+                    or attempt >= attempts
+                ):
                     logger.error(
                         "Slot %d: minteo fallido tras %d intentos", slot.index, attempts
                     )
@@ -165,7 +202,7 @@ class SessionPool:
                 )
                 await asyncio.sleep(delay)
 
-        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, proxy_url)
+        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, token)
 
         old_session = slot.session
         slot.token = token
@@ -217,7 +254,14 @@ class SessionPool:
         if needs_refresh:
             try:
                 await self._refresh_slot(slot)
-            except Exception:
+            except Exception as exc:
+                if is_proxy_billing_error(exc) or isinstance(
+                    exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
+                ):
+                    await self._persist_cost_failure(exc)
+                    slot.busy = False
+                    self._sem.release()
+                    raise
                 # No penalizar la causa por un fallo de minteo/refresh: usar la
                 # sesión/bundle existente (posiblemente vencido). El challenge F5
                 # que devuelva se detecta downstream y va por el path de bloqueo
@@ -226,16 +270,21 @@ class SessionPool:
                 logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
         return slot
 
-    async def _return_slot(self, slot: _Slot, healthy: bool) -> None:
+    async def _return_slot(self, slot: _Slot, healthy: bool, remint: bool = True) -> None:
         """Primitiva de devolución: si `healthy=False`, re-mintea ESE slot (IP
         nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
         en uso por otras corrutinas. Base compartida por `release` y
         `release_familia_bundle`."""
         try:
-            if not healthy:
+            if not healthy and remint:
                 try:
                     await self._refresh_slot(slot)
-                except Exception:
+                except Exception as exc:
+                    if is_proxy_billing_error(exc) or isinstance(
+                        exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
+                    ):
+                        await self._persist_cost_failure(exc)
+                        raise
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
         finally:
             slot.busy = False
@@ -250,7 +299,9 @@ class SessionPool:
         self._checkout[session] = slot
         return session
 
-    async def release(self, session: OJVSession, healthy: bool = True) -> None:
+    async def release(
+        self, session: OJVSession, healthy: bool = True, remint: bool = True,
+    ) -> None:
         """Libera un slot tomado por `acquire`. El slot se resuelve por el
         registro explícito de checkouts (no por identidad escaneando `_slots`).
         Una release de una sesión no registrada (nunca adquirida, o ya liberada,
@@ -260,7 +311,7 @@ class SessionPool:
         if slot is None:
             logger.warning("release() de una sesión no registrada; ignorada")
             return
-        await self._return_slot(slot, healthy)
+        await self._return_slot(slot, healthy, remint=remint)
 
     async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
         """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
@@ -278,11 +329,24 @@ class SessionPool:
             logger.exception("load_slot falló para slot %d (Familia)", slot.index)
             await self._return_slot(slot, healthy=True)
             raise
+        if bundle is not None:
+            # El store persiste sólo el token sticky, nunca la credencial. En el
+            # worker ya tenemos el URL reconstruido en memoria para este mismo
+            # slot; adjuntarlo conserva el invariante cookie <-> IP de Familia.
+            bundle = CookieBundle(
+                cookies=bundle.cookies,
+                user_agent=bundle.user_agent,
+                saved_at=bundle.saved_at,
+                proxy_url=slot.proxy_url,
+                proxy_token=bundle.proxy_token,
+            )
         return bundle, slot
 
-    async def release_familia_bundle(self, slot: _Slot, healthy: bool = True) -> None:
+    async def release_familia_bundle(
+        self, slot: _Slot, healthy: bool = True, remint: bool = True,
+    ) -> None:
         """Libera un slot prestado a Familia. Misma semántica que release()."""
-        await self._return_slot(slot, healthy)
+        await self._return_slot(slot, healthy, remint=remint)
 
     async def enforce_global_rate_limit(self):
         """En modo proxy: no-op (cada IP tiene su propio rate-limit per-adapter;

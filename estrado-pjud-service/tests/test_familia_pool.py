@@ -81,6 +81,7 @@ async def test_acquire_familia_bundle_returns_bundle_and_slot(monkeypatch):
     bundle, slot = await pool.acquire_familia_bundle()
     assert bundle.cookies == {"TSPD_101": "x"}
     assert bundle.user_agent == "UA"
+    assert bundle.proxy_url == slot.proxy_url
     assert slot.busy is True  # slot tomado, nadie más lo usa
     await pool.release_familia_bundle(slot, healthy=True)
     assert slot.busy is False

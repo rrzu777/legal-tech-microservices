@@ -1,4 +1,10 @@
-from app.bandwidth import BandwidthMeter
+from app.bandwidth import (
+    BandwidthMeter,
+    capture_proxy_usage,
+    record_proxy_request,
+    record_proxy_response,
+    record_proxy_retry,
+)
 
 
 def test_add_accumulates_bytes():
@@ -38,3 +44,27 @@ def test_reset_zeroes_counter():
     meter.add(500)
     meter.reset()
     assert meter.total_bytes == 0
+
+
+def test_capture_attributes_bytes_requests_and_retries_to_current_operation():
+    with capture_proxy_usage() as usage:
+        record_proxy_request(120)
+        record_proxy_response(880)
+        record_proxy_retry()
+
+    assert usage.bytes_up == 120
+    assert usage.bytes_down == 880
+    assert usage.request_count == 1
+    assert usage.retry_count == 1
+
+
+def test_nested_capture_restores_parent_without_cross_contamination():
+    with capture_proxy_usage() as parent:
+        record_proxy_request(10)
+        with capture_proxy_usage() as child:
+            record_proxy_request(20)
+            record_proxy_response(30)
+        record_proxy_response(40)
+
+    assert (parent.bytes_up, parent.bytes_down) == (10, 40)
+    assert (child.bytes_up, child.bytes_down) == (20, 30)

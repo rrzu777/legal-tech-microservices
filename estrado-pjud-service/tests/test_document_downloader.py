@@ -6,6 +6,7 @@ import pytest
 
 from app import document_downloader
 from app.document_downloader import download_documents, DownloadedDoc, MAX_DOC_SIZE
+from app.proxy_cost import ProxyUsagePersistenceError
 
 
 def _pdf_resp():
@@ -131,3 +132,60 @@ async def test_does_not_retry_non_transient_error(monkeypatch):
 
     assert len(results) == 0
     assert session.download_document.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_402_is_never_retried_or_swallowed(monkeypatch):
+    monkeypatch.setattr(document_downloader.asyncio, "sleep", AsyncMock())
+    session = AsyncMock()
+    session.download_document.side_effect = httpx.ProxyError("402 Payment Required")
+
+    with pytest.raises(httpx.ProxyError):
+        await download_documents(
+            session,
+            [{"documento_url": "doc.php", "documento_token": "tok"}],
+        )
+
+    assert session.download_document.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_telemetry_failure_is_never_retried_or_swallowed(monkeypatch):
+    monkeypatch.setattr(document_downloader.asyncio, "sleep", AsyncMock())
+    session = AsyncMock()
+    session.download_document.side_effect = ProxyUsagePersistenceError(
+        "ledger unavailable"
+    )
+
+    with pytest.raises(ProxyUsagePersistenceError):
+        await download_documents(
+            session,
+            [{"documento_url": "doc.php", "documento_token": "tok"}],
+        )
+
+    assert session.download_document.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_402_cancels_documents_waiting_for_concurrency_slot(monkeypatch):
+    monkeypatch.setattr(document_downloader, "DOWNLOAD_DELAY_S", 0)
+    calls = 0
+
+    async def download(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ProxyError("402 Payment Required")
+        await asyncio.sleep(60)
+
+    session = AsyncMock()
+    session.download_document.side_effect = download
+    movements = [
+        {"documento_url": f"doc-{index}.php", "documento_token": "tok"}
+        for index in range(10)
+    ]
+
+    with pytest.raises(httpx.ProxyError):
+        await download_documents(session, movements)
+
+    assert calls <= document_downloader.MAX_CONCURRENT

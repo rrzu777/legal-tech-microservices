@@ -35,6 +35,9 @@ from fastapi import HTTPException, Request
 from app.alerting import maybe_alert, maybe_alert_event
 from app.failure_kind import FailureKind, classify_exception
 from app.metrics import api_metrics
+from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.session_pool import ProxyTrafficDisabledError
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +81,25 @@ async def acquire_or_alert(pool, request: Request, endpoint: str):
     try:
         return await pool.acquire()
     except Exception as e:
+        control = getattr(request.app.state, "proxy_control", None)
+        if isinstance(e, ProxyUsagePersistenceError) and control is not None:
+            await control.pause_telemetry_unavailable()
+        elif isinstance(e, ProxyBudgetExceededError) and control is not None:
+            await control.refresh()
         await _trace_pool_failure(
             request, endpoint,
             f"el pool no pudo entregar sesion ({type(e).__name__}: {e}). "
             "Revisar bundles F5 / proxy residencial: el servicio no esta atendiendo.",
         )
+        if isinstance(e, (
+            ProxyTrafficDisabledError,
+            ProxyBudgetExceededError,
+            ProxyUsagePersistenceError,
+        )):
+            raise HTTPException(
+                status_code=503,
+                detail="Servicio de sincronizacion temporalmente no disponible",
+            ) from e
         raise
 
 
@@ -100,6 +117,17 @@ async def familia_bundle_or_alert(pool, request: Request):
     métrica y la misma alerta que `acquire_or_alert`, porque es el mismo hecho
     contado desde otra ruta: el pool no tiene con qué salir a la calle.
     """
+    try:
+        await pool.assert_proxy_enabled()
+    except ProxyTrafficDisabledError as e:
+        await _trace_pool_failure(
+            request, "familia", "control operativo del proxy no disponible",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio de sincronizacion temporalmente no disponible",
+        ) from e
+
     bundle = pool.pick_familia_bundle()
     if bundle is not None:
         return bundle
@@ -131,6 +159,19 @@ async def classify_and_alert(e: Exception, request: Request, endpoint: str) -> F
     arme su propio modelo. Lo que sí centraliza es el rastro —métrica y alerta—,
     que es lo que se olvida.
     """
+    if is_proxy_billing_error(e):
+        control = getattr(request.app.state, "proxy_control", None)
+        if control is not None:
+            await control.trip_billing_exhausted()
+    elif isinstance(e, ProxyUsagePersistenceError):
+        control = getattr(request.app.state, "proxy_control", None)
+        if control is not None:
+            await control.pause_telemetry_unavailable()
+    elif isinstance(e, ProxyBudgetExceededError):
+        control = getattr(request.app.state, "proxy_control", None)
+        if control is not None and e.blocking_scope == "global":
+            await control.refresh()
+
     kind = classify_exception(e)
 
     if kind == "infra":

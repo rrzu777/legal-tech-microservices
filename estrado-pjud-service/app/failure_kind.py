@@ -40,6 +40,8 @@ from typing import Literal
 
 import httpx
 
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+
 FailureKind = Literal["infra", "ojv", "case"]
 
 #: De quién fue la culpa de un bloqueo, para el texto que ve el abogado.
@@ -233,6 +235,8 @@ def classify_exception(e: BaseException) -> FailureKind:
             MissingCsrfTokenError,
             RejectedDetailSessionError,
             BlockedPageError,
+            ProxyBudgetExceededError,
+            ProxyUsagePersistenceError,
         ),
     ):
         return "infra"

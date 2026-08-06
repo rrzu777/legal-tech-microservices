@@ -13,6 +13,7 @@
 #   4. restart de las dos units en UNA invocación: systemd encola ambos jobs a
 #      la vez (ventana de corte = max, no suma) y una unit que falla no impide
 #      el intento de la otra
+#      Con DEPLOY_KEEP_WORKER_STOPPED=1, detiene el worker y reinicia sólo API.
 #   5. health con reintentos — la API tarda en levantar; un curl inmediato da
 #      falso negativo
 #
@@ -41,13 +42,58 @@ main() {
   local health_retries="${DEPLOY_HEALTH_RETRIES:-60}"
   local health_sleep="${DEPLOY_HEALTH_SLEEP:-1}"
   local systemctl_bin="${DEPLOY_SYSTEMCTL:-systemctl}"
-  local services=(estrado-pjud.service estrado-pjud-worker.service)
+  local keep_worker_stopped="${DEPLOY_KEEP_WORKER_STOPPED:-0}"
+  local services=(estrado-pjud.service)
+  local worker_enabled=0
+  local worker_enabled_state worker_active_state
+  if [ "$keep_worker_stopped" != "1" ]; then
+    worker_enabled_state=$("$systemctl_bin" is-enabled estrado-pjud-worker.service 2>/dev/null || true)
+    case "$worker_enabled_state" in
+      enabled)
+        worker_enabled=1
+        services+=(estrado-pjud-worker.service)
+        ;;
+      disabled) ;;
+      *)
+        echo "ABORTA: estado enabled/disabled del worker desconocido (${worker_enabled_state:-sin respuesta})" >&2
+        exit 1
+        ;;
+    esac
+  fi
 
   cd "$repo_dir"
 
-  if ! git diff-index --quiet HEAD --; then
+  if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
     echo "ABORTA: hay cambios sin commitear en $repo_dir — resolvelos antes de desplegar" >&2
     exit 1
+  fi
+
+  if [ "$keep_worker_stopped" = "1" ]; then
+    if ! "$systemctl_bin" disable --now estrado-pjud-worker.service; then
+      echo "ABORTA: no se pudo deshabilitar/detener estrado-pjud-worker.service" >&2
+      exit 1
+    fi
+    worker_enabled_state=$("$systemctl_bin" is-enabled estrado-pjud-worker.service 2>/dev/null || true)
+    worker_active_state=$("$systemctl_bin" is-active estrado-pjud-worker.service 2>/dev/null || true)
+    if [ "$worker_enabled_state" != "disabled" ] \
+      || [ "$worker_active_state" != "inactive" ]; then
+      echo "ABORTA: el worker no quedó inequívocamente disabled+inactive después del gate" >&2
+      exit 1
+    fi
+    echo "Gate activo: el worker permanece detenido; se desplegará sólo la API."
+  elif [ "$worker_enabled" = "0" ]; then
+    worker_active_state=$("$systemctl_bin" is-active estrado-pjud-worker.service 2>/dev/null || true)
+    if [ "$worker_active_state" = "active" ]; then
+      if ! "$systemctl_bin" stop estrado-pjud-worker.service \
+        || [ "$("$systemctl_bin" is-active estrado-pjud-worker.service 2>/dev/null || true)" != "inactive" ]; then
+        echo "ABORTA: worker disabled pero no se pudo detener" >&2
+        exit 1
+      fi
+    elif [ "$worker_active_state" != "inactive" ]; then
+      echo "ABORTA: estado active/inactive del worker desconocido (${worker_active_state:-sin respuesta})" >&2
+      exit 1
+    fi
+    echo "Gate persistente: worker disabled; el deploy normal no lo reiniciará."
   fi
 
   local prev
@@ -113,7 +159,11 @@ main() {
     echo "OJO: ops/cron cambió en este rango; lo instalado en /opt/estrado-cron NO se actualiza solo — corré ops/cron/deploy-cron.sh desde el laptop."
   fi
 
-  echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta, units activas."
+  if [ "$keep_worker_stopped" = "1" ] || [ "$worker_enabled" = "0" ]; then
+    echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta y el worker permanece detenido."
+  else
+    echo "OK: desplegado $(git rev-parse --short HEAD) ($prev → HEAD), health contesta, units activas."
+  fi
 }
 
 # Lee los locals de main() (scoping dinámico de bash): prev, systemctl_bin,

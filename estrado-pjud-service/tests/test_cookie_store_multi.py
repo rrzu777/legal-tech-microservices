@@ -5,31 +5,34 @@ from app.cookie_store import CookieStore
 
 DUMMY_PROXY_0 = "http://user:pw_country-cl_session-tok0_lifetime-1h@geo.example.com:12321"
 DUMMY_PROXY_1 = "http://user:pw_country-cl_session-tok1_lifetime-1h@geo.example.com:12321"
+DUMMY_TOKEN_0 = "tok0"
+DUMMY_TOKEN_1 = "tok1"
 
 
 def test_save_slot_and_load_slot_roundtrip(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot("0", cookies={"TSPD_101": "abc"}, user_agent="UA/1.0", proxy_url=DUMMY_PROXY_0)
+    store.save_slot("0", cookies={"TSPD_101": "abc"}, user_agent="UA/1.0", proxy_token=DUMMY_TOKEN_0)
     bundle = store.load_slot("0")
     assert bundle.cookies == {"TSPD_101": "abc"}
     assert bundle.user_agent == "UA/1.0"
-    assert bundle.proxy_url == DUMMY_PROXY_0
+    assert bundle.proxy_url is None
+    assert bundle.proxy_token == DUMMY_TOKEN_0
 
 
 def test_multiple_slots_coexist_and_resave_does_not_wipe_others(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot("0", cookies={"a": "1"}, user_agent="UA/0", proxy_url=DUMMY_PROXY_0)
-    store.save_slot("1", cookies={"b": "2"}, user_agent="UA/1", proxy_url=DUMMY_PROXY_1)
+    store.save_slot("0", cookies={"a": "1"}, user_agent="UA/0", proxy_token=DUMMY_TOKEN_0)
+    store.save_slot("1", cookies={"b": "2"}, user_agent="UA/1", proxy_token=DUMMY_TOKEN_1)
 
     all_bundles = store.load_all()
     assert set(all_bundles.keys()) == {"0", "1"}
     assert all_bundles["0"].cookies == {"a": "1"}
-    assert all_bundles["0"].proxy_url == DUMMY_PROXY_0
+    assert all_bundles["0"].proxy_token == DUMMY_TOKEN_0
     assert all_bundles["1"].cookies == {"b": "2"}
-    assert all_bundles["1"].proxy_url == DUMMY_PROXY_1
+    assert all_bundles["1"].proxy_token == DUMMY_TOKEN_1
 
     # Re-saving slot "0" must not wipe slot "1"
-    store.save_slot("0", cookies={"a": "new"}, user_agent="UA/0-new", proxy_url=DUMMY_PROXY_0)
+    store.save_slot("0", cookies={"a": "new"}, user_agent="UA/0-new", proxy_token=DUMMY_TOKEN_0)
     all_bundles = store.load_all()
     assert set(all_bundles.keys()) == {"0", "1"}
     assert all_bundles["0"].cookies == {"a": "new"}
@@ -38,7 +41,7 @@ def test_multiple_slots_coexist_and_resave_does_not_wipe_others(tmp_path):
 
 def test_load_slot_absent_returns_none(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot("0", cookies={"a": "1"}, user_agent="UA/0", proxy_url=DUMMY_PROXY_0)
+    store.save_slot("0", cookies={"a": "1"}, user_agent="UA/0", proxy_token=DUMMY_TOKEN_0)
     assert store.load_slot("does-not-exist") is None
 
 
@@ -64,32 +67,56 @@ def test_old_single_bundle_format_treated_as_empty(tmp_path):
     assert store.load_slot("0") is None
 
 
-def test_saved_file_is_group_world_readable(tmp_path):
+def test_saved_file_is_group_readable_but_not_world_readable(tmp_path):
     p = tmp_path / "cookies.json"
-    CookieStore(path=str(p)).save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_url=DUMMY_PROXY_0)
+    CookieStore(path=str(p)).save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_token=DUMMY_TOKEN_0)
     mode = stat.S_IMODE(os.stat(p).st_mode)
-    assert oct(os.stat(p).st_mode)[-3:] == "644"
-    assert mode == 0o644
+    assert oct(os.stat(p).st_mode)[-3:] == "640"
+    assert mode == 0o640
+
+
+def test_store_never_persists_proxy_credentials(tmp_path):
+    p = tmp_path / "cookies.json"
+    CookieStore(path=str(p)).save_slot(
+        "0", cookies={"a": "1"}, user_agent="UA", proxy_token=DUMMY_TOKEN_0
+    )
+    raw = p.read_text()
+    assert DUMMY_TOKEN_0 in raw
+    assert "http://user:" not in raw
+    assert "pw_country" not in raw
+    assert "proxy_url" not in raw
+
+
+def test_legacy_proxy_url_is_never_loaded(tmp_path):
+    p = tmp_path / "cookies.json"
+    p.write_text(
+        '{"slots":{"0":{"cookies":{"a":"1"},"user_agent":"UA",'
+        '"proxy_url":"http://user:secret@example.com:1","saved_at":123}}}'
+    )
+    bundle = CookieStore(path=str(p)).load_slot("0")
+    assert bundle is not None
+    assert bundle.proxy_url is None
+    assert bundle.proxy_token is None
 
 
 def test_age_seconds_works_on_slot_bundle(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_url=DUMMY_PROXY_0)
+    store.save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_token=DUMMY_TOKEN_0)
     bundle = store.load_slot("0")
     assert bundle.age_seconds >= 0
     assert bundle.age_seconds < 5
 
 
-def test_proxy_url_defaults_to_none_when_saved_without_it(tmp_path):
+def test_proxy_token_defaults_to_none_when_saved_without_it(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_url=None)
+    store.save_slot("0", cookies={"a": "1"}, user_agent="UA", proxy_token=None)
     bundle = store.load_slot("0")
-    assert bundle.proxy_url is None
+    assert bundle.proxy_token is None
 
 
 def test_slot_id_coerced_from_int(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
-    store.save_slot(0, cookies={"a": "1"}, user_agent="UA", proxy_url=DUMMY_PROXY_0)
+    store.save_slot(0, cookies={"a": "1"}, user_agent="UA", proxy_token=DUMMY_TOKEN_0)
     bundle = store.load_slot(0)
     assert bundle is not None
     assert bundle.cookies == {"a": "1"}
@@ -105,7 +132,7 @@ def test_malformed_slot_entry_skipped_good_slots_survive(tmp_path):
     # slot "0" sano, "1" no-dict, "2" dict sin las keys esperadas
     p.write_text(
         '{"slots": {'
-        '"0": {"cookies": {"a": "1"}, "user_agent": "UA/0", "proxy_url": null, "saved_at": 123},'
+        '"0": {"cookies": {"a": "1"}, "user_agent": "UA/0", "proxy_token": null, "saved_at": 123},'
         '"1": "not-a-dict",'
         '"2": {"user_agent": "UA/2"}'
         '}}'

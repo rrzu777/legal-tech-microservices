@@ -53,7 +53,8 @@ setup() { # setup <nombre> — deja ORIGIN, REPO, LOG_SYSCTL, LOG_PIP, SYSCTL
   git -C "$ORIGIN" config user.email t@t
   git -C "$ORIGIN" config user.name t
   echo "httpx==0.27" > "$ORIGIN/estrado-pjud-service/requirements.txt"
-  git -C "$ORIGIN" add estrado-pjud-service/requirements.txt
+  printf '.venv/\n' > "$ORIGIN/estrado-pjud-service/.gitignore"
+  git -C "$ORIGIN" add estrado-pjud-service/requirements.txt estrado-pjud-service/.gitignore
   git -C "$ORIGIN" commit -q -m base
   git clone -q "$ORIGIN" "$REPO"
 
@@ -61,7 +62,7 @@ setup() { # setup <nombre> — deja ORIGIN, REPO, LOG_SYSCTL, LOG_PIP, SYSCTL
   mkdir -p "$venv"
   printf '#!/bin/bash\nexit "${FAKE_PYTEST_EXIT:-0}"\n' > "$venv/python"
   printf '#!/bin/bash\necho "$@" >> "%s"\nexit "${FAKE_PIP_EXIT:-0}"\n' "$LOG_PIP" > "$venv/pip"
-  printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = restart ]; then exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nexit 0\n' "$LOG_SYSCTL" > "$base/systemctl"
+  printf '#!/bin/bash\necho "$@" >> "%s"\nSTATE="%s/worker-disabled"\nFORCE_ACTIVE="%s/worker-force-active"\nif [ "${FAKE_SYSTEMCTL_STATE_UNKNOWN:-0}" = 1 ] && { [ "$1" = is-enabled ] || [ "$1" = is-active ]; }; then exit 4; fi\nif [ "$1" = disable ]; then touch "$STATE"; rm -f "$FORCE_ACTIVE"; exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = stop ] && [ "$2" = estrado-pjud-worker.service ]; then rm -f "$FORCE_ACTIVE"; exit 0; fi\nif [ "$1" = is-active ] && { [ "$2" = estrado-pjud-worker.service ] || [ "${3:-}" = estrado-pjud-worker.service ]; }; then [ -f "$FORCE_ACTIVE" ] && { echo active; exit 0; }; [ -f "$STATE" ] && { echo inactive; exit 3; }; echo active; exit 0; fi\nif [ "$1" = is-enabled ]; then [ -f "$STATE" ] && { echo disabled; exit 1; }; echo enabled; exit 0; fi\nif [ "$1" = restart ]; then exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = is-active ]; then echo active; exit 0; fi\nexit 0\n' "$LOG_SYSCTL" "$base" "$base" > "$base/systemctl"
   chmod +x "$venv/python" "$venv/pip" "$base/systemctl"
   : > "$LOG_SYSCTL"; : > "$LOG_PIP"
   SYSCTL="$base/systemctl"
@@ -78,6 +79,7 @@ avanza_origin() { # avanza_origin [archivo] — commit B en origin
 # Sin set -e en este archivo: RC se captura a mano y los asserts guardan solos.
 run_deploy() { # run_deploy — usa REPO/SYSCTL/HEALTH; deja RC y OUT
   OUT=$(DEPLOY_REPO_DIR="$REPO" DEPLOY_SYSTEMCTL="$SYSCTL" DEPLOY_HEALTH_URL="$HEALTH" \
+        DEPLOY_KEEP_WORKER_STOPPED="${KEEP_WORKER_STOPPED:-0}" \
         DEPLOY_HEALTH_RETRIES=2 DEPLOY_HEALTH_SLEEP=0 bash "$DEPLOY" 2>&1)
   RC=$?
 }
@@ -97,6 +99,28 @@ expect_contains "las dos units en la misma invocación" "$(cat "$LOG_SYSCTL")" "
 expect_contains "verifica is-active" "$(cat "$LOG_SYSCTL")" "is-active"
 expect_eq "no instala deps sin cambio de requirements" "$(cat "$LOG_PIP")" ""
 expect_missing "no avisa de ops/cron si no cambió" "$OUT" "ops/cron"
+
+echo "== deploy seguro: actualiza API y mantiene worker detenido"
+setup workerstop; avanza_origin; health_ok
+KEEP_WORKER_STOPPED=1 run_deploy
+expect_eq "exit 0" "$RC" "0"
+expect_contains "deshabilita y detiene el worker" "$(cat "$LOG_SYSCTL")" "disable --now estrado-pjud-worker.service"
+expect_contains "verifica que quedó inactivo" "$(cat "$LOG_SYSCTL")" "is-active estrado-pjud-worker.service"
+expect_contains "verifica que no arranque tras reboot" "$(cat "$LOG_SYSCTL")" "is-enabled estrado-pjud-worker.service"
+expect_contains "reinicia sólo API" "$(cat "$LOG_SYSCTL")" "restart estrado-pjud.service"
+expect_missing "nunca reinicia worker" "$(cat "$LOG_SYSCTL")" "restart estrado-pjud.service estrado-pjud-worker.service"
+expect_contains "reporta el gate" "$OUT" "worker permanece detenido"
+unset KEEP_WORKER_STOPPED
+
+: > "$LOG_SYSCTL"
+touch "$(dirname "$LOG_SYSCTL")/worker-force-active"
+avanza_origin cambio-posterior.txt
+run_deploy
+expect_eq "deploy posterior sin flag pasa" "$RC" "0"
+expect_contains "deploy posterior reinicia API" "$(cat "$LOG_SYSCTL")" "restart estrado-pjud.service"
+expect_contains "detiene una activación manual aunque siga disabled" "$(cat "$LOG_SYSCTL")" "stop estrado-pjud-worker.service"
+expect_missing "deploy posterior preserva worker disabled" "$(cat "$LOG_SYSCTL")" "restart estrado-pjud.service estrado-pjud-worker.service"
+expect_contains "explica el gate persistente" "$OUT" "worker disabled"
 
 echo "== tests rojos: código vuelve, servicios NI SE TOCAN, exit 1"
 setup rojos; avanza_origin; health_ok
@@ -120,7 +144,7 @@ echo "== health falla pero el rollback sana: lo dice"
 setup sana; avanza_origin; health_bad
 # Stub de systemctl que "sana" el health recién en la ronda de rollback (la
 # segunda invocación de restart): determinista, sin sleeps ni races.
-printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$(grep -c "^restart" "%s")" -ge 2 ]; then echo ok > "%s"; fi\nexit 0\n' \
+printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = is-enabled ]; then echo enabled; exit 0; fi\nif [ "$1" = is-active ]; then echo active; exit 0; fi\nif [ "$(grep -c "^restart" "%s")" -ge 2 ]; then echo ok > "%s"; fi\nexit 0\n' \
   "$LOG_SYSCTL" "$LOG_SYSCTL" "$TMP/www/health.json" > "$SYSCTL"
 chmod +x "$SYSCTL"
 run_deploy
@@ -134,6 +158,21 @@ PREV=$(sha_repo)
 run_deploy
 expect_eq "exit 1" "$RC" "1"
 expect_eq "HEAD no se movió" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "lo dice" "$OUT" "ABORTA"
+
+echo "== systemctl sin estado confiable: aborta y no inventa un gate"
+setup stateunknown; avanza_origin; health_ok
+FAKE_SYSTEMCTL_STATE_UNKNOWN=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "lo dice" "$OUT" "estado enabled/disabled"
+
+echo "== archivo no trackeado: aborta antes de dejar un secreto fuera del guard"
+setup untracked; avanza_origin; health_ok
+echo cookie > "$REPO/estrado-pjud-service/credential-leak.json"
+run_deploy
+expect_eq "exit 1" "$RC" "1"
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "lo dice" "$OUT" "ABORTA"
 

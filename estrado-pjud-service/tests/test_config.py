@@ -30,6 +30,37 @@ def test_config_defaults(monkeypatch):
     assert s.SESSION_MAX_AGE_S == 1200
 
 
+def test_config_rejects_cookie_store_inside_production_checkout(monkeypatch):
+    monkeypatch.setenv("API_KEY", "key")
+    monkeypatch.setenv(
+        "COOKIE_STORE_PATH",
+        "/opt/legal-tech-microservices/estrado-pjud-service/.cookies.json",
+    )
+
+    from app.config import Settings
+
+    with pytest.raises(ValueError, match="outside the git checkout"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        ".cookies.json",
+        "cookies.json",
+        "/var/lib/../../opt/legal-tech-microservices/estrado-pjud-service/.cookies.json",
+    ],
+)
+def test_config_rejects_relative_or_normalized_checkout_path(monkeypatch, unsafe_path):
+    monkeypatch.setenv("API_KEY", "key")
+    monkeypatch.setenv("COOKIE_STORE_PATH", unsafe_path)
+
+    from app.config import Settings
+
+    with pytest.raises(ValueError, match="absolute and outside the git checkout"):
+        Settings(_env_file=None)
+
+
 def test_telegram_config_defaults(monkeypatch):
     monkeypatch.setenv("API_KEY", "test-key")
     from app.config import get_settings, Settings

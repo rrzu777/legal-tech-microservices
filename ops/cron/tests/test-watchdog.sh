@@ -87,6 +87,47 @@ expect_missing() { # <nombre> <salida> <texto que NO debe estar>
   fi
 }
 
+cat > "$TMP/systemctl-worker-disabled" <<'EOF'
+#!/bin/bash
+if [ "$1" = "is-enabled" ] && [ "$2" = "estrado-pjud-worker.service" ]; then echo disabled; exit 1; fi
+if [ "$1" = "is-active" ] && [ "$3" = "estrado-pjud-worker.service" ]; then exit 3; fi
+exit 0
+EOF
+cat > "$TMP/systemctl-worker-enabled-down" <<'EOF'
+#!/bin/bash
+if [ "$1" = "is-enabled" ] && [ "$2" = "estrado-pjud-worker.service" ]; then echo enabled; exit 0; fi
+if [ "$1" = "is-active" ] && [ "$3" = "estrado-pjud-worker.service" ]; then exit 3; fi
+exit 0
+EOF
+cat > "$TMP/systemctl-worker-disabled-active" <<'EOF'
+#!/bin/bash
+if [ "$1" = "is-enabled" ] && [ "$2" = "estrado-pjud-worker.service" ]; then echo disabled; exit 1; fi
+exit 0
+EOF
+cat > "$TMP/systemctl-worker-unknown" <<'EOF'
+#!/bin/bash
+if [ "$1" = "is-enabled" ]; then exit 4; fi
+if [ "$1" = "is-active" ] && [ "$3" = "estrado-pjud.service" ]; then exit 0; fi
+exit 4
+EOF
+chmod +x "$TMP"/systemctl-worker-*
+
+echo "== chequeo 1: pausa deliberada no es falso incidente =="
+OUT=$(WD_SYSTEMCTL="$TMP/systemctl-worker-disabled" run "$TMP/crontab-base")
+expect_missing "worker disabled e inactivo es el gate esperado" "$OUT" "worker-down"
+
+echo "== chequeo 1: worker habilitado pero caído sí alerta =="
+OUT=$(WD_SYSTEMCTL="$TMP/systemctl-worker-enabled-down" run "$TMP/crontab-base")
+expect_contains "worker que debía correr está caído" "$OUT" "worker-down"
+
+echo "== chequeo 1: worker disabled pero activo viola el gate =="
+OUT=$(WD_SYSTEMCTL="$TMP/systemctl-worker-disabled-active" run "$TMP/crontab-base")
+expect_contains "detecta tráfico activo contra el gate" "$OUT" "worker-gate-violated"
+
+echo "== chequeo 1: estado systemd desconocido nunca se interpreta como pausa =="
+OUT=$(WD_SYSTEMCTL="$TMP/systemctl-worker-unknown" run "$TMP/crontab-base")
+expect_contains "falla de observación alerta en vez de quedar silenciosa" "$OUT" "worker-state-unknown"
+
 # Fixtures con fechas LOCALES, que es como las escribe run-cron.sh (el VPS es
 # Europe/Berlin, no UTC). Si el chequeo comparara contra `date -u` esto fallaría
 # cerca de medianoche.

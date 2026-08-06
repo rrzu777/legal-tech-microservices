@@ -1,9 +1,10 @@
 import asyncio
 from zoneinfo import ZoneInfo
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
-from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
+from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 
@@ -53,5 +54,10 @@ class WorkerConfig(BaseSettings):
     OJV_PROXY_POOL_SIZE: int = 3
     OJV_PROXY_GB_BUDGET: float = 2.0
     OJV_PROXY_GB_ALERT_PCT: int = 80
+    OJV_PROXY_PRICE_PER_GB_USD: float = 6.25
+
+    _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
+        validate_cookie_store_path
+    )
 
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

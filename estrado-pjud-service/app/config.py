@@ -1,12 +1,15 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
-from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
+from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 
 
 class Settings(BaseSettings):
     API_KEY: str
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
     OJV_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     RATE_LIMIT_MS: int = 2500
     LOG_LEVEL: str = "INFO"
@@ -23,6 +26,11 @@ class Settings(BaseSettings):
     # Residential proxy pool (IPRoyal). None = no proxy (legacy single-IP).
     OJV_PROXY_URL: str | None = None
     OJV_PROXY_STICKY_LIFETIME: str = "1h"
+    OJV_PROXY_PRICE_PER_GB_USD: float = 6.25
+
+    _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
+        validate_cookie_store_path
+    )
 
     # extra=ignore: el .env es compartido y trae claves del worker (POOL_SIZE,
     # WORKER_ID, OJV_PROXY_POOL_SIZE, etc.) que Settings no define; sin esto

@@ -8,6 +8,8 @@ import time
 
 from app.alerting import send_ops_alert
 from app.bandwidth import METER
+from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
@@ -17,7 +19,9 @@ from worker.engine import SyncEngine
 from worker.notifier import Notifier
 from worker.metrics import Metrics
 from worker.backoff import CircuitBreaker
-from worker.sd_notify import notify_ready, notify_watchdog, notify_stopping
+from worker.sd_notify import notify_ready, notify_status, notify_stopping
+from worker.proxy_control import ProxyControl, ProxyControlSnapshot
+from worker.proxy_usage import ProxyUsageTracker
 
 logger = logging.getLogger("worker")
 
@@ -49,6 +53,7 @@ async def process_batch(
     concurrency: int,
     shutdown_event: asyncio.Event,
     backoff: CircuitBreaker,
+    proxy_control: ProxyControl | None = None,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
@@ -61,6 +66,10 @@ async def process_batch(
 
     async def _run_one(case):
         async with sem:
+            if proxy_control is not None:
+                snapshot = await refresh_proxy_gate(proxy_control, backoff)
+                if not snapshot.allowed:
+                    return
             if shutdown_event.is_set() or backoff.is_open:
                 return
             try:
@@ -110,30 +119,83 @@ async def maybe_alert_bandwidth(config, state: "BandwidthAlertState", now: float
     )
 
 
-async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10) -> bool:
+async def safe_initialize_pool(
+    pool, max_retries: int = 5, base_delay: int = 10,
+    proxy_control=None, backoff=None,
+) -> bool:
     """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
     sin crashear (evita el crash-loop de systemd martillando PJUD)."""
     for attempt in range(1, max_retries + 1):
         try:
             await pool.initialize()
             return True
-        except Exception:
+        except Exception as exc:
             logger.exception("Fallo al inicializar el pool (intento %d/%d)", attempt, max_retries)
+            if is_proxy_billing_error(exc):
+                if proxy_control is not None:
+                    await proxy_control.trip_billing_exhausted()
+                if backoff is not None:
+                    backoff.open_permanently("billing_exhausted")
+                return False
+            if isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError)):
+                if proxy_control is not None:
+                    if isinstance(exc, ProxyUsagePersistenceError):
+                        await proxy_control.pause_telemetry_unavailable()
+                    else:
+                        await proxy_control.refresh()
+                if backoff is not None:
+                    backoff.open_permanently("proxy_cost_control")
+                return False
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * attempt)
     return False
 
 
+async def refresh_proxy_gate(
+    control: ProxyControl | None, backoff: CircuitBreaker,
+) -> ProxyControlSnapshot:
+    """Synchronize the local breaker with the persistent ops control."""
+    if control is None:
+        return ProxyControlSnapshot(
+            allowed=True,
+            status="not_required",
+            reason_code=None,
+            revision=None,
+            source="local",
+        )
+    snapshot = await control.refresh()
+    if snapshot.allowed:
+        backoff.resume_permanent()
+    else:
+        backoff.open_permanently(f"proxy_control:{snapshot.status}")
+    return snapshot
+
+
 async def main():
     config = WorkerConfig()
-    setup_logging(config.LOG_LEVEL, secrets=(config.TELEGRAM_BOT_TOKEN,))
+    setup_logging(
+        config.LOG_LEVEL,
+        secrets=tuple(filter(None, (
+            config.TELEGRAM_BOT_TOKEN,
+            config.SUPABASE_SERVICE_KEY,
+            config.OJV_PROXY_URL,
+        ))),
+    )
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
 
     supabase = create_supabase(config)
-    pool = SessionPool(config)
+    proxy_usage = ProxyUsageTracker(
+        supabase,
+        enabled=bool(config.OJV_PROXY_URL),
+        price_per_gb_usd=config.OJV_PROXY_PRICE_PER_GB_USD,
+    )
+    proxy_control = ProxyControl(supabase) if config.OJV_PROXY_URL else None
+    pool = SessionPool(
+        config, proxy_usage=proxy_usage, proxy_control=proxy_control,
+    )
     scheduler = Scheduler(config, supabase)
     notifier = Notifier(supabase)
-    metrics = Metrics(config, supabase, pool=pool)
+    metrics = Metrics(config, supabase, pool=pool, proxy_control=proxy_control)
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors
@@ -149,38 +211,88 @@ async def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    # Initialize session pool
-    if not await safe_initialize_pool(pool, max_retries=config.MINT_MAX_RETRIES):
-        logger.error(
-            "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
-            config.MINT_MAX_RETRIES,
-        )
-        await send_ops_alert(
-            config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
-            "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
-        )
-        await shutdown_event.wait()
-        return
-
     metrics.start()
-
-    engine = SyncEngine(
-        pool=pool,
-        supabase=supabase,
-        notifier=notifier,
-        metrics=metrics,
-        backoff=backoff,
-        config=config,
-    )
-
-    logger.info("Worker ready, entering main loop")
     notify_ready()
-
+    notify_status("starting")
     bandwidth_alert_state = BandwidthAlertState()
 
     try:
+        initialized = False
+        while not shutdown_event.is_set() and not initialized:
+            # Never mint a paid-proxy session before the persistent control
+            # allows traffic. Missing control/DB is intentionally fail-closed.
+            snapshot = await refresh_proxy_gate(proxy_control, backoff)
+            if not snapshot.allowed:
+                metrics.set_status("paused")
+                notify_status("paused")
+                logger.warning(
+                    "Proxy control denies startup traffic (status=%s reason=%s revision=%s)",
+                    snapshot.status, snapshot.reason_code, snapshot.revision,
+                )
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            metrics.set_status("starting")
+            notify_status("initializing proxy pool")
+            initialized = await safe_initialize_pool(
+                pool,
+                max_retries=config.MINT_MAX_RETRIES,
+                proxy_control=proxy_control,
+                backoff=backoff,
+            )
+            if initialized:
+                break
+
+            logger.error(
+                "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
+                config.MINT_MAX_RETRIES,
+            )
+            await send_ops_alert(
+                config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
+                "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
+            )
+            if not backoff.is_permanently_open:
+                await shutdown_event.wait()
+                return
+
+        if shutdown_event.is_set():
+            return
+
+        engine = SyncEngine(
+            pool=pool,
+            supabase=supabase,
+            notifier=notifier,
+            metrics=metrics,
+            backoff=backoff,
+            config=config,
+            proxy_control=proxy_control,
+            proxy_usage=proxy_usage,
+        )
+        logger.info("Worker ready, entering main loop")
+        metrics.set_status("running")
+        notify_status("running")
+
         while not shutdown_event.is_set():
+            snapshot = await refresh_proxy_gate(proxy_control, backoff)
+            if not snapshot.allowed:
+                metrics.set_status("paused")
+                notify_status("paused")
+                logger.warning(
+                    "Proxy traffic paused (status=%s reason=%s revision=%s)",
+                    snapshot.status, snapshot.reason_code, snapshot.revision,
+                )
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
             if backoff.is_open:
+                metrics.set_status("backoff")
+                notify_status("temporary backoff")
                 wait = backoff.seconds_until_close
                 logger.warning("Circuit breaker open, waiting %.0fs", wait)
                 try:
@@ -188,6 +300,9 @@ async def main():
                 except asyncio.TimeoutError:
                     pass
                 continue
+
+            metrics.set_status("running")
+            notify_status("running")
 
             batch = await scheduler.get_next_batch()
 
@@ -203,7 +318,14 @@ async def main():
             case_ids = [c["id"] for c in batch]
 
             concurrency = config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
-            await process_batch(batch, engine, concurrency, shutdown_event, backoff)
+            await process_batch(
+                batch,
+                engine,
+                concurrency,
+                shutdown_event,
+                backoff,
+                proxy_control=proxy_control,
+            )
 
             await scheduler.release_batch(case_ids)
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
