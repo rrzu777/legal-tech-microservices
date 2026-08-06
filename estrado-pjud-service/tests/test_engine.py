@@ -1627,6 +1627,38 @@ class TestHelperFunctions:
         assert keys[0] == "C-1234-2024:Principal:5", "la primera conserva su clave"
         assert keys[1] == "C-1234-2024:Principal:5#2"
 
+    @pytest.mark.asyncio
+    async def test_same_folio_different_stage_or_foja_are_not_collapsed(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        first = {
+            "folio": 5,
+            "cuaderno": "Principal",
+            "fecha": "2024-05-01",
+            "tramite": "Resolución",
+            "descripcion": "Provee",
+            "etapa": "Discusión",
+            "foja": 10,
+            "sala": "Primera",
+            "estado": "Pendiente",
+        }
+        second = {
+            **first,
+            "etapa": "Cumplimiento",
+            "foja": 11,
+            "sala": "Segunda",
+            "estado": "Firmado",
+        }
+
+        await engine._upsert_movements(
+            _make_case(), {"movements": [first, second]},
+        )
+
+        rows = mock_sb.from_.return_value.upsert.call_args.args[0]
+        assert [row["external_movement_key"] for row in rows] == [
+            "C-1234-2024:Principal:5",
+            "C-1234-2024:Principal:5#2",
+        ]
+
     def test_desambigua_claves_duplicadas_en_el_mismo_batch(self):
         """Dos movimientos con el mismo cuaderno+folio rompian el upsert ENTERO con
         'ON CONFLICT DO UPDATE command cannot affect row a second time' (21000).

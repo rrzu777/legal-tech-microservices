@@ -113,14 +113,15 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
 
 
-_MOVEMENT_IDENTITY_FIELDS = (
-    "folio",
+_NULL_FOLIO_KEY_FIELDS = ("fecha", "cuaderno", "tramite", "descripcion")
+_PRESENT_FOLIO_DEDUPE_FIELDS = (
     "fecha",
     "cuaderno",
     "tramite",
     "descripcion",
+    "etapa",
+    "foja",
 )
-_NULL_FOLIO_KEY_FIELDS = ("fecha", "cuaderno", "tramite", "descripcion")
 
 _PRIMARY_DOCUMENT_FIELDS = (
     "documento_url",
@@ -132,12 +133,17 @@ _ANEXO_FIELDS = ("anexo_func", "anexo_token")
 
 def _movement_identity(movement: dict) -> tuple:
     """Return the stable PJUD fields that identify one logical movement."""
+    folio = movement.get("folio")
+    fields = (
+        _NULL_FOLIO_KEY_FIELDS
+        if folio is None
+        else _PRESENT_FOLIO_DEDUPE_FIELDS
+    )
     return (
-        movement.get("folio"),
+        folio,
         *(
             _normalize_movement_identity_part(movement.get(field))
-            for field in _MOVEMENT_IDENTITY_FIELDS
-            if field != "folio"
+            for field in fields
         ),
     )
 
