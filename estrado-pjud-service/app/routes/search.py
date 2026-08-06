@@ -70,25 +70,31 @@ def _enrich_v2_candidates(
             return
 
         for match in matches:
-            displayed_court_code = (
-                catalog_service.resolve_loaded_court(match.corte)
-                if match.corte
-                else None
-            )
-            identity, used_global_fallback = (
-                _resolve_loaded_tribunal_with_global_fallback(
-                    catalog_service, req, match.tribunal,
+            if match.corte:
+                displayed_court_code = catalog_service.resolve_loaded_court(
+                    match.corte
                 )
-            )
-            if (match.corte and displayed_court_code is None) or identity is None:
+                identity = (
+                    catalog_service.resolve_loaded_tribunal(
+                        req.competencia,
+                        match.tribunal,
+                        corte=displayed_court_code,
+                    )
+                    if displayed_court_code is not None
+                    else None
+                )
+            else:
+                identity, _used_global_fallback = (
+                    _resolve_loaded_tribunal_with_global_fallback(
+                        catalog_service, req, match.tribunal,
+                    )
+                )
+                displayed_court_code = identity.court_code if identity else None
+            if displayed_court_code is None or identity is None:
                 raise CanonicalCatalogResolutionError(
                     "first-instance territorial identity is unresolved"
                 )
-            match.corte_code = (
-                identity.court_code
-                if used_global_fallback
-                else displayed_court_code or identity.court_code
-            )
+            match.corte_code = identity.court_code
             match.tribunal_code = identity.tribunal_code
         return
 

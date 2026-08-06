@@ -261,8 +261,8 @@ def test_appeals_first_instance_broad_keeps_court_and_resolves_tribunal(client):
     assert body["matches"][0]["libro_code"] is None
 
 
-def test_appeals_first_instance_excludes_candidate_from_different_court(client):
-    """Catches a resolved lower tribunal overriding the requested appeals court."""
+def test_appeals_first_instance_rejects_incoherent_displayed_court_pair(client):
+    """Catches mixing a displayed court with a tribunal from the requested court."""
     response, _session_mock, _pool_mock = _post(
         client,
         {
@@ -283,7 +283,7 @@ def test_appeals_first_instance_excludes_candidate_from_different_court(client):
     )
 
     body = response.json()
-    assert body["status"] == "not_found"
+    assert body["status"] == "upstream_changed"
     assert body["found"] is False
     assert body["matches"] == []
 
@@ -304,7 +304,6 @@ def test_appeals_first_instance_globally_resolves_tribunal_from_other_court(clie
         [
             _raw_match(
                 "other-court", "4490-2025", "1º Juzgado Civil de San Miguel",
-                corte="C.A. de San Miguel",
             )
         ],
     )
@@ -313,6 +312,76 @@ def test_appeals_first_instance_globally_resolves_tribunal_from_other_court(clie
     assert body["status"] == "not_found"
     assert body["found"] is False
     assert body["matches"] == []
+
+
+def test_first_instance_enrichment_assigns_real_displayed_court_tribunal_pair():
+    """Catches a hybrid court/tribunal pair even when final status would be not-found."""
+    from app.models import CandidateMatch, SearchRequest
+    from app.routes.search import _enrich_v2_candidates
+
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rol",
+        case_number="4490-2025",
+        competencia="apelaciones",
+        corte=90,
+        search_mode="first_instance",
+        allow_broad=True,
+    )
+    candidate = CandidateMatch(
+        key="other-court",
+        rol="4490-2025",
+        tribunal="1º Juzgado Civil de San Miguel",
+        corte="C.A. de San Miguel",
+        caratulado="Parte",
+        fecha_ingreso="2025-01-01",
+    )
+
+    _enrich_v2_candidates(
+        [candidate],
+        request,
+        anno=2025,
+        book_code=None,
+        catalog_service=CatalogService(MagicMock(), snapshot=_snapshot()),
+    )
+
+    assert (candidate.corte_code, candidate.tribunal_code) == (91, 400)
+
+
+def test_first_instance_enrichment_rejects_hybrid_displayed_court_pair():
+    """Catches resolving a tribunal in req.corte after its displayed court differs."""
+    from app.models import CandidateMatch, SearchRequest
+    from app.routes.search import (
+        CanonicalCatalogResolutionError,
+        _enrich_v2_candidates,
+    )
+
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rol",
+        case_number="4490-2025",
+        competencia="apelaciones",
+        corte=90,
+        search_mode="first_instance",
+        allow_broad=True,
+    )
+    candidate = CandidateMatch(
+        key="hybrid",
+        rol="4490-2025",
+        tribunal="2º Juzgado Civil de Santiago",
+        corte="C.A. de San Miguel",
+        caratulado="Parte",
+        fecha_ingreso="2025-01-01",
+    )
+
+    with pytest.raises(CanonicalCatalogResolutionError):
+        _enrich_v2_candidates(
+            [candidate],
+            request,
+            anno=2025,
+            book_code=None,
+            catalog_service=CatalogService(MagicMock(), snapshot=_snapshot()),
+        )
 
 
 def test_direct_appeal_from_different_court_is_truthful_not_found(client):
