@@ -332,7 +332,7 @@
           },
           "max_matches": {
             "default": 10,
-            "maximum": 25.0,
+            "maximum": 100.0,
             "minimum": 1.0,
             "title": "Max Matches",
             "type": "integer"
@@ -983,7 +983,7 @@
           },
           "max_matches": {
             "default": 10,
-            "maximum": 25.0,
+            "maximum": 100.0,
             "minimum": 1.0,
             "title": "Max Matches",
             "type": "integer"

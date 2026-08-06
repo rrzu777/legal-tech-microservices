@@ -6,6 +6,8 @@ session so that parsers run against authentic HTML, giving us true end-to-end
 coverage minus the network.
 """
 
+import base64
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -93,6 +95,11 @@ def _make_mock_pool(mock_session):
     mock_pool.release = AsyncMock()
     mock_pool.close_all = AsyncMock()
     return mock_pool
+
+
+def _jwt_with_data(data: str, signature: str) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"data": data}).encode()).rstrip(b"=").decode()
+    return f"header.{payload}.{signature}"
 
 
 # ===================================================================
@@ -668,6 +675,40 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    @pytest.mark.asyncio
+    async def test_detail_affinity_correlates_selected_candidate_beyond_top_10(self):
+        from app.models import DetailRequest
+        from app.routes import detail as detail_route
+
+        caller_key = _jwt_with_data("selected-row-64", "caller")
+        fresh_key = _jwt_with_data("selected-row-64", "fresh")
+        request = DetailRequest(
+            detail_key=caller_key,
+            contract_version=2,
+            case_type="rol",
+            case_number="C-561-2025",
+            competencia="civil",
+            libro="C",
+            allow_broad=True,
+            max_matches=100,
+        )
+        raw_matches = [
+            {
+                "key": fresh_key if index == 63 else f"opaque-{index}",
+                "rol": "C-561-2025",
+                "tribunal": f"Tribunal {index + 1}",
+                "caratulado": f"Parte {index + 1}",
+                "fecha_ingreso": "2025-01-01",
+            }
+            for index in range(64)
+        ]
+        session = _make_mock_session(search_html="<html>resultados</html>")
+
+        with patch.object(detail_route, "parse_search_results", return_value=raw_matches):
+            correlated = await detail_route._search_for_fresh_jwt(session, "civil", request)
+
+        assert correlated == fresh_key
+
     @pytest.mark.asyncio
     async def test_detail_affinity_correlates_ruc_with_the_same_candidate_model(self):
         from app.models import DetailRequest

@@ -46,6 +46,34 @@ def test_exact_tribunal_and_rol_rank_first_and_results_are_capped():
     assert ranked.truncated is True
 
 
+def test_broad_window_returns_all_64_matches_without_truncation_at_100():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rol",
+        case_number="C-561-2025",
+        competencia="civil",
+        libro="C",
+        allow_broad=True,
+        max_matches=100,
+    )
+    matches = [
+        _candidate(
+            index,
+            rol="C-561-2025",
+            corte_code=90,
+            tribunal_code=300 + index,
+            libro_code="C",
+        )
+        for index in range(64)
+    ]
+
+    response = build_search_response(matches, request, libro_used="C")
+
+    assert response.match_count == 64
+    assert len(response.matches) == 64
+    assert response.truncated is False
+
+
 def test_multiple_exact_candidates_are_needs_disambiguation_not_not_found():
     request = SearchRequest(
         contract_version=2,
