@@ -9,6 +9,7 @@ from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
+from app.proxy_billing import is_proxy_billing_error
 from app.session import OJVSession
 from worker.config import WorkerConfig
 
@@ -153,7 +154,7 @@ class SessionPool:
                         await new_session.close()
                     except Exception:
                         logger.debug("No se pudo cerrar la sesion fallida del slot %d", slot.index)
-                if attempt >= attempts:
+                if is_proxy_billing_error(exc) or attempt >= attempts:
                     logger.error(
                         "Slot %d: minteo fallido tras %d intentos", slot.index, attempts
                     )
@@ -217,7 +218,11 @@ class SessionPool:
         if needs_refresh:
             try:
                 await self._refresh_slot(slot)
-            except Exception:
+            except Exception as exc:
+                if is_proxy_billing_error(exc):
+                    slot.busy = False
+                    self._sem.release()
+                    raise
                 # No penalizar la causa por un fallo de minteo/refresh: usar la
                 # sesión/bundle existente (posiblemente vencido). El challenge F5
                 # que devuelva se detecta downstream y va por el path de bloqueo
@@ -226,13 +231,13 @@ class SessionPool:
                 logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
         return slot
 
-    async def _return_slot(self, slot: _Slot, healthy: bool) -> None:
+    async def _return_slot(self, slot: _Slot, healthy: bool, remint: bool = True) -> None:
         """Primitiva de devolución: si `healthy=False`, re-mintea ESE slot (IP
         nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
         en uso por otras corrutinas. Base compartida por `release` y
         `release_familia_bundle`."""
         try:
-            if not healthy:
+            if not healthy and remint:
                 try:
                     await self._refresh_slot(slot)
                 except Exception:
@@ -250,7 +255,9 @@ class SessionPool:
         self._checkout[session] = slot
         return session
 
-    async def release(self, session: OJVSession, healthy: bool = True) -> None:
+    async def release(
+        self, session: OJVSession, healthy: bool = True, remint: bool = True,
+    ) -> None:
         """Libera un slot tomado por `acquire`. El slot se resuelve por el
         registro explícito de checkouts (no por identidad escaneando `_slots`).
         Una release de una sesión no registrada (nunca adquirida, o ya liberada,
@@ -260,7 +267,7 @@ class SessionPool:
         if slot is None:
             logger.warning("release() de una sesión no registrada; ignorada")
             return
-        await self._return_slot(slot, healthy)
+        await self._return_slot(slot, healthy, remint=remint)
 
     async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
         """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
@@ -280,9 +287,11 @@ class SessionPool:
             raise
         return bundle, slot
 
-    async def release_familia_bundle(self, slot: _Slot, healthy: bool = True) -> None:
+    async def release_familia_bundle(
+        self, slot: _Slot, healthy: bool = True, remint: bool = True,
+    ) -> None:
         """Libera un slot prestado a Familia. Misma semántica que release()."""
-        await self._return_slot(slot, healthy)
+        await self._return_slot(slot, healthy, remint=remint)
 
     async def enforce_global_rate_limit(self):
         """En modo proxy: no-op (cada IP tiene su propio rate-limit per-adapter;

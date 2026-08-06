@@ -7,6 +7,8 @@ from app.cookie_store import DEFAULT_COOKIE_STORE_PATH
 
 class Settings(BaseSettings):
     API_KEY: str
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
     OJV_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     RATE_LIMIT_MS: int = 2500
     LOG_LEVEL: str = "INFO"

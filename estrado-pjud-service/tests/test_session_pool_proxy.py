@@ -10,6 +10,7 @@ de browser/red real.
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from app.minter import MintResult
@@ -93,6 +94,41 @@ def _patch_pool_deps(monkeypatch, sp, mint_side_effect=None, patch_sleep=True):
     monkeypatch.setattr(sp, "CookieStore", lambda path: fake_store)
 
     return captured_proxies, fake_store
+
+
+@pytest.mark.asyncio
+async def test_402_during_mint_never_retries(monkeypatch):
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 3
+    captured, _ = _patch_pool_deps(
+        monkeypatch,
+        sp,
+        mint_side_effect=lambda _proxy: httpx.ProxyError("402 Payment Required"),
+    )
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(httpx.ProxyError):
+        await pool.initialize()
+
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_billing_release_frees_slot_without_remint(monkeypatch):
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    captured, _ = _patch_pool_deps(monkeypatch, sp)
+    pool = sp.SessionPool(config)
+    await pool.initialize()
+    session = await pool.acquire()
+
+    await pool.release(session, healthy=False, remint=False)
+
+    assert len(captured) == 1
+    assert pool._sem._value == 1
 
 
 @pytest.mark.asyncio

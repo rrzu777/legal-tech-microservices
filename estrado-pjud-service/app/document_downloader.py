@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 
+from app.proxy_billing import is_proxy_billing_error
+
 if TYPE_CHECKING:
     from app.session import OJVSession
 
@@ -54,6 +56,8 @@ async def _fetch_with_retry(
         try:
             return await session.download_document(url, token, param)
         except httpx.TransportError as e:
+            if is_proxy_billing_error(e):
+                raise
             if attempt == DOC_RETRY_ATTEMPTS - 1:
                 raise
             logger.info(
@@ -77,6 +81,7 @@ async def download_documents(
     Skips documents that are too large or fail to download.
     """
     sem = asyncio.Semaphore(MAX_CONCURRENT)
+    abort_downloads = asyncio.Event()
     results: list[DownloadedDoc] = []
 
     async def _download_one(idx: int, mov: dict) -> DownloadedDoc | None:
@@ -85,8 +90,12 @@ async def download_documents(
         param_name = mov.get("documento_param", "dtaDoc")
         if not url or not token:
             return None
+        if abort_downloads.is_set():
+            return None
 
         async with sem:
+            if abort_downloads.is_set():
+                return None
             await asyncio.sleep(DOWNLOAD_DELAY_S)
             try:
                 resp = await _fetch_with_retry(session, url, token, param_name)
@@ -104,12 +113,24 @@ async def download_documents(
 
                 return DownloadedDoc(index=idx, data=resp.content, content_type=content_type, extension=ext)
 
-            except Exception:
+            except Exception as exc:
+                if is_proxy_billing_error(exc):
+                    abort_downloads.set()
+                    raise
                 logger.warning("Failed to download document %d from %s", idx, url, exc_info=True)
                 return None
 
-    tasks = [_download_one(i, m) for i, m in enumerate(movements)]
-    for result in await asyncio.gather(*tasks):
+    tasks = [asyncio.create_task(_download_one(i, m)) for i, m in enumerate(movements)]
+    try:
+        gathered = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    for result in gathered:
         if result is not None:
             results.append(result)
 
@@ -135,6 +156,8 @@ async def download_single_document(
             logger.warning("Document suspiciously small (%d bytes), skipping", len(resp.content))
             return None
         return DownloadedDoc(index=0, data=resp.content, content_type=content_type, extension=ext)
-    except Exception:
+    except Exception as exc:
+        if is_proxy_billing_error(exc):
+            raise
         logger.warning("Failed to download document from %s", url, exc_info=True)
         return None

@@ -121,7 +121,10 @@ def pool_con_store(monkeypatch, bundles, *, proxy="http://u:p@residencial:9000",
     from app import session_pool as sp
     from app.session_pool import APISessionPool
 
-    pool = APISessionPool(api_settings(proxy=proxy))
+    pool = APISessionPool(
+        api_settings(proxy=proxy),
+        allow_uncontrolled_proxy=True,
+    )
     pool._store = MagicMock()
     pool._store.load_all.return_value = bundles
 

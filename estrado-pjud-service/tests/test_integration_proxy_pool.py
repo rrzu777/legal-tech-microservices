@@ -96,7 +96,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    api = APISessionPool(_api_settings(store_path))
+    api = APISessionPool(_api_settings(store_path), allow_uncontrolled_proxy=True)
 
     # 3 acquires sin release => 3 sesiones nuevas, round-robin sobre los 3 bundles.
     for _ in range(3):
@@ -132,7 +132,7 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
 
-    api = APISessionPool(_api_settings(store_path))
+    api = APISessionPool(_api_settings(store_path), allow_uncontrolled_proxy=True)
 
     with pytest.raises(NoUsableBundleError):
         await api.acquire()

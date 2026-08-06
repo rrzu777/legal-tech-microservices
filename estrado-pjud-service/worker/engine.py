@@ -31,9 +31,11 @@ from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
+from app.proxy_billing import is_proxy_billing_error
 from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 from worker.sync_messages import BlockCause, blocked_error_message
+from worker.proxy_control import ProxyControl
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -493,13 +495,17 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
 
 
 class SyncEngine:
-    def __init__(self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig, catalog_service=None):
+    def __init__(
+        self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig,
+        catalog_service=None, proxy_control=None,
+    ):
         self._pool = pool
         self._sb = supabase
         self._notifier = notifier
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._proxy_control = proxy_control or ProxyControl(supabase)
         self._catalog_service = catalog_service or CatalogService(pool)
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
         self._r2 = None
@@ -564,6 +570,7 @@ class SyncEngine:
 
         session = None
         session_healthy = True
+        remint_on_release = True
         try:
             # Legacy v1 needs the historical parsed form. Canonical v2 parses
             # inside build_search_form_data so RUC is accepted without forcing
@@ -583,7 +590,7 @@ class SyncEngine:
                 if result["success"]:
                     self._backoff.record_success()
                     self._metrics.record_sync()
-                else:
+                elif result.get("status") != "proxy_billing_exhausted":
                     self._backoff.record_failure()
                     self._metrics.record_error()
                 return result
@@ -848,6 +855,30 @@ class SyncEngine:
             # `suspended` por una tarde en que el portal de ellos estuvo caído.
             # La app lo clasificaba bien desde la PR #55 (`pjudHttpError`); este
             # lado no, y los dos escriben sobre las mismas filas.
+            if is_proxy_billing_error(e):
+                session_healthy = False
+                remint_on_release = False
+                await self._finish_run(
+                    sync_run_id, started_at, "blocked", 0, "infra_unavailable",
+                )
+                await self._proxy_control.trip_billing_exhausted()
+                self._backoff.open_permanently("billing_exhausted")
+                # Tenant-facing state stays generic. The provider status and
+                # raw transport detail are restricted to ops telemetry/logs.
+                await self._update_case_blocked(case["id"], "infra", None)
+                self._metrics.record_error("infra")
+                await send_ops_alert(
+                    getattr(self._config, "TELEGRAM_BOT_TOKEN", ""),
+                    getattr(self._config, "TELEGRAM_CHAT_ID", ""),
+                    "proxy_billing_exhausted",
+                    "Proxy residencial detenido por facturacion; requiere reactivacion explicita en ops.",
+                )
+                return {
+                    "success": False,
+                    "new_movements": 0,
+                    "status": "proxy_billing_exhausted",
+                }
+
             kind = classify_exception(e)
 
             if kind == "case":
@@ -891,7 +922,10 @@ class SyncEngine:
 
         finally:
             if session:
-                await self._pool.release(session, healthy=session_healthy)
+                if remint_on_release:
+                    await self._pool.release(session, healthy=session_healthy)
+                else:
+                    await self._pool.release(session, healthy=False, remint=False)
 
     async def _call_app_internal(
         self, method: str, path: str, what: str
@@ -986,6 +1020,7 @@ class SyncEngine:
             return {"success": False, "new_movements": 0}
 
         session_healthy = True
+        remint_on_release = True
         try:
             try:
                 async with asyncio.timeout(90):
@@ -1026,6 +1061,26 @@ class SyncEngine:
                 httpx.HTTPStatusError,
             ) as e:
                 session_healthy = False
+                if is_proxy_billing_error(e):
+                    remint_on_release = False
+                    await self._finish_run(
+                        sync_run_id, started_at, "blocked", 0, "infra_unavailable",
+                    )
+                    await self._proxy_control.trip_billing_exhausted()
+                    self._backoff.open_permanently("billing_exhausted")
+                    await self._update_case_blocked(case["id"], "infra", None)
+                    self._metrics.record_error("infra")
+                    await send_ops_alert(
+                        getattr(self._config, "TELEGRAM_BOT_TOKEN", ""),
+                        getattr(self._config, "TELEGRAM_CHAT_ID", ""),
+                        "proxy_billing_exhausted",
+                        "Proxy residencial detenido por facturacion; requiere reactivacion explicita en ops.",
+                    )
+                    return {
+                        "success": False,
+                        "new_movements": 0,
+                        "status": "proxy_billing_exhausted",
+                    }
                 msg = str(e) or "Timeout Familia sync"
                 # El unico `except` de los call sites que mezcla las dos causas:
                 # `FamiliaBlockedError` ES el portal cortandonos, y las otras
@@ -1044,7 +1099,12 @@ class SyncEngine:
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
         finally:
-            await self._pool.release_familia_bundle(slot, healthy=session_healthy)
+            if remint_on_release:
+                await self._pool.release_familia_bundle(slot, healthy=session_healthy)
+            else:
+                await self._pool.release_familia_bundle(
+                    slot, healthy=False, remint=False,
+                )
 
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
@@ -1275,7 +1335,9 @@ class SyncEngine:
                         "content_type": doc.content_type,
                         "label": "Documento",
                     })
-                except Exception:
+                except Exception as exc:
+                    if is_proxy_billing_error(exc):
+                        raise
                     logger.warning("Failed to upload document %s", r2_key, exc_info=True)
 
             logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
@@ -1310,7 +1372,9 @@ class SyncEngine:
                             "label": "Certificado",
                         })
                         logger.info("Uploaded cert %s (%d bytes)", r2_key, len(cert_doc.data))
-                    except Exception:
+                    except Exception as exc:
+                        if is_proxy_billing_error(exc):
+                            raise
                         logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
                         # Cert failure must NOT block primary or anexos
 
@@ -1357,10 +1421,14 @@ class SyncEngine:
                                 "codigo": anexo_file.get("codigo"),
                             })
                             logger.info("Uploaded anexo %s (%d bytes)", r2_key, len(anexo_doc.data))
-                        except Exception:
+                        except Exception as exc:
+                            if is_proxy_billing_error(exc):
+                                raise
                             logger.warning("Failed to download/upload anexo %d for %s", anexo_i, ext_key, exc_info=True)
 
-                except Exception:
+                except Exception as exc:
+                    if is_proxy_billing_error(exc):
+                        raise
                     logger.warning("Failed to resolve anexo list for %s (func=%s)", ext_key, anexo_func, exc_info=True)
                     # Anexo failure must NOT block primary or certs
 
@@ -1380,10 +1448,14 @@ class SyncEngine:
                         .eq("case_id", case["id"])
                         .eq("external_movement_key", ext_key)
                     )
-                except Exception:
+                except Exception as exc:
+                    if is_proxy_billing_error(exc):
+                        raise
                     logger.warning("Failed to update documents for %s", ext_key, exc_info=True)
 
-        except Exception:
+        except Exception as exc:
+            if is_proxy_billing_error(exc):
+                raise
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
 
     async def _load_existing_movements(self, case_id: str) -> list[dict]:

@@ -482,6 +482,32 @@ class TestSyncEngine:
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
 
     @pytest.mark.asyncio
+    async def test_sync_proxy_402_trips_persistent_billing_breaker_without_raw_user_error(self):
+        import httpx
+        engine, mock_pool, _sb, _notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_control = AsyncMock()
+        engine._proxy_control = mock_control
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_finish_run", new_callable=AsyncMock) as mock_finish, \
+             patch.object(engine, "_update_case_blocked", new_callable=AsyncMock) as mock_blocked, \
+             patch("worker.engine.send_ops_alert", new_callable=AsyncMock):
+            mock_search.side_effect = httpx.ProxyError("CONNECT failed: 402 Payment Required")
+            result = await engine.sync_case(_make_case())
+
+        assert result["status"] == "proxy_billing_exhausted"
+        mock_control.trip_billing_exhausted.assert_awaited_once()
+        mock_backoff.open_permanently.assert_called_once_with("billing_exhausted")
+        assert mock_finish.await_args.args[4] == "infra_unavailable"
+        assert "402" not in str(mock_blocked.await_args)
+        mock_metrics.record_error.assert_called_with("infra")
+        mock_pool.release.assert_awaited_once_with(
+            mock_pool.acquire.return_value,
+            healthy=False,
+            remint=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_sync_5xx_de_ojv_no_penaliza_y_se_le_atribuye_a_ojv(self):
         """Un 503 de OJV NO puede suspender la causa.
 

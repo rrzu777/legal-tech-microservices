@@ -14,6 +14,7 @@ from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
 from app.familia.parser import parse_familia_results
 from app.metrics import api_metrics
 from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
+from app.proxy_billing import is_proxy_billing_error
 from app.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,12 @@ async def familia_sync(
 
     try:
         async with asyncio.timeout(_SYNC_TIMEOUT_S):
-            resp = await _run_sync(req, rate_s, bundle)
+            resp = await _run_sync(
+                req,
+                rate_s,
+                bundle,
+                proxy_control=getattr(request.app.state, "proxy_control", None),
+            )
     except TimeoutError:
         logger.warning("familia_sync: timed out after %ds", _SYNC_TIMEOUT_S)
         api_metrics.record_error("familia")
@@ -77,7 +83,22 @@ def _blocked() -> FamiliaSyncResponse:
     return FamiliaSyncResponse(ok=False, casos=[], error_code="blocked", error=_BLOCKED_MSG)
 
 
-async def _run_sync(req: FamiliaSyncRequest, rate_s: float, bundle) -> FamiliaSyncResponse:
+async def _proxy_billing_response(error: Exception, proxy_control) -> FamiliaSyncResponse | None:
+    if not is_proxy_billing_error(error):
+        return None
+    if proxy_control is not None:
+        await proxy_control.trip_billing_exhausted()
+    return FamiliaSyncResponse(
+        ok=False,
+        casos=[],
+        error_code="session_error",
+        error="Servicio de sincronizacion temporalmente no disponible",
+    )
+
+
+async def _run_sync(
+    req: FamiliaSyncRequest, rate_s: float, bundle, proxy_control=None,
+) -> FamiliaSyncResponse:
     async with FamiliaAuthSession(
         bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
     ) as session:
@@ -99,6 +120,9 @@ async def _run_sync(req: FamiliaSyncRequest, rate_s: float, bundle) -> FamiliaSy
                 error="No se pudo establecer sesión con OJV",
             )
         except Exception as e:
+            billing = await _proxy_billing_response(e, proxy_control)
+            if billing:
+                return billing
             logger.exception("familia_sync: unexpected error during login")
             return FamiliaSyncResponse(
                 ok=False, casos=[],
@@ -125,6 +149,9 @@ async def _run_sync(req: FamiliaSyncRequest, rate_s: float, bundle) -> FamiliaSy
                     # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
                     return _blocked()
                 except Exception as e:
+                    billing = await _proxy_billing_response(e, proxy_control)
+                    if billing:
+                        return billing
                     # El mismo criterio que el bloqueo, extendido a las otras
                     # fallas que tampoco son de la causa. Este `except` se tragaba
                     # TODO y seguía, y después devolvía `ok=True` con `casos=[]` y
@@ -157,6 +184,9 @@ async def _run_sync(req: FamiliaSyncRequest, rate_s: float, bundle) -> FamiliaSy
         except FamiliaBlockedError:
             return _blocked()
         except Exception as e:
+            billing = await _proxy_billing_response(e, proxy_control)
+            if billing:
+                return billing
             logger.exception("familia_sync: unexpected error querying Familia")
             return FamiliaSyncResponse(
                 ok=False, casos=[],

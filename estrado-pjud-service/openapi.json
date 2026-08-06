@@ -710,6 +710,11 @@
             ],
             "title": "Last Successful Request"
           },
+          "pjud_available": {
+            "default": true,
+            "title": "Pjud Available",
+            "type": "boolean"
+          },
           "search_requests": {
             "default": 0,
             "title": "Search Requests",

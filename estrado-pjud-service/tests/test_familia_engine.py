@@ -142,6 +142,34 @@ async def test_session_error_no_le_echa_la_culpa_al_portal(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_proxy_402_trips_persistent_control_without_remint(monkeypatch):
+    import httpx
+    import worker.engine as eng
+
+    engine = _make_engine()
+    engine._proxy_control = AsyncMock()
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={"rut": "1-9", "password": "p", "password_type": "clave_poder_judicial"}
+    )
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(side_effect=httpx.ProxyError("402 Payment Required"))
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    result = await engine._sync_familia_case(_CASE, None, MagicMock())
+
+    assert result["status"] == "proxy_billing_exhausted"
+    engine._proxy_control.trip_billing_exhausted.assert_awaited_once()
+    engine._backoff.open_permanently.assert_called_once_with("billing_exhausted")
+    engine._backoff.record_failure.assert_not_called()
+    engine._metrics.record_error.assert_called_once_with("infra")
+    assert engine._finish_run.await_args.args[4] == "infra_unavailable"
+    _, kwargs = engine._pool.release_familia_bundle.call_args
+    assert kwargs == {"healthy": False, "remint": False}
+
+
+@pytest.mark.asyncio
 async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch):
     import worker.engine as eng
 

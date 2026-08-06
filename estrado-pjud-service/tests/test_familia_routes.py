@@ -29,6 +29,7 @@ async def test_sin_bundle_f5_es_503_y_no_un_bloqueo_de_ojv():
     from app.routes import familia as mod
 
     pool = MagicMock()
+    pool.assert_proxy_enabled = AsyncMock()
     pool.pick_familia_bundle = MagicMock(return_value=None)
     request = MagicMock()
     request.app.state.alerter = None
@@ -138,6 +139,41 @@ async def test_un_fallo_de_red_en_el_rit_no_se_disfraza_de_causa_inexistente(mon
 
     assert resp.ok is False
     assert resp.error_code == "session_error"
+
+
+@pytest.mark.asyncio
+async def test_familia_402_trips_control_and_never_returns_provider_detail(monkeypatch):
+    import httpx
+
+    from app.routes import familia as mod
+    from app.familia.models import FamiliaCaseFilter
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(
+        side_effect=httpx.ProxyError("402 Payment Required")
+    )
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+    control = AsyncMock()
+
+    resp = await mod._run_sync(
+        FamiliaSyncRequest(
+            rut="11111111-1",
+            password="p",
+            auth_type="clave_pj",
+            cases=[FamiliaCaseFilter(rit="100", year="2024")],
+        ),
+        rate_s=0.0,
+        bundle=_bundle(),
+        proxy_control=control,
+    )
+
+    control.trip_billing_exhausted.assert_awaited_once()
+    assert resp.error_code == "session_error"
+    assert "402" not in resp.error
+    assert "payment" not in resp.error.lower()
 
 
 @pytest.mark.asyncio

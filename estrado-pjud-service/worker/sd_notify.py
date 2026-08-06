@@ -20,6 +20,11 @@ def notify_watchdog():
     _send("WATCHDOG=1")
 
 
+def notify_status(status: str):
+    """Expose business readiness separately from process readiness."""
+    _send(f"STATUS={status}")
+
+
 def notify_stopping():
     """Tell systemd the service is stopping."""
     _send("STOPPING=1")

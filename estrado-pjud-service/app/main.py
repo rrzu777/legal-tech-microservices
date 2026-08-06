@@ -13,13 +13,26 @@ from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.catalogs import CatalogService
 from app.routes import health, search, detail, familia, catalogs
 from app.session_pool import APISessionPool
+from supabase import create_client
+from worker.proxy_control import ProxyControl
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    pool = APISessionPool(settings)
+    proxy_control_required = bool(settings.OJV_PROXY_URL)
+    proxy_supabase = None
+    if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_KEY:
+        proxy_supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+    proxy_control = (
+        ProxyControl(proxy_supabase, actor="estrado-pjud-api")
+        if proxy_control_required
+        else None
+    )
+    pool = APISessionPool(settings, proxy_control=proxy_control)
     app.state.session_pool = pool
+    app.state.proxy_control = proxy_control
+    app.state.proxy_control_required = proxy_control_required
     app.state.catalog_service = CatalogService(pool)
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
@@ -63,7 +76,14 @@ def create_app() -> FastAPI:
     # método/host/endpoint y rid, pero el valor configurado nunca llega al
     # journal. El helper es idempotente porque create_app se llama más de una
     # vez en tests y en algunos servidores.
-    install_secret_redaction(root_handlers, (settings.TELEGRAM_BOT_TOKEN,))
+    install_secret_redaction(
+        root_handlers,
+        tuple(filter(None, (
+            settings.TELEGRAM_BOT_TOKEN,
+            settings.SUPABASE_SERVICE_KEY,
+            settings.OJV_PROXY_URL,
+        ))),
+    )
 
     app = FastAPI(
         title="estrado-pjud-service",

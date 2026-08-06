@@ -8,6 +8,7 @@ from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
 from app.failure_kind import NoUsableBundleError, new_egress_may_help
 from app.metrics import api_metrics
+from app.proxy_billing import is_proxy_billing_error
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 _RETRY_BUDGET_S = 20.0
 
 
+class ProxyTrafficDisabledError(RuntimeError):
+    """Persistent control denied paid proxy traffic."""
+
+
 class APISessionPool:
     """Reusable session pool for API routes.
 
@@ -35,7 +40,9 @@ class APISessionPool:
     Sessions are lazily initialized and refreshed when they expire.
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self, settings: Settings, proxy_control=None, *, allow_uncontrolled_proxy: bool = False,
+    ):
         self._settings = settings
         self._pool: deque[OJVSession] = deque()
         self._lock = asyncio.Lock()
@@ -43,10 +50,13 @@ class APISessionPool:
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
         self._rr_index = 0
+        self._proxy_control = proxy_control
+        # Explicit test seam only. Production's default is fail-closed.
+        self._allow_uncontrolled_proxy = allow_uncontrolled_proxy
         # Modo proxy: salir sin la IP residencial no es una alternativa
         # aceptable. En modo legacy (sin OJV_PROXY_URL) salir directo es el
         # comportamiento previsto, no un fallback.
-        self._proxy_mode = settings.OJV_PROXY_URL is not None
+        self._proxy_mode = bool(settings.OJV_PROXY_URL)
         # Se loguea porque de este flag depende TODA la guardia: si el `.env` del
         # servicio no trae `OJV_PROXY_URL`, `_usable` da siempre True, el raise
         # nunca dispara y el fallback a la IP del datacenter sigue vivo sin que
@@ -61,6 +71,7 @@ class APISessionPool:
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
+        await self.assert_proxy_enabled()
         async with self._lock:
             # Try to get a valid session from the pool
             while self._pool:
@@ -111,6 +122,10 @@ class APISessionPool:
                 return session
             except Exception as e:
                 await session.close()
+                if is_proxy_billing_error(e):
+                    if self._proxy_control is not None:
+                        await self._proxy_control.trip_billing_exhausted()
+                    raise
                 agotado = time.monotonic() >= limite
                 if intento >= intentos or agotado or not new_egress_may_help(e):
                     # `raise` pelado: preserva la excepción y su traceback, que
@@ -126,6 +141,17 @@ class APISessionPool:
                 )
 
         raise RuntimeError("unreachable")  # el loop retorna o re-lanza
+
+    async def assert_proxy_enabled(self) -> None:
+        if not self._proxy_mode:
+            return
+        if self._allow_uncontrolled_proxy:
+            return
+        if self._proxy_control is None:
+            raise ProxyTrafficDisabledError("proxy_control_unavailable")
+        snapshot = await self._proxy_control.refresh()
+        if not snapshot.allowed:
+            raise ProxyTrafficDisabledError(snapshot.status)
 
     def _usable(self, bundle: CookieBundle) -> bool:
         """¿Con este bundle se puede salir a la calle?

@@ -109,6 +109,38 @@ class TestWorkerMetrics:
         assert meta["errors_infra_today"] == 2
         assert meta["errors_case_today"] == 1
 
+    def test_heartbeat_incluye_control_persistente_sin_secretos(self):
+        from unittest.mock import MagicMock
+        from worker.metrics import Metrics
+        from worker.proxy_control import ProxyControlSnapshot
+
+        control = MagicMock()
+        control.snapshot = ProxyControlSnapshot(
+            allowed=False,
+            status="billing_exhausted",
+            reason_code="proxy_balance_exhausted",
+            revision=12,
+            source="database",
+        )
+        config = MagicMock(WORKER_ID="worker-1", POOL_SIZE=1)
+        metrics = Metrics(config, MagicMock(), proxy_control=control)
+
+        metadata = metrics.heartbeat_payload("running")["metadata"]
+        assert metadata["proxy_control_status"] == "billing_exhausted"
+        assert metadata["proxy_control_reason"] == "proxy_balance_exhausted"
+        assert metadata["proxy_control_revision"] == 12
+        assert "url" not in str(metadata).lower()
+        assert "token" not in str(metadata).lower()
+
+    def test_heartbeat_usa_estado_operativo_actual(self):
+        m = self._make(pool=self._fake_pool())
+        assert m.current_status == "starting"
+
+        m.set_status("paused")
+
+        assert m.current_status == "paused"
+        assert m.heartbeat_payload()["status"] == "paused"
+
     def test_errors_today_sigue_siendo_el_total(self):
         """La columna existente no cambia de significado: quien la lea hoy
         sigue viendo el total."""

@@ -17,9 +17,12 @@ class CircuitBreaker:
         self._block_pause_seconds = block_pause_seconds
         self.consecutive_failures = 0
         self._open_until: float = 0.0
+        self._permanent_reason: str | None = None
 
     @property
     def is_open(self) -> bool:
+        if self._permanent_reason is not None:
+            return True
         if self._open_until == 0.0:
             return False
         if time.monotonic() >= self._open_until:
@@ -30,6 +33,8 @@ class CircuitBreaker:
 
     @property
     def seconds_until_close(self) -> float:
+        if self._permanent_reason is not None:
+            return float("inf")
         if self._open_until == 0.0:
             return 0.0
         remaining = self._open_until - time.monotonic()
@@ -46,4 +51,20 @@ class CircuitBreaker:
 
     def record_success(self):
         self.consecutive_failures = 0
+        if self._permanent_reason is not None:
+            return
         self._open_until = 0.0
+
+    @property
+    def is_permanently_open(self) -> bool:
+        return self._permanent_reason is not None
+
+    @property
+    def open_reason(self) -> str | None:
+        return self._permanent_reason
+
+    def open_permanently(self, reason: str) -> None:
+        self._permanent_reason = reason
+
+    def resume_permanent(self) -> None:
+        self._permanent_reason = None

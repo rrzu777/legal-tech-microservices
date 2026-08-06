@@ -114,6 +114,29 @@ class TestHealth:
         assert body["status"] == "ok"
         assert "uptime_seconds" in body
         assert isinstance(body["uptime_seconds"], int)
+        assert body["pjud_available"] is True
+
+    def test_health_is_down_when_required_proxy_control_is_unavailable(self, client):
+        from worker.proxy_control import ProxyControlSnapshot
+
+        control = AsyncMock()
+        control.refresh.return_value = ProxyControlSnapshot(
+            allowed=False,
+            status="unavailable",
+            reason_code="control_read_failed",
+            revision=9,
+            source="local",
+        )
+        client.app.state.proxy_control = control
+        client.app.state.proxy_control_required = True
+
+        body = client.get("/api/v1/health").json()
+
+        assert body["status"] == "down"
+        assert body["pjud_available"] is False
+        assert "proxy_control_status" not in body
+        assert "proxy_control_reason" not in body
+        assert "proxy_control_revision" not in body
 
     def test_health_reporta_down_cuando_el_pool_no_entrega_sesion(self, client):
         """El status sale DERIVADO y no de la constante `"ok"` que había acá.

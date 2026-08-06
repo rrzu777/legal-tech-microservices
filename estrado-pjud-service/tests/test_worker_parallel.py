@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -133,3 +134,32 @@ async def test_process_batch_one_case_raising_does_not_sink_others():
     await process_batch(batch, engine, 5, shutdown_event, backoff)
 
     assert sorted(engine.ran) == list(range(5))
+
+
+@pytest.mark.asyncio
+async def test_process_batch_rechecks_persistent_gate_before_each_case():
+    from worker.proxy_control import ProxyControlSnapshot
+
+    engine = ConcurrencyTrackingEngine()
+    control = AsyncMock()
+    control.refresh.return_value = ProxyControlSnapshot(
+        allowed=False,
+        status="paused",
+        reason_code="ops_pause",
+        revision=4,
+        source="database",
+    )
+    backoff = MagicMock()
+    backoff.is_open = False
+
+    await process_batch(
+        [{"id": 1}, {"id": 2}],
+        engine,
+        2,
+        asyncio.Event(),
+        backoff,
+        proxy_control=control,
+    )
+
+    assert engine.ran == []
+    assert control.refresh.await_count == 2
