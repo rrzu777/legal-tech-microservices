@@ -7,11 +7,11 @@ from fastapi import APIRouter, HTTPException, Request
 from app.auth import verify_api_key
 from app.rate_limit import limiter
 from app.models import (
-    DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
+    CandidateMatch, DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
 )
 from app.parsers.detail_parser import parse_detail
 from app.parsers.form_builder import build_search_form_data
-from app.matching import is_definitive_not_found, matches_requested_identifier
+from app.matching import is_definitive_not_found, matches_requested_candidate
 from app.parsers.normalizer import competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
@@ -94,10 +94,8 @@ async def _search_for_fresh_jwt(session, comp: str, req: DetailRequest) -> str |
             return None
         raise UpstreamChangedError("detail affinity search returned non-empty unparseable PJUD response")
 
-    exact = [
-        match for match in matches
-        if matches_requested_identifier(str(match.get("rol", "")), req)
-    ]
+    candidates = [CandidateMatch(**match) for match in matches]
+    exact = [candidate for candidate in candidates if matches_requested_candidate(candidate, req)]
 
     # The JWT `data` field is case-specific and stable across sessions.  It is
     # combined with the requested official identifier, so a stale caller JWT
@@ -106,16 +104,16 @@ async def _search_for_fresh_jwt(session, comp: str, req: DetailRequest) -> str |
     if caller_data:
         correlated = [
             match for match in exact
-            if _extract_jwt_data(match["key"]) == caller_data
+            if _extract_jwt_data(match.key) == caller_data
         ]
         if len(correlated) == 1:
             logger.info("Session-affinity search: correlated fresh JWT among %d results", len(matches))
-            return correlated[0]["key"]
+            return correlated[0].key
 
     # The only safe first-match case is unique by the official identifier.
     if len(exact) == 1:
         logger.info("Session-affinity search: unique exact official identifier")
-        return exact[0]["key"]
+        return exact[0].key
 
     logger.error(
         "Session-affinity search: %d matches, could not correlate requested candidate",

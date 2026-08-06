@@ -42,7 +42,7 @@ def _matches_requested(value: str | None, requested: object | None) -> bool:
     return value is not None and requested is not None and normalize_label(value) == normalize_label(str(requested))
 
 
-def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) -> bool:
+def matches_requested_candidate(candidate: CandidateMatch, req: SearchRequest) -> bool:
     """Compare PJUD's displayed identifier against the requested canonical one.
 
     Appellate direct-resource results prepend the official resource label
@@ -51,6 +51,24 @@ def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) 
     the requested `appeals_resource` book; it never changes stored/displayed
     identifiers and does not apply to Penal RITs.
     """
+    if req.case_type == "ruc":
+        return (
+            candidate.ruc is not None
+            and normalize_identifier(candidate.ruc) == normalize_identifier(req.case_number)
+        )
+
+    return matches_requested_identifier(candidate.rol, req)
+
+
+def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) -> bool:
+    """Legacy identifier-only matcher retained for worker compatibility.
+
+    An identifier-only caller has no RUC evidence and therefore must never
+    confirm a RUC request.  Search and Detail use `matches_requested_candidate`
+    above, which supplies the required `CandidateMatch.ruc`.
+    """
+    if req.case_type == "ruc":
+        return False
     if normalize_identifier(candidate_identifier) == normalize_identifier(req.case_number):
         return True
     if req.competencia != "apelaciones" or req.search_mode != "appeals_resource":
@@ -71,7 +89,7 @@ def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) 
 def candidate_score(candidate: CandidateMatch, req: SearchRequest) -> tuple[int, str]:
     """Score canonical evidence, then use key as a stable deterministic tie-break."""
     score = 0
-    if matches_requested_identifier(candidate.rol, req):
+    if matches_requested_candidate(candidate, req):
         score += 100
     if req.tribunal is not None and candidate.tribunal_code == req.tribunal:
         score += 40
@@ -107,7 +125,7 @@ def build_search_response(
     exact = [
         candidate
         for candidate in matches
-        if matches_requested_identifier(candidate.rol, request)
+        if matches_requested_candidate(candidate, request)
     ]
 
     if not matches:

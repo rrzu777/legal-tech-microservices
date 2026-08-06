@@ -133,6 +133,38 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
+    def test_v2_penal_ruc_search_returns_ruc_and_confirms_its_matching_candidate(self, client):
+        from app.routes import search as search_route
+
+        mock_session = _make_mock_session(search_html="<html>resultados</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        raw_match = [{
+            "key": "fresh-ruc-jwt",
+            "rol": "O-999-2025",
+            "ruc": "2500100001-5",
+            "tribunal": "Juzgado de Garantía",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2025-01-01",
+        }]
+
+        with patch.object(search_route, "parse_search_results", return_value=raw_match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "ruc",
+                    "case_number": "2500100001-5",
+                    "competencia": "penal",
+                    "corte": 90,
+                    "tribunal": 321,
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "found"
+        assert response.json()["matches"][0]["ruc"] == "2500100001-5"
+
     @pytest.mark.asyncio
     async def test_court_label_resolution_requires_one_official_catalog_code(self):
         from app.catalogs import CatalogResult
@@ -648,6 +680,33 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    @pytest.mark.asyncio
+    async def test_detail_affinity_correlates_ruc_with_the_same_candidate_model(self):
+        from app.models import DetailRequest
+        from app.routes import detail as detail_route
+
+        request = DetailRequest(
+            detail_key="caller-jwt-without-data",
+            contract_version=2,
+            case_type="ruc",
+            case_number="2500100001-5",
+            competencia="penal",
+            corte=90,
+            tribunal=321,
+        )
+        session = _make_mock_session(search_html="<html>resultados</html>")
+        with patch.object(detail_route, "parse_search_results", return_value=[{
+            "key": "fresh-ruc-jwt",
+            "rol": "O-999-2025",
+            "ruc": "2500100001-5",
+            "tribunal": "Juzgado de Garantía",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2025-01-01",
+        }]):
+            fresh_key = await detail_route._search_for_fresh_jwt(session, "penal", request)
+
+        assert fresh_key == "fresh-ruc-jwt"
+
     def test_detail_affinity_explicit_not_found_is_valid_409_and_keeps_session_healthy(self, client):
         mock_session = _make_mock_session(
             search_html="<div>No se encontraron causas</div>",

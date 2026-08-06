@@ -145,6 +145,7 @@ class TestParseSearchPenal:
     def test_rol_is_rit(self, html):
         results = parse_search_results(html, "penal")
         assert results[0]["rol"] == "O-100-2025"
+        assert results[0]["ruc"] == "2500100001-5"
 
 
 class TestParseSearchNoResults:

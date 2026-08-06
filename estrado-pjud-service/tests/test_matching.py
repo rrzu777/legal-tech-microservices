@@ -2,10 +2,17 @@ from app.matching import build_search_response, is_definitive_not_found, normali
 from app.models import CandidateMatch, SearchRequest
 
 
-def _candidate(index: int, *, rol: str = "O-243-2025", tribunal_code: int | None = None) -> CandidateMatch:
+def _candidate(
+    index: int,
+    *,
+    rol: str = "O-243-2025",
+    ruc: str | None = None,
+    tribunal_code: int | None = None,
+) -> CandidateMatch:
     return CandidateMatch(
         key=f"key-{index:03d}",
         rol=rol,
+        ruc=ruc,
         tribunal=f"{index}º Juzgado de Garantía de Santiago",
         tribunal_code=tribunal_code,
         caratulado=f"Persona {index}",
@@ -117,3 +124,36 @@ def test_appeals_ranking_uses_resolved_court_and_official_book_code():
 def test_explicit_pjud_no_results_is_not_parser_drift():
     assert is_definitive_not_found("<div>No se encontraron causas</div>") is True
     assert is_definitive_not_found("<div>markup desconocido</div>") is False
+
+
+def test_ruc_request_confirms_only_candidate_ruc_not_its_rit():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="ruc",
+        case_number="2500100001-5",
+        competencia="penal",
+        corte=90,
+        tribunal=321,
+    )
+    matching_ruc = _candidate(1, rol="O-999-2025", ruc="2500100001-5")
+    same_rit_wrong_ruc = _candidate(2, rol="O-243-2025", ruc="2500100002-5")
+
+    response = build_search_response([same_rit_wrong_ruc, matching_ruc], request)
+
+    assert response.status == "found"
+    assert response.matches[0].ruc == "2500100001-5"
+
+
+def test_ruc_request_does_not_confirm_a_different_ruc_even_when_rit_matches():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="ruc",
+        case_number="2500100001-5",
+        competencia="penal",
+        corte=90,
+        tribunal=321,
+    )
+
+    response = build_search_response([_candidate(1, ruc="2500100002-5")], request)
+
+    assert response.status == "needs_disambiguation"

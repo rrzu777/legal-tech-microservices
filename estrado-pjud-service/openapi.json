@@ -70,6 +70,17 @@
             "title": "Rol",
             "type": "string"
           },
+          "ruc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruc"
+          },
           "tribunal": {
             "title": "Tribunal",
             "type": "string"

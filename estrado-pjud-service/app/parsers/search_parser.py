@@ -229,6 +229,7 @@ def _parse_penal_row(tr) -> dict | None:
     return {
         "key": m.group(1),
         "rol": _clean(tds[1].get_text()),  # RIT
+        "ruc": _clean(tds[3].get_text()),
         "tribunal": _clean(tds[2].get_text()),
         "caratulado": _clean(tds[4].get_text()),
         "fecha_ingreso": normalize_date(_clean(tds[5].get_text())),

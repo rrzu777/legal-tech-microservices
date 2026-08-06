@@ -174,6 +174,7 @@ class SearchRequest(BaseModel):
 class CandidateMatch(BaseModel):
     key: str
     rol: str
+    ruc: str | None = None
     tribunal: str
     caratulado: str
     fecha_ingreso: str | None

@@ -32,7 +32,7 @@ CONSUMED = {
         "found", "match_count", "matches", "blocked", "error", "status", "truncated",
     ],
     "CandidateMatch": [
-        "key", "caratulado", "fecha_ingreso", "tribunal", "tribunal_code",
+        "key", "caratulado", "fecha_ingreso", "tribunal", "tribunal_code", "ruc",
     ],
     "DetailResponse": [
         "metadata", "movements", "litigantes", "ebook_token",
