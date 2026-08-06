@@ -1104,7 +1104,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "exclusiveMinimum": 0,
+                  "maximum": 91,
+                  "minimum": 10,
                   "type": "integer"
                 },
                 {
@@ -1158,7 +1159,8 @@
             "required": false,
             "schema": {
               "default": 1,
-              "minimum": 0,
+              "maximum": 1,
+              "minimum": 1,
               "title": "Tipo Busqueda",
               "type": "integer"
             }
@@ -1222,7 +1224,8 @@
             "name": "corte",
             "required": true,
             "schema": {
-              "exclusiveMinimum": 0,
+              "maximum": 91,
+              "minimum": 10,
               "title": "Corte",
               "type": "integer"
             }
@@ -1233,7 +1236,8 @@
             "required": false,
             "schema": {
               "default": 1,
-              "minimum": 0,
+              "maximum": 1,
+              "minimum": 1,
               "title": "Tipo Busqueda",
               "type": "integer"
             }

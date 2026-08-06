@@ -95,6 +95,10 @@ def parse_html_options(html: str) -> CatalogOptions:
     if not html or detect_blocked(html):
         return []
     soup = BeautifulSoup(html, "html.parser")
+    # cmbTipos.php returns only an option fragment. A complete page may be a
+    # login/WAF response which happens to contain options and is never valid.
+    if soup.html is not None or soup.find("select") is not None:
+        return []
     options: CatalogOptions = []
     for node in soup.find_all("option"):
         option = _clean_option(node.get("value"), node.get_text(" ", strip=True))
