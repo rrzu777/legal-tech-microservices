@@ -209,6 +209,56 @@ class TestCanonicalSearchRequestV2:
                 tribunal=123,
             )
 
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    @pytest.mark.parametrize("competencia,case_type,case_number,extra", [
+        (
+            "apelaciones",
+            "rol",
+            "340-2025",
+            {"corte": 90, "search_mode": "appeals_resource"},
+        ),
+        (
+            "penal",
+            "rit",
+            "O-243-2025",
+            {"corte": 90, "tribunal": 123},
+        ),
+    ])
+    @pytest.mark.parametrize("libro", ["", " \t "])
+    def test_v2_rejects_empty_or_whitespace_required_libro(
+        self, request_type, competencia, case_type, case_number, extra, libro,
+    ):
+        fields = {
+            "contract_version": 2,
+            "case_type": case_type,
+            "case_number": case_number,
+            "competencia": competencia,
+            "libro": libro,
+            **extra,
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        with pytest.raises(ValidationError):
+            request_type(**fields)
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_strips_nonempty_libro_before_form_consumers(self, request_type):
+        fields = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "340-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "libro": " 31 ",
+            "search_mode": "appeals_resource",
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        req = request_type(**fields)
+        assert req.libro == "31"
+
     def test_detail_request_carries_canonical_search_fields(self):
         req = DetailRequest(
             detail_key="key",

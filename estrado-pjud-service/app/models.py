@@ -43,7 +43,11 @@ def _validate_v2_search_contract(
     libro: str | None,
     search_mode: SearchMode | None,
     allow_broad: bool,
-) -> None:
+) -> str | None:
+    if libro is not None:
+        libro = libro.strip()
+        if not libro:
+            raise ValueError("v2 libro must not be empty or whitespace")
     if case_type not in {"rol", "rit", "ruc"}:
         raise ValueError("v2 case_type must be rol, rit, or ruc")
     if corte is not None and (corte == 0 or corte not in VALID_CORTE_CODES):
@@ -60,7 +64,7 @@ def _validate_v2_search_contract(
             raise ValueError("v2 suprema requires case_number numero-año")
         if any(value is not None for value in (corte, tribunal, libro)) or allow_broad:
             raise ValueError("v2 suprema does not accept corte, tribunal, libro, or allow_broad")
-        return
+        return libro
 
     if competencia == "apelaciones":
         if case_type != "rol" or not _NUMERO_ANNO_RE.fullmatch(case_number):
@@ -74,7 +78,7 @@ def _validate_v2_search_contract(
                 raise ValueError("appeals_resource does not accept tribunal or allow_broad")
         elif tribunal is None and not allow_broad:
             raise ValueError("first_instance requires tribunal unless allow_broad is true")
-        return
+        return libro
 
     if search_mode is not None:
         raise ValueError("search_mode is only valid for suprema and apelaciones")
@@ -97,6 +101,7 @@ def _validate_v2_search_contract(
             raise ValueError("allow_broad requires corte and tribunal to be omitted")
     elif corte is None or tribunal is None:
         raise ValueError("v2 searches require corte and tribunal unless allow_broad is true")
+    return libro
 
 
 class SearchRequest(BaseModel):
@@ -127,7 +132,7 @@ class SearchRequest(BaseModel):
         return self
 
     def _validate_v2(self):
-        _validate_v2_search_contract(
+        self.libro = _validate_v2_search_contract(
             case_type=self.case_type,
             case_number=self.case_number,
             competencia=self.competencia,
@@ -179,7 +184,7 @@ class DetailRequest(BaseModel):
             return self
         if self.case_type is None or self.case_number is None or self.competencia is None:
             raise ValueError("v2 detail requires case_type, case_number, and competencia")
-        _validate_v2_search_contract(
+        self.libro = _validate_v2_search_contract(
             case_type=self.case_type,
             case_number=self.case_number,
             competencia=self.competencia,
