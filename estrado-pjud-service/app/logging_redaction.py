@@ -1,10 +1,15 @@
 """Redacción central de secretos configurados antes de escribir cada log."""
 
 import logging
+import re
 from collections.abc import Iterable
 
 
 REDACTED = "[REDACTED]"
+_PJUD_DOWNLOAD_TOKEN_PATTERN = re.compile(
+    r"([?&](?:dtaDoc|dtaCert|valorDoc|valorFile)=)(?:\\.|[^&\s\"'\\])+",
+    re.IGNORECASE,
+)
 
 
 def _usable_secrets(values: Iterable[str]) -> tuple[str, ...]:
@@ -36,7 +41,7 @@ class SecretRedactingFormatter(logging.Formatter):
         output = self._delegate.format(record)
         for secret in self._secrets:
             output = output.replace(secret, REDACTED)
-        return output
+        return _PJUD_DOWNLOAD_TOKEN_PATTERN.sub(rf"\1{REDACTED}", output)
 
 
 def install_secret_redaction(
