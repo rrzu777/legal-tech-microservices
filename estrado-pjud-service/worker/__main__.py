@@ -8,6 +8,7 @@ import time
 
 from app.alerting import send_ops_alert
 from app.bandwidth import METER
+from app.logging_redaction import install_secret_redaction
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -34,9 +35,10 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry)
 
 
-def setup_logging(level: str):
+def setup_logging(level: str, *, secrets: tuple[str, ...] = ()):
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    install_secret_redaction((handler,), secrets)
     logging.root.handlers = [handler]
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
@@ -124,7 +126,7 @@ async def safe_initialize_pool(pool, max_retries: int = 5, base_delay: int = 10)
 
 async def main():
     config = WorkerConfig()
-    setup_logging(config.LOG_LEVEL)
+    setup_logging(config.LOG_LEVEL, secrets=(config.TELEGRAM_BOT_TOKEN,))
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
 
     supabase = create_supabase(config)
