@@ -974,15 +974,28 @@ class TestSyncEngine:
     @pytest.mark.asyncio
     async def test_lost_identity_cas_aborts_before_movements_payload_or_success(self):
         """A concurrent human choice wins before any irreversible sync effect."""
+        class UpdateFilterBuilderWithoutSelect:
+            """postgrest's update filter builder deliberately has no select()."""
+
+            def __init__(self):
+                self.filters = []
+
+            def eq(self, field, value):
+                self.filters.append(("eq", field, value))
+                return self
+
+            def is_(self, field, value):
+                self.filters.append(("is", field, value))
+                return self
+
+            def execute(self):
+                return MagicMock(data=[])
+
         engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
         case = _make_case(court_code=None, tribunal_code=None, libro="C", tribunal_unknown=True)
         chain = mock_sb.from_.return_value
-        after_tribunal_guard = MagicMock()
-        after_court_guard = MagicMock()
-        chain.is_.return_value = after_tribunal_guard
-        after_tribunal_guard.is_.return_value = after_court_guard
-        after_court_guard.select.return_value = after_court_guard
-        after_court_guard.execute.return_value = MagicMock(data=[])
+        cas_builder = UpdateFilterBuilderWithoutSelect()
+        chain.is_.return_value = cas_builder
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
              patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
@@ -1003,6 +1016,12 @@ class TestSyncEngine:
         assert find_update_payload(mock_sb, last_sync_status="success") is None
         payloads = [call.args[0] for call in chain.update.call_args_list]
         assert not any("external_payload" in payload for payload in payloads)
+        chain.eq.assert_any_call("id", case["id"])
+        chain.eq.assert_any_call("tribunal_unknown", True)
+        chain.is_.assert_called_once_with("tribunal_code", "null")
+        assert cas_builder.filters == [
+            ("is", "court_code", "null"),
+        ]
 
     @pytest.mark.asyncio
     async def test_real_one_slot_pool_finishes_broad_sync_without_nested_acquire(self):

@@ -536,7 +536,11 @@ class SyncEngine:
                     identity_query = identity_query.eq("court_code", case.get("court_code"))
                 else:
                     identity_query = identity_query.is_("court_code", "null")
-                identity_result = await run_query(identity_query.select("id"))
+                # postgrest's filtered update builder already returns its
+                # representation.  Chaining select() here is unsupported in
+                # the installed client and would turn every broad sync into an
+                # AttributeError before the CAS result can be inspected.
+                identity_result = await run_query(identity_query)
                 if not getattr(identity_result, "data", None):
                     await self._finish_run(
                         sync_run_id, started_at, "error", 0, "identity_changed",
