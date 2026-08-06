@@ -1,6 +1,192 @@
 import pytest
 from pydantic import ValidationError
-from app.models import SearchRequest, SearchResponse
+from app.models import DetailRequest, SearchRequest, SearchResponse
+
+
+class TestCanonicalSearchRequestV2:
+    def test_v2_civil_requires_court_and_tribunal_unless_broad(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+            )
+
+        req = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="C-1-2026",
+            competencia="civil",
+            allow_broad=True,
+        )
+
+        assert req.corte is None
+        assert req.tribunal is None
+
+    def test_v2_civil_rejects_partial_or_broad_filters(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+                allow_broad=True,
+            )
+
+    def test_v2_appeals_modes_validate_dependent_fields(self):
+        direct = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            libro="31",
+            search_mode="appeals_resource",
+        )
+        assert direct.tribunal is None
+
+        origin = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            tribunal=1234,
+            libro="31",
+            search_mode="first_instance",
+        )
+        assert origin.tribunal == 1234
+
+    def test_v2_appeals_rejects_invalid_mode_fields(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=90,
+                libro="31",
+                search_mode="appeals_resource",
+                tribunal=1234,
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=90,
+                libro="31",
+                search_mode="first_instance",
+            )
+
+    def test_v2_supreme_accepts_only_supreme_resource_fields(self):
+        req = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="suprema",
+            search_mode="supreme_resource",
+        )
+        assert req.search_mode == "supreme_resource"
+
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="suprema",
+                search_mode="supreme_resource",
+                libro="31",
+            )
+
+    def test_v2_penal_accepts_rit_and_ruc_only(self):
+        rit = SearchRequest(
+            contract_version=2,
+            case_type="rit",
+            case_number="O-243-2025",
+            competencia="penal",
+            corte=90,
+            tribunal=123,
+            libro="1",
+        )
+        ruc = SearchRequest(
+            contract_version=2,
+            case_type="ruc",
+            case_number="2400012345-6",
+            competencia="penal",
+            corte=90,
+            tribunal=123,
+        )
+        assert rit.case_type == "rit"
+        assert ruc.case_type == "ruc"
+
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="ruc",
+                case_number="2400012345-6",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+            )
+
+    def test_v2_penal_rejects_noncanonical_rit_and_ruc_identifiers(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rit",
+                case_number="243-2025",
+                competencia="penal",
+                corte=90,
+                tribunal=123,
+                libro="1",
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="ruc",
+                case_number="not-a-ruc",
+                competencia="penal",
+                corte=90,
+                tribunal=123,
+            )
+
+    def test_v1_request_remains_accepted_during_rollout(self):
+        req = SearchRequest(
+            case_type="rit",
+            case_number="O-243-2025",
+            competencia="penal",
+            libro="1",
+        )
+        assert req.contract_version == 1
+
+    def test_detail_request_carries_canonical_search_fields(self):
+        req = DetailRequest(
+            detail_key="key",
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            tribunal=123,
+            libro="31",
+            search_mode="first_instance",
+            max_matches=25,
+        )
+        assert req.tribunal == 123
+        assert req.max_matches == 25
 
 
 class TestSearchRequestCorte:

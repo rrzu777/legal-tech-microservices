@@ -1,8 +1,14 @@
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
+SearchMode = Literal["supreme_resource", "appeals_resource", "first_instance"]
+
+_NUMERO_ANNO_RE = re.compile(r"^\d+-\d{4}$")
+_RIT_IDENTIFIER_RE = re.compile(r"^[^-]+-\d+-\d{4}$")
+_RUC_IDENTIFIER_RE = re.compile(r"^\d{7,10}-[0-9Kk]$")
 
 
 VALID_CORTE_CODES = {
@@ -28,14 +34,22 @@ VALID_CORTE_CODES = {
 
 
 class SearchRequest(BaseModel):
-    case_type: str  # "rol" | "rit" | "ruc"
+    contract_version: Literal[1, 2] = 1
+    case_type: Literal["rol", "rit", "ruc"]
     case_number: str  # "X-NNNN-YYYY"
     competencia: COMPETENCIA_TYPE
-    corte: int | None = None  # only valid when competencia == "apelaciones"
+    corte: int | None = None
+    tribunal: int | None = None
     libro: str | None = None
+    search_mode: SearchMode | None = None
+    allow_broad: bool = False
+    max_matches: int = Field(default=10, ge=1, le=25)
 
     @model_validator(mode="after")
     def _validate_corte(self):
+        if self.contract_version == 2:
+            return self._validate_v2()
+
         if self.corte is not None and self.competencia != "apelaciones":
             raise ValueError("corte is only valid when competencia is 'apelaciones'")
         if self.competencia == "apelaciones" and self.corte is None:
@@ -44,6 +58,60 @@ class SearchRequest(BaseModel):
             raise ValueError(
                 f"Invalid corte code {self.corte}; must be one of {sorted(VALID_CORTE_CODES)}"
             )
+        return self
+
+    def _validate_v2(self):
+        if self.corte is not None and self.corte not in VALID_CORTE_CODES:
+            raise ValueError(
+                f"Invalid corte code {self.corte}; must be one of {sorted(VALID_CORTE_CODES)}"
+            )
+        if self.tribunal is not None and self.tribunal <= 0:
+            raise ValueError("tribunal must be a positive integer")
+
+        if self.competencia == "suprema":
+            if self.case_type != "rol" or self.search_mode != "supreme_resource":
+                raise ValueError("v2 suprema requires rol with search_mode='supreme_resource'")
+            if not _NUMERO_ANNO_RE.fullmatch(self.case_number):
+                raise ValueError("v2 suprema requires case_number numero-año")
+            if any(value is not None for value in (self.corte, self.tribunal, self.libro)) or self.allow_broad:
+                raise ValueError("v2 suprema does not accept corte, tribunal, libro, or allow_broad")
+            return self
+
+        if self.competencia == "apelaciones":
+            if self.case_type != "rol" or not _NUMERO_ANNO_RE.fullmatch(self.case_number):
+                raise ValueError("v2 apelaciones requires rol with case_number numero-año")
+            if self.corte is None or self.libro is None:
+                raise ValueError("v2 apelaciones requires corte and libro")
+            if self.search_mode not in {"appeals_resource", "first_instance"}:
+                raise ValueError("v2 apelaciones requires a valid search_mode")
+            if self.search_mode == "appeals_resource":
+                if self.tribunal is not None or self.allow_broad:
+                    raise ValueError("appeals_resource does not accept tribunal or allow_broad")
+            elif self.tribunal is None and not self.allow_broad:
+                raise ValueError("first_instance requires tribunal unless allow_broad is true")
+            return self
+
+        if self.search_mode is not None:
+            raise ValueError("search_mode is only valid for suprema and apelaciones")
+        if self.competencia == "penal":
+            if self.case_type not in {"rit", "ruc"}:
+                raise ValueError("v2 penal requires rit or ruc")
+            if self.case_type == "rit" and not _RIT_IDENTIFIER_RE.fullmatch(self.case_number.strip()):
+                raise ValueError("v2 penal RIT requires prefijo-numero-año")
+            if self.case_type == "ruc" and not _RUC_IDENTIFIER_RE.fullmatch(self.case_number.strip()):
+                raise ValueError("v2 penal RUC requires digitos-DV")
+            if self.case_type == "ruc" and self.libro is not None:
+                raise ValueError("v2 penal RUC does not accept libro")
+            if self.case_type == "rit" and self.libro is None:
+                raise ValueError("v2 penal RIT requires libro")
+        elif self.case_type == "ruc":
+            raise ValueError("v2 civil, laboral, and cobranza do not accept ruc")
+
+        if self.allow_broad:
+            if self.corte is not None or self.tribunal is not None:
+                raise ValueError("allow_broad requires corte and tribunal to be omitted")
+        elif self.corte is None or self.tribunal is None:
+            raise ValueError("v2 searches require corte and tribunal unless allow_broad is true")
         return self
 
 
@@ -66,13 +134,19 @@ class SearchResponse(BaseModel):
 
 class DetailRequest(BaseModel):
     detail_key: str
+    contract_version: Literal[1, 2] = 1
+    case_type: Literal["rol", "rit", "ruc"] | None = None
     competencia: COMPETENCIA_TYPE | None = None
     # Optional search params: when provided, the detail endpoint performs a search
     # on the SAME session before fetching the detail, ensuring JWT + CSRF affinity.
     # This prevents cross-case contamination when session pooling reuses sessions.
     case_number: str | None = None
     corte: int | None = None
+    tribunal: int | None = None
     libro: str | None = None
+    search_mode: SearchMode | None = None
+    allow_broad: bool = False
+    max_matches: int = Field(default=10, ge=1, le=25)
 
 
 class CaseMetadata(BaseModel):

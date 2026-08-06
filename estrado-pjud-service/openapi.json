@@ -134,6 +134,11 @@
       },
       "DetailRequest": {
         "properties": {
+          "allow_broad": {
+            "default": false,
+            "title": "Allow Broad",
+            "type": "boolean"
+          },
           "case_number": {
             "anyOf": [
               {
@@ -144,6 +149,22 @@
               }
             ],
             "title": "Case Number"
+          },
+          "case_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "rol",
+                  "rit",
+                  "ruc"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Type"
           },
           "competencia": {
             "anyOf": [
@@ -163,6 +184,15 @@
               }
             ],
             "title": "Competencia"
+          },
+          "contract_version": {
+            "default": 1,
+            "enum": [
+              1,
+              2
+            ],
+            "title": "Contract Version",
+            "type": "integer"
           },
           "corte": {
             "anyOf": [
@@ -189,6 +219,40 @@
               }
             ],
             "title": "Libro"
+          },
+          "max_matches": {
+            "default": 10,
+            "maximum": 25.0,
+            "minimum": 1.0,
+            "title": "Max Matches",
+            "type": "integer"
+          },
+          "search_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "supreme_resource",
+                  "appeals_resource",
+                  "first_instance"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Mode"
+          },
+          "tribunal": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal"
           }
         },
         "required": [
@@ -751,11 +815,21 @@
       },
       "SearchRequest": {
         "properties": {
+          "allow_broad": {
+            "default": false,
+            "title": "Allow Broad",
+            "type": "boolean"
+          },
           "case_number": {
             "title": "Case Number",
             "type": "string"
           },
           "case_type": {
+            "enum": [
+              "rol",
+              "rit",
+              "ruc"
+            ],
             "title": "Case Type",
             "type": "string"
           },
@@ -770,6 +844,15 @@
             ],
             "title": "Competencia",
             "type": "string"
+          },
+          "contract_version": {
+            "default": 1,
+            "enum": [
+              1,
+              2
+            ],
+            "title": "Contract Version",
+            "type": "integer"
           },
           "corte": {
             "anyOf": [
@@ -792,6 +875,40 @@
               }
             ],
             "title": "Libro"
+          },
+          "max_matches": {
+            "default": 10,
+            "maximum": 25.0,
+            "minimum": 1.0,
+            "title": "Max Matches",
+            "type": "integer"
+          },
+          "search_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "supreme_resource",
+                  "appeals_resource",
+                  "first_instance"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Mode"
+          },
+          "tribunal": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal"
           }
         },
         "required": [

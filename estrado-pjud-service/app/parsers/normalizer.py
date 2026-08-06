@@ -6,6 +6,7 @@ logger = logging.getLogger(__name__)
 
 _IDENTIFIER_RE = re.compile(r"^(.+)-(\d+)-(\d{4})$")
 _IDENTIFIER_NUM_RE = re.compile(r"^(\d+)-(\d{4})$")
+_RUC_IDENTIFIER_RE = re.compile(r"^(\d{7,10})-([0-9Kk])$")
 _DATE_DMY_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -68,6 +69,23 @@ def parse_case_identifier(raw: str) -> dict[str, str]:
     if m:
         return {"tipo": "", "numero": m.group(1), "anno": m.group(2)}
     raise ValueError(f"Invalid case identifier: {raw!r}")
+
+
+def parse_search_identifier(case_type: str, raw: str) -> dict[str, str | None]:
+    """Parse the canonical v2 identifier without rewriting PJUD prefixes."""
+    if case_type == "ruc":
+        match = _RUC_IDENTIFIER_RE.fullmatch(raw.strip())
+        if not match:
+            raise ValueError("Invalid RUC identifier")
+        return {
+            "tipo": "",
+            "numero": "",
+            "anno": "",
+            "ruc": match.group(1),
+            "ruc_dv": match.group(2).upper(),
+        }
+
+    return {**parse_case_identifier(raw), "ruc": None, "ruc_dv": None}
 
 
 def normalize_date(raw: str | None) -> str | None:
