@@ -16,3 +16,10 @@ def test_worker_owns_private_state_directory_and_api_can_read_its_group():
     assert "StateDirectory=estrado-pjud" in worker
     assert "StateDirectoryMode=0750" in worker
     assert "SupplementaryGroups=estrado" in api
+
+
+def test_runtime_secrets_and_logs_are_ignored_but_example_stays_versioned():
+    gitignore = (ROOT / "estrado-pjud-service/.gitignore").read_text().splitlines()
+    assert ".env.*" in gitignore
+    assert "!.env.example" in gitignore
+    assert "logs/" in gitignore
