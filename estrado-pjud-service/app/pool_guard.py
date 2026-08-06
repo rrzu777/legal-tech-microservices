@@ -36,6 +36,7 @@ from app.alerting import maybe_alert, maybe_alert_event
 from app.failure_kind import FailureKind, classify_exception
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session_pool import ProxyTrafficDisabledError
 
 logger = logging.getLogger(__name__)
@@ -80,12 +81,21 @@ async def acquire_or_alert(pool, request: Request, endpoint: str):
     try:
         return await pool.acquire()
     except Exception as e:
+        control = getattr(request.app.state, "proxy_control", None)
+        if isinstance(e, ProxyUsagePersistenceError) and control is not None:
+            await control.pause_telemetry_unavailable()
+        elif isinstance(e, ProxyBudgetExceededError) and control is not None:
+            await control.refresh()
         await _trace_pool_failure(
             request, endpoint,
             f"el pool no pudo entregar sesion ({type(e).__name__}: {e}). "
             "Revisar bundles F5 / proxy residencial: el servicio no esta atendiendo.",
         )
-        if isinstance(e, ProxyTrafficDisabledError):
+        if isinstance(e, (
+            ProxyTrafficDisabledError,
+            ProxyBudgetExceededError,
+            ProxyUsagePersistenceError,
+        )):
             raise HTTPException(
                 status_code=503,
                 detail="Servicio de sincronizacion temporalmente no disponible",
@@ -153,6 +163,14 @@ async def classify_and_alert(e: Exception, request: Request, endpoint: str) -> F
         control = getattr(request.app.state, "proxy_control", None)
         if control is not None:
             await control.trip_billing_exhausted()
+    elif isinstance(e, ProxyUsagePersistenceError):
+        control = getattr(request.app.state, "proxy_control", None)
+        if control is not None:
+            await control.pause_telemetry_unavailable()
+    elif isinstance(e, ProxyBudgetExceededError):
+        control = getattr(request.app.state, "proxy_control", None)
+        if control is not None and e.blocking_scope == "global":
+            await control.refresh()
 
     kind = classify_exception(e)
 

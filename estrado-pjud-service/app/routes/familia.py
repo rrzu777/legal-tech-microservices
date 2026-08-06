@@ -16,6 +16,7 @@ from app.metrics import api_metrics
 from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
 from app.proxy_billing import is_proxy_billing_error
 from app.rate_limit import limiter
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +46,18 @@ async def familia_sync(
 
     try:
         async with asyncio.timeout(_SYNC_TIMEOUT_S):
-            resp = await _run_sync(
-                req,
-                rate_s,
-                bundle,
-                proxy_control=getattr(request.app.state, "proxy_control", None),
-            )
+            proxy_usage = getattr(request.app.state, "proxy_usage", DISABLED_PROXY_USAGE)
+            async with proxy_usage.track(operation="search") as usage:
+                resp = await _run_sync(
+                    req,
+                    rate_s,
+                    bundle,
+                    proxy_control=getattr(request.app.state, "proxy_control", None),
+                    proxy_usage_capture=usage,
+                )
+                if not resp.ok and resp.error_code == "blocked":
+                    usage.status = "blocked"
+                    usage.error_kind = "ojv"
     except TimeoutError:
         logger.warning("familia_sync: timed out after %ds", _SYNC_TIMEOUT_S)
         api_metrics.record_error("familia")
@@ -98,6 +105,7 @@ async def _proxy_billing_response(error: Exception, proxy_control) -> FamiliaSyn
 
 async def _run_sync(
     req: FamiliaSyncRequest, rate_s: float, bundle, proxy_control=None,
+    proxy_usage_capture=None,
 ) -> FamiliaSyncResponse:
     async with FamiliaAuthSession(
         bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
@@ -122,6 +130,9 @@ async def _run_sync(
         except Exception as e:
             billing = await _proxy_billing_response(e, proxy_control)
             if billing:
+                if proxy_usage_capture is not None:
+                    proxy_usage_capture.status = "error"
+                    proxy_usage_capture.error_kind = "billing"
                 return billing
             logger.exception("familia_sync: unexpected error during login")
             return FamiliaSyncResponse(
@@ -151,6 +162,9 @@ async def _run_sync(
                 except Exception as e:
                     billing = await _proxy_billing_response(e, proxy_control)
                     if billing:
+                        if proxy_usage_capture is not None:
+                            proxy_usage_capture.status = "error"
+                            proxy_usage_capture.error_kind = "billing"
                         return billing
                     # El mismo criterio que el bloqueo, extendido a las otras
                     # fallas que tampoco son de la causa. Este `except` se tragaba
@@ -186,6 +200,9 @@ async def _run_sync(
         except Exception as e:
             billing = await _proxy_billing_response(e, proxy_control)
             if billing:
+                if proxy_usage_capture is not None:
+                    proxy_usage_capture.status = "error"
+                    proxy_usage_capture.error_kind = "billing"
                 return billing
             logger.exception("familia_sync: unexpected error querying Familia")
             return FamiliaSyncResponse(

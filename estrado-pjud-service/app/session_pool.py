@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+import uuid
+from contextlib import asynccontextmanager
 from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
@@ -9,6 +11,7 @@ from app.cookie_store import CookieBundle, CookieStore
 from app.failure_kind import NoUsableBundleError, new_egress_may_help
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ class APISessionPool:
 
     def __init__(
         self, settings: Settings, proxy_control=None, *, allow_uncontrolled_proxy: bool = False,
+        proxy_usage=None,
     ):
         self._settings = settings
         self._pool: deque[OJVSession] = deque()
@@ -51,6 +55,7 @@ class APISessionPool:
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
         self._rr_index = 0
         self._proxy_control = proxy_control
+        self._proxy_usage = proxy_usage
         # Explicit test seam only. Production's default is fail-closed.
         self._allow_uncontrolled_proxy = allow_uncontrolled_proxy
         # Modo proxy: salir sin la IP residencial no es una alternativa
@@ -68,6 +73,19 @@ class APISessionPool:
             "proxy residencial (sin bundle no se sale)" if self._proxy_mode
             else "legacy SIN PROXY (egreso directo por la IP del host)",
         )
+
+    @asynccontextmanager
+    async def _mint_usage_scope(self, attempt: int):
+        if self._proxy_usage is None or not self._proxy_mode:
+            yield None
+            return
+        async with self._proxy_usage.track(
+            operation="mint",
+            transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
+        ) as usage:
+            if attempt > 1:
+                usage.retry_count += 1
+            yield usage
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
@@ -118,13 +136,16 @@ class APISessionPool:
             )
             session = OJVSession(adapter)
             try:
-                await session.initialize()
+                async with self._mint_usage_scope(intento):
+                    await session.initialize()
                 return session
             except Exception as e:
                 await session.close()
                 if is_proxy_billing_error(e):
                     if self._proxy_control is not None:
                         await self._proxy_control.trip_billing_exhausted()
+                    raise
+                if isinstance(e, (ProxyBudgetExceededError, ProxyUsagePersistenceError)):
                     raise
                 agotado = time.monotonic() >= limite
                 if intento >= intentos or agotado or not new_egress_may_help(e):

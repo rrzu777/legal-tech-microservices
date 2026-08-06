@@ -15,6 +15,7 @@ from app.metrics import api_metrics
 from app.errors import safe_error
 from app.failure_kind import reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
 
@@ -163,14 +164,19 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
         libro_used = resolve_libro(req.competencia, parsed["tipo"], req.libro) or None
 
-        html = await session.search(comp_path, form_data)
+        proxy_usage = getattr(request.app.state, "proxy_usage", DISABLED_PROXY_USAGE)
+        async with proxy_usage.track(operation="search") as usage:
+            html = await session.search(comp_path, form_data)
+            reject_empty_body(html, "search")
+            blocked_response = detect_blocked(html)
+            if blocked_response:
+                usage.status = "blocked"
+                usage.error_kind = "ojv"
 
         # Cuerpo de cero bytes: infra, no bloqueo. Sale por el `except` de abajo
         # como 500. Sin esto, `parse_search_results` de un cuerpo vacio devuelve
         # [] y la app escribe "No encontrada en OJV — revisa el rol".
-        reject_empty_body(html, "search")
-
-        if detect_blocked(html):
+        if blocked_response:
             healthy = False
             await record_blocked_and_alert(request, "search")
             return SearchResponse(

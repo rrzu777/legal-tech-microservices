@@ -10,7 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.adapters.http_adapter import _USER_AGENT
-from app.bandwidth import METER
+from app.bandwidth import estimate_request_bytes, record_proxy_request, record_proxy_response
 from app.parsers.search_parser import detect_blocked
 
 logger = logging.getLogger(__name__)
@@ -108,13 +108,15 @@ class FamiliaAuthSession:
         )
 
     async def _get(self, url: str, **kwargs) -> httpx.Response:
+        record_proxy_request(estimate_request_bytes(kwargs))
         resp = await self._client.get(url, **kwargs)
-        METER.add(len(resp.content))
+        record_proxy_response(len(resp.content))
         return resp
 
     async def _post(self, url: str, **kwargs) -> httpx.Response:
+        record_proxy_request(estimate_request_bytes(kwargs))
         resp = await self._client.post(url, **kwargs)
-        METER.add(len(resp.content))
+        record_proxy_response(len(resp.content))
         return resp
 
     async def _wait(self) -> None:

@@ -32,10 +32,19 @@ from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import (
+    ProxyBudgetExceededError,
+    ProxyUsagePersistenceError,
+    is_proxy_cost_control_error,
+)
 from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 from worker.sync_messages import BlockCause, blocked_error_message
 from worker.proxy_control import ProxyControl
+from worker.proxy_usage import (
+    DEFAULT_PRICE_PER_GB_USD,
+    ProxyUsageTracker,
+)
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -59,9 +68,9 @@ MATTER_TO_COMPETENCIA = {
 }
 
 SYNC_INTERVALS_HOURS = {
-    1: 4,    # hot
-    2: 12,   # warm
-    3: 24,   # cold
+    1: 6,    # hot: movimiento durante los últimos 7 días
+    2: 24,   # warm: movimiento durante los últimos 30 días
+    3: 72,   # cold: sin movimiento durante más de 30 días
     4: 168,  # archived (weekly)
 }
 
@@ -135,6 +144,16 @@ _ANEXO_FIELDS = ("anexo_func", "anexo_token")
 _CANONICAL_WHITESPACE_RE = re.compile(
     r"[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
 )
+
+
+def _document_source_id(kind: str, *parts: object) -> str:
+    """Stable document identity that deliberately excludes expiring PJUD JWTs."""
+    canonical = json.dumps(
+        [kind, *("" if part is None else str(part).strip() for part in parts)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _movement_identity(movement: dict) -> tuple:
@@ -497,7 +516,7 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
 class SyncEngine:
     def __init__(
         self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig,
-        catalog_service=None, proxy_control=None,
+        catalog_service=None, proxy_control=None, proxy_usage=None,
     ):
         self._pool = pool
         self._sb = supabase
@@ -506,7 +525,18 @@ class SyncEngine:
         self._backoff = backoff
         self._config = config
         self._proxy_control = proxy_control or ProxyControl(supabase)
-        self._catalog_service = catalog_service or CatalogService(pool)
+        proxy_url = getattr(config, "OJV_PROXY_URL", None)
+        price = getattr(config, "OJV_PROXY_PRICE_PER_GB_USD", DEFAULT_PRICE_PER_GB_USD)
+        if not isinstance(price, (int, float)):
+            price = DEFAULT_PRICE_PER_GB_USD
+        self._proxy_usage = proxy_usage or ProxyUsageTracker(
+            supabase,
+            enabled=isinstance(proxy_url, str) and bool(proxy_url),
+            price_per_gb_usd=float(price),
+        )
+        self._catalog_service = catalog_service or CatalogService(
+            pool, proxy_usage=self._proxy_usage,
+        )
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
@@ -659,9 +689,19 @@ class SyncEngine:
                 )
 
             # Search
-            search_result = await search_pjud_via_session(
-                session, competencia, form_data, self._config.OJV_TIMEOUT_S,
-            )
+            async with self._proxy_usage.track(
+                operation="search",
+                law_firm_id=case["law_firm_id"],
+                case_id=case["id"],
+                sync_run_id=sync_run_id,
+                transaction_key=f"{sync_run_id}:search",
+            ) as search_usage:
+                search_result = await search_pjud_via_session(
+                    session, competencia, form_data, self._config.OJV_TIMEOUT_S,
+                )
+                if search_result["blocked"]:
+                    search_usage.status = "blocked"
+                    search_usage.error_kind = "ojv"
 
             if search_result["blocked"]:
                 session_healthy = False
@@ -718,9 +758,19 @@ class SyncEngine:
             await self._pool.enforce_global_rate_limit()
 
             # Detail
-            detail = await detail_pjud_via_session(
-                session, competencia, detail_key, self._config.OJV_TIMEOUT_S,
-            )
+            async with self._proxy_usage.track(
+                operation="detail",
+                law_firm_id=case["law_firm_id"],
+                case_id=case["id"],
+                sync_run_id=sync_run_id,
+                transaction_key=f"{sync_run_id}:detail",
+            ) as detail_usage:
+                detail = await detail_pjud_via_session(
+                    session, competencia, detail_key, self._config.OJV_TIMEOUT_S,
+                )
+                if detail["blocked"]:
+                    detail_usage.status = "blocked"
+                    detail_usage.error_kind = "ojv"
 
             if detail["blocked"]:
                 session_healthy = False
@@ -789,7 +839,9 @@ class SyncEngine:
 
             # Download and store documents
             if self._r2 and detail.get("movements"):
-                await self._download_and_store_documents(case, detail, session)
+                await self._download_and_store_documents(
+                    case, detail, session, sync_run_id=sync_run_id,
+                )
 
             # Update case
             latest_date = _get_latest_movement_date(detail["movements"])
@@ -846,6 +898,42 @@ class SyncEngine:
             await self._handle_transient(case, "upstream_changed", str(e))
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0, "status": "upstream_changed"}
+        except (ProxyBudgetExceededError, ProxyUsagePersistenceError) as e:
+            session_healthy = True
+            await self._finish_run(
+                sync_run_id, started_at, "blocked", 0, "infra_unavailable",
+            )
+            if isinstance(e, ProxyUsagePersistenceError):
+                await self._proxy_control.pause_telemetry_unavailable()
+                self._backoff.open_permanently("proxy_cost_control")
+            elif e.blocking_scope == "global":
+                await self._proxy_control.refresh()
+                self._backoff.open_permanently("proxy_cost_control")
+            await self._update_case_blocked(case["id"], "infra", None)
+            self._metrics.record_error("infra")
+            globally_paused = (
+                isinstance(e, ProxyUsagePersistenceError)
+                or e.blocking_scope == "global"
+            )
+            await send_ops_alert(
+                getattr(self._config, "TELEGRAM_BOT_TOKEN", ""),
+                getattr(self._config, "TELEGRAM_CHAT_ID", ""),
+                "proxy_cost_control_paused" if globally_paused else "proxy_budget_blocked",
+                (
+                    "Trafico PJUD detenido por presupuesto o telemetria; requiere revision en ops."
+                    if globally_paused
+                    else f"Sincronizacion PJUD bloqueada por presupuesto {e.blocking_scope}."
+                ),
+            )
+            return {
+                "success": False,
+                "new_movements": 0,
+                "status": (
+                    "proxy_cost_control_paused"
+                    if globally_paused
+                    else "proxy_budget_blocked"
+                ),
+            }
         except Exception as e:
             # Un solo `except`, clasificado, en vez de dos listas de tipos. La
             # anterior era `(httpx.TransportError, asyncio.TimeoutError)`, y
@@ -1023,28 +1111,35 @@ class SyncEngine:
         remint_on_release = True
         try:
             try:
-                async with asyncio.timeout(90):
-                    async with FamiliaAuthSession(
-                        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
-                    ) as session:
-                        try:
-                            await session.login(cred["rut"], cred["password"], auth_type)
-                        except InvalidCredentialsError:
-                            # Credencial inválida = terminal (no reintenta en loop);
-                            # la IP está sana, se libera healthy=True.
-                            await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
-                            await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
-                            # El veredicto va TAMBIEN a la credencial, no solo a
-                            # la causa: es lo que el abogado tiene que arreglar,
-                            # y la app no tiene otra forma de enterarse.
-                            await self._report_invalid_credential(credential_id)
-                            return {"success": False, "new_movements": 0}
+                async with self._proxy_usage.track(
+                    operation="search",
+                    law_firm_id=case["law_firm_id"],
+                    case_id=case["id"],
+                    sync_run_id=sync_run_id,
+                    transaction_key=f"{sync_run_id}:familia-search",
+                ):
+                    async with asyncio.timeout(90):
+                        async with FamiliaAuthSession(
+                            bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
+                        ) as session:
+                            try:
+                                await session.login(cred["rut"], cred["password"], auth_type)
+                            except InvalidCredentialsError:
+                                # Credencial inválida = terminal (no reintenta en loop);
+                                # la IP está sana, se libera healthy=True.
+                                await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
+                                await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
+                                # El veredicto va TAMBIEN a la credencial, no solo a
+                                # la causa: es lo que el abogado tiene que arreglar,
+                                # y la app no tiene otra forma de enterarse.
+                                await self._report_invalid_credential(credential_id)
+                                return {"success": False, "new_movements": 0}
 
-                        html = await session.search_familia(
-                            rut=cred["rut"],
-                            rit=str(parsed["numero"]),
-                            year=str(parsed["anno"]),
-                        )
+                            html = await session.search_familia(
+                                rut=cred["rut"],
+                                rit=str(parsed["numero"]),
+                                year=str(parsed["anno"]),
+                            )
             # Bloqueo F5 / sesión / timeout / transporte = transitorio: NO penaliza
             # consecutive_sync_failures (_handle_blocked), y marca el slot para re-mint
             # (healthy=False en el finally). str(e) preserva el detalle (los
@@ -1279,7 +1374,9 @@ class SyncEngine:
 
         return after_count - before_count
 
-    async def _download_and_store_documents(self, case: dict, detail: dict, session) -> None:
+    async def _download_and_store_documents(
+        self, case: dict, detail: dict, session, sync_run_id: str | None = None,
+    ) -> None:
         """Download PJUD documents and upload to R2.
 
         Builds a per-movement ``documents`` JSONB array and writes it
@@ -1302,24 +1399,120 @@ class SyncEngine:
         )
         movements = [movement for movement, _ in prepared]
         movement_keys = [external_key for _, external_key in prepared]
+        existing_by_key = {
+            row.get("external_movement_key"): row
+            for row in existing_movements
+            if row.get("external_movement_key")
+        }
+        movement_ids = {
+            key: row.get("id") for key, row in existing_by_key.items()
+        }
 
-        # Track all uploaded docs per movement for one atomic DB update each
-        per_movement_docs: dict[str, list[dict]] = {}  # ext_key -> list of doc entries
+        # Begin with the durable history. A partial PJUD response or a transient
+        # anexo failure must never erase document references already stored.
+        per_movement_docs: dict[str, list[dict]] = {
+            key: [dict(doc) for doc in (row.get("documents") or [])]
+            for key, row in existing_by_key.items()
+            if key in movement_keys and row.get("documents")
+        }
+
+        def remember_document(ext_key: str, entry: dict) -> None:
+            stored = per_movement_docs.setdefault(ext_key, [])
+            replacement = None
+            for index, current in enumerate(stored):
+                if entry.get("type") == "principal" and current.get("type") == "principal":
+                    replacement = index
+                    break
+                if entry.get("storage_key") == current.get("storage_key"):
+                    replacement = index
+                    break
+                if (
+                    entry.get("source_id")
+                    and entry.get("source_id") == current.get("source_id")
+                    and entry.get("type") == current.get("type")
+                ):
+                    replacement = index
+                    break
+            if replacement is None:
+                stored.append(entry)
+            else:
+                stored[replacement] = entry
+
+        async def existing_document(
+            ext_key: str,
+            doc_type: str,
+            source_id: str | None = None,
+            legacy_index: int | None = None,
+        ) -> dict | None:
+            stored = existing_by_key.get(ext_key, {}).get("documents") or []
+            candidates = [doc for doc in stored if doc.get("type") == doc_type]
+            match = None
+            if source_id is not None:
+                match = next(
+                    (doc for doc in candidates if doc.get("source_id") == source_id),
+                    None,
+                )
+            legacy_candidates = [doc for doc in candidates if not doc.get("source_id")]
+            if (
+                match is None
+                and legacy_index is not None
+                and legacy_index < len(legacy_candidates)
+            ):
+                # Backward-compatible bridge for rows written before source_id.
+                match = legacy_candidates[legacy_index]
+            if not match or not match.get("storage_key"):
+                return None
+            if not await self._r2.exists(match["storage_key"]):
+                return None
+            return {**match, **({"source_id": source_id} if source_id else {})}
 
         try:
-            docs = await download_documents(session, movements)
-            if not docs:
-                return
+            pending_primary_movements: list[dict] = []
+            pending_primary_keys: list[str] = []
+            for mov, ext_key in zip(movements, movement_keys):
+                if not (mov.get("documento_url") and mov.get("documento_token")):
+                    continue
+                stored_primary = await existing_document(ext_key, "principal", legacy_index=0)
+                if stored_primary:
+                    remember_document(ext_key, stored_primary)
+                    async with self._proxy_usage.track(
+                        operation="document_primary",
+                        law_firm_id=case["law_firm_id"],
+                        case_id=case["id"],
+                        sync_run_id=sync_run_id,
+                        movement_id=movement_ids.get(ext_key),
+                        transaction_key=f"{sync_run_id}:primary:{ext_key}:skip",
+                        estimated_bytes=0,
+                    ) as usage:
+                        usage.documents_skipped += 1
+                else:
+                    pending_primary_movements.append(mov)
+                    pending_primary_keys.append(ext_key)
+
+            def primary_usage_scope(index: int):
+                ext_key = pending_primary_keys[index]
+                return self._proxy_usage.track(
+                    operation="document_primary",
+                    law_firm_id=case["law_firm_id"],
+                    case_id=case["id"],
+                    sync_run_id=sync_run_id,
+                    movement_id=movement_ids.get(ext_key),
+                    transaction_key=f"{sync_run_id}:primary:{ext_key}",
+                )
+
+            docs = await download_documents(
+                session, pending_primary_movements, primary_usage_scope,
+            )
 
             # --- Primary documents ---
             for doc in docs:
-                mov = movements[doc.index]
-                ext_key = movement_keys[doc.index]
+                mov = pending_primary_movements[doc.index]
+                ext_key = pending_primary_keys[doc.index]
                 r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
 
                 if await self._r2.exists(r2_key):
                     # Already in R2 — still track it so the documents array is complete
-                    per_movement_docs.setdefault(ext_key, []).append({
+                    remember_document(ext_key, {
                         "type": "principal",
                         "storage_key": r2_key,
                         "content_type": doc.content_type,
@@ -1329,18 +1522,23 @@ class SyncEngine:
 
                 try:
                     await self._r2.upload(r2_key, doc.data, doc.content_type)
-                    per_movement_docs.setdefault(ext_key, []).append({
+                    remember_document(ext_key, {
                         "type": "principal",
                         "storage_key": r2_key,
                         "content_type": doc.content_type,
                         "label": "Documento",
                     })
                 except Exception as exc:
-                    if is_proxy_billing_error(exc):
+                    if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                         raise
                     logger.warning("Failed to upload document %s", r2_key, exc_info=True)
 
-            logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
+            logger.info(
+                "Stored %d new primary documents for case %s (%d already present)",
+                len(docs),
+                case["case_number"],
+                len(per_movement_docs) - len(docs),
+            )
 
             # --- Certificados (iterate ALL movements, not just downloaded docs) ---
             for mov, ext_key in zip(movements, movement_keys):
@@ -1355,25 +1553,57 @@ class SyncEngine:
                     if not cert_url or not cert_token:
                         continue
 
+                    source_id = _document_source_id(
+                        "certificate", cert_url, cert_param, cert_i,
+                    )
+                    stored_cert = await existing_document(
+                        ext_key, "certificado", source_id, cert_i,
+                    )
+                    if stored_cert:
+                        remember_document(ext_key, stored_cert)
+                        async with self._proxy_usage.track(
+                            operation="certificate",
+                            law_firm_id=case["law_firm_id"],
+                            case_id=case["id"],
+                            sync_run_id=sync_run_id,
+                            movement_id=movement_ids.get(ext_key),
+                            transaction_key=f"{sync_run_id}:certificate:{ext_key}:{source_id}:skip",
+                            estimated_bytes=0,
+                        ) as usage:
+                            usage.documents_skipped += 1
+                        continue
+
                     try:
-                        cert_doc = await download_single_document(session, cert_url, cert_token, cert_param)
+                        async with self._proxy_usage.track(
+                            operation="certificate",
+                            law_firm_id=case["law_firm_id"],
+                            case_id=case["id"],
+                            sync_run_id=sync_run_id,
+                            movement_id=movement_ids.get(ext_key),
+                            transaction_key=f"{sync_run_id}:certificate:{ext_key}:{source_id}",
+                        ) as usage:
+                            cert_doc = await download_single_document(
+                                session, cert_url, cert_token, cert_param,
+                            )
+                            if cert_doc:
+                                usage.documents_downloaded += 1
                         if not cert_doc:
                             continue
 
                         suffix = f"-cert" if len(extras) == 1 else f"-cert-{cert_i}"
                         r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}{suffix}.{cert_doc.extension}"
 
-                        # Always overwrite certs (no r2.exists check — avoids stale cache)
                         await self._r2.upload(r2_key, cert_doc.data, cert_doc.content_type)
-                        per_movement_docs.setdefault(ext_key, []).append({
+                        remember_document(ext_key, {
                             "type": "certificado",
+                            "source_id": source_id,
                             "storage_key": r2_key,
                             "content_type": cert_doc.content_type,
                             "label": "Certificado",
                         })
                         logger.info("Uploaded cert %s (%d bytes)", r2_key, len(cert_doc.data))
                     except Exception as exc:
-                        if is_proxy_billing_error(exc):
+                        if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                             raise
                         logger.warning("Failed to download/upload cert for %s", ext_key, exc_info=True)
                         # Cert failure must NOT block primary or anexos
@@ -1392,7 +1622,17 @@ class SyncEngine:
 
                 endpoint, param = endpoint_info
                 try:
-                    anexo_html = await session.fetch_anexo_list(endpoint, param, anexo_token)
+                    async with self._proxy_usage.track(
+                        operation="anexo_list",
+                        law_firm_id=case["law_firm_id"],
+                        case_id=case["id"],
+                        sync_run_id=sync_run_id,
+                        movement_id=movement_ids.get(ext_key),
+                        transaction_key=f"{sync_run_id}:anexo-list:{ext_key}",
+                    ):
+                        anexo_html = await session.fetch_anexo_list(
+                            endpoint, param, anexo_token,
+                        )
                     anexo_files = parse_anexo_list(anexo_html)
 
                     if not anexo_files:
@@ -1401,20 +1641,54 @@ class SyncEngine:
 
                     for anexo_i, anexo_file in enumerate(anexo_files):
                         try:
-                            anexo_doc = await download_single_document(
-                                session,
-                                anexo_file["download_url"],
-                                anexo_file["download_token"],
+                            source_id = _document_source_id(
+                                "anexo_document",
+                                anexo_file.get("download_url"),
                                 anexo_file.get("download_param", "dtaDoc"),
+                                anexo_file.get("codigo"),
+                                anexo_file.get("label", "Anexo"),
                             )
+                            stored_anexo = await existing_document(
+                                ext_key, "anexo", source_id, anexo_i,
+                            )
+                            if stored_anexo:
+                                remember_document(ext_key, stored_anexo)
+                                async with self._proxy_usage.track(
+                                    operation="anexo_document",
+                                    law_firm_id=case["law_firm_id"],
+                                    case_id=case["id"],
+                                    sync_run_id=sync_run_id,
+                                    movement_id=movement_ids.get(ext_key),
+                                    transaction_key=f"{sync_run_id}:anexo:{ext_key}:{source_id}:skip",
+                                    estimated_bytes=0,
+                                ) as usage:
+                                    usage.documents_skipped += 1
+                                continue
+
+                            async with self._proxy_usage.track(
+                                operation="anexo_document",
+                                law_firm_id=case["law_firm_id"],
+                                case_id=case["id"],
+                                sync_run_id=sync_run_id,
+                                movement_id=movement_ids.get(ext_key),
+                                transaction_key=f"{sync_run_id}:anexo:{ext_key}:{source_id}",
+                            ) as usage:
+                                anexo_doc = await download_single_document(
+                                    session,
+                                    anexo_file["download_url"],
+                                    anexo_file["download_token"],
+                                    anexo_file.get("download_param", "dtaDoc"),
+                                )
+                                if anexo_doc:
+                                    usage.documents_downloaded += 1
                             if not anexo_doc:
                                 continue
 
                             r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}-anexo-{anexo_i}.{anexo_doc.extension}"
-                            # Always overwrite (no r2.exists check)
                             await self._r2.upload(r2_key, anexo_doc.data, anexo_doc.content_type)
-                            per_movement_docs.setdefault(ext_key, []).append({
+                            remember_document(ext_key, {
                                 "type": "anexo",
+                                "source_id": source_id,
                                 "storage_key": r2_key,
                                 "content_type": anexo_doc.content_type,
                                 "label": anexo_file.get("label", "Anexo"),
@@ -1422,12 +1696,12 @@ class SyncEngine:
                             })
                             logger.info("Uploaded anexo %s (%d bytes)", r2_key, len(anexo_doc.data))
                         except Exception as exc:
-                            if is_proxy_billing_error(exc):
+                            if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                                 raise
                             logger.warning("Failed to download/upload anexo %d for %s", anexo_i, ext_key, exc_info=True)
 
                 except Exception as exc:
-                    if is_proxy_billing_error(exc):
+                    if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                         raise
                     logger.warning("Failed to resolve anexo list for %s (func=%s)", ext_key, anexo_func, exc_info=True)
                     # Anexo failure must NOT block primary or certs
@@ -1449,12 +1723,12 @@ class SyncEngine:
                         .eq("external_movement_key", ext_key)
                     )
                 except Exception as exc:
-                    if is_proxy_billing_error(exc):
+                    if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                         raise
                     logger.warning("Failed to update documents for %s", ext_key, exc_info=True)
 
         except Exception as exc:
-            if is_proxy_billing_error(exc):
+            if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
                 raise
             logger.warning("Document download/upload failed for case %s", case["case_number"], exc_info=True)
 
@@ -1464,7 +1738,7 @@ class SyncEngine:
         while True:
             response = await run_query(
                 self._sb.from_("case_movements")
-                .select("id,external_movement_key,raw_payload")
+                .select("id,external_movement_key,raw_payload,documents,document_storage_key,document_content_type")
                 .eq("case_id", case_id)
                 .order("id")
                 .range(start, start + _MOVEMENT_PAGE_SIZE - 1)

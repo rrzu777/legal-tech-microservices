@@ -127,3 +127,23 @@ async def test_trip_records_configured_actor():
         await control.trip_billing_exhausted()
 
     assert sb.from_.return_value.update.call_args.args[0]["changed_by"] == "estrado-pjud-api"
+
+
+@pytest.mark.asyncio
+async def test_telemetry_failure_pauses_persistent_control_fail_closed():
+    sb = _supabase()
+    control = ProxyControl(sb)
+    with patch("worker.proxy_control.run_query", return_value=_response([{
+        "provider": "iproyal", "status": "enabled", "reason_code": None, "revision": 7,
+    }])):
+        await control.refresh()
+    with patch("worker.proxy_control.run_query", return_value=_response([{
+        "provider": "iproyal", "status": "paused",
+        "reason_code": "telemetry_unavailable", "revision": 8,
+    }])):
+        snapshot = await control.pause_telemetry_unavailable()
+
+    payload = sb.from_.return_value.update.call_args.args[0]
+    assert payload["status"] == "paused"
+    assert payload["reason_code"] == "telemetry_unavailable"
+    assert snapshot.allowed is False

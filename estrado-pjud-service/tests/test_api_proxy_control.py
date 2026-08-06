@@ -6,7 +6,9 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.pool_guard import acquire_or_alert, classify_and_alert
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session_pool import APISessionPool, ProxyTrafficDisabledError
 from worker.proxy_control import ProxyControlSnapshot
 
@@ -116,6 +118,80 @@ async def test_api_pool_initialization_402_also_trips_control():
         await acquire_or_alert(pool, request, "search")
 
     request.app.state.proxy_control.trip_billing_exhausted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_telemetry_failure_pauses_control_and_returns_generic_503():
+    pool = AsyncMock()
+    pool.acquire.side_effect = ProxyUsagePersistenceError("ledger unavailable")
+    request = MagicMock()
+    request.app.state.alerter = None
+    request.app.state.proxy_control = AsyncMock()
+
+    with pytest.raises(HTTPException) as caught:
+        await acquire_or_alert(pool, request, "search")
+
+    assert caught.value.status_code == 503
+    assert "ledger" not in str(caught.value.detail).lower()
+    request.app.state.proxy_control.pause_telemetry_unavailable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_global_budget_denial_refreshes_control_and_returns_503():
+    pool = AsyncMock()
+    pool.acquire.side_effect = ProxyBudgetExceededError("global")
+    request = MagicMock()
+    request.app.state.alerter = None
+    request.app.state.proxy_control = AsyncMock()
+
+    with pytest.raises(HTTPException) as caught:
+        await acquire_or_alert(pool, request, "detail")
+
+    assert caught.value.status_code == 503
+    request.app.state.proxy_control.refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_central_handler_pauses_when_tracker_fails_after_route_returns():
+    request = MagicMock()
+    request.app.state.proxy_control = AsyncMock()
+
+    response = await proxy_cost_control_exception_handler(
+        request,
+        ProxyUsagePersistenceError("finalize failed after catalog response"),
+    )
+
+    assert response.status_code == 503
+    assert b"finalize" not in response.body
+    request.app.state.proxy_control.pause_telemetry_unavailable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_central_handler_refreshes_global_budget_without_leaking_scope():
+    request = MagicMock()
+    request.app.state.proxy_control = AsyncMock()
+
+    response = await proxy_cost_control_exception_handler(
+        request, ProxyBudgetExceededError("global"),
+    )
+
+    assert response.status_code == 503
+    assert b"budget" not in response.body.lower()
+    request.app.state.proxy_control.refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_central_handler_trips_billing_from_catalog_without_leaking_402():
+    request = MagicMock()
+    request.app.state.proxy_control = AsyncMock()
+
+    response = await proxy_cost_control_exception_handler(
+        request, httpx.ProxyError("402 Payment Required"),
+    )
+
+    assert response.status_code == 503
+    assert b"402" not in response.body
+    request.app.state.proxy_control.trip_billing_exhausted.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,9 @@ SEPARADAS (server/username/password), nunca embebidas en la URL del
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from app.bandwidth import capture_proxy_usage
 from app.minter import CookieMinter
 
 _DUMMY_PROXY = (
@@ -25,6 +28,7 @@ def _make_playwright_mock():
     ]
 
     page = AsyncMock()
+    page.on = MagicMock()
     page.evaluate = AsyncMock(return_value="Mozilla/5.0 Test UA")
 
     context = AsyncMock()
@@ -48,14 +52,14 @@ def _make_playwright_mock():
 
     async_playwright_factory = MagicMock(return_value=async_playwright_cm)
 
-    return async_playwright_factory, launch_mock
+    return async_playwright_factory, launch_mock, page
 
 
 async def test_mint_passes_separated_proxy_credentials_to_playwright():
     """Con un proxy con creds embebidas, `chromium.launch` debe recibir
     proxy={"server","username","password"} separados, NO la URL embebida.
     """
-    async_playwright_factory, launch_mock = _make_playwright_mock()
+    async_playwright_factory, launch_mock, _ = _make_playwright_mock()
 
     with patch("app.minter.async_playwright", async_playwright_factory):
         minter = CookieMinter("https://oficinajudicialvirtual.pjud.cl", proxy=_DUMMY_PROXY)
@@ -74,7 +78,7 @@ async def test_mint_passes_separated_proxy_credentials_to_playwright():
 
 async def test_mint_without_proxy_does_not_pass_proxy_kwarg():
     """Sin proxy configurado, `chromium.launch` NO debe recibir kwarg `proxy`."""
-    async_playwright_factory, launch_mock = _make_playwright_mock()
+    async_playwright_factory, launch_mock, _ = _make_playwright_mock()
 
     with patch("app.minter.async_playwright", async_playwright_factory):
         minter = CookieMinter("https://oficinajudicialvirtual.pjud.cl")
@@ -84,3 +88,53 @@ async def test_mint_without_proxy_does_not_pass_proxy_kwarg():
     _, kwargs = launch_mock.call_args
     assert "proxy" not in kwargs
     assert result.cookies == {"TSPD_101": "abc"}
+
+
+async def test_mint_attributes_chromium_transfer_sizes_to_active_operation():
+    async_playwright_factory, _, page = _make_playwright_mock()
+    page.evaluate.side_effect = [
+        "Mozilla/5.0 Test UA",
+        [{"transferSize": 700}, {"transferSize": 500}],
+    ]
+
+    with patch("app.minter.async_playwright", async_playwright_factory):
+        with capture_proxy_usage() as usage:
+            await CookieMinter(
+                "https://oficinajudicialvirtual.pjud.cl", proxy=_DUMMY_PROXY,
+            ).mint()
+
+    assert usage.request_count == 2
+    assert usage.bytes_down == 1_200
+
+
+async def test_failed_mint_still_attributes_paid_transfer_sizes():
+    async_playwright_factory, _, page = _make_playwright_mock()
+    page.wait_for_selector.side_effect = TimeoutError("challenge timeout")
+    page.evaluate.return_value = [{"transferSize": 1_500}]
+
+    with patch("app.minter.async_playwright", async_playwright_factory):
+        with capture_proxy_usage() as usage:
+            with pytest.raises(TimeoutError, match="challenge timeout"):
+                await CookieMinter(
+                    "https://oficinajudicialvirtual.pjud.cl", proxy=_DUMMY_PROXY,
+                ).mint()
+
+    assert usage.request_count == 1
+    assert usage.bytes_down == 1_500
+
+
+async def test_navigation_failure_still_records_that_proxy_was_contacted():
+    async_playwright_factory, _, page = _make_playwright_mock()
+    request = MagicMock(post_data_buffer=None)
+    page.on.side_effect = lambda event, callback: callback(request)
+    page.goto.side_effect = TimeoutError("navigation timeout")
+    page.evaluate.side_effect = RuntimeError("page unavailable")
+
+    with patch("app.minter.async_playwright", async_playwright_factory):
+        with capture_proxy_usage() as usage:
+            with pytest.raises(TimeoutError, match="navigation timeout"):
+                await CookieMinter(
+                    "https://oficinajudicialvirtual.pjud.cl", proxy=_DUMMY_PROXY,
+                ).mint()
+
+    assert usage.request_count == 1

@@ -18,6 +18,7 @@ from app.metrics import api_metrics
 from app.errors import safe_error
 from app.failure_kind import BlockedPageError, UpstreamChangedError, reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +167,10 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         # Session-affinity: if search params are provided, search on the SAME
         # session first so the JWT and CSRF share the same PJUD server context.
         detail_key = req.detail_key
+        proxy_usage = getattr(request.app.state, "proxy_usage", DISABLED_PROXY_USAGE)
         if req.case_number:
-            fresh_key = await _search_for_fresh_jwt(session, comp, req)
+            async with proxy_usage.track(operation="search"):
+                fresh_key = await _search_for_fresh_jwt(session, comp, req)
             if fresh_key:
                 detail_key = fresh_key
             else:
@@ -176,15 +179,19 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
                     detail="Could not establish PJUD session affinity for the requested candidate",
                 )
 
-        html = await session.detail(competencia_path(comp), detail_key)
+        async with proxy_usage.track(operation="detail") as usage:
+            html = await session.detail(competencia_path(comp), detail_key)
+            reject_empty_body(html, "detail")
+            blocked_response = len(html.strip()) < 100 or detect_blocked(html)
+            if blocked_response:
+                usage.status = "blocked"
+                usage.error_kind = "ojv"
 
         # Cuerpo de cero bytes: infra, no bloqueo. Una pagina contentless de ~39
         # bytes SI es un soft-block de F5 (esta medido, y por eso el `len < 100`
         # de abajo sigue contando como bloqueo), pero cero bytes es la respuesta
         # que no llego. Sale por el `except` como 500 para que la app lo lea como
         # nuestro.
-        reject_empty_body(html, "detail")
-
         # `detect_blocked` ademas del largo, igual que hace `search` y que hace
         # `detail_pjud_via_session` en el worker. Esta ruta miraba SOLO el largo,
         # asi que un challenge F5 completo —varios KB de pagina con `bobcmn`—
@@ -192,7 +199,7 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
         # 200 con `blocked=False` y la causa vacia: el abogado veia un expediente
         # sin movimientos en vez de un aviso de bloqueo. El worker tenia el test
         # de esto (`test_detail_detects_f5_challenge`) y la ruta no.
-        if len(html.strip()) < 100 or detect_blocked(html):
+        if blocked_response:
             healthy = False
             await record_blocked_and_alert(request, "detail")
             logger.warning(

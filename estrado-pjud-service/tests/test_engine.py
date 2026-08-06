@@ -1,6 +1,8 @@
 # tests/test_engine.py
 import asyncio
+from contextlib import asynccontextmanager
 
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
@@ -505,6 +507,69 @@ class TestSyncEngine:
             mock_pool.acquire.return_value,
             healthy=False,
             remint=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_budget_denial_pauses_worker_without_penalizing_or_contacting_pjud(self):
+        from app.proxy_cost import ProxyBudgetExceededError
+
+        engine, mock_pool, _sb, _notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_control = AsyncMock()
+        engine._proxy_control = mock_control
+
+        class DeniedTracker:
+            @asynccontextmanager
+            async def track(self, **_kwargs):
+                raise ProxyBudgetExceededError("case")
+                yield
+
+        engine._proxy_usage = DeniedTracker()
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as search, \
+             patch.object(engine, "_finish_run", new_callable=AsyncMock) as finish, \
+             patch.object(engine, "_update_case_blocked", new_callable=AsyncMock) as blocked, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as case_error, \
+             patch("worker.engine.send_ops_alert", new_callable=AsyncMock) as alert:
+            result = await engine.sync_case(_make_case())
+
+        assert result["status"] == "proxy_budget_blocked"
+        search.assert_not_awaited()
+        case_error.assert_not_awaited()
+        mock_control.refresh.assert_not_awaited()
+        mock_backoff.open_permanently.assert_not_called()
+        assert finish.await_args.args[4] == "infra_unavailable"
+        assert "budget detail" not in str(blocked.await_args)
+        mock_metrics.record_error.assert_called_with("infra")
+        mock_pool.release.assert_awaited_once_with(
+            mock_pool.acquire.return_value, healthy=True,
+        )
+        assert alert.await_args.args[2] == "proxy_budget_blocked"
+        assert "case" in alert.await_args.args[3]
+
+    @pytest.mark.asyncio
+    async def test_global_budget_denial_opens_global_breaker(self):
+        from app.proxy_cost import ProxyBudgetExceededError
+
+        engine, mock_pool, _sb, _notifier, _metrics, mock_backoff = _make_engine()
+        engine._proxy_control = AsyncMock()
+
+        class DeniedTracker:
+            @asynccontextmanager
+            async def track(self, **_kwargs):
+                raise ProxyBudgetExceededError("global")
+                yield
+
+        engine._proxy_usage = DeniedTracker()
+        with patch.object(engine, "_finish_run", new_callable=AsyncMock), \
+             patch.object(engine, "_update_case_blocked", new_callable=AsyncMock), \
+             patch("worker.engine.send_ops_alert", new_callable=AsyncMock):
+            result = await engine.sync_case(_make_case())
+
+        assert result["status"] == "proxy_cost_control_paused"
+        engine._proxy_control.refresh.assert_awaited_once()
+        mock_backoff.open_permanently.assert_called_once_with("proxy_cost_control")
+        mock_pool.release.assert_awaited_once_with(
+            mock_pool.acquire.return_value, healthy=True,
         )
 
     @pytest.mark.asyncio
@@ -1285,6 +1350,16 @@ class TestHelperFunctions:
         # Should be a valid ISO datetime string
         datetime.fromisoformat(result)
 
+    def test_adaptive_intervals_reduce_polling_for_inactive_cases(self):
+        from worker.engine import SYNC_INTERVALS_HOURS
+
+        assert SYNC_INTERVALS_HOURS == {
+            1: 6,
+            2: 24,
+            3: 72,
+            4: 168,
+        }
+
     def test_compute_next_sync_at_priority_4_weekly(self):
         from worker.engine import _compute_next_sync_at, SYNC_INTERVALS_HOURS
         from datetime import datetime
@@ -1785,7 +1860,8 @@ class TestHelperFunctions:
             "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
             "tramite": "", "descripcion": "Segunda",
             "etapa": "", "foja": 10,
-            "documento_url": "/secondary", "documentos_adicionales": [],
+            "documento_url": "/secondary", "documento_token": "token-secondary",
+            "documentos_adicionales": [],
         }
         engine._load_existing_movements = AsyncMock(return_value=[
             {
@@ -1798,7 +1874,9 @@ class TestHelperFunctions:
             },
         ])
         detail = {"movements": [secondary, primary]}
-        downloaded = DownloadedDoc(1, b"secondary", "application/pdf", "pdf")
+        # The incremental downloader receives only movements still missing in
+        # R2, so its index is relative to that filtered list.
+        downloaded = DownloadedDoc(0, b"secondary", "application/pdf", "pdf")
 
         with patch(
             "worker.engine.download_documents",
@@ -1812,6 +1890,200 @@ class TestHelperFunctions:
         assert uploaded_keys == [
             "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5#3.pdf",
         ]
+
+    @pytest.mark.asyncio
+    async def test_existing_primary_is_checked_before_any_pjud_download(self):
+        engine, _, _, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = True
+        movement = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "documento_url": "/doc", "documento_token": "fresh-jwt",
+            "documentos_adicionales": [],
+        }
+        storage_key = "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5.pdf"
+        engine._load_existing_movements = AsyncMock(return_value=[{
+            "external_movement_key": "C-1234-2024:Principal:5",
+            "raw_payload": movement,
+            "documents": [{
+                "type": "principal", "storage_key": storage_key,
+                "content_type": "application/pdf", "label": "Documento",
+            }],
+        }])
+
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[])) as downloader:
+            await engine._download_and_store_documents(
+                _make_case(), {"movements": [movement]}, AsyncMock(),
+            )
+
+        assert downloader.await_args.args[1] == []
+        engine._r2.upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_certificate_is_not_downloaded_again_for_new_jwt(self):
+        from worker.engine import _document_source_id
+
+        engine, _, _, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = True
+        cert = {"url": "/cert", "token": "fresh-jwt", "param": "dtaCert"}
+        movement = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "documento_url": None, "documentos_adicionales": [cert],
+        }
+        engine._load_existing_movements = AsyncMock(return_value=[{
+            "external_movement_key": "C-1234-2024:Principal:5",
+            "raw_payload": movement,
+            "documents": [{
+                "type": "certificado",
+                "source_id": _document_source_id("certificate", "/cert", "dtaCert", 0),
+                "storage_key": "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5-cert.pdf",
+                "content_type": "application/pdf", "label": "Certificado",
+            }],
+        }])
+
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[])), \
+             patch("worker.engine.download_single_document", new=AsyncMock()) as single:
+            await engine._download_and_store_documents(
+                _make_case(), {"movements": [movement]}, AsyncMock(),
+            )
+
+        single.assert_not_awaited()
+        engine._r2.upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_changed_certificate_identity_at_same_index_is_downloaded(self):
+        from app.document_downloader import DownloadedDoc
+        from worker.engine import _document_source_id
+
+        engine, _, _, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = True
+        cert = {"url": "/cert-new", "token": "fresh-jwt", "param": "dtaCert"}
+        movement = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "documento_url": None, "documentos_adicionales": [cert],
+        }
+        engine._load_existing_movements = AsyncMock(return_value=[{
+            "external_movement_key": "C-1234-2024:Principal:5",
+            "raw_payload": movement,
+            "documents": [{
+                "type": "certificado",
+                "source_id": _document_source_id("certificate", "/cert-old", "dtaCert", 0),
+                "storage_key": "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5-cert.pdf",
+                "content_type": "application/pdf", "label": "Certificado",
+            }],
+        }])
+
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[])), \
+             patch(
+                 "worker.engine.download_single_document",
+                 new=AsyncMock(return_value=DownloadedDoc(
+                     0, b"new-certificate", "application/pdf", "pdf",
+                 )),
+             ) as single:
+            await engine._download_and_store_documents(
+                _make_case(), {"movements": [movement]}, AsyncMock(),
+            )
+
+        single.assert_awaited_once()
+        engine._r2.upload.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_anexo_downloads_only_new_stable_identity(self):
+        from app.document_downloader import DownloadedDoc
+        from worker.engine import _document_source_id
+
+        engine, _, _, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = True
+        movement = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "documento_url": None, "documentos_adicionales": [],
+            "anexo_func": "anexoSolicitudCivil", "anexo_token": "fresh-modal-jwt",
+        }
+        first = {
+            "download_url": "/anexo", "download_token": "fresh-a",
+            "download_param": "dtaDoc", "label": "Anexo A", "codigo": "A1",
+        }
+        second = {
+            "download_url": "/anexo", "download_token": "fresh-b",
+            "download_param": "dtaDoc", "label": "Anexo B", "codigo": "B1",
+        }
+        engine._load_existing_movements = AsyncMock(return_value=[{
+            "external_movement_key": "C-1234-2024:Principal:5",
+            "raw_payload": movement,
+            "documents": [{
+                "type": "anexo",
+                "source_id": _document_source_id(
+                    "anexo_document", "/anexo", "dtaDoc", "A1", "Anexo A",
+                ),
+                "storage_key": "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5-anexo-0.pdf",
+                "content_type": "application/pdf", "label": "Anexo A", "codigo": "A1",
+            }],
+        }])
+        session = AsyncMock()
+        session.fetch_anexo_list.return_value = "<html>anexos</html>"
+
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[])), \
+             patch("worker.engine.parse_anexo_list", return_value=[first, second]), \
+             patch(
+                 "worker.engine.download_single_document",
+                 new=AsyncMock(return_value=DownloadedDoc(
+                     0, b"new-anexo", "application/pdf", "pdf",
+                 )),
+             ) as single:
+            await engine._download_and_store_documents(
+                _make_case(), {"movements": [movement]}, session,
+            )
+
+        single.assert_awaited_once_with(session, "/anexo", "fresh-b", "dtaDoc")
+        engine._r2.upload.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transient_anexo_list_failure_preserves_historical_document_refs(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = True
+        ext_key = "C-1234-2024:Principal:5"
+        movement = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "documento_url": "/doc", "documento_token": "jwt",
+            "documentos_adicionales": [],
+            "anexo_func": "anexoSolicitudCivil", "anexo_token": "modal-jwt",
+        }
+        historical = [
+            {
+                "type": "principal", "storage_key": f"firm/case/{ext_key}.pdf",
+                "content_type": "application/pdf", "label": "Documento",
+            },
+            {
+                "type": "anexo", "source_id": "a" * 64,
+                "storage_key": f"firm/case/{ext_key}-anexo-0.pdf",
+                "content_type": "application/pdf", "label": "Anexo histórico",
+                "codigo": "A1",
+            },
+        ]
+        engine._load_existing_movements = AsyncMock(return_value=[{
+            "id": "movement-1", "external_movement_key": ext_key,
+            "raw_payload": movement, "documents": historical,
+        }])
+        session = AsyncMock()
+        session.fetch_anexo_list.side_effect = httpx.ReadError("temporary")
+
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[])):
+            await engine._download_and_store_documents(
+                _make_case(), {"movements": [movement]}, session,
+            )
+
+        payloads = [call.args[0] for call in mock_sb.from_.return_value.update.call_args_list]
+        writeback = next(payload for payload in payloads if "documents" in payload)
+        assert writeback["documents"] == historical
 
     @pytest.mark.asyncio
     async def test_existing_movement_loader_reads_pages_after_row_thousand(self):

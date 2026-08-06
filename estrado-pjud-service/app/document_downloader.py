@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 
+from app.bandwidth import record_proxy_retry
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import is_proxy_cost_control_error
 
 if TYPE_CHECKING:
     from app.session import OJVSession
@@ -64,6 +67,7 @@ async def _fetch_with_retry(
                 "Descarga transitoria falló (intento %d/%d): %s; reintentando",
                 attempt + 1, DOC_RETRY_ATTEMPTS, type(e).__name__,
             )
+            record_proxy_retry()
             await asyncio.sleep(DOC_RETRY_BACKOFF_S * (attempt + 1))
     raise RuntimeError("unreachable")  # el loop retorna o re-lanza; satisface el type checker
 
@@ -71,6 +75,7 @@ async def _fetch_with_retry(
 async def download_documents(
     session: OJVSession,
     movements: list[dict],
+    usage_scope_factory=None,
 ) -> list[DownloadedDoc]:
     """Download documents for movements that have documento_url + documento_token.
 
@@ -84,6 +89,10 @@ async def download_documents(
     abort_downloads = asyncio.Event()
     results: list[DownloadedDoc] = []
 
+    @asynccontextmanager
+    async def _untracked():
+        yield None
+
     async def _download_one(idx: int, mov: dict) -> DownloadedDoc | None:
         url = mov.get("documento_url")
         token = mov.get("documento_token")
@@ -96,29 +105,33 @@ async def download_documents(
         async with sem:
             if abort_downloads.is_set():
                 return None
-            await asyncio.sleep(DOWNLOAD_DELAY_S)
-            try:
-                resp = await _fetch_with_retry(session, url, token, param_name)
+            scope = usage_scope_factory(idx) if usage_scope_factory else _untracked()
+            async with scope as usage:
+                await asyncio.sleep(DOWNLOAD_DELAY_S)
+                try:
+                    resp = await _fetch_with_retry(session, url, token, param_name)
 
-                content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-                ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
+                    content_type = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+                    ext = _CONTENT_TYPE_EXT.get(content_type, "bin")
 
-                if len(resp.content) > MAX_DOC_SIZE:
-                    logger.warning("Document %d too large (%d bytes), skipping", idx, len(resp.content))
+                    if len(resp.content) > MAX_DOC_SIZE:
+                        logger.warning("Document %d too large (%d bytes), skipping", idx, len(resp.content))
+                        return None
+
+                    if len(resp.content) < 100:
+                        logger.warning("Document %d suspiciously small (%d bytes), skipping", idx, len(resp.content))
+                        return None
+
+                    if usage is not None:
+                        usage.documents_downloaded += 1
+                    return DownloadedDoc(index=idx, data=resp.content, content_type=content_type, extension=ext)
+
+                except Exception as exc:
+                    if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
+                        abort_downloads.set()
+                        raise
+                    logger.warning("Failed to download document %d from %s", idx, url, exc_info=True)
                     return None
-
-                if len(resp.content) < 100:
-                    logger.warning("Document %d suspiciously small (%d bytes), skipping", idx, len(resp.content))
-                    return None
-
-                return DownloadedDoc(index=idx, data=resp.content, content_type=content_type, extension=ext)
-
-            except Exception as exc:
-                if is_proxy_billing_error(exc):
-                    abort_downloads.set()
-                    raise
-                logger.warning("Failed to download document %d from %s", idx, url, exc_info=True)
-                return None
 
     tasks = [asyncio.create_task(_download_one(i, m)) for i, m in enumerate(movements)]
     try:
@@ -157,7 +170,7 @@ async def download_single_document(
             return None
         return DownloadedDoc(index=0, data=resp.content, content_type=content_type, extension=ext)
     except Exception as exc:
-        if is_proxy_billing_error(exc):
+        if is_proxy_billing_error(exc) or is_proxy_cost_control_error(exc):
             raise
         logger.warning("Failed to download document from %s", url, exc_info=True)
         return None

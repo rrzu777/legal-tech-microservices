@@ -9,6 +9,7 @@ import time
 from app.alerting import send_ops_alert
 from app.bandwidth import METER
 from app.proxy_billing import is_proxy_billing_error
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
@@ -20,6 +21,7 @@ from worker.metrics import Metrics
 from worker.backoff import CircuitBreaker
 from worker.sd_notify import notify_ready, notify_status, notify_stopping
 from worker.proxy_control import ProxyControl, ProxyControlSnapshot
+from worker.proxy_usage import ProxyUsageTracker
 
 logger = logging.getLogger("worker")
 
@@ -135,6 +137,15 @@ async def safe_initialize_pool(
                 if backoff is not None:
                     backoff.open_permanently("billing_exhausted")
                 return False
+            if isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError)):
+                if proxy_control is not None:
+                    if isinstance(exc, ProxyUsagePersistenceError):
+                        await proxy_control.pause_telemetry_unavailable()
+                    else:
+                        await proxy_control.refresh()
+                if backoff is not None:
+                    backoff.open_permanently("proxy_cost_control")
+                return False
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * attempt)
     return False
@@ -173,10 +184,17 @@ async def main():
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
 
     supabase = create_supabase(config)
-    pool = SessionPool(config)
+    proxy_usage = ProxyUsageTracker(
+        supabase,
+        enabled=bool(config.OJV_PROXY_URL),
+        price_per_gb_usd=config.OJV_PROXY_PRICE_PER_GB_USD,
+    )
+    proxy_control = ProxyControl(supabase) if config.OJV_PROXY_URL else None
+    pool = SessionPool(
+        config, proxy_usage=proxy_usage, proxy_control=proxy_control,
+    )
     scheduler = Scheduler(config, supabase)
     notifier = Notifier(supabase)
-    proxy_control = ProxyControl(supabase) if config.OJV_PROXY_URL else None
     metrics = Metrics(config, supabase, pool=pool, proxy_control=proxy_control)
     backoff = CircuitBreaker(
         failure_threshold=5,
@@ -251,6 +269,7 @@ async def main():
             backoff=backoff,
             config=config,
             proxy_control=proxy_control,
+            proxy_usage=proxy_usage,
         )
         logger.info("Worker ready, entering main loop")
         metrics.set_status("running")

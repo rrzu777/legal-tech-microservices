@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 
 from slowapi import _rate_limit_exceeded_handler
@@ -9,12 +10,15 @@ from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.logging_redaction import install_secret_redaction
 from app.rate_limit import limiter
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.catalogs import CatalogService
 from app.routes import health, search, detail, familia, catalogs
 from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
+from worker.proxy_usage import ProxyUsageTracker
 
 
 @asynccontextmanager
@@ -29,11 +33,22 @@ async def lifespan(app: FastAPI):
         if proxy_control_required
         else None
     )
-    pool = APISessionPool(settings, proxy_control=proxy_control)
+    proxy_usage = ProxyUsageTracker(
+        proxy_supabase,
+        enabled=proxy_control_required,
+        component="api",
+        price_per_gb_usd=settings.OJV_PROXY_PRICE_PER_GB_USD,
+    )
+    pool = APISessionPool(
+        settings,
+        proxy_control=proxy_control,
+        proxy_usage=proxy_usage,
+    )
     app.state.session_pool = pool
     app.state.proxy_control = proxy_control
+    app.state.proxy_usage = proxy_usage
     app.state.proxy_control_required = proxy_control_required
-    app.state.catalog_service = CatalogService(pool)
+    app.state.catalog_service = CatalogService(pool, proxy_usage=proxy_usage)
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
         from app.alerting import TelegramAlerter
@@ -91,6 +106,13 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         lifespan=lifespan,
     )
+    app.add_exception_handler(
+        ProxyUsagePersistenceError, proxy_cost_control_exception_handler,
+    )
+    app.add_exception_handler(
+        ProxyBudgetExceededError, proxy_cost_control_exception_handler,
+    )
+    app.add_exception_handler(httpx.ProxyError, proxy_cost_control_exception_handler)
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

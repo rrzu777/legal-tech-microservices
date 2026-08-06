@@ -8,12 +8,15 @@ Mockea CookieMinter.mint, OJVHttpAdapter y OJVSession.initialize/close: nada
 de browser/red real.
 """
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from app.minter import MintResult
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 
 
 def _make_config(pool_size=1, proxy_url=None, proxy_pool_size=3, block_pause_s=30):
@@ -147,6 +150,104 @@ async def test_distinct_proxy_urls_per_slot(monkeypatch):
     for p in captured_proxies:
         assert p is not None
         assert "_session-" in p
+
+
+@pytest.mark.asyncio
+async def test_proxy_mint_runs_inside_durable_usage_operation(monkeypatch):
+    from worker import session_pool as sp
+
+    _patch_pool_deps(monkeypatch, sp)
+    tracked = []
+
+    class Tracker:
+        @asynccontextmanager
+        async def track(self, **kwargs):
+            tracked.append(kwargs)
+            yield SimpleNamespace(retry_count=0)
+
+    pool = sp.SessionPool(
+        _make_config(proxy_url="http://proxy", proxy_pool_size=1),
+        proxy_usage=Tracker(),
+    )
+    await pool.initialize()
+
+    assert len(tracked) == 1
+    assert tracked[0]["operation"] == "mint"
+
+
+@pytest.mark.asyncio
+async def test_budget_denied_mint_never_retries_or_launches_browser(monkeypatch):
+    from worker import session_pool as sp
+
+    captured, _ = _patch_pool_deps(monkeypatch, sp)
+
+    class DeniedTracker:
+        @asynccontextmanager
+        async def track(self, **_kwargs):
+            raise ProxyBudgetExceededError("blocked")
+            yield
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 3
+    pool = sp.SessionPool(config, proxy_usage=DeniedTracker())
+
+    with pytest.raises(ProxyBudgetExceededError):
+        await pool.initialize()
+
+    assert captured == []
+    assert pool.mint_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_refresh_telemetry_failure_pauses_and_does_not_checkout(monkeypatch):
+    from worker import session_pool as sp
+
+    _patch_pool_deps(monkeypatch, sp)
+    control = AsyncMock()
+    pool = sp.SessionPool(
+        _make_config(proxy_url="http://proxy", proxy_pool_size=1),
+        proxy_control=control,
+    )
+    await pool.initialize()
+    pool._slots[0].session._age = 9_999
+    pool._refresh_slot = AsyncMock(
+        side_effect=ProxyUsagePersistenceError("ledger unavailable"),
+    )
+
+    with pytest.raises(ProxyUsagePersistenceError):
+        await pool.acquire()
+
+    control.pause_telemetry_unavailable.assert_awaited_once()
+    assert pool._slots[0].busy is False
+    assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,control_method", [
+    (ProxyUsagePersistenceError("ledger unavailable"), "pause_telemetry_unavailable"),
+    (httpx.ProxyError("402 Payment Required"), "trip_billing_exhausted"),
+])
+async def test_reactive_remint_cost_failure_trips_control_and_frees_slot(
+    monkeypatch, failure, control_method,
+):
+    from worker import session_pool as sp
+
+    _patch_pool_deps(monkeypatch, sp)
+    control = AsyncMock()
+    pool = sp.SessionPool(
+        _make_config(proxy_url="http://proxy", proxy_pool_size=1),
+        proxy_control=control,
+    )
+    await pool.initialize()
+    session = await pool.acquire()
+    pool._refresh_slot = AsyncMock(side_effect=failure)
+
+    with pytest.raises(type(failure)):
+        await pool.release(session, healthy=False)
+
+    getattr(control, control_method).assert_awaited_once()
+    assert pool._slots[0].busy is False
+    assert pool._sem._value == 1
 
 
 @pytest.mark.asyncio

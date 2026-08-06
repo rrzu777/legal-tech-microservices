@@ -39,7 +39,7 @@ class ProxyControl:
             revision=None,
             source="local",
         )
-        self._local_billing_trip_revision: int | None = None
+        self._local_trip_revision: int | None = None
 
     @property
     def snapshot(self) -> ProxyControlSnapshot:
@@ -74,24 +74,17 @@ class ProxyControl:
                 return self._snapshot
 
             if (
-                self._local_billing_trip_revision is not None
+                self._local_trip_revision is not None
                 and status == "enabled"
-                and revision <= self._local_billing_trip_revision
+                and revision <= self._local_trip_revision
             ):
-                self._snapshot = ProxyControlSnapshot(
-                    allowed=False,
-                    status="billing_exhausted",
-                    reason_code="local_billing_trip_unconfirmed",
-                    revision=revision,
-                    source="local",
-                )
                 return self._snapshot
 
             if (
-                self._local_billing_trip_revision is not None
-                and revision > self._local_billing_trip_revision
+                self._local_trip_revision is not None
+                and revision > self._local_trip_revision
             ):
-                self._local_billing_trip_revision = None
+                self._local_trip_revision = None
 
             self._snapshot = ProxyControlSnapshot(
                 allowed=status == "enabled",
@@ -113,32 +106,44 @@ class ProxyControl:
 
     async def trip_billing_exhausted(self) -> ProxyControlSnapshot:
         async with self._lock:
-            return await self._trip_billing_exhausted_unlocked()
+            return await self._trip_unlocked(
+                status="billing_exhausted",
+                reason_code="proxy_balance_exhausted",
+            )
 
-    async def _trip_billing_exhausted_unlocked(self) -> ProxyControlSnapshot:
+    async def pause_telemetry_unavailable(self) -> ProxyControlSnapshot:
+        async with self._lock:
+            return await self._trip_unlocked(
+                status="paused",
+                reason_code="telemetry_unavailable",
+            )
+
+    async def _trip_unlocked(
+        self, *, status: str, reason_code: str,
+    ) -> ProxyControlSnapshot:
         if (
-            self._snapshot.status == "billing_exhausted"
+            self._snapshot.status == status
             and self._snapshot.source == "database"
         ):
             return self._snapshot
 
         base_revision = self._snapshot.revision
-        self._local_billing_trip_revision = base_revision
+        self._local_trip_revision = base_revision
         self._snapshot = ProxyControlSnapshot(
             allowed=False,
-            status="billing_exhausted",
-            reason_code="proxy_balance_exhausted",
+            status=status,
+            reason_code=reason_code,
             revision=base_revision,
             source="local",
         )
 
         if base_revision is None:
-            logger.error("Proxy billing trip could not persist without a known revision")
+            logger.error("Proxy control trip could not persist without a known revision")
             return self._snapshot
 
         payload = {
-            "status": "billing_exhausted",
-            "reason_code": "proxy_balance_exhausted",
+            "status": status,
+            "reason_code": reason_code,
             "changed_at": datetime.now(timezone.utc).isoformat(),
             "changed_by": self._actor,
             "revision": base_revision + 1,
@@ -155,14 +160,26 @@ class ProxyControl:
                 raise RuntimeError("proxy control compare-and-set did not update one row")
             row = rows[0]
             revision = int(row["revision"])
-            self._local_billing_trip_revision = revision
+            self._local_trip_revision = revision
             self._snapshot = ProxyControlSnapshot(
                 allowed=False,
-                status="billing_exhausted",
-                reason_code="proxy_balance_exhausted",
+                status=status,
+                reason_code=reason_code,
                 revision=revision,
                 source="database",
             )
         except Exception:
-            logger.exception("Proxy billing trip persistence failed; keeping local fail-closed state")
+            unconfirmed_reason = (
+                "local_billing_trip_unconfirmed"
+                if status == "billing_exhausted"
+                else "local_telemetry_pause_unconfirmed"
+            )
+            self._snapshot = ProxyControlSnapshot(
+                allowed=False,
+                status=status,
+                reason_code=unconfirmed_reason,
+                revision=base_revision,
+                source="local",
+            )
+            logger.exception("Proxy control trip persistence failed; keeping local fail-closed state")
         return self._snapshot

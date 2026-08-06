@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from playwright.async_api import async_playwright
 
+from app.bandwidth import record_proxy_request, record_proxy_response
 from app.proxy import split_proxy_for_playwright
 
 logger = logging.getLogger(__name__)
@@ -60,9 +61,24 @@ class CookieMinter:
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(**launch_kwargs)
+            page = None
+            observed_requests = 0
+
+            def _record_started(request) -> None:
+                nonlocal observed_requests
+                observed_requests += 1
+                try:
+                    body = request.post_data_buffer or b""
+                except Exception:
+                    body = b""
+                record_proxy_request(len(body))
+
             try:
                 context = await browser.new_context()
                 page = await context.new_page()
+                # This fires as soon as Chromium starts a request, including
+                # navigations that later timeout before performance data can be read.
+                page.on("request", _record_started)
                 await page.goto(
                     f"{self._base_url}{_CONSULTA_PATH}",
                     wait_until="domcontentloaded",
@@ -77,4 +93,30 @@ class CookieMinter:
                 logger.info("Cookies minteados (TSPD_101 presente), UA=%s", ua[:40])
                 return MintResult(cookies=cookies, user_agent=ua)
             finally:
+                if page is not None:
+                    try:
+                        transfers = await page.evaluate(
+                            """() => [
+                              ...performance.getEntriesByType('navigation'),
+                              ...performance.getEntriesByType('resource'),
+                            ].map((entry) => ({
+                              transferSize: entry.transferSize || entry.encodedBodySize || 0,
+                            }))"""
+                        )
+                        if isinstance(transfers, list):
+                            for transfer in transfers:
+                                if not isinstance(transfer, dict):
+                                    continue
+                                # Test/mocked browsers may not emit request events.
+                                # The fallback still makes a paid navigation durable.
+                                if observed_requests == 0:
+                                    record_proxy_request(0)
+                                record_proxy_response(
+                                    int(transfer.get("transferSize") or 0)
+                                )
+                    except Exception:
+                        logger.warning(
+                            "No fue posible medir transferencia del minteo",
+                            exc_info=True,
+                        )
                 await browser.close()

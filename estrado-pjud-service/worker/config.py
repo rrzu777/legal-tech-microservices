@@ -53,5 +53,6 @@ class WorkerConfig(BaseSettings):
     OJV_PROXY_POOL_SIZE: int = 3
     OJV_PROXY_GB_BUDGET: float = 2.0
     OJV_PROXY_GB_ALERT_PCT: int = 80
+    OJV_PROXY_PRICE_PER_GB_USD: float = 6.25
 
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

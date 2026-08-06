@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.adapters.http_adapter import OJVHttpAdapter
-from app.bandwidth import METER
+from app.bandwidth import METER, capture_proxy_usage
 from app.config import Settings
 
 
@@ -48,3 +48,20 @@ async def test_get_accumulates_across_multiple_calls():
     await adapter.get("/foo")
 
     assert METER.total_bytes == 10
+
+
+@pytest.mark.asyncio
+async def test_adapter_attributes_request_and_response_to_active_operation():
+    adapter = OJVHttpAdapter(_settings())
+    adapter._client.post = AsyncMock(return_value=httpx.Response(
+        200,
+        content=b"response",
+        request=httpx.Request("POST", "https://x/foo", content=b"payload"),
+    ))
+
+    with capture_proxy_usage() as usage:
+        await adapter.post("/foo", content=b"payload")
+
+    assert usage.request_count == 1
+    assert usage.bytes_up == len(b"payload")
+    assert usage.bytes_down == len(b"response")
