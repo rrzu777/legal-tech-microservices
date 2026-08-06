@@ -150,6 +150,16 @@ class MissingCsrfTokenError(Exception):
     """
 
 
+class RejectedDetailSessionError(Exception):
+    """OJV rechazó con 405 vacío una sesión que sí llevaba token CSRF.
+
+    Este patrón no describe a la causa. En producción apareció después de que
+    el mismo slot completara correctamente una consulta anterior: search seguía
+    respondiendo, pero detail rechazaba la sesión reutilizada. Una sesión nueva
+    sí puede corregirlo, por lo que el worker debe descartar y re-mintear el slot.
+    """
+
+
 def slot_still_healthy(e: BaseException) -> bool:
     """¿El slot F5 sigue sirviendo pese a esta excepción?
 
@@ -221,6 +231,7 @@ def classify_exception(e: BaseException) -> FailureKind:
             UpstreamChangedError,
             NoUsableBundleError,
             MissingCsrfTokenError,
+            RejectedDetailSessionError,
             BlockedPageError,
         ),
     ):
