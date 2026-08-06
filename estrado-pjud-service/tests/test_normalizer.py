@@ -2,6 +2,7 @@ import pytest
 
 from app.parsers.normalizer import (
     parse_case_identifier,
+    parse_search_identifier,
     normalize_date,
     competencia_code,
     competencia_path,
@@ -39,6 +40,28 @@ class TestParseCaseIdentifier:
     def test_number_only_suprema(self):
         result = parse_case_identifier("100-2025")
         assert result == {"tipo": "", "numero": "100", "anno": "2025"}
+
+
+class TestParseSearchIdentifier:
+    def test_penal_rit_keeps_official_prefix(self):
+        parsed = parse_search_identifier("rit", "O-243-2025")
+        assert parsed == {
+            "tipo": "O",
+            "numero": "243",
+            "anno": "2025",
+            "ruc": None,
+            "ruc_dv": None,
+        }
+
+    def test_ruc_keeps_body_and_verifier_digit_separate(self):
+        parsed = parse_search_identifier("ruc", "2400012345-k")
+        assert parsed == {
+            "tipo": "",
+            "numero": "",
+            "anno": "",
+            "ruc": "2400012345",
+            "ruc_dv": "K",
+        }
 
 
 class TestNormalizeDate:

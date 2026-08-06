@@ -2,20 +2,21 @@ import base64
 import json
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.auth import verify_api_key
 from app.rate_limit import limiter
 from app.models import (
-    DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
+    CandidateMatch, DetailRequest, DetailResponse, CaseMetadata, Movement, Litigante,
 )
 from app.parsers.detail_parser import parse_detail
 from app.parsers.form_builder import build_search_form_data
-from app.parsers.normalizer import parse_case_identifier, competencia_path
+from app.matching import is_definitive_not_found, matches_requested_candidate
+from app.parsers.normalizer import competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
-from app.failure_kind import reject_empty_body
+from app.failure_kind import BlockedPageError, UpstreamChangedError, reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
 
 logger = logging.getLogger(__name__)
@@ -59,48 +60,63 @@ async def _search_for_fresh_jwt(session, comp: str, req: DetailRequest) -> str |
 
     Returns the fresh JWT key, or None if the search fails to find a match.
     """
-    parsed = parse_case_identifier(req.case_number)
     comp_path = competencia_path(comp)
 
     form_data = build_search_form_data(
         competencia=comp,
-        tipo=parsed["tipo"],
-        numero=parsed["numero"],
-        anno=parsed["anno"],
-        corte=req.corte if comp == "apelaciones" else 0,
+        case_type=req.case_type or "rol",
+        case_number=req.case_number,
+        corte=req.corte if req.contract_version == 2 else (
+            req.corte if comp == "apelaciones" else 0
+        ),
+        tribunal=req.tribunal,
         libro=req.libro,
+        search_mode=req.search_mode,
+        allow_broad=req.allow_broad,
     )
 
     html = await session.search(comp_path, form_data)
 
+    reject_empty_body(html, "detail affinity search")
     if detect_blocked(html):
-        logger.warning("Search blocked during detail session-affinity search")
-        return None
+        raise BlockedPageError("detail affinity search returned WAF or captcha")
 
-    matches = parse_search_results(html, comp)
+    try:
+        matches = parse_search_results(html, comp)
+    except ValueError as exc:
+        raise UpstreamChangedError("detail affinity search parser rejected PJUD response") from exc
 
     if not matches:
-        logger.warning("No matches found during detail session-affinity search for %s", req.case_number)
-        return None
+        if is_definitive_not_found(html):
+            # This is a valid affinity search with a definitive absence.  It
+            # deliberately returns None so the caller emits the normal 409
+            # correlation outcome while retaining the healthy PJUD session.
+            return None
+        raise UpstreamChangedError("detail affinity search returned non-empty unparseable PJUD response")
 
-    if len(matches) == 1:
-        logger.info("Session-affinity search: 1 match, using fresh JWT")
-        return matches[0]["key"]
+    candidates = [CandidateMatch(**match) for match in matches]
+    exact = [candidate for candidate in candidates if matches_requested_candidate(candidate, req)]
 
-    # Multiple matches — use the caller's detail_key to correlate.
-    # The JWT 'data' field is case-specific and stable across sessions,
-    # so we can match on it even though iat/exp differ.
+    # The JWT `data` field is case-specific and stable across sessions.  It is
+    # combined with the requested official identifier, so a stale caller JWT
+    # cannot select another row from a broad result set.
     caller_data = _extract_jwt_data(req.detail_key)
     if caller_data:
-        for m in matches:
-            if _extract_jwt_data(m["key"]) == caller_data:
-                logger.info("Session-affinity search: matched JWT data field among %d results", len(matches))
-                return m["key"]
+        correlated = [
+            match for match in exact
+            if _extract_jwt_data(match.key) == caller_data
+        ]
+        if len(correlated) == 1:
+            logger.info("Session-affinity search: correlated fresh JWT among %d results", len(matches))
+            return correlated[0].key
 
-    # Cannot correlate — fall back to caller's original JWT rather than guessing
+    # The only safe first-match case is unique by the official identifier.
+    if len(exact) == 1:
+        logger.info("Session-affinity search: unique exact official identifier")
+        return exact[0].key
+
     logger.error(
-        "Session-affinity search: %d matches, could not correlate JWT — "
-        "falling back to caller JWT (potential contamination risk)",
+        "Session-affinity search: %d matches, could not correlate requested candidate",
         len(matches),
     )
     return None
@@ -155,7 +171,10 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             if fresh_key:
                 detail_key = fresh_key
             else:
-                logger.warning("Session-affinity search failed, falling back to caller JWT")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Could not establish PJUD session affinity for the requested candidate",
+                )
 
         html = await session.detail(competencia_path(comp), detail_key)
 
@@ -207,6 +226,8 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             incompetencia=parsed.get("incompetencia", []),
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Detail fetch failed")
         healthy = False

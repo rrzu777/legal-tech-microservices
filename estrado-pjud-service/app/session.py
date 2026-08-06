@@ -1,4 +1,5 @@
 import logging
+import json
 import re
 import time
 
@@ -112,6 +113,27 @@ class OJVSession:
         )
         resp.raise_for_status()
         return _decode(resp)
+
+    async def catalog_json(self, path: str, data: dict[str, str]) -> list[dict]:
+        """Fetch a PJUD JSON combo using this session's authorized cookies."""
+        response = await self._adapter.post(path, data=data, headers=_AJAX_HEADERS)
+        response.raise_for_status()
+        body = _decode(response)
+        reject_empty_body(body, "catalog JSON")
+        if detect_blocked(body):
+            raise BlockedPageError(
+                f"el catálogo JSON vino bloqueado ({len(response.content)} bytes)"
+            )
+        payload = json.loads(body)
+        if not isinstance(payload, list):
+            raise ValueError("PJUD catalog JSON response is not a list")
+        return payload
+
+    async def catalog_html(self, path: str, data: dict[str, str]) -> str:
+        """Fetch PJUD's books combo fragment using this session's cookies."""
+        response = await self._adapter.post(path, data=data, headers=_AJAX_HEADERS)
+        response.raise_for_status()
+        return _decode(response)
 
     async def detail(self, competencia_path: str, jwt_token: str) -> str:
         """Step 4: POST detail request and return decoded HTML."""

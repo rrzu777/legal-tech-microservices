@@ -41,9 +41,49 @@ class TestBuildSearchFormData:
     def test_backwards_compatible_without_libro(self):
         """Calling without libro kwarg still works (backwards compat)."""
         form = build_search_form_data(
-            competencia="civil", tipo="C", numero="1234", anno="2024",
+            competencia="civil", tipo="C", numero="1234", anno="2024", corte=90,
         )
         assert form["conTipoCausa"] == "C"
+        assert form["conCorte"] == "0"
+
+    def test_canonical_non_appeals_maps_court_and_tribunal(self):
+        form = build_search_form_data(
+            competencia="civil",
+            case_type="rol",
+            case_number="C-1234-2024",
+            corte=90,
+            tribunal=123,
+        )
+        assert form["conCorte"] == "90"
+        assert form["conTribunal"] == "123"
+
+    def test_canonical_suprema_maps_explicit_none_filters_to_zero(self):
+        form = build_search_form_data(
+            competencia="suprema",
+            case_type="rol",
+            case_number="340-2025",
+            corte=None,
+            tribunal=None,
+            search_mode="supreme_resource",
+        )
+        assert form["conCorte"] == "0"
+        assert form["conTribunal"] == "0"
+
+    def test_first_instance_broad_maps_explicit_none_filters_to_zero(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="340-2025",
+            corte=None,
+            tribunal=None,
+            libro="31",
+            search_mode="first_instance",
+            allow_broad=True,
+        )
+        assert form["conCorte"] == "0"
+        assert form["conTribunal"] == "0"
+        assert form["conTipoBusApe"] == "1"
+        assert "conTipoCausa" not in form
 
     def test_unknown_libro_logs_warning(self, caplog):
         """Unknown libro value logs a warning but doesn't raise."""
@@ -76,3 +116,45 @@ class TestBuildSearchFormData:
 
         assert form["conTipoCausa"] == "PROTECCION"
         assert form["conCorte"] == "46"
+
+    def test_penal_ruc_populates_real_pjud_fields(self):
+        form = build_search_form_data(
+            competencia="penal",
+            case_type="ruc",
+            case_number="2400012345-6",
+            corte=90,
+            tribunal=123,
+            libro="1",
+        )
+        assert form["radio-groupPenal"] == "2"
+        assert form["rucPen1"] == "2400012345"
+        assert form["rucPen2"] == "6"
+        assert form["conRolCausa"] == ""
+        assert form["conEraCausa"] == ""
+
+    def test_appeals_first_instance_maps_all_filters(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="340-2025",
+            corte=90,
+            tribunal=123,
+            libro="31",
+            search_mode="first_instance",
+        )
+        assert form["conCorte"] == "90"
+        assert form["conTribunal"] == "123"
+        assert form["conTipoBusApe"] == "1"
+        assert "conTipoCausa" not in form
+
+    def test_appeals_resource_keeps_libro_filter(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="340-2025",
+            corte=90,
+            libro="31",
+            search_mode="appeals_resource",
+        )
+        assert form["conTipoBusApe"] == "0"
+        assert form["conTipoCausa"] == "PENAL"

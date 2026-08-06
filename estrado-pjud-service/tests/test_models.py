@@ -1,6 +1,363 @@
 import pytest
 from pydantic import ValidationError
-from app.models import SearchRequest, SearchResponse
+from app.models import DetailRequest, SearchRequest, SearchResponse
+
+
+class TestCanonicalSearchRequestV2:
+    @pytest.mark.parametrize("competencia,case_type,case_number,extra", [
+        ("civil", "rol", "C-1234-2024", {"corte": 90, "tribunal": 321, "libro": "F"}),
+        ("laboral", "rit", "O-1234-2024", {"corte": 90, "tribunal": 321, "libro": "U"}),
+        ("penal", "rit", "O-243-2025", {"corte": 90, "tribunal": 321, "libro": "5"}),
+        ("cobranza", "rol", "C-1234-2024", {"corte": 90, "tribunal": 321, "libro": "L"}),
+        ("apelaciones", "rol", "4490-2025", {"corte": 90, "libro": "42", "search_mode": "appeals_resource"}),
+    ])
+    def test_v2_accepts_observed_official_book_codes(self, competencia, case_type, case_number, extra):
+        request = SearchRequest(
+            contract_version=2,
+            competencia=competencia,
+            case_type=case_type,
+            case_number=case_number,
+            **extra,
+        )
+        assert request.libro == extra["libro"]
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_rejects_unknown_official_book_code(self, request_type):
+        payload = {
+            "contract_version": 2,
+            "competencia": "apelaciones",
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "corte": 90,
+            "libro": "999",
+            "search_mode": "appeals_resource",
+        }
+        if request_type is DetailRequest:
+            payload["detail_key"] = "key"
+        with pytest.raises(ValidationError):
+            request_type(**payload)
+
+    def test_v2_civil_requires_court_and_tribunal_unless_broad(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+            )
+
+        req = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="C-1-2026",
+            competencia="civil",
+            allow_broad=True,
+        )
+
+        assert req.corte is None
+        assert req.tribunal is None
+
+    def test_v2_civil_rejects_partial_or_broad_filters(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+                allow_broad=True,
+            )
+
+    def test_v2_appeals_modes_validate_dependent_fields(self):
+        direct = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            libro="31",
+            search_mode="appeals_resource",
+        )
+        assert direct.tribunal is None
+
+        origin = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            tribunal=1234,
+            search_mode="first_instance",
+        )
+        assert origin.tribunal == 1234
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_first_instance_rejects_libro(self, request_type):
+        fields = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "340-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "tribunal": 1234,
+            "libro": "31",
+            "search_mode": "first_instance",
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        with pytest.raises(ValidationError):
+            request_type(**fields)
+
+    def test_v2_appeals_rejects_invalid_mode_fields(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=90,
+                libro="31",
+                search_mode="appeals_resource",
+                tribunal=1234,
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=90,
+                libro="31",
+                search_mode="first_instance",
+            )
+
+    @pytest.mark.parametrize("search_mode,tribunal", [
+        ("appeals_resource", None),
+        ("first_instance", 1234),
+    ])
+    def test_v2_appeals_rejects_v1_all_courts_sentinel(self, search_mode, tribunal):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=0,
+                tribunal=tribunal,
+                libro="31",
+                search_mode=search_mode,
+            )
+
+    def test_v2_supreme_accepts_only_supreme_resource_fields(self):
+        req = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="suprema",
+            search_mode="supreme_resource",
+        )
+        assert req.search_mode == "supreme_resource"
+
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="suprema",
+                search_mode="supreme_resource",
+                libro="31",
+            )
+
+    def test_v2_penal_accepts_rit_and_ruc_only(self):
+        rit = SearchRequest(
+            contract_version=2,
+            case_type="rit",
+            case_number="O-243-2025",
+            competencia="penal",
+            corte=90,
+            tribunal=123,
+            libro="1",
+        )
+        ruc = SearchRequest(
+            contract_version=2,
+            case_type="ruc",
+            case_number="2400012345-6",
+            competencia="penal",
+            corte=90,
+            tribunal=123,
+        )
+        assert rit.case_type == "rit"
+        assert ruc.case_type == "ruc"
+
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="ruc",
+                case_number="2400012345-6",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+            )
+
+    def test_v2_penal_rejects_noncanonical_rit_and_ruc_identifiers(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rit",
+                case_number="243-2025",
+                competencia="penal",
+                corte=90,
+                tribunal=123,
+                libro="1",
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="ruc",
+                case_number="not-a-ruc",
+                competencia="penal",
+                corte=90,
+                tribunal=123,
+            )
+
+    def test_v1_request_remains_accepted_during_rollout(self):
+        req = SearchRequest(
+            case_type="rit",
+            case_number="O-243-2025",
+            competencia="penal",
+            libro="1",
+        )
+        assert req.contract_version == 1
+
+    def test_v1_keeps_legacy_case_type_values(self):
+        req = SearchRequest(
+            case_type="legacy-cause-type",
+            case_number="O-243-2025",
+            competencia="penal",
+            libro="1",
+        )
+        assert req.case_type == "legacy-cause-type"
+
+    def test_v2_rejects_legacy_case_type_values(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="legacy-cause-type",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+            )
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    @pytest.mark.parametrize("competencia,case_type,case_number,extra", [
+        (
+            "apelaciones",
+            "rol",
+            "340-2025",
+            {"corte": 90, "search_mode": "appeals_resource"},
+        ),
+        (
+            "penal",
+            "rit",
+            "O-243-2025",
+            {"corte": 90, "tribunal": 123},
+        ),
+    ])
+    @pytest.mark.parametrize("libro", ["", " \t "])
+    def test_v2_rejects_empty_or_whitespace_required_libro(
+        self, request_type, competencia, case_type, case_number, extra, libro,
+    ):
+        fields = {
+            "contract_version": 2,
+            "case_type": case_type,
+            "case_number": case_number,
+            "competencia": competencia,
+            "libro": libro,
+            **extra,
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        with pytest.raises(ValidationError):
+            request_type(**fields)
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_strips_nonempty_libro_before_form_consumers(self, request_type):
+        fields = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "340-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "libro": " 31 ",
+            "search_mode": "appeals_resource",
+        }
+        if request_type is DetailRequest:
+            fields["detail_key"] = "key"
+
+        req = request_type(**fields)
+        assert req.libro == "31"
+
+    def test_detail_request_carries_canonical_search_fields(self):
+        req = DetailRequest(
+            detail_key="key",
+            contract_version=2,
+            case_type="rol",
+            case_number="340-2025",
+            competencia="apelaciones",
+            corte=90,
+            tribunal=123,
+            search_mode="first_instance",
+            max_matches=25,
+        )
+        assert req.tribunal == 123
+        assert req.max_matches == 25
+
+    def test_detail_v2_rejects_invalid_canonical_combinations(self):
+        with pytest.raises(ValidationError):
+            DetailRequest(detail_key="key", contract_version=2)
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=0,
+                libro="31",
+                search_mode="appeals_resource",
+            )
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=-1,
+            )
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="suprema",
+                corte=90,
+                search_mode="supreme_resource",
+            )
 
 
 class TestSearchRequestCorte:

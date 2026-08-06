@@ -7,6 +7,28 @@
             "title": "Caratulado",
             "type": "string"
           },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "corte_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte Code"
+          },
           "fecha_ingreso": {
             "anyOf": [
               {
@@ -22,13 +44,57 @@
             "title": "Key",
             "type": "string"
           },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "libro_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro Code"
+          },
           "rol": {
             "title": "Rol",
             "type": "string"
           },
+          "ruc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruc"
+          },
           "tribunal": {
             "title": "Tribunal",
             "type": "string"
+          },
+          "tribunal_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal Code"
           }
         },
         "required": [
@@ -132,8 +198,62 @@
         "title": "CaseMetadata",
         "type": "object"
       },
+      "CatalogOption": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "label"
+        ],
+        "title": "CatalogOption",
+        "type": "object"
+      },
+      "CatalogResponse": {
+        "properties": {
+          "fetched_at": {
+            "title": "Fetched At",
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogOption"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "live",
+              "cache",
+              "snapshot"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "options",
+          "source",
+          "fetched_at"
+        ],
+        "title": "CatalogResponse",
+        "type": "object"
+      },
       "DetailRequest": {
         "properties": {
+          "allow_broad": {
+            "default": false,
+            "title": "Allow Broad",
+            "type": "boolean"
+          },
           "case_number": {
             "anyOf": [
               {
@@ -144,6 +264,17 @@
               }
             ],
             "title": "Case Number"
+          },
+          "case_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Type"
           },
           "competencia": {
             "anyOf": [
@@ -163,6 +294,15 @@
               }
             ],
             "title": "Competencia"
+          },
+          "contract_version": {
+            "default": 1,
+            "enum": [
+              1,
+              2
+            ],
+            "title": "Contract Version",
+            "type": "integer"
           },
           "corte": {
             "anyOf": [
@@ -189,6 +329,40 @@
               }
             ],
             "title": "Libro"
+          },
+          "max_matches": {
+            "default": 10,
+            "maximum": 25.0,
+            "minimum": 1.0,
+            "title": "Max Matches",
+            "type": "integer"
+          },
+          "search_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "supreme_resource",
+                  "appeals_resource",
+                  "first_instance"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Mode"
+          },
+          "tribunal": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal"
           }
         },
         "required": [
@@ -751,6 +925,11 @@
       },
       "SearchRequest": {
         "properties": {
+          "allow_broad": {
+            "default": false,
+            "title": "Allow Broad",
+            "type": "boolean"
+          },
           "case_number": {
             "title": "Case Number",
             "type": "string"
@@ -770,6 +949,15 @@
             ],
             "title": "Competencia",
             "type": "string"
+          },
+          "contract_version": {
+            "default": 1,
+            "enum": [
+              1,
+              2
+            ],
+            "title": "Contract Version",
+            "type": "integer"
           },
           "corte": {
             "anyOf": [
@@ -792,6 +980,40 @@
               }
             ],
             "title": "Libro"
+          },
+          "max_matches": {
+            "default": 10,
+            "maximum": 25.0,
+            "minimum": 1.0,
+            "title": "Max Matches",
+            "type": "integer"
+          },
+          "search_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "supreme_resource",
+                  "appeals_resource",
+                  "first_instance"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Mode"
+          },
+          "tribunal": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal"
           }
         },
         "required": [
@@ -844,6 +1066,24 @@
             },
             "title": "Matches",
             "type": "array"
+          },
+          "status": {
+            "default": "not_found",
+            "enum": [
+              "found",
+              "not_found",
+              "needs_disambiguation",
+              "pjud_blocked",
+              "pjud_timeout",
+              "upstream_changed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
           }
         },
         "required": [
@@ -910,6 +1150,216 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/catalogs/books": {
+      "get": {
+        "operationId": "books_api_v1_catalogs_books_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "competencia",
+            "required": true,
+            "schema": {
+              "enum": [
+                "apelaciones",
+                "civil",
+                "laboral",
+                "penal",
+                "cobranza"
+              ],
+              "title": "Competencia",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "anno",
+            "required": true,
+            "schema": {
+              "maximum": 2026,
+              "minimum": 2022,
+              "title": "Anno",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "corte",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 91,
+                  "minimum": 10,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Corte"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Books",
+        "tags": [
+          "catalogs"
+        ]
+      }
+    },
+    "/api/v1/catalogs/courts": {
+      "get": {
+        "operationId": "courts_api_v1_catalogs_courts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tipo_busqueda",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 1,
+              "minimum": 1,
+              "title": "Tipo Busqueda",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Courts",
+        "tags": [
+          "catalogs"
+        ]
+      }
+    },
+    "/api/v1/catalogs/tribunals": {
+      "get": {
+        "operationId": "tribunals_api_v1_catalogs_tribunals_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "competencia",
+            "required": true,
+            "schema": {
+              "enum": [
+                "apelaciones",
+                "civil",
+                "laboral",
+                "penal",
+                "cobranza"
+              ],
+              "title": "Competencia",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "corte",
+            "required": true,
+            "schema": {
+              "maximum": 91,
+              "minimum": 10,
+              "title": "Corte",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tipo_busqueda",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 1,
+              "minimum": 1,
+              "title": "Tipo Busqueda",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Tribunals",
+        "tags": [
+          "catalogs"
+        ]
+      }
+    },
     "/api/v1/detail": {
       "post": {
         "operationId": "case_detail_api_v1_detail_post",

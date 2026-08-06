@@ -1,7 +1,11 @@
 # worker/engine.py
 import asyncio
+import hashlib
+import json
 import logging
+import re
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, date
 
@@ -9,8 +13,10 @@ import httpx
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
+from app.catalogs import CatalogService, normalize_catalog_label
 from app.document_downloader import download_documents, download_single_document
 from app.failure_kind import (
+    UpstreamChangedError,
     block_cause,
     classify_exception,
     reject_empty_body,
@@ -18,6 +24,8 @@ from app.failure_kind import (
 )
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
+from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
+from app.models import CandidateMatch, SearchRequest
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
@@ -33,6 +41,10 @@ _BLOCK_DURATION_S = 3600  # 1 hour
 # lo más 1 por hora, para no spamear Telegram ante un drift global del parser.
 _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
+
+
+class InvalidCanonicalIdentityError(ValueError):
+    """Persisted v2 identity is present but violates PJUD's v2 contract."""
 
 MATTER_TO_COMPETENCIA = {
     "civil": "civil",
@@ -101,6 +113,251 @@ def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
 
 
+_NULL_FOLIO_KEY_FIELDS = ("fecha", "cuaderno", "tramite", "descripcion")
+_PRESENT_FOLIO_DEDUPE_FIELDS = (
+    "fecha",
+    "cuaderno",
+    "tramite",
+    "descripcion",
+    "etapa",
+    "foja",
+)
+
+_PRIMARY_DOCUMENT_FIELDS = (
+    "documento_url",
+    "documento_token",
+    "documento_param",
+)
+_ANEXO_FIELDS = ("anexo_func", "anexo_token")
+_CANONICAL_WHITESPACE_RE = re.compile(
+    r"[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
+)
+
+
+def _movement_identity(movement: dict) -> tuple:
+    """Return the stable PJUD fields that identify one logical movement."""
+    folio = movement.get("folio")
+    fields = (
+        _NULL_FOLIO_KEY_FIELDS
+        if folio is None
+        else _PRESENT_FOLIO_DEDUPE_FIELDS
+    )
+    return (
+        folio,
+        *(
+            _normalize_movement_identity_part(movement.get(field))
+            for field in fields
+        ),
+    )
+
+
+def _normalize_movement_identity_part(value) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = _CANONICAL_WHITESPACE_RE.sub(" ", normalized)
+    if normalized.startswith(" "):
+        normalized = normalized[1:]
+    if normalized.endswith(" "):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def _build_movement_external_key(case_number: str, movement: dict) -> str:
+    """Build a stable movement key while retaining every historical folio key."""
+    folio = movement.get("folio")
+    if folio is not None:
+        return _build_external_movement_key(
+            case_number,
+            movement.get("cuaderno", ""),
+            folio,
+        )
+
+    identity = {
+        field: _normalize_movement_identity_part(movement.get(field))
+        for field in _NULL_FOLIO_KEY_FIELDS
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"pjud:null-folio:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _copy_movement(movement: dict) -> dict:
+    copied = dict(movement)
+    copied["documentos_adicionales"] = [
+        dict(document)
+        for document in movement.get("documentos_adicionales", [])
+    ]
+    return copied
+
+
+def _prefer_complete_group(target: dict, source: dict, fields: tuple[str, ...]) -> None:
+    """Copy one linked metadata group only when the source is more complete.
+
+    URL/token/param and anexo function/token are paired values. Filling them
+    independently can manufacture a credential combination PJUD never emitted.
+    """
+    target_score = sum(bool(target.get(field)) for field in fields)
+    source_score = sum(bool(source.get(field)) for field in fields)
+    if source_score <= target_score:
+        return
+    for field in fields:
+        target[field] = source.get(field)
+
+
+def _merge_movement_metadata(target: dict, source: dict) -> None:
+    """Keep the richest document metadata from duplicate logical movements."""
+    _prefer_complete_group(target, source, _PRIMARY_DOCUMENT_FIELDS)
+    _prefer_complete_group(target, source, _ANEXO_FIELDS)
+
+    additional = target.setdefault("documentos_adicionales", [])
+    seen_documents = {
+        (document.get("url"), document.get("token"), document.get("param"))
+        for document in additional
+    }
+    for document in source.get("documentos_adicionales", []):
+        identity = (
+            document.get("url"),
+            document.get("token"),
+            document.get("param"),
+        )
+        if identity not in seen_documents:
+            additional.append(dict(document))
+            seen_documents.add(identity)
+
+
+def _prepare_pjud_movements(
+    case: dict,
+    movements: list[dict],
+    *,
+    log_undated: bool,
+) -> list[tuple[dict, str]]:
+    """Filter invalid rows, collapse logical duplicates and assign persisted keys."""
+    prepared: list[tuple[dict, str]] = []
+    skipped_count = 0
+    identity_indexes: dict[tuple, int] = {}
+    base_key_occurrences: dict[str, int] = {}
+
+    for movement in movements:
+        if not movement.get("fecha"):
+            skipped_count += 1
+            continue
+
+        base_key = _build_movement_external_key(case["case_number"], movement)
+        occurrence = base_key_occurrences.get(base_key, 0) + 1
+        base_key_occurrences[base_key] = occurrence
+
+        identity = _movement_identity(movement)
+        existing_index = identity_indexes.get(identity)
+        if existing_index is not None:
+            _merge_movement_metadata(prepared[existing_index][0], movement)
+            continue
+
+        external_key = base_key if occurrence == 1 else f"{base_key}#{occurrence}"
+        identity_indexes[identity] = len(prepared)
+        prepared.append((_copy_movement(movement), external_key))
+
+    if skipped_count and log_undated:
+        logger.warning(
+            "Skipping undated PJUD movements",
+            extra={
+                "case_id": case.get("id"),
+                "case_number": case.get("case_number"),
+                "skipped_count": skipped_count,
+            },
+        )
+
+    return prepared
+
+
+def search_params_from_case(case: dict) -> dict:
+    """Return the persisted PJUD identity without applying legacy defaults.
+
+    A case row from before migration 00063 has no ``tribunal_unknown`` column.
+    Its absence is the staged-rollout marker: callers keep the v1 path rather
+    than turning an already-tracked case into an invalid v2 request.
+    """
+    return {
+        "case_type": case.get("case_type"),
+        "case_number": case.get("case_number"),
+        "corte": case.get("court_code"),
+        "tribunal": case.get("tribunal_code"),
+        "libro": case.get("libro"),
+        "search_mode": case.get("pjud_search_mode"),
+        "allow_broad": bool(case.get("tribunal_unknown")),
+    }
+
+
+def _canonical_search_request(case: dict, competencia: str) -> SearchRequest | None:
+    """Build the v2 contract only for rows that carry the new schema marker.
+
+    Rows that are missing it (or have not yet been backfilled with a complete
+    identity) remain v1-compatible until JurisTrack's migration is deployed.
+    """
+    if "tribunal_unknown" not in case:
+        return None
+
+    try:
+        return SearchRequest(
+            contract_version=2,
+            competencia=competencia,
+            **search_params_from_case(case),
+        )
+    except ValueError as exc:
+        canonical_signal = (
+            case.get("pjud_search_mode") is not None
+            or case.get("tribunal_code") is not None
+            or case.get("tribunal_unknown") is True
+            or (competencia != "apelaciones" and case.get("court_code") is not None)
+        )
+        if canonical_signal:
+            raise InvalidCanonicalIdentityError(str(exc)) from exc
+        logger.info(
+            "Case %s has incomplete canonical PJUD identity; retaining v1 compatibility",
+            case.get("id"),
+        )
+        return None
+
+
+def _matches_known_context(candidate: CandidateMatch, request: SearchRequest) -> bool:
+    """Known v2 context requires complete, matching official codes."""
+    tribunal_matches = request.tribunal is None or candidate.tribunal_code == request.tribunal
+    corte_matches = request.corte is None or candidate.corte_code == request.corte
+    return tribunal_matches and corte_matches
+
+
+def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMatch | None:
+    """Return one exact official candidate, never an arbitrary result row."""
+    candidates = _dedupe_candidates([CandidateMatch.model_validate(match) for match in matches])
+    ranked = rank_matches(candidates, request)
+    exact = [
+        candidate
+        for candidate in ranked.matches
+        if matches_requested_candidate(candidate, request)
+        and _matches_known_context(candidate, request)
+    ]
+    return exact[0] if len(exact) == 1 else None
+
+
+def _dedupe_candidates(candidates: list[CandidateMatch]) -> list[CandidateMatch]:
+    """Collapse repeated PJUD rows before exact-match ambiguity is evaluated."""
+    unique: list[CandidateMatch] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for candidate in candidates:
+        identity = (
+            normalize_catalog_label(candidate.rol),
+            normalize_catalog_label(candidate.ruc or ""),
+            str(candidate.corte_code) if candidate.corte_code is not None else normalize_catalog_label(candidate.corte or ""),
+            str(candidate.tribunal_code) if candidate.tribunal_code is not None else normalize_catalog_label(candidate.tribunal),
+            candidate.libro_code or normalize_catalog_label(candidate.libro or ""),
+        )
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(candidate)
+    return unique
+
+
 def _dedupe_movement_keys(keys: list[str]) -> list[str]:
     """Desambigua claves repetidas DENTRO de un mismo batch de upsert.
 
@@ -135,7 +392,12 @@ async def search_pjud_via_session(session, competencia: str, form_data: dict, ti
     reject_empty_body(html, "search")
     if detect_blocked(html) or len(html.strip()) < 100:
         return {"found": False, "match_count": 0, "matches": [], "blocked": True, "error": None}
-    matches = parse_search_results(html, competencia)
+    try:
+        matches = parse_search_results(html, competencia)
+    except ValueError as exc:
+        raise UpstreamChangedError("search parser rejected PJUD response") from exc
+    if not matches and not is_definitive_not_found(html):
+        raise UpstreamChangedError("search response did not contain PJUD results or explicit absence")
     return {
         "found": len(matches) > 0,
         "match_count": len(matches),
@@ -168,13 +430,14 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
 
 
 class SyncEngine:
-    def __init__(self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig):
+    def __init__(self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig, catalog_service=None):
         self._pool = pool
         self._sb = supabase
         self._notifier = notifier
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._catalog_service = catalog_service or CatalogService(pool)
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
@@ -184,6 +447,36 @@ class SyncEngine:
                 endpoint=config.R2_ENDPOINT,
                 bucket=config.R2_BUCKET,
             )
+
+    async def _enrich_candidates(
+        self, matches: list[dict], request: SearchRequest
+    ) -> list[dict]:
+        """Enrich parser labels from loaded official data without nested pool I/O."""
+        resolved_labels = {}
+        enriched: list[dict] = []
+        for match in matches:
+            label = str(match.get("tribunal", ""))
+            if label not in resolved_labels:
+                resolved_labels[label] = self._catalog_service.resolve_loaded_tribunal(
+                    request.competencia, label, corte=request.corte,
+                )
+            identity = resolved_labels[label]
+            enriched.append({
+                **match,
+                "tribunal_code": identity.tribunal_code if identity else None,
+                "corte_code": identity.court_code if identity else None,
+            })
+        return enriched
+
+    async def _handle_transient(self, case: dict, status: str, message: str):
+        retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
+        await run_query(
+            self._sb.from_("cases").update({
+                "last_sync_status": status,
+                "last_sync_error": message,
+                "next_sync_at": retry_at,
+            }).eq("id", case["id"])
+        )
 
     async def sync_case(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
@@ -209,16 +502,20 @@ class SyncEngine:
         session = None
         session_healthy = True
         try:
-            # Parse identifier — raises ValueError on invalid input
+            # Legacy v1 needs the historical parsed form. Canonical v2 parses
+            # inside build_search_form_data so RUC is accepted without forcing
+            # it through the old X-NNN-YYYY parser first.
             try:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
-                await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                await self._update_case_error(case, "Identificador invalido")
-                self._metrics.record_error()
-                return {"success": False, "new_movements": 0}
+                parsed = None
 
             if case.get("matter") == "familia":
+                if parsed is None:
+                    await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
+                    await self._update_case_error(case, "Identificador invalido")
+                    self._metrics.record_error()
+                    return {"success": False, "new_movements": 0}
                 result = await self._sync_familia_case(case, sync_run_id, started_at)
                 if result["success"]:
                     self._backoff.record_success()
@@ -235,38 +532,61 @@ class SyncEngine:
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
+            try:
+                canonical_request = _canonical_search_request(case, competencia)
+            except InvalidCanonicalIdentityError as exc:
+                await self._finish_run(sync_run_id, started_at, "error", 0, "invalid_identity")
+                await self._handle_transient(case, "invalid_identity", str(exc))
+                self._metrics.record_error("resolution")
+                return {"success": False, "new_movements": 0, "status": "invalid_identity"}
+            if canonical_request is None and parsed is None:
+                await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
+                await self._update_case_error(case, "Identificador invalido")
+                self._metrics.record_error()
+                return {"success": False, "new_movements": 0}
+
             session = await self._pool.acquire()
             await self._pool.enforce_global_rate_limit()
 
-            # For apelaciones, read corte from the case's court_code column (primary)
-            # or external_payload.corte (legacy fallback).
-            corte_value = ""
-            if competencia == "apelaciones":
-                corte_value = str(case.get("court_code") or "")
-                if not corte_value:
-                    # Legacy fallback: some cases might have corte in external_payload
-                    corte_value = str(
-                        case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
-                    )
-                if not corte_value:
-                    logger.warning(
-                        "No court_code for apelaciones case %s; searching all cortes",
-                        case.get("case_number", case["id"]),
-                    )
+            if canonical_request is not None:
+                form_data = build_search_form_data(
+                    competencia=competencia,
+                    case_type=canonical_request.case_type,
+                    case_number=canonical_request.case_number,
+                    corte=canonical_request.corte,
+                    tribunal=canonical_request.tribunal,
+                    libro=canonical_request.libro,
+                    search_mode=canonical_request.search_mode,
+                    allow_broad=canonical_request.allow_broad,
+                )
+            else:
+                # For apelaciones, read corte from the case's court_code column
+                # (primary) or external_payload.corte (legacy fallback).
+                corte_value = ""
+                if competencia == "apelaciones":
+                    corte_value = str(case.get("court_code") or "")
+                    if not corte_value:
+                        corte_value = str(
+                            case.get("external_payload", {}).get("corte", "") if case.get("external_payload") else ""
+                        )
+                    if not corte_value:
+                        logger.warning(
+                            "No court_code for apelaciones case %s; searching all cortes",
+                            case.get("case_number", case["id"]),
+                        )
 
-            # Read libro from the case's libro column (primary) or external_payload (fallback)
-            libro_value = case.get("libro") or None
-            if not libro_value and case.get("external_payload"):
-                libro_value = case["external_payload"].get("libro") or None
+                libro_value = case.get("libro") or None
+                if not libro_value and case.get("external_payload"):
+                    libro_value = case["external_payload"].get("libro") or None
 
-            form_data = build_search_form_data(
-                competencia=competencia,
-                tipo=parsed["tipo"],
-                numero=parsed["numero"],
-                anno=parsed["anno"],
-                corte=corte_value,
-                libro=libro_value,
-            )
+                form_data = build_search_form_data(
+                    competencia=competencia,
+                    tipo=parsed["tipo"],
+                    numero=parsed["numero"],
+                    anno=parsed["anno"],
+                    corte=corte_value,
+                    libro=libro_value,
+                )
 
             # Search
             search_result = await search_pjud_via_session(
@@ -286,8 +606,40 @@ class SyncEngine:
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
-            # Get detail key — prefer fresh key from search (stored key may have expired JWT)
-            detail_key = search_result["matches"][0].get("key") or case.get("external_case_key")
+            # Canonical rows must correlate the fresh same-session search result
+            # to one official identifier. Legacy rows preserve v1's historical
+            # first-row behavior until their identity is backfilled.
+            confirmed_match = None
+            if canonical_request is not None:
+                candidates = await self._enrich_candidates(search_result["matches"], canonical_request)
+                confirmed_match = _confirmed_match(candidates, canonical_request)
+                if canonical_request.allow_broad and (
+                    confirmed_match is None
+                    or confirmed_match.tribunal_code is None
+                    or (
+                        canonical_request.competencia != "apelaciones"
+                        and confirmed_match.corte_code is None
+                    )
+                ):
+                    confirmed_match = None
+                if confirmed_match is None:
+                    await self._finish_run(
+                        sync_run_id, started_at, "error", 0, "needs_disambiguation",
+                    )
+                    await self._handle_resolution_required(case)
+                    self._metrics.record_error("resolution")
+                    return {
+                        "success": False,
+                        "new_movements": 0,
+                        "status": "needs_disambiguation",
+                    }
+
+            # Prefer the fresh key from this session: persisted JWTs can expire
+            # or belong to a different session and must not contaminate detail.
+            detail_key = (
+                confirmed_match.key if confirmed_match is not None
+                else search_result["matches"][0].get("key") or case.get("external_case_key")
+            )
             if not detail_key:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "No detail key available")
                 self._metrics.record_error()
@@ -319,6 +671,49 @@ class SyncEngine:
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
+            identity_update = None
+            if (
+                canonical_request is not None
+                and canonical_request.allow_broad
+                and confirmed_match is not None
+            ):
+                # This happens after the same-session detail is known good but
+                # before *any* movement, document, payload or success write.
+                # A concurrent human selection wins over this automatic guess.
+                identity_update = {
+                    "tribunal_code": confirmed_match.tribunal_code,
+                    "tribunal_unknown": False,
+                    "court": confirmed_match.tribunal,
+                }
+                if canonical_request.competencia != "apelaciones":
+                    identity_update["court_code"] = confirmed_match.corte_code
+
+                identity_query = (
+                    self._sb.from_("cases").update(identity_update)
+                    .eq("id", case["id"])
+                    .eq("tribunal_unknown", True)
+                    .is_("tribunal_code", "null")
+                )
+                if canonical_request.competencia == "apelaciones":
+                    identity_query = identity_query.eq("court_code", case.get("court_code"))
+                else:
+                    identity_query = identity_query.is_("court_code", "null")
+                # postgrest's filtered update builder already returns its
+                # representation.  Chaining select() here is unsupported in
+                # the installed client and would turn every broad sync into an
+                # AttributeError before the CAS result can be inspected.
+                identity_result = await run_query(identity_query)
+                if not getattr(identity_result, "data", None):
+                    await self._finish_run(
+                        sync_run_id, started_at, "error", 0, "identity_changed",
+                    )
+                    self._metrics.record_error("resolution")
+                    return {
+                        "success": False,
+                        "new_movements": 0,
+                        "status": "identity_changed",
+                    }
+
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
 
@@ -331,10 +726,13 @@ class SyncEngine:
             priority = _compute_priority(case.get("status", "active"), latest_date)
             next_sync = _compute_next_sync_at(priority)
 
-            canonical = f"{competencia}:{parsed['tipo']}:{parsed['numero']}:{parsed['anno']}"
+            canonical = (
+                f"{competencia}:{canonical_request.case_type}:{canonical_request.case_number}"
+                if canonical_request is not None
+                else f"{competencia}:{parsed['tipo']}:{parsed['numero']}:{parsed['anno']}"
+            )
 
-            await run_query(
-                self._sb.from_("cases").update({
+            case_update = {
                     "tracking_status": "active",
                     "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
                     "last_sync_status": "success",
@@ -352,8 +750,8 @@ class SyncEngine:
                     "sync_priority": priority,
                     "next_sync_at": next_sync,
                     "latest_movement_date": latest_date,
-                }).eq("id", case["id"])
-            )
+            }
+            await run_query(self._sb.from_("cases").update(case_update).eq("id", case["id"]))
 
             # Finish sync run
             await self._finish_run(sync_run_id, started_at, "success", new_count)
@@ -367,6 +765,17 @@ class SyncEngine:
             logger.info("Synced case %s: %d new movements", case["case_number"], new_count)
             return {"success": True, "new_movements": new_count}
 
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            session_healthy = False
+            await self._finish_run(sync_run_id, started_at, "error", 0, "pjud_timeout")
+            await self._handle_transient(case, "pjud_timeout", str(e))
+            self._metrics.record_error("infra")
+            return {"success": False, "new_movements": 0, "status": "pjud_timeout"}
+        except UpstreamChangedError as e:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "upstream_changed")
+            await self._handle_transient(case, "upstream_changed", str(e))
+            self._metrics.record_error("infra")
+            return {"success": False, "new_movements": 0, "status": "upstream_changed"}
         except Exception as e:
             # Un solo `except`, clasificado, en vez de dos listas de tipos. La
             # anterior era `(httpx.TransportError, asyncio.TimeoutError)`, y
@@ -676,8 +1085,12 @@ class SyncEngine:
         if not movements:
             return 0
 
+        prepared = _prepare_pjud_movements(case, movements, log_undated=True)
+        if not prepared:
+            return 0
+
         rows = []
-        for mov in movements:
+        for mov, external_key in prepared:
             rows.append({
                 "law_firm_id": case["law_firm_id"],
                 "case_id": case["id"],
@@ -689,24 +1102,25 @@ class SyncEngine:
                 "document_url": mov.get("documento_url"),
                 "is_relevant": True,
                 "include_in_report": True,
-                "external_movement_key": _build_external_movement_key(
-                    case["case_number"],
-                    mov.get("cuaderno", ""),
-                    mov.get("folio", ""),
-                ),
+                "external_movement_key": external_key,
                 "raw_payload": mov,
             })
 
-        keys = _dedupe_movement_keys([r["external_movement_key"] for r in rows])
-        n_dupes = sum(1 for k in keys if "#" in k)
+        base_keys = [
+            _build_movement_external_key(case["case_number"], movement)
+            for movement, _ in prepared
+        ]
+        n_dupes = sum(
+            1
+            for row, base_key in zip(rows, base_keys)
+            if row["external_movement_key"] != base_key
+        )
         if n_dupes:
             logger.warning(
                 "Causa %s: %d movimiento(s) con cuaderno+folio repetido en el mismo "
                 "batch; se les agrega sufijo para no perderlos",
                 case["case_number"], n_dupes,
             )
-        for row, key in zip(rows, keys):
-            row["external_movement_key"] = key
 
         # Count before
         before_resp = await run_query(
@@ -746,6 +1160,12 @@ class SyncEngine:
         if not movements:
             return
 
+        prepared = _prepare_pjud_movements(case, movements, log_undated=False)
+        if not prepared:
+            return
+        movements = [movement for movement, _ in prepared]
+        movement_keys = [external_key for _, external_key in prepared]
+
         # Track all uploaded docs per movement for one atomic DB update each
         per_movement_docs: dict[str, list[dict]] = {}  # ext_key -> list of doc entries
 
@@ -757,11 +1177,7 @@ class SyncEngine:
             # --- Primary documents ---
             for doc in docs:
                 mov = movements[doc.index]
-                ext_key = _build_external_movement_key(
-                    case["case_number"],
-                    mov.get("cuaderno", ""),
-                    mov.get("folio", ""),
-                )
+                ext_key = movement_keys[doc.index]
                 r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
 
                 if await self._r2.exists(r2_key):
@@ -788,14 +1204,10 @@ class SyncEngine:
             logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
 
             # --- Certificados (iterate ALL movements, not just downloaded docs) ---
-            for mov in movements:
+            for mov, ext_key in zip(movements, movement_keys):
                 extras = mov.get("documentos_adicionales", [])
                 if not extras:
                     continue
-
-                ext_key = _build_external_movement_key(
-                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
-                )
 
                 for cert_i, cert in enumerate(extras):
                     cert_url = cert.get("url", "")
@@ -826,15 +1238,11 @@ class SyncEngine:
                         # Cert failure must NOT block primary or anexos
 
             # --- Anexos (iterate ALL movements, not just downloaded docs) ---
-            for mov in movements:
+            for mov, ext_key in zip(movements, movement_keys):
                 anexo_func = mov.get("anexo_func")
                 anexo_token = mov.get("anexo_token")
                 if not anexo_func or not anexo_token:
                     continue
-
-                ext_key = _build_external_movement_key(
-                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
-                )
 
                 endpoint_info = ANEXO_ENDPOINTS.get(anexo_func)
                 if not endpoint_info:
@@ -970,6 +1378,17 @@ class SyncEngine:
             "parse_failed",
             f"Causa {case.get('external_case_number') or case['id']} ({competencia}): "
             f"página recibida pero el parser no extrajo nada. Revisar forma de la página / parser.",
+        )
+
+    async def _handle_resolution_required(self, case: dict):
+        """Keep ambiguous PJUD identities retryable without treating them as absent."""
+        retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
+        await run_query(
+            self._sb.from_("cases").update({
+                "last_sync_status": "needs_disambiguation",
+                "last_sync_error": "La búsqueda PJUD requiere confirmar un único tribunal/candidato",
+                "next_sync_at": retry_at,
+            }).eq("id", case["id"])
         )
 
     async def _update_case_blocked(
