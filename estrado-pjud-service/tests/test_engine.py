@@ -1,4 +1,6 @@
 # tests/test_engine.py
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
@@ -748,19 +750,12 @@ class TestSyncEngine:
         which loses the persisted PJUD identity after the case was confirmed.
         """
         engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
-        from app.catalogs import CatalogResult
-        catalog = AsyncMock()
-        catalog.tribunals.return_value = CatalogResult(
-            options=[{"code": "321", "label": "3° Juzgado de Garantía de Santiago"}],
-            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
-        )
-        engine._catalog_service = catalog
         case = _make_case(
             matter="penal",
             case_number="O-243-2025",
             case_type="rit",
             court_code=90,
-            tribunal_code=321,
+            tribunal_code=1222,
             libro="1",
             pjud_search_mode=None,
             tribunal_unknown=False,
@@ -781,30 +776,21 @@ class TestSyncEngine:
         assert result["success"] is True
         form = mock_search.call_args.args[2]
         assert form["conCorte"] == "90"
-        assert form["conTribunal"] == "321"
+        assert form["conTribunal"] == "1222"
         assert form["conTipoCausa"] == "1"
         assert form["radio-groupPenal"] == "1"
         assert mock_search.call_args.args[0] is mock_detail.call_args.args[0]
-        catalog.tribunals.assert_awaited_once_with("penal", 90)
 
     @pytest.mark.asyncio
     async def test_sync_enriches_real_parser_candidate_with_official_catalog(self):
         """The worker must resolve a parser label through one official catalog lookup."""
-        from app.catalogs import CatalogResult
-
         engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
-        catalog = AsyncMock()
-        catalog.tribunals.return_value = CatalogResult(
-            options=[{"code": "321", "label": "4º Juzgado de Garantía de Santiago"}],
-            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
-        )
-        engine._catalog_service = catalog
         case = _make_case(
             matter="penal",
             case_number="O-100-2025",
             case_type="rit",
             court_code=90,
-            tribunal_code=321,
+            tribunal_code=1223,
             libro="1",
             tribunal_unknown=False,
         )
@@ -816,7 +802,6 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is True
-        catalog.tribunals.assert_awaited_once_with("penal", 90)
         mock_detail.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -886,16 +871,9 @@ class TestSyncEngine:
 
     @pytest.mark.asyncio
     async def test_duplicate_logical_candidates_do_not_create_false_ambiguity(self):
-        """PJUD can repeat the same row; only distinct identities are ambiguous."""
+        """The same official row with a new JWT is not a second cause."""
         engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
-        catalog = AsyncMock()
-        from app.catalogs import CatalogResult
-        catalog.tribunals.return_value = CatalogResult(
-            options=[{"code": "321", "label": "2° Juzgado Civil de Santiago"}],
-            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
-        )
-        engine._catalog_service = catalog
-        case = _make_case(court_code=90, tribunal_code=321, libro="C", tribunal_unknown=False)
+        case = _make_case(court_code=90, tribunal_code=260, libro="C", tribunal_unknown=False)
         candidate = {
             "key": "eyJsame",
             "rol": "C-1234-2024",
@@ -905,7 +883,10 @@ class TestSyncEngine:
         }
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
              patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
-            mock_search.return_value = _mock_search_response(matches=[candidate, candidate.copy()])
+            mock_search.return_value = _mock_search_response(matches=[
+                candidate,
+                {**candidate, "key": "eyJfreshJWT"},
+            ])
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
 
@@ -913,16 +894,29 @@ class TestSyncEngine:
         mock_detail.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_known_identity_rejects_unresolved_official_code_without_detail(self):
+        """A parser label not present in the catalog is not neutral evidence."""
+        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        case = _make_case(court_code=90, tribunal_code=260, libro="C", tribunal_unknown=False)
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response(matches=[{
+                "key": "eyJunresolved",
+                "rol": "C-1234-2024",
+                "tribunal": "Tribunal inexistente en catalogo",
+                "caratulado": "TARGET",
+                "fecha_ingreso": "2024-01-15",
+            }])
+            result = await engine.sync_case(case)
+
+        assert result["status"] == "needs_disambiguation"
+        mock_detail.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_sync_rejects_exact_identifier_with_conflicting_official_tribunal(self):
         """Known canonical tribunal codes are a hard anti-contamination signal."""
         engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
-        from app.catalogs import CatalogResult
-        catalog = AsyncMock()
-        catalog.tribunals.return_value = CatalogResult(
-            options=[{"code": "999", "label": "9° Juzgado Civil de Santiago"}],
-            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
-        )
-        engine._catalog_service = catalog
         case = _make_case(
             court_code=90,
             tribunal_code=321,
@@ -947,40 +941,133 @@ class TestSyncEngine:
 
     @pytest.mark.asyncio
     async def test_sync_learns_broad_tribunal_only_after_confirmed_detail(self):
-        """The official code/name learned from a unique exact row is persisted
-        only with the successful detail update, never while search is ambiguous.
-        """
-        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        """A real parser row learns both official codes only after detail."""
+        engine, mock_pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
         case = _make_case(
+            matter="penal",
+            case_number="O-100-2025",
+            case_type="rit",
             court_code=None,
             tribunal_code=None,
-            libro="C",
+            libro="1",
             pjud_search_mode=None,
             tribunal_unknown=True,
         )
-        candidate = {
-            "key": "eyJtarget",
-            "rol": "C-1234-2024",
-            "tribunal": "2° Juzgado Civil de Santiago",
-            "caratulado": "TARGET",
-            "fecha_ingreso": "2024-01-15",
-            "tribunal_code": 321,
-        }
+        fixture = (Path(__file__).parent / "fixtures" / "search_Penal_O_100_2025.html").read_text()
+        mock_pool.acquire.return_value.search = AsyncMock(return_value=fixture)
 
-        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
-             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
-            mock_search.return_value = _mock_search_response(matches=[candidate])
+        with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
 
         assert result["success"] is True
-        learned_update = find_update_payload(mock_sb, tribunal_code=321)
+        learned_update = find_update_payload(mock_sb, tribunal_code=1223)
         assert learned_update is not None
-        assert learned_update["court"] == "2° Juzgado Civil de Santiago"
+        assert learned_update["court_code"] == 90
+        assert learned_update["court"] == "4º Juzgado de Garantía de Santiago"
         assert learned_update["tribunal_unknown"] is False
         chain = mock_sb.from_.return_value
         chain.eq.assert_any_call("tribunal_unknown", True)
-        chain.is_.assert_called_once_with("tribunal_code", "null")
+        chain.is_.assert_any_call("tribunal_code", "null")
+        chain.is_.return_value.is_.assert_called_once_with("court_code", "null")
+
+    @pytest.mark.asyncio
+    async def test_lost_identity_cas_aborts_before_movements_payload_or_success(self):
+        """A concurrent human choice wins before any irreversible sync effect."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        case = _make_case(court_code=None, tribunal_code=None, libro="C", tribunal_unknown=True)
+        chain = mock_sb.from_.return_value
+        after_tribunal_guard = MagicMock()
+        after_court_guard = MagicMock()
+        chain.is_.return_value = after_tribunal_guard
+        after_tribunal_guard.is_.return_value = after_court_guard
+        after_court_guard.select.return_value = after_court_guard
+        after_court_guard.execute.return_value = MagicMock(data=[])
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail, \
+             patch.object(engine, "_upsert_movements", new_callable=AsyncMock) as mock_upsert:
+            mock_search.return_value = _mock_search_response(matches=[{
+                "key": "eyJtarget",
+                "rol": "C-1234-2024",
+                "tribunal": "2° Juzgado Civil de Santiago",
+                "caratulado": "TARGET",
+                "fecha_ingreso": "2024-01-15",
+            }])
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result == {"success": False, "new_movements": 0, "status": "identity_changed"}
+        mock_detail.assert_awaited_once()
+        mock_upsert.assert_not_awaited()
+        assert find_update_payload(mock_sb, last_sync_status="success") is None
+        payloads = [call.args[0] for call in chain.update.call_args_list]
+        assert not any("external_payload" in payload for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_real_one_slot_pool_finishes_broad_sync_without_nested_acquire(self):
+        """A real SessionPool(1) must not deadlock resolving a broad result."""
+        from worker.session_pool import SessionPool, _Slot
+
+        config = MagicMock(
+            OJV_PROXY_URL="http://proxy.example",
+            OJV_PROXY_POOL_SIZE=1,
+            POOL_SIZE=1,
+            SESSION_MAX_AGE_S=1500,
+            OJV_PROXY_STICKY_LIFETIME="1h",
+            COOKIE_STORE_PATH="/tmp/pjud-worker-test-cookies.json",
+            PJUD_BASE_URL="https://pjud.example",
+            RATE_LIMIT_MS=0,
+            BLOCK_PAUSE_S=30,
+            MINT_MAX_RETRIES=1,
+            OJV_TIMEOUT_S=25,
+            R2_ENABLED=False,
+        )
+        pool = SessionPool(config)
+        session = MagicMock(age_seconds=0)
+        fixture = (Path(__file__).parent / "fixtures" / "search_Penal_O_100_2025.html").read_text()
+        session.search = AsyncMock(return_value=fixture)
+        pool._slots = [_Slot(index=0, session=session)]
+        engine, _unused_pool, mock_sb, _notifier, _metrics, _backoff = _make_engine(mock_pool=pool)
+        case = _make_case(
+            matter="penal", case_number="O-100-2025", case_type="rit",
+            court_code=None, tribunal_code=None, libro="1", tribunal_unknown=True,
+        )
+
+        with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_detail.return_value = _mock_detail_response()
+            result = await asyncio.wait_for(engine.sync_case(case), timeout=0.5)
+
+        assert result["success"] is True
+        assert pool._sem._value == 1
+        assert find_update_payload(mock_sb, tribunal_code=1223)["court_code"] == 90
+
+    @pytest.mark.asyncio
+    async def test_appeals_first_instance_broad_keeps_known_court_and_learns_tribunal(self):
+        """Appeals broad resolution is scoped to the persisted Corte de Apelaciones."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        case = _make_case(
+            matter="apelaciones", case_number="4490-2025", case_type="rol",
+            court_code=90, tribunal_code=None, libro=None,
+            pjud_search_mode="first_instance", tribunal_unknown=True,
+        )
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response(matches=[{
+                "key": "eyJappeal-first-instance",
+                "rol": "4490-2025",
+                "tribunal": "2° Juzgado Civil de Santiago",
+                "caratulado": "TARGET",
+                "fecha_ingreso": "2025-01-15",
+            }])
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+        learned = find_update_payload(mock_sb, tribunal_code=260)
+        assert learned is not None
+        assert "court_code" not in learned
 
     @pytest.mark.asyncio
     async def test_sync_legacy_default_false_without_complete_identity_keeps_v1(self):
@@ -1047,7 +1134,7 @@ class TestSyncEngine:
             case_number="2400100001-5",
             case_type="ruc",
             court_code=90,
-            tribunal_code=321,
+            tribunal_code=1222,
             libro=None,
             pjud_search_mode=None,
             tribunal_unknown=False,
@@ -1063,7 +1150,7 @@ class TestSyncEngine:
                     "tribunal": "3° Juzgado de Garantía de Santiago",
                     "caratulado": "WRONG RUC",
                     "fecha_ingreso": "2025-01-15",
-                    "tribunal_code": 321,
+                    "tribunal_code": 1222,
                 },
                 {
                     "key": "eyJruckey",
@@ -1072,7 +1159,7 @@ class TestSyncEngine:
                     "tribunal": "3° Juzgado de Garantía de Santiago",
                     "caratulado": "TEST",
                     "fecha_ingreso": "2025-01-15",
-                    "tribunal_code": 321,
+                    "tribunal_code": 1222,
                 },
             ])
             mock_detail.return_value = _mock_detail_response()

@@ -75,6 +75,55 @@ async def test_catalog_falls_back_to_snapshot_when_live_fails():
     assert result.options == [{"code": "123", "label": "2º Juzgado Civil de Santiago"}]
 
 
+def test_loaded_snapshot_resolves_one_global_tribunal_identity_without_pool_io():
+    """Broad worker lookup must use loaded official data, never a second slot."""
+    pool = MagicMock()
+    service = CatalogService(
+        pool,
+        snapshot={
+            "generated_at": "2026-08-06T00:00:00+00:00",
+            "tribunals": {
+                "civil:90:1": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [{"code": "321", "label": "2º Juzgado Civil de Santiago"}],
+                },
+                "civil:91:1": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [{"code": "400", "label": "1º Juzgado Civil de San Miguel"}],
+                },
+            },
+        },
+    )
+
+    identity = service.resolve_loaded_tribunal("civil", " 2° juzgado civil de santiago ")
+
+    assert identity is not None
+    assert (identity.court_code, identity.tribunal_code) == (90, 321)
+    assert identity.tribunal_label == "2º Juzgado Civil de Santiago"
+    pool.acquire.assert_not_called()
+
+
+def test_loaded_snapshot_fails_closed_when_label_maps_to_two_courts():
+    service = CatalogService(
+        MagicMock(),
+        snapshot={
+            "generated_at": "2026-08-06T00:00:00+00:00",
+            "tribunals": {
+                "civil:90:1": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [{"code": "321", "label": "Juzgado Duplicado"}],
+                },
+                "civil:91:1": {
+                    "fetched_at": "2026-08-06T00:00:00+00:00",
+                    "options": [{"code": "400", "label": "Juzgado Duplicado"}],
+                },
+            },
+        },
+    )
+
+    assert service.resolve_loaded_tribunal("civil", "juzgado duplicado") is None
+
+
 @pytest.mark.asyncio
 async def test_catalog_uses_nonempty_live_value_for_24_hour_cache(monkeypatch):
     """Catches refetching every request instead of keeping the live catalog for its TTL."""

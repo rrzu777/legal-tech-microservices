@@ -9,7 +9,7 @@ import httpx
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
-from app.catalogs import CatalogService
+from app.catalogs import CatalogService, normalize_catalog_label
 from app.document_downloader import download_documents, download_single_document
 from app.failure_kind import (
     UpstreamChangedError,
@@ -20,9 +20,8 @@ from app.failure_kind import (
 )
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
-from app.matching import is_definitive_not_found, matches_requested_candidate, normalize_label, rank_matches
+from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
 from app.models import CandidateMatch, SearchRequest
-from app.routes.search import _resolve_tribunal_code_from_options
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
@@ -160,17 +159,9 @@ def _canonical_search_request(case: dict, competencia: str) -> SearchRequest | N
 
 
 def _matches_known_context(candidate: CandidateMatch, request: SearchRequest) -> bool:
-    """Reject only conflicting official codes; absent parser enrichment is neutral."""
-    tribunal_matches = (
-        request.tribunal is None
-        or candidate.tribunal_code is None
-        or candidate.tribunal_code == request.tribunal
-    )
-    corte_matches = (
-        request.corte is None
-        or candidate.corte_code is None
-        or candidate.corte_code == request.corte
-    )
+    """Known v2 context requires complete, matching official codes."""
+    tribunal_matches = request.tribunal is None or candidate.tribunal_code == request.tribunal
+    corte_matches = request.corte is None or candidate.corte_code == request.corte
     return tribunal_matches and corte_matches
 
 
@@ -190,13 +181,14 @@ def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMa
 def _dedupe_candidates(candidates: list[CandidateMatch]) -> list[CandidateMatch]:
     """Collapse repeated PJUD rows before exact-match ambiguity is evaluated."""
     unique: list[CandidateMatch] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     for candidate in candidates:
         identity = (
-            candidate.key,
-            normalize_label(candidate.rol),
-            normalize_label(candidate.ruc or ""),
-            normalize_label(candidate.tribunal),
+            normalize_catalog_label(candidate.rol),
+            normalize_catalog_label(candidate.ruc or ""),
+            str(candidate.corte_code) if candidate.corte_code is not None else normalize_catalog_label(candidate.corte or ""),
+            str(candidate.tribunal_code) if candidate.tribunal_code is not None else normalize_catalog_label(candidate.tribunal),
+            candidate.libro_code or normalize_catalog_label(candidate.libro or ""),
         )
         if identity not in seen:
             seen.add(identity)
@@ -297,21 +289,21 @@ class SyncEngine:
     async def _enrich_candidates(
         self, matches: list[dict], request: SearchRequest
     ) -> list[dict]:
-        """Resolve tribunal labels once from the official catalog, never by guesswork."""
-        if request.corte is None:
-            return matches
-        try:
-            catalog = await self._catalog_service.tribunals(request.competencia, request.corte)
-        except Exception:
-            logger.warning("Catalog unavailable while correlating PJUD candidates", exc_info=True)
-            return matches
-        codes: dict[str, int | None] = {}
+        """Enrich parser labels from loaded official data without nested pool I/O."""
+        resolved_labels = {}
         enriched: list[dict] = []
         for match in matches:
             label = str(match.get("tribunal", ""))
-            if label not in codes:
-                codes[label] = _resolve_tribunal_code_from_options(catalog.options, label)
-            enriched.append({**match, "tribunal_code": codes[label]})
+            if label not in resolved_labels:
+                resolved_labels[label] = self._catalog_service.resolve_loaded_tribunal(
+                    request.competencia, label, corte=request.corte,
+                )
+            identity = resolved_labels[label]
+            enriched.append({
+                **match,
+                "tribunal_code": identity.tribunal_code if identity else None,
+                "corte_code": identity.court_code if identity else None,
+            })
         return enriched
 
     async def _handle_transient(self, case: dict, status: str, message: str):
@@ -460,7 +452,12 @@ class SyncEngine:
                 candidates = await self._enrich_candidates(search_result["matches"], canonical_request)
                 confirmed_match = _confirmed_match(candidates, canonical_request)
                 if canonical_request.allow_broad and (
-                    confirmed_match is None or confirmed_match.tribunal_code is None
+                    confirmed_match is None
+                    or confirmed_match.tribunal_code is None
+                    or (
+                        canonical_request.competencia != "apelaciones"
+                        and confirmed_match.corte_code is None
+                    )
                 ):
                     confirmed_match = None
                 if confirmed_match is None:
@@ -512,6 +509,45 @@ class SyncEngine:
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
 
+            identity_update = None
+            if (
+                canonical_request is not None
+                and canonical_request.allow_broad
+                and confirmed_match is not None
+            ):
+                # This happens after the same-session detail is known good but
+                # before *any* movement, document, payload or success write.
+                # A concurrent human selection wins over this automatic guess.
+                identity_update = {
+                    "tribunal_code": confirmed_match.tribunal_code,
+                    "tribunal_unknown": False,
+                    "court": confirmed_match.tribunal,
+                }
+                if canonical_request.competencia != "apelaciones":
+                    identity_update["court_code"] = confirmed_match.corte_code
+
+                identity_query = (
+                    self._sb.from_("cases").update(identity_update)
+                    .eq("id", case["id"])
+                    .eq("tribunal_unknown", True)
+                    .is_("tribunal_code", "null")
+                )
+                if canonical_request.competencia == "apelaciones":
+                    identity_query = identity_query.eq("court_code", case.get("court_code"))
+                else:
+                    identity_query = identity_query.is_("court_code", "null")
+                identity_result = await run_query(identity_query.select("id"))
+                if not getattr(identity_result, "data", None):
+                    await self._finish_run(
+                        sync_run_id, started_at, "error", 0, "identity_changed",
+                    )
+                    self._metrics.record_error("resolution")
+                    return {
+                        "success": False,
+                        "new_movements": 0,
+                        "status": "identity_changed",
+                    }
+
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
 
@@ -549,37 +585,7 @@ class SyncEngine:
                     "next_sync_at": next_sync,
                     "latest_movement_date": latest_date,
             }
-            identity_update = None
-            if (
-                canonical_request is not None
-                and canonical_request.allow_broad
-                and confirmed_match is not None
-                and confirmed_match.tribunal_code is not None
-            ):
-                # The parser never invents a code. It reaches this branch only
-                # when the search candidate was enriched by the official catalog
-                # and the corresponding detail request already succeeded.
-                identity_update = {
-                    "tribunal_code": confirmed_match.tribunal_code,
-                    "tribunal_unknown": False,
-                    "court": confirmed_match.tribunal,
-                }
-
             await run_query(self._sb.from_("cases").update(case_update).eq("id", case["id"]))
-            if identity_update is not None:
-                # Another actor may have confirmed a tribunal while this detail
-                # was in flight. Conditional update preserves that human choice.
-                identity_result = await run_query(
-                    self._sb.from_("cases").update(identity_update)
-                    .eq("id", case["id"])
-                    .eq("tribunal_unknown", True)
-                    .is_("tribunal_code", "null")
-                )
-                if not getattr(identity_result, "data", None):
-                    logger.info(
-                        "Skipped PJUD tribunal learning for case %s; identity was resolved concurrently",
-                        case["id"],
-                    )
 
             # Finish sync run
             await self._finish_run(sync_run_id, started_at, "success", new_count)

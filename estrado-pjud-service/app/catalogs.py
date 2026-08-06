@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -91,6 +93,15 @@ class CatalogResponse(BaseModel):
 
 
 @dataclass(frozen=True)
+class TribunalIdentity:
+    """One official PJUD tribunal identity resolved without network I/O."""
+
+    court_code: int
+    tribunal_code: int
+    tribunal_label: str
+
+
+@dataclass(frozen=True)
 class _CacheEntry:
     options: CatalogOptions
     fetched_at: str
@@ -118,6 +129,26 @@ def _unique_options(options: list[dict[str, str]]) -> CatalogOptions:
         seen_codes.add(code)
         result.append(option)
     return result
+
+
+def normalize_catalog_label(value: str) -> str:
+    """Stable label comparison shared by catalog consumers."""
+    # PJUD alternates between masculine ordinal and degree glyphs (``2º`` /
+    # ``2°``) for the same tribunal. They are typography, not identity.
+    value = value.replace("º", "").replace("°", "")
+    decomposed = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return re.sub(r"\W+", " ", decomposed).strip().upper()
+
+
+def resolve_catalog_code(options: CatalogOptions, label: str) -> int | None:
+    """Return a code only when one official option exactly matches the label."""
+    normalized_label = normalize_catalog_label(label)
+    codes = {
+        option["code"]
+        for option in options
+        if normalize_catalog_label(option["label"]) == normalized_label and option["code"].isdigit()
+    }
+    return int(codes.pop()) if len(codes) == 1 else None
 
 
 def parse_json_options(rows: object, code_key: str, label_key: str) -> CatalogOptions:
@@ -213,6 +244,65 @@ class CatalogService:
             "tipo_busqueda": str(tipo_busqueda),
         }
         return await self._get("tribunals", params, f"{competencia}:{corte}:{tipo_busqueda}")
+
+    def resolve_loaded_tribunal(
+        self, competencia: str, tribunal_label: str, *, corte: int | None = None
+    ) -> TribunalIdentity | None:
+        """Resolve from the loaded snapshot/cache only, never acquiring a session.
+
+        Broad worker searches hold the only PJUD slot while parsing results.  A
+        second live catalog fetch here would wait for that same slot forever at
+        pool size one, so this method deliberately has no async path and fails
+        closed when its official local data is absent or ambiguous.
+        """
+        target = normalize_catalog_label(tribunal_label)
+        if not target:
+            return None
+
+        by_court: dict[int, CatalogOptions] = {}
+        tribunals = self._snapshot.get("tribunals")
+        if isinstance(tribunals, dict):
+            for key, record in tribunals.items():
+                parts = key.split(":")
+                if len(parts) != 3 or parts[0] != competencia or parts[2] != "1":
+                    continue
+                try:
+                    court_code = int(parts[1])
+                except ValueError:
+                    continue
+                if corte is not None and court_code != corte:
+                    continue
+                if isinstance(record, dict):
+                    by_court[court_code] = _snapshot_options(record.get("options"))
+
+        # A fresh live lookup already loaded in this process is just as official
+        # as the snapshot and supersedes the stale record for its court. Reading
+        # it is local memory; it never turns into a nested pool acquisition.
+        prefix = f"tribunals:{competencia}:"
+        for cache_key, entry in self._cache.items():
+            if not cache_key.startswith(prefix) or not cache_key.endswith(":1"):
+                continue
+            court_text = cache_key[len(prefix):-2]
+            try:
+                court_code = int(court_text)
+            except ValueError:
+                continue
+            if corte is None or court_code == corte:
+                by_court[court_code] = entry.options
+
+        identities: dict[tuple[int, int], TribunalIdentity] = {}
+        for court_code, options in by_court.items():
+            for option in options:
+                if normalize_catalog_label(option["label"]) != target or not option["code"].isdigit():
+                    continue
+                tribunal_code = int(option["code"])
+                identities[(court_code, tribunal_code)] = TribunalIdentity(
+                    court_code=court_code,
+                    tribunal_code=tribunal_code,
+                    tribunal_label=option["label"],
+                )
+
+        return next(iter(identities.values())) if len(identities) == 1 else None
 
     async def books(
         self, competencia: str, corte: int | None, anno: int

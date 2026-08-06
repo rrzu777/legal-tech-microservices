@@ -5,8 +5,8 @@ from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
 from app.rate_limit import limiter
-from app.catalogs import CatalogResult
-from app.matching import build_search_response, is_definitive_not_found, normalize_label
+from app.catalogs import CatalogResult, resolve_catalog_code
+from app.matching import build_search_response, is_definitive_not_found
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import competencia_path, parse_search_identifier, resolve_libro
@@ -30,7 +30,7 @@ async def resolve_tribunal_code(
     result: CatalogResult = await catalog_service.tribunals(
         request.competencia, request.corte
     )
-    return _resolve_tribunal_code_from_options(result.options, tribunal_label)
+    return resolve_catalog_code(result.options, tribunal_label)
 
 
 async def resolve_corte_code(catalog_service, corte_label: str) -> int | None:
@@ -38,25 +38,7 @@ async def resolve_corte_code(catalog_service, corte_label: str) -> int | None:
     if catalog_service is None or not corte_label.strip():
         return None
     result: CatalogResult = await catalog_service.courts()
-    return _resolve_catalog_code_from_options(result.options, corte_label)
-
-
-def _resolve_tribunal_code_from_options(
-    options: list[dict[str, str]], tribunal_label: str
-) -> int | None:
-    return _resolve_catalog_code_from_options(options, tribunal_label)
-
-
-def _resolve_catalog_code_from_options(
-    options: list[dict[str, str]], label: str
-) -> int | None:
-    normalized_label = normalize_label(label)
-    codes = {
-        option["code"]
-        for option in options
-        if normalize_label(option["label"]) == normalized_label and option["code"].isdigit()
-    }
-    return int(codes.pop()) if len(codes) == 1 else None
+    return resolve_catalog_code(result.options, corte_label)
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -137,7 +119,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                         courts: CatalogResult = await catalog_service.courts()
                         for match in matches:
                             if match.corte and match.corte not in court_codes:
-                                court_codes[match.corte] = _resolve_catalog_code_from_options(
+                                court_codes[match.corte] = resolve_catalog_code(
                                     courts.options, match.corte
                                 )
                             if match.corte:
@@ -157,7 +139,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                     if catalog is not None:
                         for match in matches:
                             if match.tribunal not in resolved_labels:
-                                resolved_labels[match.tribunal] = _resolve_tribunal_code_from_options(
+                                resolved_labels[match.tribunal] = resolve_catalog_code(
                                     catalog.options, match.tribunal
                                 )
                             match.tribunal_code = resolved_labels[match.tribunal]
