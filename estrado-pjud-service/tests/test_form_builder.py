@@ -57,6 +57,33 @@ class TestBuildSearchFormData:
         assert form["conCorte"] == "90"
         assert form["conTribunal"] == "123"
 
+    def test_canonical_suprema_maps_explicit_none_filters_to_zero(self):
+        form = build_search_form_data(
+            competencia="suprema",
+            case_type="rol",
+            case_number="340-2025",
+            corte=None,
+            tribunal=None,
+            search_mode="supreme_resource",
+        )
+        assert form["conCorte"] == "0"
+        assert form["conTribunal"] == "0"
+
+    def test_first_instance_broad_maps_explicit_none_filters_to_zero(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="340-2025",
+            corte=None,
+            tribunal=None,
+            libro="31",
+            search_mode="first_instance",
+            allow_broad=True,
+        )
+        assert form["conCorte"] == "0"
+        assert form["conTribunal"] == "0"
+        assert form["conTipoBusApe"] == "1"
+
     def test_unknown_libro_logs_warning(self, caplog):
         """Unknown libro value logs a warning but doesn't raise."""
         import logging

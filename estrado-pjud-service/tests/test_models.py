@@ -91,6 +91,23 @@ class TestCanonicalSearchRequestV2:
                 search_mode="first_instance",
             )
 
+    @pytest.mark.parametrize("search_mode,tribunal", [
+        ("appeals_resource", None),
+        ("first_instance", 1234),
+    ])
+    def test_v2_appeals_rejects_v1_all_courts_sentinel(self, search_mode, tribunal):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=0,
+                tribunal=tribunal,
+                libro="31",
+                search_mode=search_mode,
+            )
+
     def test_v2_supreme_accepts_only_supreme_resource_fields(self):
         req = SearchRequest(
             contract_version=2,
@@ -172,6 +189,26 @@ class TestCanonicalSearchRequestV2:
         )
         assert req.contract_version == 1
 
+    def test_v1_keeps_legacy_case_type_values(self):
+        req = SearchRequest(
+            case_type="legacy-cause-type",
+            case_number="O-243-2025",
+            competencia="penal",
+            libro="1",
+        )
+        assert req.case_type == "legacy-cause-type"
+
+    def test_v2_rejects_legacy_case_type_values(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="legacy-cause-type",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=123,
+            )
+
     def test_detail_request_carries_canonical_search_fields(self):
         req = DetailRequest(
             detail_key="key",
@@ -187,6 +224,41 @@ class TestCanonicalSearchRequestV2:
         )
         assert req.tribunal == 123
         assert req.max_matches == 25
+
+    def test_detail_v2_rejects_invalid_canonical_combinations(self):
+        with pytest.raises(ValidationError):
+            DetailRequest(detail_key="key", contract_version=2)
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=0,
+                libro="31",
+                search_mode="appeals_resource",
+            )
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="C-1-2026",
+                competencia="civil",
+                corte=90,
+                tribunal=-1,
+            )
+        with pytest.raises(ValidationError):
+            DetailRequest(
+                detail_key="key",
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="suprema",
+                corte=90,
+                search_mode="supreme_resource",
+            )
 
 
 class TestSearchRequestCorte:

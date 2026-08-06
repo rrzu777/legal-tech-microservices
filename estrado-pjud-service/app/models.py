@@ -33,9 +33,75 @@ VALID_CORTE_CODES = {
 }
 
 
+def _validate_v2_search_contract(
+    *,
+    case_type: str,
+    case_number: str,
+    competencia: COMPETENCIA_TYPE,
+    corte: int | None,
+    tribunal: int | None,
+    libro: str | None,
+    search_mode: SearchMode | None,
+    allow_broad: bool,
+) -> None:
+    if case_type not in {"rol", "rit", "ruc"}:
+        raise ValueError("v2 case_type must be rol, rit, or ruc")
+    if corte is not None and (corte == 0 or corte not in VALID_CORTE_CODES):
+        raise ValueError(
+            f"Invalid v2 corte code {corte}; must be a real court code from {sorted(VALID_CORTE_CODES - {0})}"
+        )
+    if tribunal is not None and tribunal <= 0:
+        raise ValueError("tribunal must be a positive integer")
+
+    if competencia == "suprema":
+        if case_type != "rol" or search_mode != "supreme_resource":
+            raise ValueError("v2 suprema requires rol with search_mode='supreme_resource'")
+        if not _NUMERO_ANNO_RE.fullmatch(case_number):
+            raise ValueError("v2 suprema requires case_number numero-año")
+        if any(value is not None for value in (corte, tribunal, libro)) or allow_broad:
+            raise ValueError("v2 suprema does not accept corte, tribunal, libro, or allow_broad")
+        return
+
+    if competencia == "apelaciones":
+        if case_type != "rol" or not _NUMERO_ANNO_RE.fullmatch(case_number):
+            raise ValueError("v2 apelaciones requires rol with case_number numero-año")
+        if corte is None or libro is None:
+            raise ValueError("v2 apelaciones requires corte and libro")
+        if search_mode not in {"appeals_resource", "first_instance"}:
+            raise ValueError("v2 apelaciones requires a valid search_mode")
+        if search_mode == "appeals_resource":
+            if tribunal is not None or allow_broad:
+                raise ValueError("appeals_resource does not accept tribunal or allow_broad")
+        elif tribunal is None and not allow_broad:
+            raise ValueError("first_instance requires tribunal unless allow_broad is true")
+        return
+
+    if search_mode is not None:
+        raise ValueError("search_mode is only valid for suprema and apelaciones")
+    if competencia == "penal":
+        if case_type not in {"rit", "ruc"}:
+            raise ValueError("v2 penal requires rit or ruc")
+        if case_type == "rit" and not _RIT_IDENTIFIER_RE.fullmatch(case_number.strip()):
+            raise ValueError("v2 penal RIT requires prefijo-numero-año")
+        if case_type == "ruc" and not _RUC_IDENTIFIER_RE.fullmatch(case_number.strip()):
+            raise ValueError("v2 penal RUC requires digitos-DV")
+        if case_type == "ruc" and libro is not None:
+            raise ValueError("v2 penal RUC does not accept libro")
+        if case_type == "rit" and libro is None:
+            raise ValueError("v2 penal RIT requires libro")
+    elif case_type == "ruc":
+        raise ValueError("v2 civil, laboral, and cobranza do not accept ruc")
+
+    if allow_broad:
+        if corte is not None or tribunal is not None:
+            raise ValueError("allow_broad requires corte and tribunal to be omitted")
+    elif corte is None or tribunal is None:
+        raise ValueError("v2 searches require corte and tribunal unless allow_broad is true")
+
+
 class SearchRequest(BaseModel):
     contract_version: Literal[1, 2] = 1
-    case_type: Literal["rol", "rit", "ruc"]
+    case_type: str
     case_number: str  # "X-NNNN-YYYY"
     competencia: COMPETENCIA_TYPE
     corte: int | None = None
@@ -61,57 +127,16 @@ class SearchRequest(BaseModel):
         return self
 
     def _validate_v2(self):
-        if self.corte is not None and self.corte not in VALID_CORTE_CODES:
-            raise ValueError(
-                f"Invalid corte code {self.corte}; must be one of {sorted(VALID_CORTE_CODES)}"
-            )
-        if self.tribunal is not None and self.tribunal <= 0:
-            raise ValueError("tribunal must be a positive integer")
-
-        if self.competencia == "suprema":
-            if self.case_type != "rol" or self.search_mode != "supreme_resource":
-                raise ValueError("v2 suprema requires rol with search_mode='supreme_resource'")
-            if not _NUMERO_ANNO_RE.fullmatch(self.case_number):
-                raise ValueError("v2 suprema requires case_number numero-año")
-            if any(value is not None for value in (self.corte, self.tribunal, self.libro)) or self.allow_broad:
-                raise ValueError("v2 suprema does not accept corte, tribunal, libro, or allow_broad")
-            return self
-
-        if self.competencia == "apelaciones":
-            if self.case_type != "rol" or not _NUMERO_ANNO_RE.fullmatch(self.case_number):
-                raise ValueError("v2 apelaciones requires rol with case_number numero-año")
-            if self.corte is None or self.libro is None:
-                raise ValueError("v2 apelaciones requires corte and libro")
-            if self.search_mode not in {"appeals_resource", "first_instance"}:
-                raise ValueError("v2 apelaciones requires a valid search_mode")
-            if self.search_mode == "appeals_resource":
-                if self.tribunal is not None or self.allow_broad:
-                    raise ValueError("appeals_resource does not accept tribunal or allow_broad")
-            elif self.tribunal is None and not self.allow_broad:
-                raise ValueError("first_instance requires tribunal unless allow_broad is true")
-            return self
-
-        if self.search_mode is not None:
-            raise ValueError("search_mode is only valid for suprema and apelaciones")
-        if self.competencia == "penal":
-            if self.case_type not in {"rit", "ruc"}:
-                raise ValueError("v2 penal requires rit or ruc")
-            if self.case_type == "rit" and not _RIT_IDENTIFIER_RE.fullmatch(self.case_number.strip()):
-                raise ValueError("v2 penal RIT requires prefijo-numero-año")
-            if self.case_type == "ruc" and not _RUC_IDENTIFIER_RE.fullmatch(self.case_number.strip()):
-                raise ValueError("v2 penal RUC requires digitos-DV")
-            if self.case_type == "ruc" and self.libro is not None:
-                raise ValueError("v2 penal RUC does not accept libro")
-            if self.case_type == "rit" and self.libro is None:
-                raise ValueError("v2 penal RIT requires libro")
-        elif self.case_type == "ruc":
-            raise ValueError("v2 civil, laboral, and cobranza do not accept ruc")
-
-        if self.allow_broad:
-            if self.corte is not None or self.tribunal is not None:
-                raise ValueError("allow_broad requires corte and tribunal to be omitted")
-        elif self.corte is None or self.tribunal is None:
-            raise ValueError("v2 searches require corte and tribunal unless allow_broad is true")
+        _validate_v2_search_contract(
+            case_type=self.case_type,
+            case_number=self.case_number,
+            competencia=self.competencia,
+            corte=self.corte,
+            tribunal=self.tribunal,
+            libro=self.libro,
+            search_mode=self.search_mode,
+            allow_broad=self.allow_broad,
+        )
         return self
 
 
@@ -135,7 +160,7 @@ class SearchResponse(BaseModel):
 class DetailRequest(BaseModel):
     detail_key: str
     contract_version: Literal[1, 2] = 1
-    case_type: Literal["rol", "rit", "ruc"] | None = None
+    case_type: str | None = None
     competencia: COMPETENCIA_TYPE | None = None
     # Optional search params: when provided, the detail endpoint performs a search
     # on the SAME session before fetching the detail, ensuring JWT + CSRF affinity.
@@ -147,6 +172,24 @@ class DetailRequest(BaseModel):
     search_mode: SearchMode | None = None
     allow_broad: bool = False
     max_matches: int = Field(default=10, ge=1, le=25)
+
+    @model_validator(mode="after")
+    def _validate_v2_search_contract(self):
+        if self.contract_version == 1:
+            return self
+        if self.case_type is None or self.case_number is None or self.competencia is None:
+            raise ValueError("v2 detail requires case_type, case_number, and competencia")
+        _validate_v2_search_contract(
+            case_type=self.case_type,
+            case_number=self.case_number,
+            competencia=self.competencia,
+            corte=self.corte,
+            tribunal=self.tribunal,
+            libro=self.libro,
+            search_mode=self.search_mode,
+            allow_broad=self.allow_broad,
+        )
+        return self
 
 
 class CaseMetadata(BaseModel):

@@ -153,11 +153,6 @@
           "case_type": {
             "anyOf": [
               {
-                "enum": [
-                  "rol",
-                  "rit",
-                  "ruc"
-                ],
                 "type": "string"
               },
               {
@@ -825,11 +820,6 @@
             "type": "string"
           },
           "case_type": {
-            "enum": [
-              "rol",
-              "rit",
-              "ruc"
-            ],
             "title": "Case Type",
             "type": "string"
           },
