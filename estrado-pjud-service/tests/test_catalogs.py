@@ -40,6 +40,17 @@ def test_parse_html_options_rejects_non_option_html_and_keeps_utf8_labels():
     ) == [{"code": "31", "label": "Penal – Ñuble"}]
 
 
+@pytest.mark.parametrize("html", [
+    '<!doctype html><body><option value="13">Metropolitana</option></body>',
+    '<body><option value="13">Metropolitana</option></body>',
+    '<form><option value="13">Metropolitana</option></form>',
+    '<option value="13">Metropolitana</option>unexpected',
+])
+def test_parse_html_options_rejects_anything_but_a_top_level_option_fragment(html):
+    """Catches WAF/login HTML that embeds a plausible-looking option tag."""
+    assert parse_html_options(html) == []
+
+
 @pytest.mark.asyncio
 async def test_catalog_falls_back_to_snapshot_when_live_fails():
     """Catches a timeout making catalog-dependent registration unavailable."""
@@ -100,6 +111,36 @@ async def test_empty_live_value_is_not_cached_or_used_as_a_catalog():
     assert result.source == "snapshot"
     assert result.options == [{"code": "90", "label": "C.A. de Santiago"}]
     assert service._cache == {}
+
+
+@pytest.mark.asyncio
+async def test_wrapped_books_html_invalidates_the_session_and_uses_snapshot():
+    """Catches caching a WAF/login page that embeds a valid-looking option."""
+    session = MagicMock()
+    session.catalog_html = AsyncMock(
+        return_value='<!doctype html><body><option value="13">Metropolitana</option></body>'
+    )
+    pool = MagicMock()
+    pool.acquire = AsyncMock(return_value=session)
+    pool.release = AsyncMock()
+    service = CatalogService(
+        pool,
+        snapshot={
+            "generated_at": "2026-08-05T12:00:00+00:00",
+            "books": {
+                "civil:90:2025": {
+                    "fetched_at": "2026-08-05T12:00:00+00:00",
+                    "options": [{"code": "C", "label": "C"}],
+                }
+            },
+        },
+    )
+
+    result = await service.books("civil", 90, 2025)
+
+    assert result.source == "snapshot"
+    assert service._cache == {}
+    pool.release.assert_awaited_once_with(session, healthy=False)
 
 
 @pytest.mark.asyncio

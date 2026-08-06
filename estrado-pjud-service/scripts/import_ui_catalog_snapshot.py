@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,9 @@ from typing import Any, Mapping
 
 SOURCE_URL = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 CAPTURED_AT = "2026-08-06T05:01:52.325Z"
+# SHA-256 of /tmp/juristrack-pjud-ui-catalog-2026-08-06.json, reviewed with
+# CAPTURED_AT above.  The CLI accepts no alternate digest.
+CAPTURE_SHA256 = "48d52f68100bd3cff6307dab3f7003de6901661d4b2bef0775e0abddc3886e76"
 HISTORICAL_APPEALS_AT = "2026-03-12T00:23:37+00:00"
 COURT_CODES = (
     "10", "11", "15", "20", "25", "30", "35", "40", "45", "46",
@@ -110,6 +114,13 @@ def _capture_time(value: Any) -> str:
     if value != CAPTURED_AT:
         _fail("UI capture is not the reviewed capture")
     return value
+
+
+def verify_source_digest(source_bytes: bytes, expected_sha256: str) -> None:
+    """Pin the reviewed capture bytes before JSON parsing or snapshot writes."""
+    actual_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        _fail("UI capture digest mismatch")
 
 
 def validate_capture(value: Any) -> ReviewedCapture:
@@ -234,8 +245,13 @@ def write_snapshot(snapshot: Mapping[str, Any], output: Path) -> None:
 
 def main(source: Path, output: Path) -> None:
     try:
-        raw_capture = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        source_bytes = source.read_bytes()
+    except OSError as error:
+        raise ValueError("unable to read UI capture") from error
+    verify_source_digest(source_bytes, CAPTURE_SHA256)
+    try:
+        raw_capture = json.loads(source_bytes)
+    except json.JSONDecodeError as error:
         raise ValueError("unable to read UI capture") from error
     write_snapshot(build_snapshot(validate_capture(raw_capture)), output)
 

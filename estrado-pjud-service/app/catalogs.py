@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -26,6 +27,49 @@ CatalogOptions = list[dict[str, str]]
 
 class CatalogContentError(ValueError):
     """PJUD returned a body that cannot safely be used as a catalog."""
+
+
+class _OptionFragmentValidator(HTMLParser):
+    """Accept only a whitespace-delimited sequence of closed top-level options."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.valid = True
+        self._option_open = False
+        self._option_count = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() != "option" or self._option_open:
+            self.valid = False
+            return
+        self._option_open = True
+        self._option_count += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "option" or not self._option_open:
+            self.valid = False
+            return
+        self._option_open = False
+
+    def handle_data(self, data: str) -> None:
+        if not self._option_open and data.strip():
+            self.valid = False
+
+    def handle_decl(self, decl: str) -> None:
+        self.valid = False
+
+    def handle_comment(self, data: str) -> None:
+        self.valid = False
+
+    def handle_pi(self, data: str) -> None:
+        self.valid = False
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        self.valid = False
+
+    @property
+    def is_complete(self) -> bool:
+        return self.valid and not self._option_open and self._option_count > 0
 
 
 @dataclass(frozen=True)
@@ -93,6 +137,11 @@ def parse_json_options(rows: object, code_key: str, label_key: str) -> CatalogOp
 def parse_html_options(html: str) -> CatalogOptions:
     """Parse PJUD's books `<option>` fragment; non-options are never catalogs."""
     if not html or detect_blocked(html):
+        return []
+    validator = _OptionFragmentValidator()
+    validator.feed(html)
+    validator.close()
+    if not validator.is_complete:
         return []
     soup = BeautifulSoup(html, "html.parser")
     # cmbTipos.php returns only an option fragment. A complete page may be a

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -56,11 +57,9 @@ def _capture() -> dict:
 
 
 def _import(capture: dict, tmp_path: Path, *, output_contents: str = "unchanged") -> Path:
-    source = tmp_path / "capture.json"
     output = tmp_path / "catalog_snapshot.json"
-    source.write_text(json.dumps(capture), encoding="utf-8")
     output.write_text(output_contents, encoding="utf-8")
-    importer.main(source, output)
+    importer.write_snapshot(importer.build_snapshot(importer.validate_capture(capture)), output)
     return output
 
 
@@ -68,6 +67,35 @@ def _assert_rejected_without_writing(capture: dict, tmp_path: Path) -> None:
     output = tmp_path / "catalog_snapshot.json"
     with pytest.raises(ValueError):
         _import(capture, tmp_path)
+    assert output.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize("mutate", ["code", "label"])
+def test_importer_rejects_digest_mismatch_before_writing_even_when_counts_hold(
+    tmp_path, monkeypatch, mutate,
+):
+    """Catches edits that preserve all structural coverage but change reviewed bytes."""
+    reviewed = _capture()
+    reviewed_bytes = json.dumps(reviewed, ensure_ascii=False).encode("utf-8")
+    capture = copy.deepcopy(reviewed)
+    if mutate == "code":
+        capture["courts"][0]["code"] = "999"
+        for competencia in capture["competencias"].values():
+            competencia["999"] = competencia.pop("10")
+    else:
+        capture["courts"][0]["label"] = "Etiqueta adulterada"
+
+    source = tmp_path / "capture.json"
+    output = tmp_path / "catalog_snapshot.json"
+    source.write_text(json.dumps(capture, ensure_ascii=False), encoding="utf-8")
+    output.write_text("unchanged", encoding="utf-8")
+    monkeypatch.setattr(
+        importer, "CAPTURE_SHA256", hashlib.sha256(reviewed_bytes).hexdigest(), raising=False,
+    )
+
+    with pytest.raises(ValueError, match="digest mismatch"):
+        importer.main(source, output)
+
     assert output.read_text(encoding="utf-8") == "unchanged"
 
 
