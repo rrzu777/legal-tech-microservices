@@ -178,6 +178,7 @@ def infra_exceptions() -> list:
     pool de IPs residenciales.
     """
     import httpx
+    from app.failure_kind import RejectedDetailSessionError
 
     return [
         httpx.ReadTimeout("timed out"),
@@ -186,4 +187,5 @@ def infra_exceptions() -> list:
         httpx.ProxyError("proxy down"),
         httpx.ReadError("connection reset"),
         httpx.RemoteProtocolError("server disconnected"),
+        RejectedDetailSessionError("405 vacío en detalle"),
     ]

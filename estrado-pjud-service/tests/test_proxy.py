@@ -91,9 +91,9 @@ class TestRedactProxyUrl:
         assert "pw_country-cl" not in result
         assert "tok12345" not in result
 
-    def test_preserves_host_user_port(self):
+    def test_preserves_host_port_but_masks_user(self):
         result = redact_proxy_url(DUMMY_BASE_URL)
         assert "geo.iproyal.com" in result
-        assert "user123" in result
+        assert "user123" not in result
         assert ":12321" in result
-        assert result == "http://user123:***@geo.iproyal.com:12321"
+        assert result == "http://***:***@geo.iproyal.com:12321"

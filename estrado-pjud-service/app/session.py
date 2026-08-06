@@ -9,6 +9,7 @@ from app.adapters.http_adapter import OJVHttpAdapter
 from app.failure_kind import (
     BlockedPageError,
     MissingCsrfTokenError,
+    RejectedDetailSessionError,
     reject_empty_body,
 )
 from app.parsers.search_parser import detect_blocked
@@ -88,7 +89,7 @@ class OJVSession:
         m = _CSRF_RE.search(html)
         if m:
             self.csrf_token = m.group(1)
-            logger.info("CSRF token acquired: %s...", self.csrf_token[:8])
+            logger.info("CSRF token acquired")
         else:
             logger.warning("CSRF token not found in initial page")
 
@@ -164,6 +165,10 @@ class OJVSession:
             "Detail response: comp=%s status=%d length=%d",
             competencia_path, resp.status_code, len(resp.content),
         )
+        if resp.status_code == 405 and not resp.content:
+            raise RejectedDetailSessionError(
+                f"OJV rechazó la sesión del detalle de {competencia_path} con HTTP 405 vacío"
+            )
         resp.raise_for_status()
         return _decode(resp)
 
