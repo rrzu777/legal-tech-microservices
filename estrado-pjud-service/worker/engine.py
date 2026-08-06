@@ -9,6 +9,7 @@ import httpx
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
+from app.catalogs import CatalogService
 from app.document_downloader import download_documents, download_single_document
 from app.failure_kind import (
     UpstreamChangedError,
@@ -19,8 +20,9 @@ from app.failure_kind import (
 )
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
 from app.familia.parser import parse_familia_results
-from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
+from app.matching import is_definitive_not_found, matches_requested_candidate, normalize_label, rank_matches
 from app.models import CandidateMatch, SearchRequest
+from app.routes.search import _resolve_tribunal_code_from_options
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
@@ -36,6 +38,10 @@ _BLOCK_DURATION_S = 3600  # 1 hour
 # lo más 1 por hora, para no spamear Telegram ante un drift global del parser.
 _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
+
+
+class InvalidCanonicalIdentityError(ValueError):
+    """Persisted v2 identity is present but violates PJUD's v2 contract."""
 
 MATTER_TO_COMPETENCIA = {
     "civil": "civil",
@@ -137,7 +143,15 @@ def _canonical_search_request(case: dict, competencia: str) -> SearchRequest | N
             competencia=competencia,
             **search_params_from_case(case),
         )
-    except ValueError:
+    except ValueError as exc:
+        canonical_signal = (
+            case.get("pjud_search_mode") is not None
+            or case.get("tribunal_code") is not None
+            or case.get("tribunal_unknown") is True
+            or (competencia != "apelaciones" and case.get("court_code") is not None)
+        )
+        if canonical_signal:
+            raise InvalidCanonicalIdentityError(str(exc)) from exc
         logger.info(
             "Case %s has incomplete canonical PJUD identity; retaining v1 compatibility",
             case.get("id"),
@@ -162,7 +176,7 @@ def _matches_known_context(candidate: CandidateMatch, request: SearchRequest) ->
 
 def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMatch | None:
     """Return one exact official candidate, never an arbitrary result row."""
-    candidates = [CandidateMatch.model_validate(match) for match in matches]
+    candidates = _dedupe_candidates([CandidateMatch.model_validate(match) for match in matches])
     ranked = rank_matches(candidates, request)
     exact = [
         candidate
@@ -171,6 +185,23 @@ def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMa
         and _matches_known_context(candidate, request)
     ]
     return exact[0] if len(exact) == 1 else None
+
+
+def _dedupe_candidates(candidates: list[CandidateMatch]) -> list[CandidateMatch]:
+    """Collapse repeated PJUD rows before exact-match ambiguity is evaluated."""
+    unique: list[CandidateMatch] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for candidate in candidates:
+        identity = (
+            candidate.key,
+            normalize_label(candidate.rol),
+            normalize_label(candidate.ruc or ""),
+            normalize_label(candidate.tribunal),
+        )
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(candidate)
+    return unique
 
 
 def _dedupe_movement_keys(keys: list[str]) -> list[str]:
@@ -245,13 +276,14 @@ async def detail_pjud_via_session(session, competencia: str, detail_key: str, ti
 
 
 class SyncEngine:
-    def __init__(self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig):
+    def __init__(self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig, catalog_service=None):
         self._pool = pool
         self._sb = supabase
         self._notifier = notifier
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._catalog_service = catalog_service or CatalogService(pool)
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
@@ -261,6 +293,36 @@ class SyncEngine:
                 endpoint=config.R2_ENDPOINT,
                 bucket=config.R2_BUCKET,
             )
+
+    async def _enrich_candidates(
+        self, matches: list[dict], request: SearchRequest
+    ) -> list[dict]:
+        """Resolve tribunal labels once from the official catalog, never by guesswork."""
+        if request.corte is None:
+            return matches
+        try:
+            catalog = await self._catalog_service.tribunals(request.competencia, request.corte)
+        except Exception:
+            logger.warning("Catalog unavailable while correlating PJUD candidates", exc_info=True)
+            return matches
+        codes: dict[str, int | None] = {}
+        enriched: list[dict] = []
+        for match in matches:
+            label = str(match.get("tribunal", ""))
+            if label not in codes:
+                codes[label] = _resolve_tribunal_code_from_options(catalog.options, label)
+            enriched.append({**match, "tribunal_code": codes[label]})
+        return enriched
+
+    async def _handle_transient(self, case: dict, status: str, message: str):
+        retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
+        await run_query(
+            self._sb.from_("cases").update({
+                "last_sync_status": status,
+                "last_sync_error": message,
+                "next_sync_at": retry_at,
+            }).eq("id", case["id"])
+        )
 
     async def sync_case(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
@@ -316,7 +378,13 @@ class SyncEngine:
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
-            canonical_request = _canonical_search_request(case, competencia)
+            try:
+                canonical_request = _canonical_search_request(case, competencia)
+            except InvalidCanonicalIdentityError as exc:
+                await self._finish_run(sync_run_id, started_at, "error", 0, "invalid_identity")
+                await self._handle_transient(case, "invalid_identity", str(exc))
+                self._metrics.record_error("resolution")
+                return {"success": False, "new_movements": 0, "status": "invalid_identity"}
             if canonical_request is None and parsed is None:
                 await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
                 await self._update_case_error(case, "Identificador invalido")
@@ -389,7 +457,12 @@ class SyncEngine:
             # first-row behavior until their identity is backfilled.
             confirmed_match = None
             if canonical_request is not None:
-                confirmed_match = _confirmed_match(search_result["matches"], canonical_request)
+                candidates = await self._enrich_candidates(search_result["matches"], canonical_request)
+                confirmed_match = _confirmed_match(candidates, canonical_request)
+                if canonical_request.allow_broad and (
+                    confirmed_match is None or confirmed_match.tribunal_code is None
+                ):
+                    confirmed_match = None
                 if confirmed_match is None:
                     await self._finish_run(
                         sync_run_id, started_at, "error", 0, "needs_disambiguation",
@@ -476,6 +549,7 @@ class SyncEngine:
                     "next_sync_at": next_sync,
                     "latest_movement_date": latest_date,
             }
+            identity_update = None
             if (
                 canonical_request is not None
                 and canonical_request.allow_broad
@@ -485,13 +559,27 @@ class SyncEngine:
                 # The parser never invents a code. It reaches this branch only
                 # when the search candidate was enriched by the official catalog
                 # and the corresponding detail request already succeeded.
-                case_update.update({
+                identity_update = {
                     "tribunal_code": confirmed_match.tribunal_code,
                     "tribunal_unknown": False,
                     "court": confirmed_match.tribunal,
-                })
+                }
 
             await run_query(self._sb.from_("cases").update(case_update).eq("id", case["id"]))
+            if identity_update is not None:
+                # Another actor may have confirmed a tribunal while this detail
+                # was in flight. Conditional update preserves that human choice.
+                identity_result = await run_query(
+                    self._sb.from_("cases").update(identity_update)
+                    .eq("id", case["id"])
+                    .eq("tribunal_unknown", True)
+                    .is_("tribunal_code", "null")
+                )
+                if not getattr(identity_result, "data", None):
+                    logger.info(
+                        "Skipped PJUD tribunal learning for case %s; identity was resolved concurrently",
+                        case["id"],
+                    )
 
             # Finish sync run
             await self._finish_run(sync_run_id, started_at, "success", new_count)
@@ -505,6 +593,17 @@ class SyncEngine:
             logger.info("Synced case %s: %d new movements", case["case_number"], new_count)
             return {"success": True, "new_movements": new_count}
 
+        except (asyncio.TimeoutError, httpx.TimeoutException) as e:
+            session_healthy = False
+            await self._finish_run(sync_run_id, started_at, "error", 0, "pjud_timeout")
+            await self._handle_transient(case, "pjud_timeout", str(e))
+            self._metrics.record_error("infra")
+            return {"success": False, "new_movements": 0, "status": "pjud_timeout"}
+        except UpstreamChangedError as e:
+            await self._finish_run(sync_run_id, started_at, "error", 0, "upstream_changed")
+            await self._handle_transient(case, "upstream_changed", str(e))
+            self._metrics.record_error("infra")
+            return {"success": False, "new_movements": 0, "status": "upstream_changed"}
         except Exception as e:
             # Un solo `except`, clasificado, en vez de dos listas de tipos. La
             # anterior era `(httpx.TransportError, asyncio.TimeoutError)`, y

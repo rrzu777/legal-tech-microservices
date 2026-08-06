@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
+from pathlib import Path
 
 from tests.helpers import find_update_payload, http_status_error
 
@@ -249,6 +250,7 @@ class TestSyncEngine:
         # Anti-apagón: a block must never penalize the case via _update_case_error
         # nor increment consecutive_sync_failures.
         mock_update_error.assert_not_called()
+        assert result.get("status") is None
         update_calls = chain.update.call_args_list
         for call in update_calls:
             payload = call[0][0] if call[0] else {}
@@ -335,6 +337,7 @@ class TestSyncEngine:
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
         # Anti-apagón: a block must never penalize the case via _update_case_error.
         mock_update_error.assert_not_called()
+        assert result.get("status") is None
 
     @pytest.mark.asyncio
     async def test_sync_parse_suspect_short_circuits_without_clobber(self):
@@ -363,11 +366,7 @@ class TestSyncEngine:
 
     @pytest.mark.asyncio
     async def test_sync_timeout_is_infra_non_penalizing(self):
-        """G2: a timeout is an INFRA failure (bad/slow residential IP), not the
-        case's fault. It must be treated like a block: _handle_blocked (which
-        calls record_blocked, NOT record_failure), no _update_case_error, no
-        consecutive_sync_failures increment, and release(healthy=False) so the slot
-        re-mints."""
+        """A timeout remints only its session; it does not open the OJV breaker."""
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
         mock_session = mock_pool.acquire.return_value
 
@@ -379,15 +378,38 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is False
-        mock_backoff.record_blocked.assert_called_once()
+        mock_backoff.record_blocked.assert_not_called()
         mock_backoff.record_failure.assert_not_called()
         mock_metrics.record_error.assert_called_once()
         mock_update_error.assert_not_called()
+        assert result["status"] == "pjud_timeout"
+        assert find_update_payload(mock_sb, last_sync_status="pjud_timeout") is not None
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
         update_calls = mock_sb.from_.return_value.update.call_args_list
         for call in update_calls:
             payload = call[0][0] if call[0] else {}
             assert "consecutive_sync_failures" not in payload
+
+    @pytest.mark.asyncio
+    async def test_sync_upstream_changed_keeps_session_healthy_without_breaker(self):
+        """Valid PJUD HTML with parser drift is operationally distinct from WAF."""
+        from app.failure_kind import UpstreamChangedError
+
+        engine, mock_pool, mock_sb, _notifier, mock_metrics, mock_backoff = _make_engine()
+        mock_session = mock_pool.acquire.return_value
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
+            mock_search.side_effect = UpstreamChangedError("unexpected PJUD markup")
+            result = await engine.sync_case(_make_case())
+
+        assert result == {"success": False, "new_movements": 0, "status": "upstream_changed"}
+        mock_backoff.record_blocked.assert_not_called()
+        mock_backoff.record_failure.assert_not_called()
+        mock_update_error.assert_not_called()
+        mock_metrics.record_error.assert_called_once_with("infra")
+        assert find_update_payload(mock_sb, last_sync_status="upstream_changed") is not None
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
 
     @pytest.mark.asyncio
     async def test_sync_transport_error_is_infra_non_penalizing(self):
@@ -428,8 +450,9 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is False
-        mock_backoff.record_blocked.assert_called_once()
+        mock_backoff.record_blocked.assert_not_called()
         mock_update_error.assert_not_called()
+        assert result["status"] == "pjud_timeout"
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
 
     @pytest.mark.asyncio
@@ -725,6 +748,13 @@ class TestSyncEngine:
         which loses the persisted PJUD identity after the case was confirmed.
         """
         engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        from app.catalogs import CatalogResult
+        catalog = AsyncMock()
+        catalog.tribunals.return_value = CatalogResult(
+            options=[{"code": "321", "label": "3° Juzgado de Garantía de Santiago"}],
+            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
+        )
+        engine._catalog_service = catalog
         case = _make_case(
             matter="penal",
             case_number="O-243-2025",
@@ -744,7 +774,6 @@ class TestSyncEngine:
                 "tribunal": "3° Juzgado de Garantía de Santiago",
                 "caratulado": "TEST",
                 "fecha_ingreso": "2025-01-15",
-                "tribunal_code": 321,
             }])
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
@@ -756,6 +785,39 @@ class TestSyncEngine:
         assert form["conTipoCausa"] == "1"
         assert form["radio-groupPenal"] == "1"
         assert mock_search.call_args.args[0] is mock_detail.call_args.args[0]
+        catalog.tribunals.assert_awaited_once_with("penal", 90)
+
+    @pytest.mark.asyncio
+    async def test_sync_enriches_real_parser_candidate_with_official_catalog(self):
+        """The worker must resolve a parser label through one official catalog lookup."""
+        from app.catalogs import CatalogResult
+
+        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        catalog = AsyncMock()
+        catalog.tribunals.return_value = CatalogResult(
+            options=[{"code": "321", "label": "4º Juzgado de Garantía de Santiago"}],
+            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
+        )
+        engine._catalog_service = catalog
+        case = _make_case(
+            matter="penal",
+            case_number="O-100-2025",
+            case_type="rit",
+            court_code=90,
+            tribunal_code=321,
+            libro="1",
+            tribunal_unknown=False,
+        )
+        fixture = (Path(__file__).parent / "fixtures" / "search_Penal_O_100_2025.html").read_text()
+        mock_pool.acquire.return_value.search = AsyncMock(return_value=fixture)
+
+        with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+        catalog.tribunals.assert_awaited_once_with("penal", 90)
+        mock_detail.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_sync_broad_ambiguous_candidates_require_resolution_without_detail(self):
@@ -804,9 +866,63 @@ class TestSyncEngine:
         assert "consecutive_sync_failures" not in resolution_update
 
     @pytest.mark.asyncio
+    async def test_invalid_canonical_identity_never_falls_back_to_first_legacy_match(self):
+        """A populated but invalid v2 identity must not re-enable matches[0]."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        case = _make_case(
+            court_code=90,
+            tribunal_code=321,
+            libro="INVALID",
+            tribunal_unknown=False,
+        )
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            result = await engine.sync_case(case)
+
+        assert result["status"] == "invalid_identity"
+        mock_search.assert_not_awaited()
+        mock_detail.assert_not_awaited()
+        assert find_update_payload(mock_sb, last_sync_status="invalid_identity") is not None
+
+    @pytest.mark.asyncio
+    async def test_duplicate_logical_candidates_do_not_create_false_ambiguity(self):
+        """PJUD can repeat the same row; only distinct identities are ambiguous."""
+        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        catalog = AsyncMock()
+        from app.catalogs import CatalogResult
+        catalog.tribunals.return_value = CatalogResult(
+            options=[{"code": "321", "label": "2° Juzgado Civil de Santiago"}],
+            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
+        )
+        engine._catalog_service = catalog
+        case = _make_case(court_code=90, tribunal_code=321, libro="C", tribunal_unknown=False)
+        candidate = {
+            "key": "eyJsame",
+            "rol": "C-1234-2024",
+            "tribunal": "2° Juzgado Civil de Santiago",
+            "caratulado": "TARGET",
+            "fecha_ingreso": "2024-01-15",
+        }
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response(matches=[candidate, candidate.copy()])
+            mock_detail.return_value = _mock_detail_response()
+            result = await engine.sync_case(case)
+
+        assert result["success"] is True
+        mock_detail.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_sync_rejects_exact_identifier_with_conflicting_official_tribunal(self):
         """Known canonical tribunal codes are a hard anti-contamination signal."""
         engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        from app.catalogs import CatalogResult
+        catalog = AsyncMock()
+        catalog.tribunals.return_value = CatalogResult(
+            options=[{"code": "999", "label": "9° Juzgado Civil de Santiago"}],
+            source="snapshot", fetched_at="2026-08-06T00:00:00Z",
+        )
+        engine._catalog_service = catalog
         case = _make_case(
             court_code=90,
             tribunal_code=321,
@@ -821,7 +937,6 @@ class TestSyncEngine:
                 "key": "eyJwrongtribunal",
                 "rol": "C-1234-2024",
                 "tribunal": "9° Juzgado Civil de Santiago",
-                "tribunal_code": 999,
                 "caratulado": "TARGET",
                 "fecha_ingreso": "2024-01-15",
             }])
@@ -863,6 +978,9 @@ class TestSyncEngine:
         assert learned_update is not None
         assert learned_update["court"] == "2° Juzgado Civil de Santiago"
         assert learned_update["tribunal_unknown"] is False
+        chain = mock_sb.from_.return_value
+        chain.eq.assert_any_call("tribunal_unknown", True)
+        chain.is_.assert_called_once_with("tribunal_code", "null")
 
     @pytest.mark.asyncio
     async def test_sync_legacy_default_false_without_complete_identity_keeps_v1(self):
