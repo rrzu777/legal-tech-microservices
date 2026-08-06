@@ -107,6 +107,8 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        chain.order.return_value = chain
+        chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
 
@@ -148,6 +150,8 @@ class TestSyncEngine:
         chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        chain.order.return_value = chain
+        chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
 
@@ -608,12 +612,15 @@ class TestSyncEngine:
         chain.single.return_value = chain
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        chain.order.return_value = chain
+        chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
 
         # Return 0 for before-count, 2 for after-count
         execute_returns = [
             MagicMock(data={"id": "sync-run-1"}, count=None),  # sync run insert
+            MagicMock(data=[], count=None),  # existing movement identities
             MagicMock(data=[], count=0),   # before count
             MagicMock(data=[], count=None),  # upsert
             MagicMock(data=[], count=2),   # after count
@@ -1528,13 +1535,13 @@ class TestHelperFunctions:
         assert "#" not in rows[0]["external_movement_key"]
 
     @pytest.mark.asyncio
-    async def test_logical_duplicate_still_consumes_historical_folio_suffix(self):
+    async def test_logical_duplicate_does_not_consume_folio_suffix(self):
         engine, _, mock_sb, *_ = _make_engine()
         first = {
             "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
             "tramite": "Resolución", "descripcion": "Primera", "etapa": "",
         }
-        different = {**first, "tramite": "Escrito", "descripcion": "Segunda"}
+        different = {**first, "tramite": "", "descripcion": "Segunda"}
 
         await engine._upsert_movements(
             _make_case(),
@@ -1544,8 +1551,104 @@ class TestHelperFunctions:
         rows = mock_sb.from_.return_value.upsert.call_args.args[0]
         assert [row["external_movement_key"] for row in rows] == [
             "C-1234-2024:Principal:5",
-            "C-1234-2024:Principal:5#3",
+            "C-1234-2024:Principal:5#2",
         ]
+
+    def test_same_identity_keeps_key_when_pjud_reverses_response_order(self):
+        from worker.engine import _prepare_pjud_movements
+
+        primary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Movimiento principal",
+            "etapa": "Discusión", "foja": 10,
+        }
+        secondary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "", "descripcion": "Movimiento secundario",
+            "etapa": "", "foja": 10,
+        }
+
+        forward = _prepare_pjud_movements(
+            _make_case(), [primary, secondary], log_undated=False,
+        )
+        reverse = _prepare_pjud_movements(
+            _make_case(), [secondary, primary], log_undated=False,
+        )
+
+        forward_keys = {movement["descripcion"]: key for movement, key in forward}
+        reverse_keys = {movement["descripcion"]: key for movement, key in reverse}
+        assert forward_keys == reverse_keys
+
+    def test_foja_zero_is_not_collapsed_with_missing_foja(self):
+        from worker.engine import _prepare_pjud_movements
+
+        base = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee",
+            "etapa": "Discusión",
+        }
+
+        prepared = _prepare_pjud_movements(
+            _make_case(),
+            [{**base, "foja": 0}, {**base, "foja": None}],
+            log_undated=False,
+        )
+
+        assert len(prepared) == 2
+
+    def test_sort_digest_matches_cross_runtime_unicode_zero_vector(self):
+        from worker.engine import _movement_sort_key
+
+        movement = {
+            "folio": 5,
+            "fecha": " 2024-05-01 ",
+            "cuaderno": "Ｐrincipal",
+            "tramite": "Resolución",
+            "descripcion": " Árbitro\u00a0  cero ",
+            "etapa": "Discusión",
+            "foja": 0,
+        }
+
+        assert _movement_sort_key(movement)[1] == (
+            "f9060484ee6e9a686c3138dcf4d7b90c"
+            "d3434490ae8a309a867430284d816d42"
+        )
+
+    def test_historical_keys_survive_reordering_and_exact_duplicates(self):
+        from worker.engine import _prepare_pjud_movements
+
+        primary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Primera",
+            "etapa": "Discusión", "foja": 10,
+        }
+        secondary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "", "descripcion": "Segunda",
+            "etapa": "", "foja": 10,
+        }
+        existing = [
+            {
+                "external_movement_key": "C-1234-2024:Principal:5",
+                "raw_payload": primary,
+            },
+            {
+                "external_movement_key": "C-1234-2024:Principal:5#3",
+                "raw_payload": secondary,
+            },
+        ]
+
+        prepared = _prepare_pjud_movements(
+            _make_case(),
+            [secondary, primary, dict(primary)],
+            log_undated=False,
+            existing_movements=existing,
+        )
+
+        assert {movement["descripcion"]: key for movement, key in prepared} == {
+            "Primera": "C-1234-2024:Principal:5",
+            "Segunda": "C-1234-2024:Principal:5#3",
+        }
 
     def test_logical_duplicates_merge_document_metadata_conservatively(self):
         from worker.engine import _prepare_pjud_movements
@@ -1638,6 +1741,82 @@ class TestHelperFunctions:
         uploaded_keys = [call.args[0] for call in engine._r2.upload.await_args_list]
         assert all(inserted_key in storage_key for storage_key in uploaded_keys)
         assert all("undated" not in storage_key for storage_key in uploaded_keys)
+
+    @pytest.mark.asyncio
+    async def test_document_writeback_preserves_historical_suffixed_key(self):
+        from app.document_downloader import DownloadedDoc
+
+        engine, _, mock_sb, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = False
+        primary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Primera",
+            "etapa": "Discusión", "foja": 10,
+            "documento_url": None, "documentos_adicionales": [],
+        }
+        secondary = {
+            "folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "", "descripcion": "Segunda",
+            "etapa": "", "foja": 10,
+            "documento_url": "/secondary", "documentos_adicionales": [],
+        }
+        engine._load_existing_movements = AsyncMock(return_value=[
+            {
+                "external_movement_key": "C-1234-2024:Principal:5",
+                "raw_payload": primary,
+            },
+            {
+                "external_movement_key": "C-1234-2024:Principal:5#3",
+                "raw_payload": secondary,
+            },
+        ])
+        detail = {"movements": [secondary, primary]}
+        downloaded = DownloadedDoc(1, b"secondary", "application/pdf", "pdf")
+
+        with patch(
+            "worker.engine.download_documents",
+            new=AsyncMock(return_value=[downloaded]),
+        ):
+            await engine._download_and_store_documents(
+                _make_case(), detail, AsyncMock(),
+            )
+
+        uploaded_keys = [call.args[0] for call in engine._r2.upload.await_args_list]
+        assert uploaded_keys == [
+            "firm-uuid-1/case-uuid-1/C-1234-2024:Principal:5#3.pdf",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_existing_movement_loader_reads_pages_after_row_thousand(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        chain = mock_sb.from_.return_value
+        first_page = [
+            {
+                "id": f"movement-{index:04d}",
+                "external_movement_key": f"C-1234-2024:Principal:{index}",
+                "raw_payload": {"folio": index, "cuaderno": "Principal"},
+            }
+            for index in range(1_000)
+        ]
+        historical = {
+            "id": "movement-1000",
+            "external_movement_key": "C-1234-2024:Principal:5#3",
+            "raw_payload": {"folio": 5, "cuaderno": "Principal"},
+        }
+        chain.execute.side_effect = [
+            MagicMock(data=first_page),
+            MagicMock(data=[historical]),
+        ]
+
+        rows = await engine._load_existing_movements("case-uuid-1")
+
+        assert len(rows) == 1_001
+        assert rows[-1] == historical
+        assert chain.range.call_args_list == [
+            ((0, 999),),
+            ((1_000, 1_999),),
+        ]
 
     @pytest.mark.asyncio
     async def test_upsert_movements_manda_claves_unicas(self):
