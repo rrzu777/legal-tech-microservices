@@ -90,3 +90,25 @@ def test_appeals_resource_matches_its_official_book_prefix_without_rewriting_dis
 
     assert response.status == "found"
     assert response.matches[0].rol == "Protección-4490-2025"
+
+
+def test_appeals_ranking_uses_resolved_court_and_official_book_code():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rol",
+        case_number="4490-2025",
+        competencia="apelaciones",
+        corte=90,
+        libro="34",
+        search_mode="appeals_resource",
+    )
+    wrong_affinity = _candidate(
+        1, rol="Protección-4490-2025"
+    ).model_copy(update={"corte_code": 90, "libro_code": "31"})
+    requested_affinity = _candidate(
+        2, rol="Protección-4490-2025"
+    ).model_copy(update={"corte_code": 90, "libro_code": "34"})
+
+    ranked = rank_matches([wrong_affinity, requested_affinity], request)
+
+    assert ranked.matches[0].key == "key-002"

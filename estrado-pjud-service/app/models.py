@@ -18,6 +18,14 @@ _NUMERO_ANNO_RE = re.compile(r"^\d+-\d{4}$")
 _RIT_IDENTIFIER_RE = re.compile(r"^[^-]+-\d+-\d{4}$")
 _RUC_IDENTIFIER_RE = re.compile(r"^\d{7,10}-[0-9Kk]$")
 
+_V2_LIBROS: dict[str, set[str]] = {
+    "civil": {"C", "V", "E", "A", "F", "I"},
+    "laboral": {"O", "T", "M", "E", "S", "U", "V", "I"},
+    "penal": {"1", "2", "3", "4", "5"},
+    "cobranza": {"A", "C", "D", "E", "J", "L", "P", "R"},
+    "apelaciones": {str(code) for code in range(28, 43)},
+}
+
 
 VALID_CORTE_CODES = {
     0,   # Todas (all courts)
@@ -56,6 +64,11 @@ def _validate_v2_search_contract(
         libro = libro.strip()
         if not libro:
             raise ValueError("v2 libro must not be empty or whitespace")
+        allowed_libros = _V2_LIBROS.get(competencia)
+        if allowed_libros is not None and libro not in allowed_libros:
+            raise ValueError(
+                f"Invalid v2 libro {libro!r} for {competencia}; must be one of {sorted(allowed_libros)}"
+            )
     if case_type not in {"rol", "rit", "ruc"}:
         raise ValueError("v2 case_type must be rol, rit, or ruc")
     if corte is not None and (corte == 0 or corte not in VALID_CORTE_CODES):

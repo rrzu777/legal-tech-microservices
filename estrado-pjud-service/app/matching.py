@@ -68,7 +68,7 @@ def candidate_score(candidate: CandidateMatch, req: SearchRequest) -> tuple[int,
         score += 20
     expected_book = resolve_libro(req.competencia, "", req.libro)
     if expected_book and (
-        _matches_requested(candidate.libro_code, expected_book)
+        _matches_requested(candidate.libro_code, req.libro)
         or _matches_requested(candidate.libro, expected_book)
     ):
         score += 10

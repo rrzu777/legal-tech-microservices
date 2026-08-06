@@ -16,7 +16,7 @@ from app.parsers.normalizer import competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.metrics import api_metrics
 from app.errors import safe_error
-from app.failure_kind import reject_empty_body
+from app.failure_kind import BlockedPageError, UpstreamChangedError, reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
 
 logger = logging.getLogger(__name__)
@@ -77,15 +77,17 @@ async def _search_for_fresh_jwt(session, comp: str, req: DetailRequest) -> str |
 
     html = await session.search(comp_path, form_data)
 
+    reject_empty_body(html, "detail affinity search")
     if detect_blocked(html):
-        logger.warning("Search blocked during detail session-affinity search")
-        return None
+        raise BlockedPageError("detail affinity search returned WAF or captcha")
 
-    matches = parse_search_results(html, comp)
+    try:
+        matches = parse_search_results(html, comp)
+    except ValueError as exc:
+        raise UpstreamChangedError("detail affinity search parser rejected PJUD response") from exc
 
     if not matches:
-        logger.warning("No matches found during detail session-affinity search for %s", req.case_number)
-        return None
+        raise UpstreamChangedError("detail affinity search returned non-empty unparseable PJUD response")
 
     exact = [
         match for match in matches

@@ -4,6 +4,39 @@ from app.models import DetailRequest, SearchRequest, SearchResponse
 
 
 class TestCanonicalSearchRequestV2:
+    @pytest.mark.parametrize("competencia,case_type,case_number,extra", [
+        ("civil", "rol", "C-1234-2024", {"corte": 90, "tribunal": 321, "libro": "F"}),
+        ("laboral", "rit", "O-1234-2024", {"corte": 90, "tribunal": 321, "libro": "U"}),
+        ("penal", "rit", "O-243-2025", {"corte": 90, "tribunal": 321, "libro": "5"}),
+        ("cobranza", "rol", "C-1234-2024", {"corte": 90, "tribunal": 321, "libro": "L"}),
+        ("apelaciones", "rol", "4490-2025", {"corte": 90, "libro": "42", "search_mode": "appeals_resource"}),
+    ])
+    def test_v2_accepts_observed_official_book_codes(self, competencia, case_type, case_number, extra):
+        request = SearchRequest(
+            contract_version=2,
+            competencia=competencia,
+            case_type=case_type,
+            case_number=case_number,
+            **extra,
+        )
+        assert request.libro == extra["libro"]
+
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_v2_rejects_unknown_official_book_code(self, request_type):
+        payload = {
+            "contract_version": 2,
+            "competencia": "apelaciones",
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "corte": 90,
+            "libro": "999",
+            "search_mode": "appeals_resource",
+        }
+        if request_type is DetailRequest:
+            payload["detail_key"] = "key"
+        with pytest.raises(ValidationError):
+            request_type(**payload)
+
     def test_v2_civil_requires_court_and_tribunal_unless_broad(self):
         with pytest.raises(ValidationError):
             SearchRequest(

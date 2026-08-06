@@ -33,10 +33,24 @@ async def resolve_tribunal_code(
     return _resolve_tribunal_code_from_options(result.options, tribunal_label)
 
 
+async def resolve_corte_code(catalog_service, corte_label: str) -> int | None:
+    """Map a result court label only when the official courts catalog is unique."""
+    if catalog_service is None or not corte_label.strip():
+        return None
+    result: CatalogResult = await catalog_service.courts()
+    return _resolve_catalog_code_from_options(result.options, corte_label)
+
+
 def _resolve_tribunal_code_from_options(
     options: list[dict[str, str]], tribunal_label: str
 ) -> int | None:
-    normalized_label = normalize_label(tribunal_label)
+    return _resolve_catalog_code_from_options(options, tribunal_label)
+
+
+def _resolve_catalog_code_from_options(
+    options: list[dict[str, str]], label: str
+) -> int | None:
+    normalized_label = normalize_label(label)
     codes = {
         option["code"]
         for option in options
@@ -105,7 +119,16 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 status="pjud_blocked",
             )
 
-        raw_matches = parse_search_results(html, req.competencia)
+        try:
+            raw_matches = parse_search_results(html, req.competencia)
+        except ValueError:
+            if req.contract_version == 2:
+                return SearchResponse(
+                    found=False, match_count=0, matches=[], blocked=False,
+                    error="PJUD search response could not be parsed", libro_used=None,
+                    status="upstream_changed",
+                )
+            raise
         matches = [CandidateMatch(**m) for m in raw_matches]
 
         if req.contract_version == 2 and not matches and not _is_definitive_not_found(html):
@@ -119,22 +142,36 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             resolved_labels: dict[str, int | None] = {}
             catalog_service = getattr(request.app.state, "catalog_service", None)
             if catalog_service is not None:
+                court_codes: dict[str, int | None] = {}
                 try:
-                    catalog: CatalogResult = await catalog_service.tribunals(
-                        req.competencia, req.corte
-                    )
+                    if any(match.corte for match in matches):
+                        courts: CatalogResult = await catalog_service.courts()
+                        for match in matches:
+                            if match.corte and match.corte not in court_codes:
+                                court_codes[match.corte] = _resolve_catalog_code_from_options(
+                                    courts.options, match.corte
+                                )
+                            if match.corte:
+                                match.corte_code = court_codes[match.corte]
+                    if req.tribunal is not None:
+                        catalog: CatalogResult = await catalog_service.tribunals(
+                            req.competencia, req.corte
+                        )
+                    else:
+                        catalog = None
                 except Exception:
                     # Codes influence ranking only.  A catalog outage must not
                     # erase an already parsed PJUD result or turn it into a
                     # false `not_found`; unresolved candidates remain explicit.
                     logger.warning("Tribunal catalog unavailable; returning unranked codes", exc_info=True)
                 else:
-                    for match in matches:
-                        if match.tribunal not in resolved_labels:
-                            resolved_labels[match.tribunal] = _resolve_tribunal_code_from_options(
-                                catalog.options, match.tribunal
-                            )
-                        match.tribunal_code = resolved_labels[match.tribunal]
+                    if catalog is not None:
+                        for match in matches:
+                            if match.tribunal not in resolved_labels:
+                                resolved_labels[match.tribunal] = _resolve_tribunal_code_from_options(
+                                    catalog.options, match.tribunal
+                                )
+                            match.tribunal_code = resolved_labels[match.tribunal]
 
         api_metrics.record_success("search")
 
@@ -155,7 +192,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         # Mismo motivo que el `acquire_or_alert` de arriba: una falla NUESTRA no
         # puede salir con 200. Es el 5xx lo que le dice a la app que clasifique
         # esto como infra y no le sume una falla a la causa.
-        if kind == "infra":
+        if kind == "infra" or (req.contract_version == 2 and kind == "case"):
             raise
 
         return SearchResponse(

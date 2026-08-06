@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from bs4 import BeautifulSoup
 
@@ -12,6 +13,26 @@ from app.parsers.normalizer import normalize_date
 _JWT_RE = re.compile(
     r"detalleCausa\w+\('(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)'\)"
 )
+
+_APPEALS_BOOK_BY_LABEL = {
+    unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode().upper(): code
+    for code, label in {
+        "28": "CIVIL", "29": "FAMILIA", "30": "LABORAL", "31": "PENAL",
+        "32": "CONTENCIOSO", "33": "TRIBUTARIO", "34": "PROTECCIÓN",
+        "35": "AMPARO", "36": "POLICÍA", "37": "EXHORTO", "38": "NAVEGACIÓN",
+        "39": "AMBIENTAL", "40": "TRASPASO", "41": "MINISTRO", "42": "COMLIBCOND",
+    }.items()
+}
+
+
+def _appeals_book_from_rol(rol: str) -> tuple[str | None, str | None]:
+    match = re.fullmatch(r"(.+)-(\d+)-(\d{4})", rol.strip())
+    if not match:
+        return None, None
+    label = match.group(1).strip()
+    normalized = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode().upper()
+    code = _APPEALS_BOOK_BY_LABEL.get(normalized)
+    return (label, code) if code is not None else (None, None)
 
 
 def _clean(text: str) -> str:
@@ -167,10 +188,15 @@ def _parse_apelaciones_row(tr) -> dict | None:
     m = _JWT_RE.search(a_tag["onclick"])
     if not m:
         return None
+    rol = _clean(tds[1].get_text())
+    libro, libro_code = _appeals_book_from_rol(rol)
     return {
         "key": m.group(1),
-        "rol": _clean(tds[1].get_text()),
+        "rol": rol,
         "tribunal": _clean(tds[7].get_text()),
+        "corte": _clean(tds[2].get_text()),
+        "libro": libro,
+        "libro_code": libro_code,
         "caratulado": _clean(tds[3].get_text()),
         "fecha_ingreso": normalize_date(_clean(tds[4].get_text())),
     }

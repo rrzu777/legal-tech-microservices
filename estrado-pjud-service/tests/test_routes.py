@@ -134,6 +134,91 @@ class TestHealth:
 
 class TestSearch:
     @pytest.mark.asyncio
+    async def test_court_label_resolution_requires_one_official_catalog_code(self):
+        from app.catalogs import CatalogResult
+        from app.routes.search import resolve_corte_code
+
+        catalog_service = MagicMock()
+        catalog_service.courts = AsyncMock(return_value=CatalogResult(
+            options=[
+                {"code": "91", "label": "C.A. de San Miguel"},
+                {"code": "90", "label": "C.A. de San Miguel"},
+            ],
+            source="snapshot",
+            fetched_at="2026-08-05T00:00:00+00:00",
+        ))
+
+        code = await resolve_corte_code(catalog_service, " C.A. DE SAN MIGUEL ")
+
+        assert code is None
+
+    def test_v2_appeals_search_resolves_result_court_once_for_ranking(self, client):
+        from app.catalogs import CatalogResult
+        from app.routes import search as search_route
+
+        mock_session = _make_mock_session(search_html="<html>resultados</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        catalog_service = MagicMock()
+        catalog_service.courts = AsyncMock(return_value=CatalogResult(
+            options=[{"code": "91", "label": "C.A. de San Miguel"}],
+            source="snapshot",
+            fetched_at="2026-08-05T00:00:00+00:00",
+        ))
+        client.app.state.catalog_service = catalog_service
+        raw_match = [{
+            "key": "fresh-jwt",
+            "rol": "Protección-4490-2025",
+            "tribunal": "Corte apelaciones",
+            "corte": "C.A. de San Miguel",
+            "libro": "Protección",
+            "libro_code": "34",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2025-01-01",
+        }]
+
+        with patch.object(search_route, "parse_search_results", return_value=raw_match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "4490-2025",
+                    "competencia": "apelaciones",
+                    "corte": 91,
+                    "libro": "34",
+                    "search_mode": "appeals_resource",
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["matches"][0]["corte_code"] == 91
+        catalog_service.courts.assert_awaited_once_with()
+
+    def test_v2_search_parser_value_error_is_upstream_changed(self, client):
+        """Markup parser drift is not a missing case or an internal 5xx."""
+        from app.routes import search as search_route
+
+        mock_session = _make_mock_session(search_html="<html>nuevo markup</html>")
+        client.app.state.session_pool = _make_mock_pool(mock_session)
+        with patch.object(search_route, "parse_search_results", side_effect=ValueError("unexpected table")):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "upstream_changed"
+
+    @pytest.mark.asyncio
     async def test_tribunal_label_resolution_requires_one_official_catalog_code(self):
         from app.catalogs import CatalogResult
         from app.models import SearchRequest
@@ -563,6 +648,38 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    @pytest.mark.parametrize("search_html", [
+        " ",
+        '<html><script>window["bobcmn"] = "1"</script></html>',
+        "<html>markup PJUD desconocido</html>",
+    ], ids=["empty", "waf", "parse_drift"])
+    def test_detail_affinity_upstream_failures_are_not_409_or_detail_fetches(
+        self, client_5xx, search_html
+    ):
+        """Only a valid but uncorrelatable search may end in affinity 409."""
+        mock_session = _make_mock_session(
+            search_html=search_html,
+            detail_html=_load("detail_Civil_C_1234_2024.html"),
+        )
+        mock_pool = _make_mock_pool(mock_session)
+        client_5xx.app.state.session_pool = mock_pool
+
+        response = client_5xx.post(
+            "/api/v1/detail",
+            json={
+                "detail_key": "caller-jwt-without-data",
+                "competencia": "civil",
+                "case_type": "rol",
+                "case_number": "C-1234-2024",
+            },
+            headers=AUTH,
+        )
+
+        assert response.status_code >= 500
+        assert response.status_code != 409
+        mock_session.detail.assert_not_awaited()
+        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+
     @pytest.mark.asyncio
     async def test_detail_affinity_accepts_unique_appeals_resource_with_book_prefix(self):
         from app.models import DetailRequest

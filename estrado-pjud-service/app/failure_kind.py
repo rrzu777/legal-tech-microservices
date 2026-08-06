@@ -63,6 +63,15 @@ class EmptyResponseError(Exception):
     """
 
 
+class UpstreamChangedError(Exception):
+    """PJUD returned a non-empty response that no longer matches our parser.
+
+    This is neither a missing case nor a request-validation error.  Routes must
+    surface it as a retryable server-side failure, avoiding a false 409 during
+    detail session affinity or a silent false not-found.
+    """
+
+
 class NoUsableBundleError(Exception):
     """El pool no tiene ningún bundle F5 con el cual salir.
 
@@ -209,6 +218,7 @@ def classify_exception(e: BaseException) -> FailureKind:
             httpx.TransportError,
             TimeoutError,
             EmptyResponseError,
+            UpstreamChangedError,
             NoUsableBundleError,
             MissingCsrfTokenError,
             BlockedPageError,

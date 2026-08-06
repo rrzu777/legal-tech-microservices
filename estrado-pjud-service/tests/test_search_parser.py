@@ -97,6 +97,14 @@ class TestParseSearchApelaciones:
         assert isinstance(results, list)
         assert len(results) >= 1
 
+    def test_preserves_court_and_derives_official_book_from_real_result(self):
+        html = (FIXTURES / "search_Apelaciones_Proteccion_4490_2025.html").read_text(encoding="utf-8")
+        result = parse_search_results(html, "apelaciones")[0]
+
+        assert result["corte"] == "C.A. de San Miguel"
+        assert result["libro"] == "Protección"
+        assert result["libro_code"] == "34"
+
     def test_jwt_keys_present(self, html):
         results = parse_search_results(html, "apelaciones")
         for m in results:
