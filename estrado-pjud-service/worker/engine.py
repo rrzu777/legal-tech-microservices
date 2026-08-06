@@ -129,6 +129,9 @@ _PRIMARY_DOCUMENT_FIELDS = (
     "documento_param",
 )
 _ANEXO_FIELDS = ("anexo_func", "anexo_token")
+_CANONICAL_WHITESPACE_RE = re.compile(
+    r"[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
+)
 
 
 def _movement_identity(movement: dict) -> tuple:
@@ -149,8 +152,13 @@ def _movement_identity(movement: dict) -> tuple:
 
 
 def _normalize_movement_identity_part(value) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
-    return re.sub(r"\s+", " ", normalized)
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = _CANONICAL_WHITESPACE_RE.sub(" ", normalized)
+    if normalized.startswith(" "):
+        normalized = normalized[1:]
+    if normalized.endswith(" "):
+        normalized = normalized[:-1]
+    return normalized
 
 
 def _build_movement_external_key(case_number: str, movement: dict) -> str:

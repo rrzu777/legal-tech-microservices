@@ -1325,6 +1325,40 @@ class TestHelperFunctions:
         assert first_key != _build_movement_external_key("C-1234-2024", second)
         assert len(first_key) == 80
 
+    def test_null_folio_key_uses_explicit_cross_runtime_whitespace_set(self):
+        from worker.engine import _build_movement_external_key
+
+        canonical = {
+            "folio": None,
+            "cuaderno": "Principal",
+            "fecha": "2024-05-01",
+            "tramite": "Resolución",
+            "descripcion": "Provee demanda",
+        }
+        ecma_whitespace = {
+            **canonical,
+            "descripcion": (
+                "\ufeffProvee\u1680\u2003\u2028\u2029\u202f\u205f\u3000demanda\ufeff"
+            ),
+        }
+        python_only_whitespace = {
+            **canonical,
+            "descripcion": "Provee\u0085demanda",
+        }
+
+        assert _build_movement_external_key(
+            "C-1234-2024", ecma_whitespace,
+        ) == (
+            "pjud:null-folio:"
+            "233b28b1647858c30529573ec89896d993ce6e22723d3fe73d053c3f7f65a84a"
+        )
+        assert _build_movement_external_key(
+            "C-1234-2024", python_only_whitespace,
+        ) == (
+            "pjud:null-folio:"
+            "c782b1b1bff4d2943d4fc89584cf613b659689f07be20253606ee8ff3bc84942"
+        )
+
     def test_null_folio_key_ignores_all_mutable_and_document_fields(self):
         from worker.engine import _build_movement_external_key
 
