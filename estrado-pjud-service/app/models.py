@@ -140,7 +140,7 @@ class SearchRequest(BaseModel):
     libro: str | None = None
     search_mode: SearchMode | None = None
     allow_broad: bool = False
-    max_matches: int = Field(default=10, ge=1, le=25)
+    max_matches: int = Field(default=10, ge=1, le=100)
 
     @model_validator(mode="after")
     def _validate_corte(self):
@@ -215,7 +215,7 @@ class DetailRequest(BaseModel):
     libro: str | None = None
     search_mode: SearchMode | None = None
     allow_broad: bool = False
-    max_matches: int = Field(default=10, ge=1, le=25)
+    max_matches: int = Field(default=10, ge=1, le=100)
 
     @model_validator(mode="after")
     def _validate_v2_search_contract(self):

@@ -4,6 +4,24 @@ from app.models import DetailRequest, SearchRequest, SearchResponse
 
 
 class TestCanonicalSearchRequestV2:
+    @pytest.mark.parametrize("request_type", [SearchRequest, DetailRequest])
+    def test_match_window_defaults_to_10_accepts_100_and_rejects_101(self, request_type):
+        payload = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "C-561-2025",
+            "competencia": "civil",
+            "libro": "C",
+            "allow_broad": True,
+        }
+        if request_type is DetailRequest:
+            payload["detail_key"] = "key"
+
+        assert request_type(**payload).max_matches == 10
+        assert request_type(**payload, max_matches=100).max_matches == 100
+        with pytest.raises(ValidationError):
+            request_type(**payload, max_matches=101)
+
     @pytest.mark.parametrize("competencia,case_type,case_number,extra", [
         ("civil", "rol", "C-1234-2024", {"corte": 90, "tribunal": 321, "libro": "F"}),
         ("laboral", "rit", "O-1234-2024", {"corte": 90, "tribunal": 321, "libro": "U"}),
