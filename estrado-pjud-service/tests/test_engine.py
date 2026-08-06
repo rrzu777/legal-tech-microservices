@@ -1285,6 +1285,167 @@ class TestHelperFunctions:
         key = _build_external_movement_key("C-1234-2024", "Principal", 5)
         assert key == "C-1234-2024:Principal:5"
 
+    def test_build_movement_key_preserves_historical_key_with_folio(self):
+        from worker.engine import _build_movement_external_key
+
+        key = _build_movement_external_key(
+            "C-1234-2024",
+            {"folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01"},
+        )
+
+        assert key == "C-1234-2024:Principal:5"
+
+    def test_null_folio_key_is_stable_bounded_and_content_derived(self):
+        from worker.engine import _build_movement_external_key
+
+        first = {
+            "folio": None,
+            "cuaderno": "Principal",
+            "fecha": "2024-05-01",
+            "tramite": "Resolución",
+            "descripcion": "Provee demanda",
+            "etapa": "Discusión",
+            "foja": None,
+            "sala": "",
+            "estado": "",
+        }
+        second = {**first, "descripcion": "Provee contestación"}
+
+        first_key = _build_movement_external_key("C-1234-2024", first)
+
+        assert first_key == _build_movement_external_key("C-1234-2024", dict(first))
+        assert first_key != _build_movement_external_key("C-1234-2024", second)
+        assert first_key.startswith("pjud:null:")
+        assert len(first_key) == 74
+
+    @pytest.mark.asyncio
+    async def test_upsert_movements_undated_only_returns_zero_without_db_calls(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        detail = {"movements": [{
+            "folio": None,
+            "cuaderno": "Principal",
+            "tramite": "Resolución",
+            "descripcion": "Sin fecha",
+            "fecha": None,
+            "raw_payload": {"secret": "must-not-be-logged"},
+        }]}
+
+        result = await engine._upsert_movements(_make_case(), detail)
+
+        assert result == 0
+        mock_sb.from_.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upsert_movements_skips_undated_and_persists_dated_rows(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        detail = {"movements": [
+            {"folio": 4, "cuaderno": "Principal", "tramite": "Resolución",
+             "descripcion": "Sin fecha", "fecha": None, "etapa": ""},
+            {"folio": 5, "cuaderno": "Principal", "tramite": "Escrito",
+             "descripcion": "Con fecha", "fecha": "2024-05-01", "etapa": ""},
+        ]}
+
+        await engine._upsert_movements(_make_case(), detail)
+
+        rows = mock_sb.from_.return_value.upsert.call_args[0][0]
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2024-05-01"
+        assert rows[0]["external_movement_key"] == "C-1234-2024:Principal:5"
+
+    @pytest.mark.asyncio
+    async def test_upsert_movements_logs_one_structured_payload_free_warning(self, caplog):
+        engine, _, _, *_ = _make_engine()
+        detail = {"movements": [
+            {"folio": None, "cuaderno": "Principal", "fecha": None,
+             "tramite": "JWT super-secret", "descripcion": "litigante Jane Doe",
+             "documento_token": "document-token", "raw_payload": {"rut": "1-9"}},
+            {"folio": 5, "cuaderno": "Principal", "fecha": "2024-05-01",
+             "tramite": "Escrito", "descripcion": "Válido", "etapa": ""},
+        ]}
+
+        with caplog.at_level("WARNING", logger="worker.engine"):
+            await engine._upsert_movements(_make_case(), detail)
+
+        warnings = [record for record in caplog.records if record.msg == "Skipping undated PJUD movements"]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert warning.case_id == "case-uuid-1"
+        assert warning.case_number == "C-1234-2024"
+        assert warning.skipped_count == 1
+        rendered = caplog.text
+        assert "super-secret" not in rendered
+        assert "document-token" not in rendered
+        assert "Jane Doe" not in rendered
+        assert "1-9" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_identical_null_folio_movements_are_collapsed_before_upsert(self):
+        engine, _, mock_sb, *_ = _make_engine()
+        movement = {
+            "folio": None, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee", "etapa": "Discusión",
+            "foja": None, "sala": "", "estado": "",
+        }
+
+        await engine._upsert_movements(
+            _make_case(), {"movements": [movement, dict(movement)]}
+        )
+
+        rows = mock_sb.from_.return_value.upsert.call_args[0][0]
+        assert len(rows) == 1
+        assert "#" not in rows[0]["external_movement_key"]
+
+    @pytest.mark.asyncio
+    async def test_document_writeback_uses_insert_key_and_skips_undated_movements(self):
+        from app.document_downloader import DownloadedDoc
+
+        engine, _, mock_sb, *_ = _make_engine()
+        engine._r2 = AsyncMock()
+        engine._r2.exists.return_value = False
+        undated = {
+            "folio": None, "cuaderno": "Principal", "fecha": None,
+            "tramite": "Resolución", "descripcion": "Sin fecha",
+            "documento_url": "/undated", "documento_token": "undated-token",
+            "anexo_func": "anexoSolicitudCivil", "anexo_token": "undated-anexo",
+        }
+        dated = {
+            "folio": None, "cuaderno": "Principal", "fecha": "2024-05-01",
+            "tramite": "Resolución", "descripcion": "Provee", "etapa": "Discusión",
+            "foja": None, "sala": "", "estado": "",
+            "documento_url": "/dated", "documento_token": "dated-token",
+            "documentos_adicionales": [],
+            "anexo_func": "anexoSolicitudCivil", "anexo_token": "dated-anexo",
+        }
+        detail = {"movements": [undated, dated]}
+
+        await engine._upsert_movements(_make_case(), detail)
+        inserted_key = mock_sb.from_.return_value.upsert.call_args[0][0][0]["external_movement_key"]
+
+        mock_sb.reset_mock()
+        session = AsyncMock()
+        session.fetch_anexo_list.return_value = "<html>anexo</html>"
+        primary = DownloadedDoc(0, b"primary", "application/pdf", "pdf")
+        anexo = DownloadedDoc(0, b"anexo", "application/pdf", "pdf")
+        with patch("worker.engine.download_documents", new=AsyncMock(return_value=[primary])) as downloader, \
+             patch("worker.engine.parse_anexo_list", return_value=[{
+                 "download_url": "/anexo", "download_token": "anexo-token",
+                 "download_param": "dtaDoc", "label": "Anexo", "codigo": "A1",
+             }]), \
+             patch("worker.engine.download_single_document", new=AsyncMock(return_value=anexo)):
+            await engine._download_and_store_documents(_make_case(), detail, session)
+
+        downloaded_movements = downloader.await_args.args[1]
+        assert downloaded_movements == [dated]
+        external_key_filters = [
+            call.args[1]
+            for call in mock_sb.from_.return_value.eq.call_args_list
+            if call.args and call.args[0] == "external_movement_key"
+        ]
+        assert external_key_filters == [inserted_key]
+        uploaded_keys = [call.args[0] for call in engine._r2.upload.await_args_list]
+        assert all(inserted_key in storage_key for storage_key in uploaded_keys)
+        assert all("undated" not in storage_key for storage_key in uploaded_keys)
+
     @pytest.mark.asyncio
     async def test_upsert_movements_manda_claves_unicas(self):
         """El helper puede estar perfecto y no estar CABLEADO: una lista de rows sin
@@ -1305,6 +1466,7 @@ class TestHelperFunctions:
         assert len(keys) == 2, "no puede perder movimientos"
         assert len(set(keys)) == 2, f"claves duplicadas llegan al upsert: {keys}"
         assert keys[0] == "C-1234-2024:Principal:5", "la primera conserva su clave"
+        assert keys[1] == "C-1234-2024:Principal:5#2"
 
     def test_desambigua_claves_duplicadas_en_el_mismo_batch(self):
         """Dos movimientos con el mismo cuaderno+folio rompian el upsert ENTERO con

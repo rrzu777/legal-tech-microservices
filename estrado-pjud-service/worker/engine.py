@@ -1,5 +1,7 @@
 # worker/engine.py
 import asyncio
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -107,6 +109,89 @@ def _get_latest_movement_date(movements: list[dict]) -> str | None:
 
 def _build_external_movement_key(case_number: str, cuaderno: str, folio) -> str:
     return f"{case_number}:{cuaderno}:{folio}"
+
+
+_MOVEMENT_IDENTITY_FIELDS = (
+    "folio",
+    "cuaderno",
+    "fecha",
+    "tramite",
+    "descripcion",
+    "etapa",
+    "foja",
+    "sala",
+    "estado",
+)
+
+
+def _movement_identity(movement: dict) -> tuple:
+    """Return the stable PJUD fields that identify one logical movement."""
+    return tuple(movement.get(field) for field in _MOVEMENT_IDENTITY_FIELDS)
+
+
+def _build_movement_external_key(case_number: str, movement: dict) -> str:
+    """Build a stable movement key while retaining every historical folio key."""
+    folio = movement.get("folio")
+    if folio is not None:
+        return _build_external_movement_key(
+            case_number,
+            movement.get("cuaderno", ""),
+            folio,
+        )
+
+    identity = {
+        "case_number": case_number,
+        **{
+            field: movement.get(field)
+            for field in _MOVEMENT_IDENTITY_FIELDS
+        },
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"pjud:null:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _prepare_pjud_movements(
+    case: dict,
+    movements: list[dict],
+    *,
+    log_undated: bool,
+) -> list[tuple[dict, str]]:
+    """Filter invalid rows, collapse logical duplicates and assign persisted keys."""
+    dated: list[dict] = []
+    skipped_count = 0
+    seen_identities: set[tuple] = set()
+
+    for movement in movements:
+        if not movement.get("fecha"):
+            skipped_count += 1
+            continue
+        identity = _movement_identity(movement)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        dated.append(movement)
+
+    if skipped_count and log_undated:
+        logger.warning(
+            "Skipping undated PJUD movements",
+            extra={
+                "case_id": case.get("id"),
+                "case_number": case.get("case_number"),
+                "skipped_count": skipped_count,
+            },
+        )
+
+    base_keys = [
+        _build_movement_external_key(case["case_number"], movement)
+        for movement in dated
+    ]
+    keys = _dedupe_movement_keys(base_keys)
+    return list(zip(dated, keys))
 
 
 def search_params_from_case(case: dict) -> dict:
@@ -923,8 +1008,12 @@ class SyncEngine:
         if not movements:
             return 0
 
+        prepared = _prepare_pjud_movements(case, movements, log_undated=True)
+        if not prepared:
+            return 0
+
         rows = []
-        for mov in movements:
+        for mov, external_key in prepared:
             rows.append({
                 "law_firm_id": case["law_firm_id"],
                 "case_id": case["id"],
@@ -936,24 +1025,25 @@ class SyncEngine:
                 "document_url": mov.get("documento_url"),
                 "is_relevant": True,
                 "include_in_report": True,
-                "external_movement_key": _build_external_movement_key(
-                    case["case_number"],
-                    mov.get("cuaderno", ""),
-                    mov.get("folio", ""),
-                ),
+                "external_movement_key": external_key,
                 "raw_payload": mov,
             })
 
-        keys = _dedupe_movement_keys([r["external_movement_key"] for r in rows])
-        n_dupes = sum(1 for k in keys if "#" in k)
+        base_keys = [
+            _build_movement_external_key(case["case_number"], movement)
+            for movement, _ in prepared
+        ]
+        n_dupes = sum(
+            1
+            for row, base_key in zip(rows, base_keys)
+            if row["external_movement_key"] != base_key
+        )
         if n_dupes:
             logger.warning(
                 "Causa %s: %d movimiento(s) con cuaderno+folio repetido en el mismo "
                 "batch; se les agrega sufijo para no perderlos",
                 case["case_number"], n_dupes,
             )
-        for row, key in zip(rows, keys):
-            row["external_movement_key"] = key
 
         # Count before
         before_resp = await run_query(
@@ -993,6 +1083,12 @@ class SyncEngine:
         if not movements:
             return
 
+        prepared = _prepare_pjud_movements(case, movements, log_undated=False)
+        if not prepared:
+            return
+        movements = [movement for movement, _ in prepared]
+        movement_keys = [external_key for _, external_key in prepared]
+
         # Track all uploaded docs per movement for one atomic DB update each
         per_movement_docs: dict[str, list[dict]] = {}  # ext_key -> list of doc entries
 
@@ -1004,11 +1100,7 @@ class SyncEngine:
             # --- Primary documents ---
             for doc in docs:
                 mov = movements[doc.index]
-                ext_key = _build_external_movement_key(
-                    case["case_number"],
-                    mov.get("cuaderno", ""),
-                    mov.get("folio", ""),
-                )
+                ext_key = movement_keys[doc.index]
                 r2_key = f"{case['law_firm_id']}/{case['id']}/{ext_key}.{doc.extension}"
 
                 if await self._r2.exists(r2_key):
@@ -1035,14 +1127,10 @@ class SyncEngine:
             logger.info("Stored %d documents for case %s", len(docs), case["case_number"])
 
             # --- Certificados (iterate ALL movements, not just downloaded docs) ---
-            for mov in movements:
+            for mov, ext_key in zip(movements, movement_keys):
                 extras = mov.get("documentos_adicionales", [])
                 if not extras:
                     continue
-
-                ext_key = _build_external_movement_key(
-                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
-                )
 
                 for cert_i, cert in enumerate(extras):
                     cert_url = cert.get("url", "")
@@ -1073,15 +1161,11 @@ class SyncEngine:
                         # Cert failure must NOT block primary or anexos
 
             # --- Anexos (iterate ALL movements, not just downloaded docs) ---
-            for mov in movements:
+            for mov, ext_key in zip(movements, movement_keys):
                 anexo_func = mov.get("anexo_func")
                 anexo_token = mov.get("anexo_token")
                 if not anexo_func or not anexo_token:
                     continue
-
-                ext_key = _build_external_movement_key(
-                    case["case_number"], mov.get("cuaderno", ""), mov.get("folio", ""),
-                )
 
                 endpoint_info = ANEXO_ENDPOINTS.get(anexo_func)
                 if not endpoint_info:
