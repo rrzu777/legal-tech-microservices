@@ -86,6 +86,10 @@ def _snapshot(*, duplicate_civil_label: bool = False):
         "fetched_at": generated,
         "options": [{"code": "321", "label": "2º Juzgado Civil de Santiago"}],
     }
+    tribunals["apelaciones:91:1"] = {
+        "fetched_at": generated,
+        "options": [{"code": "400", "label": "1º Juzgado Civil de San Miguel"}],
+    }
     return {
         "generated_at": generated,
         "courts": {
@@ -284,6 +288,33 @@ def test_appeals_first_instance_excludes_candidate_from_different_court(client):
     assert body["matches"] == []
 
 
+def test_appeals_first_instance_globally_resolves_tribunal_from_other_court(client):
+    """Catches an out-of-court tribunal being mislabeled as catalog drift."""
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "search_mode": "first_instance",
+            "allow_broad": True,
+        },
+        [
+            _raw_match(
+                "other-court", "4490-2025", "1º Juzgado Civil de San Miguel",
+                corte="C.A. de San Miguel",
+            )
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["found"] is False
+    assert body["matches"] == []
+
+
 def test_direct_appeal_from_different_court_is_truthful_not_found(client):
     """Catches a unique resource identifier overriding the requested court."""
     response, _session_mock, _pool_mock = _post(
@@ -369,7 +400,7 @@ def test_known_nonappeal_identity_fails_closed_for_candidate_from_other_court(
     )
 
     body = response.json()
-    assert body["status"] == "upstream_changed"
+    assert body["status"] == "not_found"
     assert body["found"] is False
     assert body["matches"] == []
 

@@ -25,6 +25,21 @@ class CanonicalCatalogResolutionError(ValueError):
     """A parsed v2 row cannot be tied to one loaded official identity."""
 
 
+def _resolve_loaded_tribunal_with_global_fallback(
+    catalog_service, req: SearchRequest, tribunal_label: str
+):
+    """Prefer the requested court, then identify a unique out-of-court row."""
+    identity = catalog_service.resolve_loaded_tribunal(
+        req.competencia, tribunal_label, corte=req.corte,
+    )
+    if identity is not None or req.corte is None:
+        return identity, False
+    return (
+        catalog_service.resolve_loaded_tribunal(req.competencia, tribunal_label),
+        True,
+    )
+
+
 def _enrich_v2_candidates(
     matches: list[CandidateMatch],
     req: SearchRequest,
@@ -55,25 +70,33 @@ def _enrich_v2_candidates(
             return
 
         for match in matches:
-            court_code = (
+            displayed_court_code = (
                 catalog_service.resolve_loaded_court(match.corte)
                 if match.corte
-                else req.corte
+                else None
             )
-            identity = catalog_service.resolve_loaded_tribunal(
-                req.competencia, match.tribunal, corte=req.corte,
+            identity, used_global_fallback = (
+                _resolve_loaded_tribunal_with_global_fallback(
+                    catalog_service, req, match.tribunal,
+                )
             )
-            if court_code is None or identity is None:
+            if (match.corte and displayed_court_code is None) or identity is None:
                 raise CanonicalCatalogResolutionError(
                     "first-instance territorial identity is unresolved"
                 )
-            match.corte_code = court_code
+            match.corte_code = (
+                identity.court_code
+                if used_global_fallback
+                else displayed_court_code or identity.court_code
+            )
             match.tribunal_code = identity.tribunal_code
         return
 
     for match in matches:
-        identity = catalog_service.resolve_loaded_tribunal(
-            req.competencia, match.tribunal, corte=req.corte,
+        identity, _used_global_fallback = (
+            _resolve_loaded_tribunal_with_global_fallback(
+                catalog_service, req, match.tribunal,
+            )
         )
         if identity is None:
             raise CanonicalCatalogResolutionError("tribunal identity is unresolved")
