@@ -9,6 +9,7 @@ import pytest
 from app.config import Settings
 from app.cookie_store import CookieBundle
 from app.minter import MintResult
+from app.failure_kind import BlockedPageError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from tests.helpers import FakeOJVSession
 from worker.proxy_control import ProxyControlSnapshot
@@ -101,6 +102,56 @@ async def test_empty_proxy_pool_mints_and_persists_one_bundle_on_demand(monkeypa
         "user_agent": "fresh-UA",
         "cookies": {"TSPD_101": "fresh"},
     }]
+
+
+@pytest.mark.asyncio
+async def test_on_demand_mint_rotates_ip_after_f5_challenge(monkeypatch, tmp_path):
+    """One challenged residential IP must not fail the user's whole action."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    control = AsyncMock()
+    control.refresh.return_value = ProxyControlSnapshot(
+        allowed=True,
+        status="enabled",
+        reason_code="interactive",
+        revision=1,
+        source="database",
+    )
+    usage = RecordingUsageTracker()
+    attempts = 0
+    minted_proxies: list[str | None] = []
+
+    class FlakyMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted_proxies.append(proxy)
+
+        async def mint(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise BlockedPageError("F5 challenge")
+            return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FlakyMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
+
+    pool = APISessionPool(settings, proxy_control=control, proxy_usage=usage)
+    pool._store = MemoryCookieStore()
+
+    session = await pool.acquire()
+
+    assert isinstance(session, FakeOJVSession)
+    assert attempts == 3
+    assert len(set(minted_proxies)) == 3
+    assert usage.operations == ["mint", "mint", "mint"]
 
 
 @pytest.mark.asyncio
