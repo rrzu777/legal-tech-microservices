@@ -466,6 +466,36 @@ def test_direct_appeal_without_parsed_book_is_upstream_changed(client):
     assert response.json()["matches"] == []
 
 
+def test_direct_appeal_ignores_unresolved_rows_after_exact_book_match(client):
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "libro": "34",
+            "search_mode": "appeals_resource",
+        },
+        [
+            _raw_match(
+                "jwt-exact", "Protección-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago", libro="Protección", libro_code="34",
+            ),
+            _raw_match(
+                "jwt-irrelevant", "Policia Local-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago",
+            ),
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "found"
+    assert body["match_count"] == 1
+    assert [match["rol"] for match in body["matches"]] == ["Protección-4490-2025"]
+
+
 @pytest.mark.parametrize(
     ("competencia", "case_type", "case_number", "libro"),
     [

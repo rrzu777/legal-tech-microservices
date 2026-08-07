@@ -248,6 +248,12 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                         )
                     matches = resolved_matches
                 else:
+                    exact_matches = [
+                        match for match in matches
+                        if matches_requested_candidate(match, req)
+                    ]
+                    if exact_matches:
+                        matches = exact_matches
                     _enrich_v2_candidates(
                         matches, req, **enrichment_kwargs,
                     )
