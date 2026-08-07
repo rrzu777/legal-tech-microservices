@@ -117,6 +117,18 @@ class TestBuildSearchFormData:
         assert form["conTipoCausa"] == "PROTECCION"
         assert form["conCorte"] == "46"
 
+    def test_apelaciones_laboral_uses_live_pjud_composite_book_value(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="833-2025",
+            corte=46,
+            libro="30",
+            search_mode="appeals_resource",
+        )
+
+        assert form["conTipoCausa"] == "LABORAL - COBRANZA"
+
     def test_penal_ruc_populates_real_pjud_fields(self):
         form = build_search_form_data(
             competencia="penal",

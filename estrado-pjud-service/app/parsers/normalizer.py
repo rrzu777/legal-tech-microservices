@@ -21,7 +21,7 @@ VALID_LIBROS: dict[str, set[str]] = {
 APELACIONES_LIBRO_CODE_MAP: dict[str, str] = {
     "28": "CIVIL",
     "29": "FAMILIA",
-    "30": "LABORAL",
+    "30": "LABORAL - COBRANZA",
     "31": "PENAL",
     "32": "CONTENCIOSO",
     "33": "TRIBUTARIO",
