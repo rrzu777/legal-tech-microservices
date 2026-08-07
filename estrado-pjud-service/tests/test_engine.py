@@ -1318,11 +1318,17 @@ class TestHelperFunctions:
         from worker.engine import _compute_priority
         assert _compute_priority("archived", "2024-01-01") == 4
 
-    def test_compute_priority_recent_movement(self):
+    def test_compute_priority_recent_movement_is_daily_without_explicit_urgency(self):
         from worker.engine import _compute_priority
         from datetime import date, timedelta
         recent = (date.today() - timedelta(days=3)).isoformat()
-        assert _compute_priority("active", recent) == 1
+        assert _compute_priority("active", recent, is_urgent=False) == 2
+
+    def test_compute_priority_explicit_urgency(self):
+        from worker.engine import _compute_priority
+        from datetime import date, timedelta
+        recent = (date.today() - timedelta(days=3)).isoformat()
+        assert _compute_priority("active", recent, is_urgent=True) == 1
 
     def test_compute_priority_medium_age_movement(self):
         from worker.engine import _compute_priority
@@ -1356,7 +1362,7 @@ class TestHelperFunctions:
         assert SYNC_INTERVALS_HOURS == {
             1: 6,
             2: 24,
-            3: 72,
+            3: 168,
             4: 168,
         }
 

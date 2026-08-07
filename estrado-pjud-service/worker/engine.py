@@ -68,10 +68,10 @@ MATTER_TO_COMPETENCIA = {
 }
 
 SYNC_INTERVALS_HOURS = {
-    1: 6,    # hot: movimiento durante los últimos 7 días
-    2: 24,   # warm: movimiento durante los últimos 30 días
-    3: 72,   # cold: sin movimiento durante más de 30 días
-    4: 168,  # archived (weekly)
+    1: 6,    # urgente explícita: hasta dos veces por día hábil
+    2: 24,   # diaria: movimiento durante los últimos 30 días
+    3: 168,  # semanal: sin movimiento durante más de 30 días
+    4: 168,  # archivada (semanal nominal; fuera del polling activo)
 }
 
 TRAMITE_TO_TYPE = {
@@ -90,9 +90,16 @@ def _map_tramite(tramite: str) -> str:
     return "other"
 
 
-def _compute_priority(case_status: str, latest_date: str | None) -> int:
+def _compute_priority(
+    case_status: str,
+    latest_date: str | None,
+    *,
+    is_urgent: bool = False,
+) -> int:
     if case_status in ("closed", "archived"):
         return 4
+    if is_urgent:
+        return 1
     if not latest_date:
         return 2
     try:
@@ -101,8 +108,6 @@ def _compute_priority(case_status: str, latest_date: str | None) -> int:
         days = (today - d).days
     except ValueError:
         return 2
-    if days < 7:
-        return 1
     if days <= 30:
         return 2
     return 3
@@ -845,7 +850,11 @@ class SyncEngine:
 
             # Update case
             latest_date = _get_latest_movement_date(detail["movements"])
-            priority = _compute_priority(case.get("status", "active"), latest_date)
+            priority = _compute_priority(
+                case.get("status", "active"),
+                latest_date,
+                is_urgent=bool(case.get("is_urgent")),
+            )
             next_sync = _compute_next_sync_at(priority)
 
             canonical = (
@@ -1251,7 +1260,11 @@ class SyncEngine:
             except Exception:
                 logger.warning("Failed to upsert familia movement for case %s", case["id"], exc_info=True)
 
-        priority = _compute_priority(case.get("status", "active"), None)
+        priority = _compute_priority(
+            case.get("status", "active"),
+            None,
+            is_urgent=bool(case.get("is_urgent")),
+        )
         next_sync = _compute_next_sync_at(priority)
 
         await run_query(
