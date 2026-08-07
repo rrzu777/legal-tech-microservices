@@ -6,7 +6,11 @@ from fastapi import APIRouter, Request
 from app.auth import verify_api_key
 from app.rate_limit import limiter
 from app.catalogs import normalize_catalog_label
-from app.matching import build_search_response, is_definitive_not_found
+from app.matching import (
+    build_search_response,
+    is_definitive_not_found,
+    matches_requested_candidate,
+)
 from app.models import SearchRequest, SearchResponse, CandidateMatch
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import competencia_path, parse_search_identifier, resolve_libro
@@ -207,18 +211,46 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
         if req.contract_version == 2:
             try:
-                _enrich_v2_candidates(
-                    matches,
-                    req,
-                    anno=int(parsed["anno"]) if parsed["anno"] else None,
-                    book_code=(
+                enrichment_kwargs = {
+                    "anno": int(parsed["anno"]) if parsed["anno"] else None,
+                    "book_code": (
                         req.libro or libro_used
                         if req.competencia not in {"suprema", "apelaciones"}
                         and req.case_type != "ruc"
                         else None
                     ),
-                    catalog_service=getattr(request.app.state, "catalog_service", None),
-                )
+                    "catalog_service": getattr(
+                        request.app.state, "catalog_service", None,
+                    ),
+                }
+                if req.allow_broad:
+                    exact_matches = [
+                        match for match in matches
+                        if matches_requested_candidate(match, req)
+                    ]
+                    resolved_matches = []
+                    for match in exact_matches:
+                        try:
+                            _enrich_v2_candidates(
+                                [match], req, **enrichment_kwargs,
+                            )
+                        except CanonicalCatalogResolutionError:
+                            continue
+                        resolved_matches.append(match)
+                    if exact_matches and not resolved_matches:
+                        raise CanonicalCatalogResolutionError(
+                            "no exact broad candidate has canonical identity"
+                        )
+                    if len(resolved_matches) != len(exact_matches):
+                        logger.info(
+                            "Skipped %d broad candidates without canonical identity",
+                            len(exact_matches) - len(resolved_matches),
+                        )
+                    matches = resolved_matches
+                else:
+                    _enrich_v2_candidates(
+                        matches, req, **enrichment_kwargs,
+                    )
             except CanonicalCatalogResolutionError:
                 logger.warning("Loaded PJUD catalog could not resolve search identity")
                 return SearchResponse(

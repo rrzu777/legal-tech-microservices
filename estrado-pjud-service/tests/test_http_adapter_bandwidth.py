@@ -65,3 +65,34 @@ async def test_adapter_attributes_request_and_response_to_active_operation():
     assert usage.request_count == 1
     assert usage.bytes_up == len(b"payload")
     assert usage.bytes_down == len(b"response")
+
+
+@pytest.mark.asyncio
+async def test_adapter_retries_one_transient_transport_disconnect():
+    adapter = OJVHttpAdapter(_settings())
+    adapter._client.post = AsyncMock(side_effect=[
+        httpx.RemoteProtocolError("server disconnected"),
+        _fake_response(b"ok"),
+    ])
+
+    with capture_proxy_usage() as usage:
+        response = await adapter.post("/foo", content=b"payload")
+
+    assert response.content == b"ok"
+    assert adapter._client.post.await_count == 2
+    assert usage.request_count == 2
+    assert usage.retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_adapter_stops_after_one_transient_transport_retry():
+    adapter = OJVHttpAdapter(_settings())
+    adapter._client.get = AsyncMock(side_effect=httpx.ConnectError("proxy down"))
+
+    with capture_proxy_usage() as usage:
+        with pytest.raises(httpx.ConnectError, match="proxy down"):
+            await adapter.get("/foo")
+
+    assert adapter._client.get.await_count == 2
+    assert usage.request_count == 2
+    assert usage.retry_count == 1

@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from app.models import CandidateMatch, SearchRequest, SearchResponse
-from app.parsers.normalizer import resolve_libro
+from app.parsers.normalizer import PENAL_LIBRO_CODE_MAP, resolve_libro
 
 
 def normalize_label(value: str) -> str:
@@ -48,8 +48,9 @@ def matches_requested_candidate(candidate: CandidateMatch, req: SearchRequest) -
     Appellate direct-resource results prepend the official resource label
     (``Protección-4490-2025``) although their request field is only
     ``4490-2025``.  That exception is comparison-only and is constrained by
-    the requested `appeals_resource` book; it never changes stored/displayed
-    identifiers and does not apply to Penal RITs.
+    the requested official book; it never changes stored/displayed identifiers.
+    Penal RIT results likewise expose ``Ordinaria-243-2025`` while the canonical
+    request remains ``O-243-2025``.
     """
     if req.case_type == "ruc":
         return (
@@ -111,12 +112,21 @@ def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) 
         return False
     if normalize_identifier(candidate_identifier) == normalize_identifier(req.case_number):
         return True
+    candidate_parts = normalize_identifier(candidate_identifier).split()
+    requested_parts = normalize_identifier(req.case_number).split()
+    if req.competencia == "penal" and req.case_type == "rit":
+        expected_book = PENAL_LIBRO_CODE_MAP.get(req.libro or "")
+        return (
+            bool(expected_book)
+            and len(candidate_parts) >= 3
+            and len(requested_parts) >= 3
+            and " ".join(candidate_parts[:-2]) == normalize_identifier(expected_book)
+            and candidate_parts[-2:] == requested_parts[-2:]
+        )
     if req.competencia != "apelaciones" or req.search_mode != "appeals_resource":
         return False
 
     expected_book = resolve_libro(req.competencia, "", req.libro)
-    candidate_parts = normalize_identifier(candidate_identifier).split()
-    requested_parts = normalize_identifier(req.case_number).split()
     return (
         bool(expected_book)
         and len(candidate_parts) >= 3
