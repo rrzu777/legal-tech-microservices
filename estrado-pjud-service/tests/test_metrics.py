@@ -141,6 +141,13 @@ class TestWorkerMetrics:
         assert m.current_status == "paused"
         assert m.heartbeat_payload()["status"] == "paused"
 
+    def test_heartbeat_distingue_reposo_fuera_de_horario(self):
+        m = self._make(pool=self._fake_pool())
+
+        m.set_status("idle_off_hours")
+
+        assert m.heartbeat_payload()["status"] == "idle_off_hours"
+
     def test_errors_today_sigue_siendo_el_total(self):
         """La columna existente no cambia de significado: quien la lea hoy
         sigue viendo el total."""

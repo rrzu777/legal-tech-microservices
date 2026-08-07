@@ -6,27 +6,24 @@ from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 logger = logging.getLogger(__name__)
 
 
-def _is_office_hours(dt: datetime | None = None) -> bool:
+def is_scheduled_processing_window(dt: datetime | None = None) -> bool:
     now = dt or datetime.now(TZ_SANTIAGO)
     if now.tzinfo is None:
         now = now.replace(tzinfo=TZ_SANTIAGO)
     return now.weekday() < 5 and 8 <= now.hour < 18
-
-
-def _is_archived_window(dt: datetime | None = None) -> bool:
-    now = dt or datetime.now(TZ_SANTIAGO)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=TZ_SANTIAGO)
-    return now.weekday() == 6 and (now.hour >= 22 or now.hour < 6)
-
 
 class Scheduler:
     def __init__(self, config: WorkerConfig, supabase):
         self._config = config
         self._sb = supabase
 
-    async def get_next_batch(self) -> list[dict]:
-        now_iso = datetime.now(TZ_SANTIAGO).isoformat()
+    async def get_next_batch(self, now: datetime | None = None) -> list[dict]:
+        now = now or datetime.now(TZ_SANTIAGO)
+        if not is_scheduled_processing_window(now):
+            return []
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=TZ_SANTIAGO)
+        now_iso = now.isoformat()
 
         query = (
             self._sb.from_("cases")
@@ -35,6 +32,7 @@ class Scheduler:
             .eq("source_system", "pjud_ojv")
             .or_(f"sync_blocked_until.is.null,sync_blocked_until.lt.{now_iso}")
             .or_(f"next_sync_at.is.null,next_sync_at.lte.{now_iso}")
+            .lte("sync_priority", 3)
             .order("sync_priority", desc=False)
             .order("next_sync_at", desc=False)
             .limit(self._config.BATCH_SIZE)
@@ -42,12 +40,6 @@ class Scheduler:
 
         resp = await run_query(query)
         cases = resp.data or []
-
-        now = datetime.now(TZ_SANTIAGO)
-        if _is_office_hours(now):
-            cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 3]
-        elif not _is_archived_window(now):
-            cases = [c for c in cases if c.get("sync_priority") is None or c["sync_priority"] <= 3]
 
         if not cases:
             return []

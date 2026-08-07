@@ -2,7 +2,17 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from worker.__main__ import safe_initialize_pool
+from worker.__main__ import safe_initialize_pool, can_initialize_paid_pool
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def test_paid_pool_initialization_only_during_office_window():
+    tz = ZoneInfo("America/Santiago")
+
+    assert can_initialize_paid_pool(datetime(2026, 3, 2, 8, 0, tzinfo=tz)) is True
+    assert can_initialize_paid_pool(datetime(2026, 3, 2, 18, 0, tzinfo=tz)) is False
+    assert can_initialize_paid_pool(datetime(2026, 3, 1, 10, 0, tzinfo=tz)) is False
 
 
 @pytest.mark.asyncio

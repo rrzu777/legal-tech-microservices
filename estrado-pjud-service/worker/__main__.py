@@ -14,7 +14,7 @@ from app.logging_redaction import install_secret_redaction
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
-from worker.scheduler import Scheduler
+from worker.scheduler import Scheduler, is_scheduled_processing_window
 from worker.engine import SyncEngine
 from worker.notifier import Notifier
 from worker.metrics import Metrics
@@ -151,6 +151,11 @@ async def safe_initialize_pool(
     return False
 
 
+def can_initialize_paid_pool(now=None) -> bool:
+    """El pool residencial solo puede mintear cuando el scheduler puede trabajar."""
+    return is_scheduled_processing_window(now)
+
+
 async def refresh_proxy_gate(
     control: ProxyControl | None, backoff: CircuitBreaker,
 ) -> ProxyControlSnapshot:
@@ -219,6 +224,15 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
+            if not can_initialize_paid_pool():
+                metrics.set_status("idle_off_hours")
+                notify_status("idle outside PJUD office hours")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
             # Never mint a paid-proxy session before the persistent control
             # allows traffic. Missing control/DB is intentionally fail-closed.
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
@@ -276,6 +290,15 @@ async def main():
         notify_status("running")
 
         while not shutdown_event.is_set():
+            if not is_scheduled_processing_window():
+                metrics.set_status("idle_off_hours")
+                notify_status("idle outside PJUD office hours")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
             if not snapshot.allowed:
                 metrics.set_status("paused")
