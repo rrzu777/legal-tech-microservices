@@ -113,6 +113,7 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
+        mock_sb.rpc.return_value = chain
 
     if mock_notifier is None:
         mock_notifier = AsyncMock()
@@ -179,6 +180,10 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is True
+        mock_sb.rpc.assert_any_call("schedule_pjud_case_after_sync", {
+            "p_case_id": case["id"],
+            "p_latest_movement_date": "2024-07-01",
+        })
         mock_pool.acquire.assert_called_once()
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
         mock_backoff.record_success.assert_called_once()

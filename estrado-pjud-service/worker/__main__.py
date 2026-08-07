@@ -54,6 +54,7 @@ async def process_batch(
     shutdown_event: asyncio.Event,
     backoff: CircuitBreaker,
     proxy_control: ProxyControl | None = None,
+    processing_window=is_scheduled_processing_window,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
@@ -66,6 +67,12 @@ async def process_batch(
 
     async def _run_one(case):
         async with sem:
+            # Un lote reclamado al final de la jornada puede seguir esperando
+            # el semáforo después de las 18:00. No iniciar tráfico nuevo cuando
+            # finalmente obtiene un slot; next_sync_at queda vencido para la
+            # próxima apertura.
+            if not processing_window():
+                return
             if proxy_control is not None:
                 snapshot = await refresh_proxy_gate(proxy_control, backoff)
                 if not snapshot.allowed:
@@ -156,6 +163,32 @@ def can_initialize_paid_pool(now=None) -> bool:
     return is_scheduled_processing_window(now)
 
 
+async def safe_get_next_batch(scheduler, metrics, backoff):
+    """Un fallo del claim no debe cerrar el proceso y provocar otro minteo.
+
+    `None` distingue infraestructura caída de un lote legítimamente vacío.
+    """
+    try:
+        return await scheduler.get_next_batch()
+    except Exception:
+        logger.exception("Failed to claim PJUD sync batch; keeping pool alive")
+        metrics.record_error("infra")
+        backoff.record_failure()
+        return None
+
+
+async def scheduler_contract_ready(scheduler, metrics, backoff) -> bool:
+    """Falla cerrado antes del primer mint si la migración/RPC no está lista."""
+    try:
+        await scheduler.verify_claim_contract()
+        return True
+    except Exception:
+        logger.exception("PJUD scheduler contract unavailable; refusing to mint")
+        metrics.record_error("infra")
+        backoff.record_failure()
+        return False
+
+
 async def refresh_proxy_gate(
     control: ProxyControl | None, backoff: CircuitBreaker,
 ) -> ProxyControlSnapshot:
@@ -224,15 +257,6 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
-            if not can_initialize_paid_pool():
-                metrics.set_status("idle_off_hours")
-                notify_status("idle outside PJUD office hours")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
             # Never mint a paid-proxy session before the persistent control
             # allows traffic. Missing control/DB is intentionally fail-closed.
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
@@ -243,6 +267,24 @@ async def main():
                     "Proxy control denies startup traffic (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if not can_initialize_paid_pool():
+                metrics.set_status("idle_off_hours")
+                notify_status("idle outside PJUD office hours")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if not await scheduler_contract_ready(scheduler, metrics, backoff):
+                metrics.set_status("backoff")
+                notify_status("scheduler migration unavailable; mint blocked")
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -290,15 +332,6 @@ async def main():
         notify_status("running")
 
         while not shutdown_event.is_set():
-            if not is_scheduled_processing_window():
-                metrics.set_status("idle_off_hours")
-                notify_status("idle outside PJUD office hours")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
             if not snapshot.allowed:
                 metrics.set_status("paused")
@@ -307,6 +340,15 @@ async def main():
                     "Proxy traffic paused (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if not is_scheduled_processing_window():
+                metrics.set_status("idle_off_hours")
+                notify_status("idle outside PJUD office hours")
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -327,7 +369,16 @@ async def main():
             metrics.set_status("running")
             notify_status("running")
 
-            batch = await scheduler.get_next_batch()
+            batch = await safe_get_next_batch(scheduler, metrics, backoff)
+
+            if batch is None:
+                metrics.set_status("backoff")
+                notify_status("scheduler unavailable; pool kept alive")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                continue
 
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")

@@ -850,12 +850,6 @@ class SyncEngine:
 
             # Update case
             latest_date = _get_latest_movement_date(detail["movements"])
-            priority = _compute_priority(
-                case.get("status", "active"),
-                latest_date,
-                is_urgent=bool(case.get("is_urgent")),
-            )
-            next_sync = _compute_next_sync_at(priority)
 
             canonical = (
                 f"{competencia}:{canonical_request.case_type}:{canonical_request.case_number}"
@@ -878,11 +872,14 @@ class SyncEngine:
                         "metadata": detail["metadata"],
                         "litigantes": detail["litigantes"],
                     },
-                    "sync_priority": priority,
-                    "next_sync_at": next_sync,
-                    "latest_movement_date": latest_date,
             }
             await run_query(self._sb.from_("cases").update(case_update).eq("id", case["id"]))
+            # PostgreSQL lee is_urgent bajo row lock: un toggle concurrente no
+            # puede ser revertido por el snapshot viejo reclamado al inicio.
+            await run_query(self._sb.rpc("schedule_pjud_case_after_sync", {
+                "p_case_id": case["id"],
+                "p_latest_movement_date": latest_date,
+            }))
 
             # Finish sync run
             await self._finish_run(sync_run_id, started_at, "success", new_count)
@@ -1260,13 +1257,6 @@ class SyncEngine:
             except Exception:
                 logger.warning("Failed to upsert familia movement for case %s", case["id"], exc_info=True)
 
-        priority = _compute_priority(
-            case.get("status", "active"),
-            None,
-            is_urgent=bool(case.get("is_urgent")),
-        )
-        next_sync = _compute_next_sync_at(priority)
-
         await run_query(
             self._sb.from_("cases").update({
                 "tracking_status": "active",
@@ -1278,8 +1268,6 @@ class SyncEngine:
                 "sync_blocked_until": None,
                 "court": caso.tribunal or case.get("court", ""),
                 "title": caso.caratulado or case.get("title", ""),
-                "sync_priority": priority,
-                "next_sync_at": next_sync,
                 "external_payload": {
                     "estado": caso.estado,
                     "materia": caso.materia,
@@ -1289,6 +1277,13 @@ class SyncEngine:
                 },
             }).eq("id", case["id"])
         )
+        await run_query(self._sb.rpc("schedule_pjud_case_after_sync", {
+            "p_case_id": case["id"],
+            # Familia no trae movimientos públicos en este flujo. Preservar la
+            # fecha importada/existente evita borrarla y permite clasificar una
+            # causa realmente inactiva como semanal.
+            "p_latest_movement_date": case.get("latest_movement_date"),
+        }))
 
         await self._finish_run(sync_run_id, started_at, "success", new_count)
 
