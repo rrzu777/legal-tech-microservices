@@ -189,6 +189,35 @@ def test_broad_ambiguity_returns_only_identifier_and_book_compatible_candidates(
     assert all(match["tribunal_code"] is not None for match in body["matches"])
 
 
+def test_broad_search_skips_only_unresolvable_exact_rows(client):
+    """One malformed PJUD row must not poison other canonically resolved hits."""
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rit",
+            "case_number": "O-243-2025",
+            "competencia": "penal",
+            "libro": "1",
+            "allow_broad": True,
+            "max_matches": 100,
+        },
+        [
+            _raw_match("resolved", "Ordinaria-243-2025", "Tribunal penal Santiago"),
+            _raw_match("unresolved", "Ordinaria-243-2025", "Tribunal retirado del catálogo"),
+            _raw_match("wrong-rol", "Ordinaria-999-2025", "Tribunal retirado del catálogo"),
+        ],
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "found"
+    assert body["match_count"] == 1
+    assert [match["key"] for match in body["matches"]] == ["resolved"]
+    assert body["matches"][0]["corte_code"] == 90
+    assert body["matches"][0]["tribunal_code"] == 321
+
+
 def test_duplicate_loaded_tribunal_label_fails_closed_as_upstream_changed(client):
     """Catches an ambiguous official label being exposed as a null-code candidate."""
     response, _session_mock, _pool_mock = _post(

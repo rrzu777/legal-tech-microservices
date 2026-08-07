@@ -116,6 +116,51 @@ def test_normalization_is_only_for_comparison_and_never_rewrites_penal_rit():
     assert "Ordinaria" not in ranked.matches[0].rol
 
 
+def test_penal_rit_matches_pjud_official_book_label_without_rewriting_display():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rit",
+        case_number="O-243-2025",
+        competencia="penal",
+        corte=90,
+        tribunal=321,
+        libro="1",
+    )
+    candidate = _candidate(
+        1,
+        rol="Ordinaria-243-2025",
+        corte_code=90,
+        tribunal_code=321,
+        libro_code="1",
+    )
+
+    response = build_search_response([candidate], request)
+
+    assert response.status == "found"
+    assert response.matches[0].rol == "Ordinaria-243-2025"
+
+
+def test_penal_rit_does_not_accept_display_label_for_another_requested_book():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rit",
+        case_number="X-243-2025",
+        competencia="penal",
+        corte=90,
+        tribunal=321,
+        libro="2",
+    )
+    candidate = _candidate(
+        1,
+        rol="Ordinaria-243-2025",
+        corte_code=90,
+        tribunal_code=321,
+        libro_code="2",
+    )
+
+    assert build_search_response([candidate], request).status == "not_found"
+
+
 def test_appeals_resource_matches_its_official_book_prefix_without_rewriting_display():
     request = SearchRequest(
         contract_version=2,

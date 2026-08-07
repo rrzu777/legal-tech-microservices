@@ -36,6 +36,14 @@ APELACIONES_LIBRO_CODE_MAP: dict[str, str] = {
     "42": "COMLIBCOND",
 }
 
+PENAL_LIBRO_CODE_MAP: dict[str, str] = {
+    "1": "ORDINARIA",
+    "2": "EXHORTO",
+    "3": "ADMINISTRATIVA",
+    "4": "EXTRADICION",
+    "5": "MILITAR",
+}
+
 LIBRO_DEFAULTS: dict[str, str] = {
     "civil": "C",
     "laboral": "O",
