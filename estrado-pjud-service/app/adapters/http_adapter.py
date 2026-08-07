@@ -4,7 +4,12 @@ import time
 
 import httpx
 
-from app.bandwidth import estimate_request_bytes, record_proxy_request, record_proxy_response
+from app.bandwidth import (
+    estimate_request_bytes,
+    record_proxy_request,
+    record_proxy_response,
+    record_proxy_retry,
+)
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -46,22 +51,30 @@ class OJVHttpAdapter:
         self._last_request_time = time.monotonic()
 
     async def get(self, path: str, **kwargs) -> httpx.Response:
-        await self._rate_limit()
-        url = f"{self._base}{path}"
-        logger.debug("GET %s", url)
-        record_proxy_request(estimate_request_bytes(kwargs))
-        response = await self._client.get(url, **kwargs)
-        record_proxy_response(len(response.content))
-        return response
+        return await self._request("get", path, **kwargs)
 
     async def post(self, path: str, **kwargs) -> httpx.Response:
-        await self._rate_limit()
+        return await self._request("post", path, **kwargs)
+
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         url = f"{self._base}{path}"
-        logger.debug("POST %s", url)
-        record_proxy_request(estimate_request_bytes(kwargs))
-        response = await self._client.post(url, **kwargs)
-        record_proxy_response(len(response.content))
-        return response
+        request = getattr(self._client, method)
+        for attempt in range(2):
+            await self._rate_limit()
+            logger.debug("%s %s", method.upper(), url)
+            record_proxy_request(estimate_request_bytes(kwargs))
+            try:
+                response = await request(url, **kwargs)
+            except httpx.TransportError:
+                if attempt == 1:
+                    raise
+                record_proxy_retry()
+                logger.warning("OJV transport failed; retrying once")
+                continue
+            record_proxy_response(len(response.content))
+            return response
+
+        raise AssertionError("unreachable")
 
     @property
     def cookies(self) -> httpx.Cookies:
