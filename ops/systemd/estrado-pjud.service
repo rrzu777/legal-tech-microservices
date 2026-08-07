@@ -7,9 +7,14 @@ PartOf=legaltech.slice
 Type=simple
 User=www-data
 SupplementaryGroups=estrado
+RuntimeDirectory=estrado-pjud-api
+RuntimeDirectoryMode=0750
 WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
 
 Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+Environment=HOME=/run/estrado-pjud-api
+Environment=TMPDIR=/run/estrado-pjud-api
 EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
 
 # Solo localhost: el único que entra es Caddy (443, TLS) — ops/caddy/README.md.
@@ -23,7 +28,11 @@ EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
 # se midió que el 100% del tráfico externo del 8000 eran scanners—. El default
 # de forwarded_allow_ips además lo pisa la env FORWARDED_ALLOW_IPS, y este
 # unit carga un EnvironmentFile: escribirlo acá lo deja fuera de ese alcance.
-ExecStart=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
+# El worker automático y el API interactivo comparten el mismo CookieMinter:
+# Chromium debe correr headed para superar F5. Xvfb permite ese mint desde una
+# acción 24/7 sin encender el worker programado. TMPDIR apunta al RuntimeDirectory
+# porque ProtectSystem=strict deja /tmp de solo lectura para esta unit.
+ExecStart=/usr/bin/xvfb-run -a /opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
 
 Slice=legaltech.slice
 

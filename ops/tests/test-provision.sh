@@ -72,6 +72,16 @@ run_prov() {
 reloads() { grep -c '^daemon-reload' "$LOG_SYSCTL" || true; }
 caddy_reloads() { grep -c '^reload caddy' "$LOG_SYSCTL" || true; }
 
+echo "== API interactiva: Playwright headed tiene display, browser y tmp escribible"
+API_UNIT=$(cat "$OPS_DIR/systemd/estrado-pjud.service")
+expect_contains "API corre dentro de Xvfb" "$API_UNIT" "/usr/bin/xvfb-run -a"
+expect_contains "API usa Chromium instalado del VPS" "$API_UNIT" \
+  "Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright"
+expect_contains "API declara runtime privado escribible" "$API_UNIT" \
+  "RuntimeDirectory=estrado-pjud-api"
+expect_contains "Playwright usa ese runtime para temporales" "$API_UNIT" \
+  "Environment=TMPDIR=/run/estrado-pjud-api"
+
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
 expect_eq "exit 0" "$RC" "0"
