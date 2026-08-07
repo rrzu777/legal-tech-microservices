@@ -11,7 +11,7 @@ RuntimeDirectory=estrado-pjud-api
 RuntimeDirectoryMode=0750
 WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service
 
-Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin
+Environment=PATH=/opt/legal-tech-microservices/estrado-pjud-service/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 Environment=HOME=/run/estrado-pjud-api
 Environment=TMPDIR=/run/estrado-pjud-api
@@ -30,8 +30,8 @@ EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
 # unit carga un EnvironmentFile: escribirlo acá lo deja fuera de ese alcance.
 # El worker automático y el API interactivo comparten el mismo CookieMinter:
 # Chromium debe correr headed para superar F5. Xvfb permite ese mint desde una
-# acción 24/7 sin encender el worker programado. TMPDIR apunta al RuntimeDirectory
-# porque ProtectSystem=strict deja /tmp de solo lectura para esta unit.
+# acción 24/7 sin encender el worker programado. PrivateTmp da a Xvfb su socket
+# Unix escribible; TMPDIR mantiene los artefactos de Playwright en el runtime.
 ExecStart=/usr/bin/xvfb-run -a /opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips 127.0.0.1
 
 Slice=legaltech.slice
@@ -51,6 +51,7 @@ SyslogIdentifier=estrado-pjud
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
+PrivateTmp=true
 ReadWritePaths=/opt/legal-tech-microservices/estrado-pjud-service
 
 [Install]

@@ -81,6 +81,10 @@ expect_contains "API declara runtime privado escribible" "$API_UNIT" \
   "RuntimeDirectory=estrado-pjud-api"
 expect_contains "Playwright usa ese runtime para temporales" "$API_UNIT" \
   "Environment=TMPDIR=/run/estrado-pjud-api"
+expect_contains "xvfb-run conserva binarios del sistema en PATH" "$API_UNIT" \
+  ":/usr/bin:/sbin:/bin"
+expect_contains "Xvfb tiene un socket Unix escribible y aislado" "$API_UNIT" \
+  "PrivateTmp=true"
 
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
