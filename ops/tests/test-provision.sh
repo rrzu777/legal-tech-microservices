@@ -85,6 +85,13 @@ expect_contains "xvfb-run conserva binarios del sistema en PATH" "$API_UNIT" \
   ":/usr/bin:/sbin:/bin"
 expect_contains "Xvfb tiene un socket Unix escribible y aislado" "$API_UNIT" \
   "PrivateTmp=true"
+expect_contains "API crea el directorio persistente aunque el worker esté apagado" "$API_UNIT" \
+  "StateDirectory=estrado-pjud"
+expect_contains "API escribe cookies con el grupo compartido" "$API_UNIT" \
+  "Group=estrado"
+WORKER_UNIT=$(cat "$OPS_DIR/systemd/estrado-pjud-worker.service")
+expect_contains "worker conserva escritura del grupo compartido" "$WORKER_UNIT" \
+  "StateDirectoryMode=0770"
 
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
