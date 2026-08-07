@@ -1,7 +1,11 @@
 from pathlib import Path
 import pytest
 
-from app.parsers.search_parser import parse_search_results, detect_blocked
+from app.parsers.search_parser import (
+    _appeals_book_from_rol,
+    detect_blocked,
+    parse_search_results,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -104,6 +108,15 @@ class TestParseSearchApelaciones:
         assert result["corte"] == "C.A. de San Miguel"
         assert result["libro"] == "Protección"
         assert result["libro_code"] == "34"
+
+    def test_derives_composite_laboral_cobranza_book_from_real_display_label(self):
+        assert _appeals_book_from_rol("Laboral - Cobranza-833-2025") == (
+            "Laboral - Cobranza",
+            "30",
+        )
+
+    def test_does_not_collapse_unknown_composite_labels(self):
+        assert _appeals_book_from_rol("Laboral - Otro-833-2025") == (None, None)
 
     def test_jwt_keys_present(self, html):
         results = parse_search_results(html, "apelaciones")

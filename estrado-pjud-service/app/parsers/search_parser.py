@@ -23,6 +23,10 @@ _APPEALS_BOOK_BY_LABEL = {
         "39": "AMBIENTAL", "40": "TRASPASO", "41": "MINISTRO", "42": "COMLIBCOND",
     }.items()
 }
+# The live Appeals table uses the full official catalog label for book 30,
+# while older rows and fixtures expose only ``Laboral``.  Both are explicit
+# upstream labels for the same code; no fuzzy or substring matching is used.
+_APPEALS_BOOK_BY_LABEL["LABORAL - COBRANZA"] = "30"
 
 
 def _appeals_book_from_rol(rol: str) -> tuple[str | None, str | None]:
