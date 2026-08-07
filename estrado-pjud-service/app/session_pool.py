@@ -93,6 +93,17 @@ class APISessionPool:
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
+        return await self._acquire_with_deadline(
+            time.monotonic() + _RETRY_BUDGET_S,
+        )
+
+    async def _acquire_with_deadline(
+        self,
+        deadline: float,
+        *,
+        permit_initial_attempt: bool = True,
+    ) -> OJVSession:
+        """Acquire without renewing the interactive request's retry budget."""
         await self.assert_proxy_enabled()
         async with self._lock:
             # Try to get a valid session from the pool
@@ -106,9 +117,10 @@ class APISessionPool:
 
         # No valid session available — create outside the lock to avoid blocking
         logger.info("Creating new API session")
+        limite = deadline
         utilizables = self._usable_bundles()
         if not utilizables and self._proxy_mode:
-            minted = await self._mint_on_demand()
+            minted = await self._mint_on_demand(deadline=limite)
             if minted is not None:
                 return minted
             utilizables = self._usable_bundles()
@@ -129,8 +141,13 @@ class APISessionPool:
         # —los bundles sobreviven a un deploy que apague `OJV_PROXY_URL`, y
         # `_usable` los acepta a todos—, así que ahí también puede haber varios.
         intentos = max(1, len(utilizables))
-        limite = time.monotonic() + _RETRY_BUDGET_S
+        bundles_rechazados: set[str] = set()
         for intento in range(1, intentos + 1):
+            if (
+                time.monotonic() >= limite
+                and (not permit_initial_attempt or intento > 1)
+            ):
+                raise TimeoutError("presupuesto temporal de sesión API agotado")
             bundle = self._rotate(utilizables)
             adapter = OJVHttpAdapter(
                 self._settings,
@@ -152,10 +169,38 @@ class APISessionPool:
                 if isinstance(e, (ProxyBudgetExceededError, ProxyUsagePersistenceError)):
                     raise
                 agotado = time.monotonic() >= limite
-                if intento >= intentos or agotado or not new_egress_may_help(e):
+                puede_cambiar_con_ip_nueva = new_egress_may_help(e)
+                if bundle is not None:
+                    identity = bundle.proxy_token or bundle.proxy_url
+                    if identity:
+                        bundles_rechazados.add(identity)
+                if agotado or not puede_cambiar_con_ip_nueva:
                     # `raise` pelado: preserva la excepción y su traceback, que
                     # es lo que `acquire_or_alert` clasifica y loguea.
                     raise
+                if intento >= intentos:
+                    if not self._proxy_mode:
+                        raise
+                    logger.warning(
+                        "Todos los bundles API guardados fallaron (%d/%d); "
+                        "probando minteo interactivo con IP residencial nueva",
+                        intento,
+                        intentos,
+                    )
+                    api_metrics.record_bundle_retry()
+                    minted = await self._mint_on_demand(
+                        rejected_proxy_tokens=bundles_rechazados,
+                        deadline=limite,
+                    )
+                    if minted is not None:
+                        return minted
+                    # Otra request ganó el lock y guardó un bundle que esta
+                    # request todavía no probó. Releer el store permite usarlo
+                    # sin pagar un segundo minteo concurrente.
+                    return await self._acquire_with_deadline(
+                        limite,
+                        permit_initial_attempt=False,
+                    )
                 # Antes del reintento, no después: si el proceso se cae en la
                 # vuelta siguiente, el bundle quemado igual quedó contado.
                 api_metrics.record_bundle_retry()
@@ -167,12 +212,25 @@ class APISessionPool:
 
         raise RuntimeError("unreachable")  # el loop retorna o re-lanza
 
-    async def _mint_on_demand(self) -> OJVSession | None:
+    async def _mint_on_demand(
+        self,
+        *,
+        rejected_proxy_tokens: set[str] | None = None,
+        deadline: float | None = None,
+    ) -> OJVSession | None:
         """Mint one bundle for an interactive request, independent of worker hours."""
         async with self._mint_lock:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("presupuesto temporal de minteo API agotado")
             # Another interactive request may have populated the store while
             # this one waited. Reuse that paid mint instead of duplicating it.
-            if self._usable_bundles():
+            current = self._usable_bundles()
+            if rejected_proxy_tokens is None and current:
+                return None
+            if rejected_proxy_tokens is not None and any(
+                (bundle.proxy_token or bundle.proxy_url) not in rejected_proxy_tokens
+                for bundle in current
+            ):
                 return None
             for attempt in range(1, _ON_DEMAND_MINT_ATTEMPTS + 1):
                 try:
@@ -180,6 +238,7 @@ class APISessionPool:
                 except Exception as exc:
                     if (
                         attempt >= _ON_DEMAND_MINT_ATTEMPTS
+                        or (deadline is not None and time.monotonic() >= deadline)
                         or isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError))
                         or is_proxy_billing_error(exc)
                         or not new_egress_may_help(exc)

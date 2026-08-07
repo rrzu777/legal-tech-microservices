@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ from app.config import Settings
 from app.cookie_store import CookieBundle
 from app.minter import MintResult
 from app.failure_kind import BlockedPageError
+from app.metrics import api_metrics
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from tests.helpers import FakeOJVSession
 from worker.proxy_control import ProxyControlSnapshot
@@ -152,6 +154,161 @@ async def test_on_demand_mint_rotates_ip_after_f5_challenge(monkeypatch, tmp_pat
     assert attempts == 3
     assert len(set(minted_proxies)) == 3
     assert usage.operations == ["mint", "mint", "mint"]
+
+
+@pytest.mark.asyncio
+async def test_challenged_stored_bundle_falls_back_to_fresh_on_demand_mint(
+    monkeypatch, tmp_path,
+):
+    """A single persisted but challenged IP must not bypass fresh-IP retries."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    control = AsyncMock()
+    control.refresh.return_value = ProxyControlSnapshot(
+        allowed=True,
+        status="enabled",
+        reason_code="interactive",
+        revision=1,
+        source="database",
+    )
+    store = MemoryCookieStore()
+    store.save_slot(0, {"TSPD_101": "stale"}, "stale-UA", "stale-token")
+    initialized_cookies: list[dict] = []
+    minted_proxies: list[str | None] = []
+
+    class FreshMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted_proxies.append(proxy)
+
+        async def mint(self):
+            return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
+
+    class CookieAwareSession(FakeOJVSession):
+        async def initialize(self):
+            cookies = self.adapter.cookies
+            initialized_cookies.append(cookies)
+            if cookies == {"TSPD_101": "stale"}:
+                raise BlockedPageError("stored IP challenged")
+
+    def fake_adapter(_settings, **kwargs):
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", fake_adapter)
+    monkeypatch.setattr(pool_module, "OJVSession", CookieAwareSession)
+
+    pool = APISessionPool(
+        settings,
+        proxy_control=control,
+        proxy_usage=RecordingUsageTracker(),
+    )
+    pool._store = store
+
+    session = await pool.acquire()
+
+    assert isinstance(session, CookieAwareSession)
+    assert initialized_cookies == [
+        {"TSPD_101": "stale"},
+        {"TSPD_101": "fresh"},
+    ]
+    assert len(minted_proxies) == 1
+    assert store.slots["0"].cookies == {"TSPD_101": "fresh"}
+    assert api_metrics.snapshot()["total_bundle_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_on_demand_mint_does_not_start_more_ips_after_retry_budget(
+    monkeypatch, tmp_path,
+):
+    """A failed slow mint must not keep spending after the request budget."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    control = AsyncMock()
+    control.refresh.return_value = ProxyControlSnapshot(
+        allowed=True,
+        status="enabled",
+        reason_code="interactive",
+        revision=1,
+        source="database",
+    )
+    attempts = 0
+
+    class SlowBlockedMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            nonlocal attempts
+            attempts += 1
+            raise BlockedPageError("slow challenge")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", SlowBlockedMinter)
+    monkeypatch.setattr(pool_module, "_RETRY_BUDGET_S", -1)
+    pool = APISessionPool(
+        settings,
+        proxy_control=control,
+        proxy_usage=RecordingUsageTracker(),
+    )
+    pool._store = MemoryCookieStore()
+
+    with pytest.raises(TimeoutError):
+        await pool.acquire()
+
+    assert attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_mint_lock_does_not_renew_deadline(monkeypatch, tmp_path):
+    """A concurrent request cannot spend after its original deadline expires."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    attempts = 0
+
+    class ForbiddenLateMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            nonlocal attempts
+            attempts += 1
+            return MintResult(cookies={"TSPD_101": "late"}, user_agent="late-UA")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", ForbiddenLateMinter)
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = MemoryCookieStore()
+
+    await pool._mint_lock.acquire()
+    waiting = asyncio.create_task(
+        pool._mint_on_demand(deadline=time.monotonic() + 0.01)
+    )
+    await asyncio.sleep(0.02)
+    pool._mint_lock.release()
+
+    with pytest.raises(TimeoutError):
+        await waiting
+
+    assert attempts == 0
 
 
 @pytest.mark.asyncio

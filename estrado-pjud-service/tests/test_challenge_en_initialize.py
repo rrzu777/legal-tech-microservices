@@ -193,12 +193,26 @@ async def test_el_reintento_queda_contado(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
-    """Sin IP sana no se inventa una: se acaban los intentos y sale la excepción.
+    """Tras agotar bundles guardados y minteos frescos, sale la excepción.
 
-    El techo es la cantidad de bundles justamente para que esto no sea un loop:
-    tres bundles, tres intentos, y la excepción del último llega entera a
-    `acquire_or_alert` para que la clasifique.
+    Los bundles existentes se prueban una vez. Después el camino interactivo
+    tiene su propio techo de tres IPs frescas y la última excepción llega entera
+    a `acquire_or_alert` para que la clasifique.
     """
+    from app import session_pool as pool_module
+
+    mint_attempts = 0
+
+    class AlwaysBlockedMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            nonlocal mint_attempts
+            mint_attempts += 1
+            raise BlockedPageError("fresh IP challenged")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", AlwaysBlockedMinter)
     pool, capturados = pool_con_store(
         monkeypatch,
         _bundles(3),
@@ -209,6 +223,7 @@ async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
         await pool.acquire()
 
     assert len(capturados) == 3, "un intento por bundle, ni uno más"
+    assert mint_attempts == 3, "el minteo interactivo también debe ser acotado"
 
 
 @pytest.mark.asyncio
