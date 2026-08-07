@@ -8,10 +8,11 @@ from collections import deque
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
-from app.failure_kind import NoUsableBundleError, new_egress_may_help
+from app.failure_kind import new_egress_may_help
+from app.minter import CookieMinter
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
-from app.proxy import build_sticky_proxy_url
+from app.proxy import build_sticky_proxy_url, generate_session_token
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 
@@ -51,6 +52,7 @@ class APISessionPool:
         self._settings = settings
         self._pool: deque[OJVSession] = deque()
         self._lock = asyncio.Lock()
+        self._mint_lock = asyncio.Lock()
         self._max_size = settings.SESSION_POOL_SIZE
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
@@ -105,10 +107,10 @@ class APISessionPool:
         logger.info("Creating new API session")
         utilizables = self._usable_bundles()
         if not utilizables and self._proxy_mode:
-            # Sin bundle con proxy NO se sale — ver `NoUsableBundleError`.
-            raise NoUsableBundleError(
-                "no hay bundle F5 con proxy residencial (el worker no minteo)"
-            )
+            minted = await self._mint_on_demand()
+            if minted is not None:
+                return minted
+            utilizables = self._usable_bundles()
 
         # Un intento por bundle: como `_rotate` avanza el round-robin, cada
         # vuelta sale por una IP residencial distinta, y en `len(utilizables)`
@@ -163,6 +165,53 @@ class APISessionPool:
                 )
 
         raise RuntimeError("unreachable")  # el loop retorna o re-lanza
+
+    async def _mint_on_demand(self) -> OJVSession | None:
+        """Mint one bundle for an interactive request, independent of worker hours."""
+        async with self._mint_lock:
+            # Another interactive request may have populated the store while
+            # this one waited. Reuse that paid mint instead of duplicating it.
+            if self._usable_bundles():
+                return None
+            return await self._mint_new_bundle()
+
+    async def _mint_new_bundle(self) -> OJVSession:
+        """Mint and persist one residential bundle after winning the mint lock."""
+        await self.assert_proxy_enabled()
+        token = generate_session_token()
+        proxy_url = build_sticky_proxy_url(
+            self._settings.OJV_PROXY_URL,
+            token,
+            self._settings.OJV_PROXY_STICKY_LIFETIME,
+        )
+        session = None
+        try:
+            async with self._mint_usage_scope(1):
+                credentials = await CookieMinter(
+                    self._settings.OJV_BASE_URL,
+                    proxy=proxy_url,
+                ).mint()
+                adapter = OJVHttpAdapter(
+                    self._settings,
+                    proxy=proxy_url,
+                    user_agent=credentials.user_agent,
+                    cookies=credentials.cookies,
+                )
+                session = OJVSession(adapter)
+                await session.initialize()
+            self._store.save_slot(
+                0,
+                credentials.cookies,
+                credentials.user_agent,
+                token,
+            )
+            return session
+        except Exception as exc:
+            if session is not None:
+                await session.close()
+            if is_proxy_billing_error(exc) and self._proxy_control is not None:
+                await self._proxy_control.trip_billing_exhausted()
+            raise
 
     async def assert_proxy_enabled(self) -> None:
         if not self._proxy_mode:
@@ -219,9 +268,8 @@ class APISessionPool:
         veces algo con lo que no se puede salir es un fallo intermitente, que es
         el más caro de diagnosticar.
 
-        Devuelve None cuando no queda ninguno — y en modo proxy eso NO es una
-        invitación a salir sin proxy: `acquire()` lo convierte en
-        `NoUsableBundleError`.
+        Devuelve None cuando no queda ninguno. En modo proxy eso NO invita a
+        salir directo: `acquire()` mintea una sesión residencial a demanda.
         """
         return self._rotate(self._usable_bundles())
 
