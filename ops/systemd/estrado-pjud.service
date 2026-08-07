@@ -6,7 +6,9 @@ PartOf=legaltech.slice
 [Service]
 Type=simple
 User=www-data
-SupplementaryGroups=estrado
+Group=estrado
+StateDirectory=estrado-pjud
+StateDirectoryMode=0770
 RuntimeDirectory=estrado-pjud-api
 RuntimeDirectoryMode=0750
 WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service

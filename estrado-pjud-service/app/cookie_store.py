@@ -55,8 +55,8 @@ class CookieStore:
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(payload, f)
-            # El worker (User/Group=estrado) escribe; la API (www-data con
-            # SupplementaryGroups=estrado) lee. Nunca exponer cookies al resto.
+            # Worker y API comparten Group=estrado y el StateDirectory 0770.
+            # El archivo queda legible sólo por dueño/grupo, nunca por el resto.
             os.chmod(tmp, 0o640)
             os.replace(tmp, self._path)
         except BaseException:
