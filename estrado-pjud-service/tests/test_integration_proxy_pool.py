@@ -12,7 +12,6 @@ import pytest
 
 import worker.session_pool as wsp
 import app.session_pool as asp
-from app.failure_kind import NoUsableBundleError
 from app.minter import MintResult
 from app.cookie_store import CookieStore
 from worker.session_pool import SessionPool
@@ -118,7 +117,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkeypatch):
-    """Sin bundles en el store, el API NO degrada a proxy=None: se niega a salir.
+    """Sin bundles, el API mintea residencial a demanda; jamás usa proxy=None.
 
     Este test decía lo contrario —"degrada a proxy=None sin crashear"— y ese
     "sin crashear" costaba caro. Medido en el VPS el 1 de agosto de 2026: por la
@@ -128,11 +127,19 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
     como "OJV bloqueó la consulta". Y de paso gastaba reputación de la IP en cada
     intento.
 
-    El `NoUsableBundleError` está clasificado como infra, así que la ruta sale con
-    500 y la app lo lee como `PjudInfraError`: sin sumarle fallas a la causa.
+    El registro interactivo debe seguir funcionando fuera del horario del worker,
+    pero la salida directa por el datacenter continúa prohibida.
     """
     store_path = tmp_path / "empty.json"
     captured = []
+    minted = []
+
+    class OnDemandMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted.append(proxy)
+
+        async def mint(self):
+            return MintResult(cookies={"TSPD_101": "on-demand"}, user_agent="UA")
 
     def capture_adapter(settings, proxy=None, user_agent=None, cookies=None):
         captured.append(proxy)
@@ -140,11 +147,13 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
 
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
+    monkeypatch.setattr(asp, "CookieMinter", OnDemandMinter)
 
     api = APISessionPool(_api_settings(store_path), allow_uncontrolled_proxy=True)
 
-    with pytest.raises(NoUsableBundleError):
-        await api.acquire()
+    await api.acquire()
 
-    # Ni siquiera llegó a construir un adapter: no hubo request a OJV.
-    assert captured == []
+    assert len(minted) == 1
+    assert minted[0] is not None
+    assert captured == minted
+    assert CookieStore(str(store_path)).load_all()

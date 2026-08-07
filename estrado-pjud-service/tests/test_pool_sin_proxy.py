@@ -17,23 +17,37 @@ re-mintea cuando procesa causas, habria fabricado la caida que decia prevenir.
 """
 
 import asyncio
-import pytest
-
-from app.failure_kind import NoUsableBundleError
+from app.minter import MintResult
 from tests.helpers import cookie_bundle, pool_con_store
+
+
+def permitir_mint_residencial(monkeypatch):
+    """Reemplaza el browser por un mint controlado y registra su proxy."""
+    from app import session_pool as sp
+
+    proxies = []
+
+    class FakeMinter:
+        def __init__(self, _base_url, proxy=None):
+            proxies.append(proxy)
+
+        async def mint(self):
+            return MintResult(cookies={"TSPD_101": "tok-nuevo"}, user_agent="UA-nuevo")
+
+    monkeypatch.setattr(sp, "CookieMinter", FakeMinter)
+    return proxies
 
 
 class TestNuncaSalirSinProxy:
     def test_con_proxy_configurado_y_store_vacio_no_sale_a_la_calle(self, monkeypatch):
         pool, capturados = pool_con_store(monkeypatch, {})
+        proxies = permitir_mint_residencial(monkeypatch)
 
-        with pytest.raises(NoUsableBundleError):
-            asyncio.run(pool.acquire())
+        asyncio.run(pool.acquire())
 
-        # Lo que de verdad importa: no llego a construir NINGUN adapter. Afirmarlo
-        # por ausencia y no por `proxy is None` es lo que impide que el dia que
-        # alguien reintroduzca el fallback el test siga pasando.
-        assert capturados == []
+        assert len(proxies) == 1
+        assert proxies[0] is not None
+        assert capturados[0]["proxy"] == proxies[0]
 
     def test_un_bundle_sin_proxy_url_no_sirve_en_modo_proxy(self, monkeypatch):
         # El fallback entrando por la puerta de los DATOS. El store sobrevive a
@@ -42,19 +56,22 @@ class TestNuncaSalirSinProxy:
         # `acquire()` no lo veia como None, y el adapter salia con proxy=None —
         # o sea por la IP del datacenter, con cookies y todo.
         pool, capturados = pool_con_store(monkeypatch, {"0": cookie_bundle("sin-proxy", proxy_url=None)})
+        proxies = permitir_mint_residencial(monkeypatch)
 
-        with pytest.raises(NoUsableBundleError):
-            asyncio.run(pool.acquire())
-        assert capturados == []
+        asyncio.run(pool.acquire())
+        assert capturados[0]["proxy"] == proxies[0]
+        assert capturados[0]["proxy"] is not None
+        assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
 
     def test_un_proxy_url_vacio_tampoco_sirve(self, monkeypatch):
         # `""` es tan inservible como `None` y egresa igual por la IP del
         # datacenter, pero pasa un chequeo escrito como `is not None`.
         pool, capturados = pool_con_store(monkeypatch, {"0": cookie_bundle("vacio", proxy_url="")})
+        proxies = permitir_mint_residencial(monkeypatch)
 
-        with pytest.raises(NoUsableBundleError):
-            asyncio.run(pool.acquire())
-        assert capturados == []
+        asyncio.run(pool.acquire())
+        assert capturados[0]["proxy"] == proxies[0]
+        assert capturados[0]["proxy"] is not None
 
     def test_saltea_el_inutilizable_y_se_queda_con_el_bueno(self, monkeypatch):
         # El descarte va ANTES del round-robin: rotar sobre todos entregaba el
