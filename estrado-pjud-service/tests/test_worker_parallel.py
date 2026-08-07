@@ -53,7 +53,9 @@ async def test_process_batch_bounds_concurrency_to_n():
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
 
-    task = asyncio.create_task(process_batch(batch, engine, 3, shutdown_event, backoff))
+    task = asyncio.create_task(
+        process_batch(batch, engine, 3, shutdown_event, backoff, processing_window=lambda: True)
+    )
 
     # Let the semaphore-bound tasks start and block on the delay event.
     for _ in range(20):
@@ -79,7 +81,9 @@ async def test_process_batch_skips_not_yet_started_on_shutdown():
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
 
-    task = asyncio.create_task(process_batch(batch, engine, 2, shutdown_event, backoff))
+    task = asyncio.create_task(
+        process_batch(batch, engine, 2, shutdown_event, backoff, processing_window=lambda: True)
+    )
 
     # Wait until the first wave (bounded by N=2) has started.
     for _ in range(20):
@@ -107,7 +111,9 @@ async def test_process_batch_skips_when_circuit_breaker_opens_mid_batch():
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
 
-    task = asyncio.create_task(process_batch(batch, engine, 2, shutdown_event, backoff))
+    task = asyncio.create_task(
+        process_batch(batch, engine, 2, shutdown_event, backoff, processing_window=lambda: True)
+    )
 
     for _ in range(20):
         await asyncio.sleep(0)
@@ -131,7 +137,9 @@ async def test_process_batch_one_case_raising_does_not_sink_others():
     backoff = FakeBackoff()
 
     # Should not raise, despite one case's sync_case raising.
-    await process_batch(batch, engine, 5, shutdown_event, backoff)
+    await process_batch(
+        batch, engine, 5, shutdown_event, backoff, processing_window=lambda: True,
+    )
 
     assert sorted(engine.ran) == list(range(5))
 
@@ -159,7 +167,24 @@ async def test_process_batch_rechecks_persistent_gate_before_each_case():
         asyncio.Event(),
         backoff,
         proxy_control=control,
+        processing_window=lambda: True,
     )
 
     assert engine.ran == []
     assert control.refresh.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_process_batch_does_not_start_cases_after_office_window_closes():
+    engine = ConcurrencyTrackingEngine()
+
+    await process_batch(
+        [{"id": 1}, {"id": 2}],
+        engine,
+        1,
+        asyncio.Event(),
+        FakeBackoff(),
+        processing_window=lambda: False,
+    )
+
+    assert engine.ran == []

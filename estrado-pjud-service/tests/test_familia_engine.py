@@ -243,7 +243,11 @@ async def test_sync_success_resets_el_contador(monkeypatch):
     )
     monkeypatch.setattr(eng, "parse_familia_results", MagicMock(return_value=([caso], None)))
 
-    case = {**_CASE, "consecutive_sync_failures": 20}
+    case = {
+        **_CASE,
+        "consecutive_sync_failures": 20,
+        "latest_movement_date": "2024-01-15",
+    }
     result = await engine._sync_familia_case(case, None, MagicMock())
 
     assert result["success"] is True
@@ -255,6 +259,10 @@ async def test_sync_success_resets_el_contador(monkeypatch):
         f"Un sync Familia exitoso debe resetear consecutive_sync_failures a 0, "
         f"pero quedó en {success_update['consecutive_sync_failures']}"
     )
+    engine._sb.rpc.assert_called_with("schedule_pjud_case_after_sync", {
+        "p_case_id": "c1",
+        "p_latest_movement_date": "2024-01-15",
+    })
 
 
 @pytest.mark.asyncio

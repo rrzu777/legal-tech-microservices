@@ -113,6 +113,7 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
+        mock_sb.rpc.return_value = chain
 
     if mock_notifier is None:
         mock_notifier = AsyncMock()
@@ -179,6 +180,10 @@ class TestSyncEngine:
             result = await engine.sync_case(case)
 
         assert result["success"] is True
+        mock_sb.rpc.assert_any_call("schedule_pjud_case_after_sync", {
+            "p_case_id": case["id"],
+            "p_latest_movement_date": "2024-07-01",
+        })
         mock_pool.acquire.assert_called_once()
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
         mock_backoff.record_success.assert_called_once()
@@ -1318,11 +1323,17 @@ class TestHelperFunctions:
         from worker.engine import _compute_priority
         assert _compute_priority("archived", "2024-01-01") == 4
 
-    def test_compute_priority_recent_movement(self):
+    def test_compute_priority_recent_movement_is_daily_without_explicit_urgency(self):
         from worker.engine import _compute_priority
         from datetime import date, timedelta
         recent = (date.today() - timedelta(days=3)).isoformat()
-        assert _compute_priority("active", recent) == 1
+        assert _compute_priority("active", recent, is_urgent=False) == 2
+
+    def test_compute_priority_explicit_urgency(self):
+        from worker.engine import _compute_priority
+        from datetime import date, timedelta
+        recent = (date.today() - timedelta(days=3)).isoformat()
+        assert _compute_priority("active", recent, is_urgent=True) == 1
 
     def test_compute_priority_medium_age_movement(self):
         from worker.engine import _compute_priority
@@ -1356,7 +1367,7 @@ class TestHelperFunctions:
         assert SYNC_INTERVALS_HOURS == {
             1: 6,
             2: 24,
-            3: 72,
+            3: 168,
             4: 168,
         }
 

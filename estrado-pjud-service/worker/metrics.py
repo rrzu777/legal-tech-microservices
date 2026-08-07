@@ -55,7 +55,9 @@ class Metrics:
             self._current_date = today
 
     def set_status(self, status: str) -> None:
-        if status not in {"starting", "paused", "running", "backoff", "stopped"}:
+        if status not in {
+            "starting", "paused", "running", "backoff", "idle_off_hours", "stopped",
+        }:
             raise ValueError(f"invalid worker status: {status}")
         self.current_status = status
 
