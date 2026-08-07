@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 #: primer intento que se cuelga los 30 s ya no arranca un segundo, y uno que
 #: falla rápido —el challenge cortó en ~3 s— deja lugar para los otros bundles.
 _RETRY_BUDGET_S = 20.0
+_ON_DEMAND_MINT_ATTEMPTS = 3
 
 
 class ProxyTrafficDisabledError(RuntimeError):
@@ -173,9 +174,28 @@ class APISessionPool:
             # this one waited. Reuse that paid mint instead of duplicating it.
             if self._usable_bundles():
                 return None
-            return await self._mint_new_bundle()
+            for attempt in range(1, _ON_DEMAND_MINT_ATTEMPTS + 1):
+                try:
+                    return await self._mint_new_bundle(attempt)
+                except Exception as exc:
+                    if (
+                        attempt >= _ON_DEMAND_MINT_ATTEMPTS
+                        or isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError))
+                        or is_proxy_billing_error(exc)
+                        or not new_egress_may_help(exc)
+                    ):
+                        raise
+                    api_metrics.record_bundle_retry()
+                    logger.warning(
+                        "Minteo interactivo bloqueado en intento %d/%d; "
+                        "reintentando con otra IP residencial (%s)",
+                        attempt,
+                        _ON_DEMAND_MINT_ATTEMPTS,
+                        type(exc).__name__,
+                    )
+            raise RuntimeError("unreachable")
 
-    async def _mint_new_bundle(self) -> OJVSession:
+    async def _mint_new_bundle(self, attempt: int = 1) -> OJVSession:
         """Mint and persist one residential bundle after winning the mint lock."""
         await self.assert_proxy_enabled()
         token = generate_session_token()
@@ -186,7 +206,7 @@ class APISessionPool:
         )
         session = None
         try:
-            async with self._mint_usage_scope(1):
+            async with self._mint_usage_scope(attempt):
                 credentials = await CookieMinter(
                     self._settings.OJV_BASE_URL,
                     proxy=proxy_url,
