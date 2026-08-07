@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from app.bandwidth import ProxyUsageCapture, capture_proxy_usage
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.usage_context import current_usage_scope
 from worker.config import run_query
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,10 @@ class ProxyUsageTracker:
         transaction_key: str | None = None,
         estimated_bytes: int | None = None,
     ):
+        inherited = current_usage_scope()
+        law_firm_id = law_firm_id or inherited["law_firm_id"]
+        case_id = case_id or inherited["case_id"]
+        sync_run_id = sync_run_id or inherited["sync_run_id"]
         if not self._enabled:
             with capture_proxy_usage() as usage:
                 yield usage
@@ -77,6 +82,22 @@ class ProxyUsageTracker:
         estimated_cost = estimate / 1_000_000_000 * self._price_per_gb_usd
 
         try:
+            if self._component == "api" and sync_run_id is not None:
+                scope_response = await run_query(
+                    self._sb.from_("case_sync_runs")
+                    .select("id")
+                    .eq("id", sync_run_id)
+                    .eq("case_id", case_id)
+                    .eq("law_firm_id", law_firm_id)
+                    .limit(1)
+                )
+                scope_rows = (
+                    scope_response.data
+                    if isinstance(scope_response.data, list)
+                    else []
+                )
+                if len(scope_rows) != 1:
+                    raise RuntimeError("sync run attribution does not match case and law firm")
             reserve_response = await run_query(self._sb.rpc(
                 "pjud_proxy_reserve_budget",
                 {

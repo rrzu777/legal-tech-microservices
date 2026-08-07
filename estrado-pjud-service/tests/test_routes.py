@@ -163,6 +163,26 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
+    def test_authentication_precedes_paid_usage_attribution_validation(self, client):
+        client.app.state.proxy_control_required = True
+        payload = {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "C-1-2026",
+            "competencia": "civil",
+            "corte": 90,
+            "tribunal": 321,
+            "libro": "C",
+            "allow_broad": False,
+        }
+
+        assert client.post("/api/v1/search", json=payload).status_code == 401
+        assert client.post(
+            "/api/v1/search",
+            json=payload,
+            headers={"Authorization": "Bearer incorrect"},
+        ).status_code == 401
+
     def test_v2_penal_ruc_search_returns_ruc_and_confirms_its_matching_candidate(self, client):
         from app.catalogs import CatalogService
         from app.routes import search as search_route

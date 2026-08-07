@@ -13,6 +13,7 @@ from app.rate_limit import limiter
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
+from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
 from app.routes import health, search, detail, familia, catalogs
 from app.session_pool import APISessionPool
@@ -116,6 +117,7 @@ def create_app() -> FastAPI:
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(PjudUsageContextMiddleware)
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health.router)

@@ -7,6 +7,7 @@ import pytest
 from app.bandwidth import record_proxy_request, record_proxy_response
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from worker.proxy_usage import ProxyUsageTracker
+from app.usage_context import usage_scope
 
 
 def _response(data):
@@ -65,6 +66,63 @@ async def test_usage_tracker_reserves_persists_and_finalizes_actual_bytes():
     assert finalize.args[0] == "pjud_proxy_finalize_budget_reservation"
     assert finalize.args[1]["p_reservation_id"] == "reservation-1"
     assert finalize.args[1]["p_release"] is False
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_inherits_request_attribution_for_mint_search_and_detail():
+    """Dropping request context must make paid API work unattributed again."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="api")
+    responses = []
+    for index in range(3):
+        responses.extend([
+            _response([{"id": "33333333-3333-4333-8333-333333333333"}]),
+            _response([{
+                "allowed": True,
+                "reservation_id": f"reservation-{index}",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": f"event-{index}"}]),
+            _response(None),
+        ])
+
+    with patch("worker.proxy_usage.run_query", side_effect=responses):
+        with usage_scope(
+            law_firm_id="11111111-1111-4111-8111-111111111111",
+            case_id="22222222-2222-4222-8222-222222222222",
+            sync_run_id="33333333-3333-4333-8333-333333333333",
+        ):
+            for operation in ("mint", "search", "detail"):
+                async with tracker.track(operation=operation):
+                    record_proxy_request(10)
+                    record_proxy_response(90)
+
+    payloads = [call.args[0] for call in sb.from_.return_value.insert.call_args_list]
+    assert [payload["operation"] for payload in payloads] == ["mint", "search", "detail"]
+    assert all(payload["law_firm_id"] == "11111111-1111-4111-8111-111111111111" for payload in payloads)
+    assert all(payload["case_id"] == "22222222-2222-4222-8222-222222222222" for payload in payloads)
+    assert all(payload["sync_run_id"] == "33333333-3333-4333-8333-333333333333" for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_unknown_sync_run_before_reservation_or_provider_work():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="api")
+    entered = False
+
+    with patch("worker.proxy_usage.run_query", return_value=_response([])):
+        with pytest.raises(ProxyUsagePersistenceError):
+            with usage_scope(
+                law_firm_id="11111111-1111-4111-8111-111111111111",
+                case_id="22222222-2222-4222-8222-222222222222",
+                sync_run_id="33333333-3333-4333-8333-333333333333",
+            ):
+                async with tracker.track(operation="search"):
+                    entered = True
+
+    assert entered is False
+    sb.rpc.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -182,8 +240,8 @@ async def test_billing_error_is_recorded_for_ops_without_raw_message():
     payload = sb.from_.return_value.insert.call_args.args[0]
     assert payload["status"] == "error"
     assert payload["error_kind"] == "billing"
-    assert "402" not in str(payload)
-    assert "secret-provider-detail" not in str(payload)
+    assert "error_message" not in payload
+    assert "secret-provider-detail" not in str(payload.values())
 
 
 @pytest.mark.asyncio
