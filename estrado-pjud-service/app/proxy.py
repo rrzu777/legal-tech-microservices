@@ -8,11 +8,21 @@ No mintea nada ni hace I/O: solo construye/parsea URLs de proxy.
 - `split_proxy_for_playwright`: separa server/username/password porque
   Chromium/Playwright rechaza credenciales embebidas en la URL del proxy.
 """
+import re
 import secrets
 import string
 from urllib.parse import urlparse, urlunparse
 
 _TOKEN_ALPHABET = string.ascii_lowercase + string.digits
+_STICKY_LIFETIME_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>[mh])$")
+
+
+def sticky_lifetime_seconds(value: str) -> int:
+    match = _STICKY_LIFETIME_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("OJV_PROXY_STICKY_LIFETIME debe usar Nm o Nh con N positivo")
+    multiplier = 60 if match.group("unit") == "m" else 3600
+    return int(match.group("amount")) * multiplier
 
 
 def generate_session_token(n: int = 8) -> str:

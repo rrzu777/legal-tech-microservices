@@ -4,6 +4,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
+from app.proxy import sticky_lifetime_seconds
 
 
 class Settings(BaseSettings):
@@ -39,6 +40,12 @@ class Settings(BaseSettings):
     _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
         validate_cookie_store_path
     )
+
+    @field_validator("OJV_PROXY_STICKY_LIFETIME")
+    @classmethod
+    def _valid_sticky_lifetime(cls, value: str) -> str:
+        sticky_lifetime_seconds(value)
+        return value
 
     # extra=ignore: el .env es compartido y trae claves del worker (POOL_SIZE,
     # WORKER_ID, OJV_PROXY_POOL_SIZE, etc.) que Settings no define; sin esto
