@@ -24,6 +24,10 @@ class AlertCooldownStore:
 
     def claim(self, event: str, cooldown_seconds: int) -> bool:
         """Persist a due event and return whether its alert may be attempted."""
+        return self.reserve(event, cooldown_seconds) is not None
+
+    def reserve(self, event: str, cooldown_seconds: int) -> float | None:
+        """Reserve a due event and return the exact token used for rollback."""
         with self._interprocess_lock():
             now = time.time()
             cooldowns = self._load()
@@ -34,11 +38,20 @@ class AlertCooldownStore:
                         "Alert cooldown timestamp is in the future; failing open"
                     )
                 elif now - last_sent_at < cooldown_seconds:
-                    return False
+                    return None
 
             cooldowns[event] = now
             self._write(cooldowns)
-            return True
+            return now
+
+    def rollback(self, event: str, reservation: float) -> None:
+        """Remove only this failed delivery reservation, never a newer claim."""
+        with self._interprocess_lock():
+            cooldowns = self._load()
+            if cooldowns.get(event) != reservation:
+                return
+            del cooldowns[event]
+            self._write(cooldowns)
 
     @contextmanager
     def _interprocess_lock(self) -> Iterator[None]:

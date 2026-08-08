@@ -30,6 +30,35 @@ def _env(monkeypatch):
 
 
 class TestTelegramAlerter:
+    @pytest.mark.asyncio
+    async def test_failed_event_delivery_rolls_back_durable_cooldown(self, tmp_path):
+        from app.alert_cooldown_store import AlertCooldownStore
+        from app.alerting import TelegramAlerter
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        alerter = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+
+        try:
+            with patch.object(
+                alerter._client,
+                "post",
+                new_callable=AsyncMock,
+                side_effect=[
+                    MagicMock(status_code=500, text="temporary failure"),
+                    MagicMock(status_code=200, text="ok"),
+                ],
+            ) as send:
+                assert await alerter.alert_event("pool_unavailable", "outage") is False
+                assert await alerter.alert_event("pool_unavailable", "outage") is True
+                assert send.await_count == 2
+        finally:
+            await alerter.close()
+
     def test_future_event_timestamp_fails_open_and_is_repaired(self, tmp_path, caplog):
         from app.alert_cooldown_store import AlertCooldownStore
 

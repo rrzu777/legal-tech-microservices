@@ -15,7 +15,7 @@ from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
-from app.routes import health, search, detail, familia, catalogs
+from app.routes import health, search, detail, familia
 from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
@@ -134,8 +134,6 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(detail.router)
     app.include_router(familia.router)
-    app.include_router(catalogs.router)
-
     return app
 
 
