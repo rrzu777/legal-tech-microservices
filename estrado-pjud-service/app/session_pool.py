@@ -50,7 +50,10 @@ class APISessionPool:
         proxy_usage=None,
     ):
         self._settings = settings
-        self._pool: asyncio.Queue[OJVSession] = asyncio.Queue(maxsize=settings.SESSION_POOL_SIZE)
+        self._max_size = settings.SESSION_POOL_SIZE
+        self._pool: asyncio.Queue[OJVSession] = asyncio.Queue(
+            maxsize=max(1, self._max_size),
+        )
         self._lock = asyncio.Lock()
         self._mint_lock = asyncio.Lock()
         self._closing_tasks: set[asyncio.Task[None]] = set()
@@ -402,6 +405,9 @@ class APISessionPool:
         If healthy=False the session is closed immediately and not recycled.
         """
         if not healthy:
+            await session.close()
+            return
+        if self._max_size <= 0:
             await session.close()
             return
         if session.age_seconds >= self._max_age:

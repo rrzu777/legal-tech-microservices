@@ -60,6 +60,26 @@ class TestAPISessionPool:
         assert pool._pool.qsize() == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("pool_size", [0, -1])
+    async def test_release_nonpositive_pool_size_closes_without_retaining(
+        self,
+        pool_size,
+    ):
+        """Nonpositive sizes preserve the old disabled-retention behavior."""
+        from app.config import Settings
+        from app.session_pool import APISessionPool
+
+        settings = Settings(API_KEY="test", _env_file=None)
+        settings.SESSION_POOL_SIZE = pool_size
+        pool = APISessionPool(settings)
+        session = _make_mock_session(age=10)
+
+        await pool.release(session)
+
+        assert pool._pool.qsize() == 0
+        session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_try_acquire_ready_never_mints_or_loads_store(self, monkeypatch):
         """A cold opportunistic checkout must stay local and return immediately."""
         from app.config import Settings
