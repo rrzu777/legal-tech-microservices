@@ -3,7 +3,6 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from collections import deque
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
@@ -51,10 +50,10 @@ class APISessionPool:
         proxy_usage=None,
     ):
         self._settings = settings
-        self._pool: deque[OJVSession] = deque()
+        self._pool: asyncio.Queue[OJVSession] = asyncio.Queue(maxsize=settings.SESSION_POOL_SIZE)
         self._lock = asyncio.Lock()
         self._mint_lock = asyncio.Lock()
-        self._max_size = settings.SESSION_POOL_SIZE
+        self._closing_tasks: set[asyncio.Task[None]] = set()
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
         self._rr_index = 0
@@ -107,8 +106,11 @@ class APISessionPool:
         await self.assert_proxy_enabled()
         async with self._lock:
             # Try to get a valid session from the pool
-            while self._pool:
-                session = self._pool.popleft()
+            while True:
+                try:
+                    session = self._pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
                 if session.age_seconds < self._max_age:
                     return session
                 # Session expired, close it
@@ -402,15 +404,62 @@ class APISessionPool:
         if not healthy:
             await session.close()
             return
-        async with self._lock:
-            if len(self._pool) < self._max_size and session.age_seconds < self._max_age:
-                self._pool.append(session)
-            else:
-                await session.close()
+        if session.age_seconds >= self._max_age:
+            await session.close()
+            return
+        try:
+            self._pool.put_nowait(session)
+        except asyncio.QueueFull:
+            await session.close()
+
+    async def try_acquire_ready(self) -> OJVSession | None:
+        """Return an already-queued valid session without waiting or creating one.
+
+        This intentionally bypasses the interactive lock, bundle store and mint
+        path. It is only for opportunistic work that must skip under contention
+        or when the pool is cold.
+        """
+        # A held lock means an interactive acquire is inspecting the queue.
+        # Skip instead of competing with it; never turn this into check+await.
+        if self._lock.locked():
+            return None
+
+        while True:
+            try:
+                session = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+            if session.age_seconds < self._max_age:
+                return session
+            logger.info(
+                "Closing expired ready-only API session (age=%.0fs)",
+                session.age_seconds,
+            )
+            self._close_in_background(session)
+
+    def _close_in_background(self, session: OJVSession) -> None:
+        """Close a stale ready-only entry without delaying the caller."""
+        task = asyncio.create_task(session.close())
+        self._closing_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._closing_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed to close expired ready-only API session")
+
+        task.add_done_callback(finished)
 
     async def close_all(self):
         """Close all pooled sessions (for app shutdown)."""
-        async with self._lock:
-            while self._pool:
-                session = self._pool.popleft()
-                await session.close()
+        while True:
+            try:
+                session = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            await session.close()
+        if self._closing_tasks:
+            await asyncio.gather(*tuple(self._closing_tasks), return_exceptions=True)

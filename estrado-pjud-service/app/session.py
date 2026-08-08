@@ -2,6 +2,7 @@ import logging
 import json
 import re
 import time
+import uuid
 
 import httpx
 
@@ -46,7 +47,15 @@ _AJAX_HEADERS = {
 class OJVSession:
     """Manages a single OJV session: cookies + CSRF token."""
 
-    def __init__(self, adapter: OJVHttpAdapter):
+    def __init__(
+        self,
+        adapter: OJVHttpAdapter,
+        *,
+        generation_id: uuid.UUID | None = None,
+    ):
+        # Correlation identifier for this in-memory generation only. It is
+        # deliberately random and contains no proxy, cookie or egress identity.
+        self.generation_id = generation_id or uuid.uuid4()
         self._adapter = adapter
         self.csrf_token: str | None = None
         self._created_at: float = time.monotonic()
