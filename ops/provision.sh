@@ -10,8 +10,8 @@
 #     daemon-reload únicamente si algo cambió)
 #   - ops/caddy/Caddyfile → /etc/caddy/Caddyfile (reload de caddy solo si
 #     cambió; si el paquete caddy falta, receta y exit 1 — ops/caddy/README.md)
-#   - .env presente y con TODAS las variables de ops/env.inventory (compara
-#     NOMBRES; los valores nunca se leen ni se imprimen)
+#   - .env presente, 0640 root:estrado y con TODAS las variables de
+#     ops/env.inventory (compara NOMBRES; los valores nunca se imprimen)
 #   - venv, usuarios de las units y /opt/legaltech-monitoring (los scripts de
 #     monitoreo NO viven en este repo — solo se avisa si faltan)
 #   - systemctl enable de las units; el worker requiere opt-in explícito
@@ -24,7 +24,8 @@
 # Sale 0 solo si el VPS quedó completo. Inyectable por entorno para probarlo
 # en el laptop (ver ops/tests/test-provision.sh): PROV_REPO_DIR,
 # PROV_SYSTEMD_DIR, PROV_SYSTEMCTL, PROV_ENV_FILE, PROV_REQUIRED_USERS,
-# PROV_MONITORING_DIR, PROV_CADDY_BIN, PROV_CADDYFILE_DEST.
+# PROV_ENV_OWNER, PROV_ENV_GROUP, PROV_MONITORING_DIR, PROV_CADDY_BIN,
+# PROV_CADDYFILE_DEST.
 set -euo pipefail
 
 main() {
@@ -32,6 +33,8 @@ main() {
   local systemd_dir="${PROV_SYSTEMD_DIR:-/etc/systemd/system}"
   local systemctl_bin="${PROV_SYSTEMCTL:-systemctl}"
   local env_file="${PROV_ENV_FILE:-$repo_dir/estrado-pjud-service/.env}"
+  local env_owner="${PROV_ENV_OWNER:-root}"
+  local env_group="${PROV_ENV_GROUP:-estrado}"
   local required_users="${PROV_REQUIRED_USERS:-estrado www-data}"
   local monitoring_dir="${PROV_MONITORING_DIR:-/opt/legaltech-monitoring}"
   local cron_dir="${PROV_CRON_DIR:-/opt/estrado-cron}"
@@ -97,11 +100,24 @@ main() {
     fi
   fi
 
-  # --- .env: nombres, jamás valores --------------------------------------
-  if [ ! -r "$env_file" ]; then
-    echo "FALTA $env_file (modo 600). Variables requeridas en ops/env.inventory; los valores se reponen desde el gestor de secretos." >&2
+  # --- .env: acceso compartido API/worker; nombres, jamás valores --------
+  # API corre como www-data:estrado y worker como estrado. 0600 para el
+  # owner de la API deja al worker en crash-loop; 0640 comparte sólo con el
+  # grupo de servicio y mantiene fuera a otros usuarios.
+  if [ ! -f "$env_file" ] || [ -L "$env_file" ]; then
+    echo "FALTA $env_file como archivo regular (0640 $env_owner:$env_group). Variables requeridas en ops/env.inventory; los valores se reponen desde el gestor de secretos." >&2
     rc=1
   else
+    # Restringir primero y SIEMPRE intentar ambas operaciones. Un chown que
+    # falle durante una reconstrucción no puede dejar un secreto 0644/0666.
+    if ! chmod 640 "$env_file"; then
+      echo "NO SE PUDO dejar $env_file en modo 0640." >&2
+      rc=1
+    fi
+    if ! chown "$env_owner:$env_group" "$env_file"; then
+      echo "NO SE PUDO dejar $env_file con owner $env_owner:$env_group." >&2
+      rc=1
+    fi
     local missing extra cookie_store_value
     missing=$(comm -23 \
       <(grep -vE '^#|^$' "$repo_dir/ops/env.inventory" | sort) \

@@ -43,6 +43,7 @@ setup() { # setup <nombre> — repo falso completo y sano
   grep -vE '^#|^$' "$REPO/ops/env.inventory" | sed 's/$/=valor-secreto-falso/' > "$ENVF"
   sed -i.bak 's|^COOKIE_STORE_PATH=.*|COOKIE_STORE_PATH=/var/lib/estrado-pjud/cookies.json|' "$ENVF"
   rm "$ENVF.bak"
+  chmod 600 "$ENVF"
   touch "$REPO/estrado-pjud-service/.venv/bin/python"
   chmod +x "$REPO/estrado-pjud-service/.venv/bin/python"
   touch "$MON/monitor.py" "$MON/resource-tracker.py"
@@ -63,6 +64,7 @@ setup() { # setup <nombre> — repo falso completo y sano
 run_prov() {
   OUT=$(PROV_REPO_DIR="$REPO" PROV_SYSTEMD_DIR="$SYSD" PROV_SYSTEMCTL="$SYSCTL" \
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
+        PROV_ENV_OWNER="${ENV_OWNER:-$(id -un)}" PROV_ENV_GROUP="${ENV_GROUP:-$(id -gn)}" \
         PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
         PROV_ENABLE_PJUD_WORKER="${PROV_ENABLE_PJUD_WORKER:-0}" \
         PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
@@ -71,6 +73,15 @@ run_prov() {
 
 reloads() { grep -c '^daemon-reload' "$LOG_SYSCTL" || true; }
 caddy_reloads() { grep -c '^reload caddy' "$LOG_SYSCTL" || true; }
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+}
+file_owner() {
+  stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1"
+}
+file_group() {
+  stat -f '%Sg' "$1" 2>/dev/null || stat -c '%G' "$1"
+}
 
 echo "== API interactiva: Playwright headed tiene display, browser y tmp escribible"
 API_UNIT=$(cat "$OPS_DIR/systemd/estrado-pjud.service")
@@ -105,6 +116,9 @@ expect_contains "habilita las 3 units seguras y deja el worker bajo gate explíc
 expect_missing "no habilita el worker por defecto" "$(cat "$LOG_SYSCTL")" \
   "enable estrado-pjud-worker.service"
 expect_contains "lo dice" "$OUT" "OK:"
+expect_eq ".env queda legible por API y worker, no por otros" "$(file_mode "$ENVF")" "640"
+expect_eq ".env conserva el owner declarado" "$(file_owner "$ENVF")" "$(id -un)"
+expect_eq ".env conserva el grupo declarado" "$(file_group "$ENVF")" "$(id -gn)"
 expect_same_file "instaló el Caddyfile del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
 expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
 
@@ -184,6 +198,13 @@ echo "== .env ausente: lo dice y exit 1"
 setup noenv; rm "$ENVF"; run_prov
 expect_eq "exit 1" "$RC" "1"
 expect_contains "lo dice" "$OUT" "FALTA"
+
+echo "== chown del .env falla: igual restringe el modo y sale 1"
+setup badenvowner; chmod 666 "$ENVF"
+ENV_OWNER="usuario-que-no-existe-xyz" run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica el owner inválido" "$OUT" "NO SE PUDO"
+expect_eq "no deja el secreto expuesto" "$(file_mode "$ENVF")" "640"
 
 echo "== cookie store dentro del checkout: falla cerrado sin imprimir el valor"
 setup cookiestore
