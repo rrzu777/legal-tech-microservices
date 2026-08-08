@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 #: falla rápido —el challenge cortó en ~3 s— deja lugar para los otros bundles.
 _RETRY_BUDGET_S = 20.0
 _ON_DEMAND_MINT_ATTEMPTS = 3
+_CATALOG_RETIREMENT_CORRELATION_S = 10 * 60
 
 
 class ProxyTrafficDisabledError(RuntimeError):
@@ -67,6 +68,8 @@ class APISessionPool:
         )
         self._lock = asyncio.Lock()
         self._mint_lock = asyncio.Lock()
+        self._catalog_retirement_lock = asyncio.Lock()
+        self._catalog_retirement_marker: tuple[uuid.UUID, float] | None = None
         self._closing_tasks: set[asyncio.Task[None]] = set()
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
@@ -96,13 +99,43 @@ class APISessionPool:
         if self._proxy_usage is None or not self._proxy_mode:
             yield None
             return
+        cause_session_id = await self._consume_catalog_retirement_marker()
+        cause = (
+            {
+                "cause_operation": "opportunistic_catalog_refresh",
+                "cause_session_id": cause_session_id,
+            }
+            if cause_session_id is not None
+            else {}
+        )
         async with self._proxy_usage.track(
             operation="mint",
             transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
+            **cause,
         ) as usage:
             if attempt > 1:
                 usage.retry_count += 1
             yield usage
+
+    async def record_catalog_retirement(self, generation_id: uuid.UUID) -> None:
+        """Correlate one near-term mint with a session retired by catalog work."""
+        expires_at = time.monotonic() + _CATALOG_RETIREMENT_CORRELATION_S
+        async with self._catalog_retirement_lock:
+            current = self._catalog_retirement_marker
+            if current is not None and current[1] > time.monotonic():
+                return
+            self._catalog_retirement_marker = (generation_id, expires_at)
+
+    async def _consume_catalog_retirement_marker(self) -> uuid.UUID | None:
+        async with self._catalog_retirement_lock:
+            marker = self._catalog_retirement_marker
+            self._catalog_retirement_marker = None
+            if marker is None:
+                return None
+            generation_id, expires_at = marker
+            if time.monotonic() >= expires_at:
+                return None
+            return generation_id
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""

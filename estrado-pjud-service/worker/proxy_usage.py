@@ -6,6 +6,7 @@ import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from app.bandwidth import ProxyUsageCapture, capture_proxy_usage
 from app.proxy_billing import is_proxy_billing_error
@@ -27,6 +28,7 @@ ESTIMATED_OPERATION_BYTES = {
     "anexo_document": 12_000_000,
     "mint": 10_000_000,
     "catalog": 2_000_000,
+    "opportunistic_catalog_refresh": 2_000_000,
     "health": 1_000_000,
     "other": 5_000_000,
 }
@@ -59,6 +61,8 @@ class ProxyUsageTracker:
         movement_id: str | None = None,
         transaction_key: str | None = None,
         estimated_bytes: int | None = None,
+        cause_operation: Literal["opportunistic_catalog_refresh"] | None = None,
+        cause_session_id: uuid.UUID | None = None,
     ):
         inherited = current_usage_scope()
         law_firm_id = law_firm_id or inherited["law_firm_id"]
@@ -146,6 +150,8 @@ class ProxyUsageTracker:
                         case_id=case_id,
                         sync_run_id=sync_run_id,
                         movement_id=movement_id,
+                        cause_operation=cause_operation,
+                        cause_session_id=cause_session_id,
                         error=caught,
                         estimated_bytes=estimate,
                     )
@@ -170,6 +176,8 @@ class ProxyUsageTracker:
         case_id: str | None,
         sync_run_id: str | None,
         movement_id: str | None,
+        cause_operation: Literal["opportunistic_catalog_refresh"] | None,
+        cause_session_id: uuid.UUID | None,
         error: BaseException | None,
         estimated_bytes: int,
     ) -> None:
@@ -201,6 +209,10 @@ class ProxyUsageTracker:
             "case_id": case_id,
             "sync_run_id": sync_run_id,
             "movement_id": movement_id,
+            "cause_operation": cause_operation,
+            "cause_session_id": (
+                str(cause_session_id) if cause_session_id is not None else None
+            ),
             "request_id": str(uuid.uuid4()),
             "component": self._component,
             "operation": operation,

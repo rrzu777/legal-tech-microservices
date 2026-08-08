@@ -1,5 +1,6 @@
 import re
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import httpx
 import pytest
@@ -66,6 +67,57 @@ async def test_usage_tracker_reserves_persists_and_finalizes_actual_bytes():
     assert finalize.args[0] == "pjud_proxy_finalize_budget_reservation"
     assert finalize.args[1]["p_reservation_id"] == "reservation-1"
     assert finalize.args[1]["p_release"] is False
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_reserves_two_mb():
+    """An underestimated refresh could bypass the intended cost guard."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, price_per_gb_usd=6.25)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(operation="opportunistic_catalog_refresh"):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    reserve = sb.rpc.call_args_list[0]
+    assert reserve.args[1]["p_estimated_cost_usd"] == pytest.approx(0.0125)
+
+
+@pytest.mark.asyncio
+async def test_mint_persists_typed_catalog_cause():
+    """Dropping either causal field makes an indirect mint indistinguishable."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    session_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="mint",
+            cause_operation="opportunistic_catalog_refresh",
+            cause_session_id=session_id,
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["operation"] == "mint"
+    assert payload["cause_operation"] == "opportunistic_catalog_refresh"
+    assert payload["cause_session_id"] == str(session_id)
 
 
 @pytest.mark.asyncio

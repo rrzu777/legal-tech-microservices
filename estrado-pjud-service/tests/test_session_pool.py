@@ -1,6 +1,7 @@
 """Tests for API session pool health tracking."""
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -21,6 +22,31 @@ def _make_mock_session(age=0):
 
 
 class TestAPISessionPool:
+    @staticmethod
+    def _proxy_pool_with_captured_usage():
+        from app.config import Settings
+        from app.session_pool import APISessionPool
+
+        calls = []
+        tracker = MagicMock()
+
+        @asynccontextmanager
+        async def track(**kwargs):
+            calls.append(kwargs)
+            yield MagicMock(retry_count=0)
+
+        tracker.track.side_effect = track
+        settings = Settings(
+            API_KEY="test",
+            OJV_PROXY_URL="http://proxy.test:1234",
+            _env_file=None,
+        )
+        return APISessionPool(
+            settings,
+            allow_uncontrolled_proxy=True,
+            proxy_usage=tracker,
+        ), calls
+
     @pytest.mark.asyncio
     async def test_release_healthy_returns_to_pool(self):
         from app.session_pool import APISessionPool, SessionReleaseOutcome
@@ -107,6 +133,72 @@ class TestAPISessionPool:
             requeued=False,
             retired_reason="full",
         )
+
+    @pytest.mark.asyncio
+    async def test_first_mint_consumes_catalog_retirement_marker_once(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+
+        await pool.record_catalog_retirement(session_id)
+        async with pool._mint_usage_scope(1):
+            pass
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert calls[0]["cause_operation"] == "opportunistic_catalog_refresh"
+        assert calls[0]["cause_session_id"] == session_id
+        assert "cause_operation" not in calls[1]
+        assert "cause_session_id" not in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_catalog_retirement_marker_expires_after_fixed_window(self, monkeypatch):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        clock = [100.0, 701.0]
+        monkeypatch.setattr(
+            "app.session_pool.time.monotonic",
+            lambda: clock.pop(0) if clock else 701.0,
+        )
+
+        await pool.record_catalog_retirement(session_id)
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert "cause_operation" not in calls[0]
+        assert "cause_session_id" not in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_expired_release_does_not_mark_next_mint(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        expired = _make_mock_session(age=pool._max_age)
+
+        outcome = await pool.release(expired)
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert outcome.retired_reason == "expired"
+        assert "cause_operation" not in calls[0]
+        assert "cause_session_id" not in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mints_cannot_consume_same_marker_twice(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        await pool.record_catalog_retirement(session_id)
+
+        async def mint_scope():
+            async with pool._mint_usage_scope(1):
+                await asyncio.sleep(0)
+
+        await asyncio.gather(mint_scope(), mint_scope())
+
+        attributed = [
+            call for call in calls
+            if call.get("cause_operation") == "opportunistic_catalog_refresh"
+        ]
+        assert len(attributed) == 1
+        assert attributed[0]["operation"] == "mint"
+        assert attributed[0]["cause_session_id"] == session_id
 
     @pytest.mark.asyncio
     async def test_try_acquire_ready_never_mints_or_loads_store(self, monkeypatch):

@@ -436,6 +436,21 @@ class CatalogRefreshQueue:
         # Fail closed locally before any persistence, release, or optional event.
         self._circuit_open = True
         self.metrics.sessions_retired_by_catalog_refresh += 1
+        try:
+            await self._pool.record_catalog_retirement(session.generation_id)
+        except asyncio.CancelledError:
+            # Cancellation must not prevent the durable, cross-replica breaker.
+            critical = self._track_breaker_task(self._persist_breaker_once(
+                claim,
+                intent,
+                reason,
+                session.generation_id,
+            ))
+            await asyncio.shield(critical)
+            raise
+        except Exception:
+            # Causal attribution is best effort; safety remains authoritative.
+            logger.exception("Catalog retirement causal marker failed")
         critical = self._track_breaker_task(self._persist_breaker_once(
             claim,
             intent,

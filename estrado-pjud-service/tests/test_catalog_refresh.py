@@ -284,6 +284,10 @@ async def test_invalid_catalog_retires_session_opens_circuit_and_stops_consumer(
         assert fakes.queue.circuit_open is True
         events.append("breaker")
 
+    async def record_marker(*_args):
+        assert fakes.queue.circuit_open is True
+        events.append("marker")
+
     async def release(*_args, **_kwargs):
         events.append("release")
         return SessionReleaseOutcome(requeued=False, retired_reason="unhealthy")
@@ -292,15 +296,35 @@ async def test_invalid_catalog_retires_session_opens_circuit_and_stops_consumer(
         events.append("telemetry")
 
     fakes.repository.retire_and_open_circuit.side_effect = durable_breaker
+    fakes.pool.record_catalog_retirement.side_effect = record_marker
     fakes.pool.release.side_effect = release
     fakes.repository.record_event.side_effect = telemetry
 
     await fakes.queue.consume_one(intent())
 
     fakes.pool.release.assert_awaited_once_with(session, healthy=False)
+    fakes.pool.record_catalog_retirement.assert_awaited_once_with(session.generation_id)
     fakes.repository.retire_and_open_circuit.assert_awaited_once()
-    assert events[:2] == ["breaker", "release"]
+    assert events[:3] == ["marker", "breaker", "release"]
     assert fakes.queue.circuit_open is True
+
+
+@pytest.mark.asyncio
+async def test_marker_failure_never_blocks_durable_breaker_or_retries_pjud(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.catalogs.fetch_with_session.side_effect = CatalogContentError("invalid")
+    fakes.pool.record_catalog_retirement.side_effect = RuntimeError("marker unavailable")
+    fakes.pool.release.return_value = SessionReleaseOutcome(
+        requeued=False,
+        retired_reason="unhealthy",
+    )
+
+    await fakes.queue.consume_one(intent())
+
+    assert fakes.queue.circuit_open is True
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
+    assert fakes.catalogs.fetch_with_session.await_count == 1
 
 
 @pytest.mark.asyncio
