@@ -361,6 +361,13 @@ class CatalogRefreshQueue:
         except Exception as exc:
             self.metrics.session_release_errors += 1
             logger.exception("Catalog refresh session release failed")
+            # The pool no longer owns this session. Fail closed locally and
+            # make one best-effort close so a release bug cannot leak it alive.
+            self._circuit_open = True
+            try:
+                await session.close()
+            except Exception:
+                logger.exception("Catalog refresh session close after release failed")
             if not breaker_already_open:
                 await self._open_retirement_circuit(
                     claim,

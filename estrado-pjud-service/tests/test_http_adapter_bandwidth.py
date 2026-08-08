@@ -110,3 +110,45 @@ async def test_post_once_never_retries_transport_errors():
     assert adapter._client.post.await_count == 1
     assert usage.request_count == 1
     assert usage.retry_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redirect_status", [307, 308])
+async def test_post_once_never_follows_redirects_or_hides_wire_requests(
+    redirect_status,
+):
+    wire_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        wire_requests.append(request)
+        if request.url.path == "/redirected":
+            return httpx.Response(200, content=b"unexpected", request=request)
+        return httpx.Response(
+            redirect_status,
+            headers={"location": "/redirected"},
+            content=b"redirect",
+            request=request,
+        )
+
+    adapter = OJVHttpAdapter(_settings())
+    await adapter._client.aclose()
+    adapter._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+
+    try:
+        with capture_proxy_usage() as usage:
+            first = await adapter.post_once("/first")
+            second = await adapter.post_once("/second")
+    finally:
+        await adapter.close()
+
+    assert [response.status_code for response in (first, second)] == [
+        redirect_status,
+        redirect_status,
+    ]
+    assert len(wire_requests) == 2
+    assert usage.request_count == 2
+    assert usage.retry_count == 0
+    assert usage.bytes_down == len(b"redirect") * 2

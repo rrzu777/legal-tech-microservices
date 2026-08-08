@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -77,6 +78,34 @@ async def test_fetch_with_session_classifies_invalid_payload_as_catalog_content_
             session,
             "tribunals",
             {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 308])
+async def test_fetch_with_session_classifies_redirect_as_invalid_catalog(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(
+        status,
+        headers={"location": "/unexpected"},
+        request=request,
+    )
+    session = MagicMock()
+    session.catalog_json = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "redirect",
+            request=request,
+            response=response,
+        )
+    )
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
         )
 
 

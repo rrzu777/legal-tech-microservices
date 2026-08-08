@@ -58,6 +58,9 @@ class OJVHttpAdapter:
 
     async def post_once(self, path: str, **kwargs) -> httpx.Response:
         """POST exactly once; opportunistic work must never amplify traffic."""
+        # The shared client follows redirects for normal PJUD traffic. A 307/308
+        # preserves POST, so following it here would be a hidden second request.
+        kwargs["follow_redirects"] = False
         return await self._request("post", path, max_attempts=1, **kwargs)
 
     async def _request(

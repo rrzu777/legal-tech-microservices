@@ -346,6 +346,7 @@ async def test_successful_refresh_opens_circuit_when_release_retires_session(fak
 @pytest.mark.asyncio
 async def test_release_exception_has_its_own_metric_and_fails_closed(fakes):
     session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    session.close = AsyncMock()
     fakes.pool.try_acquire_ready.return_value = session
     fakes.pool.release.side_effect = RuntimeError("close failed")
 
@@ -353,6 +354,21 @@ async def test_release_exception_has_its_own_metric_and_fails_closed(fakes):
 
     assert fakes.queue.metrics.session_release_errors == 1
     assert fakes.queue.metrics.persistence_errors == 0
+    assert fakes.queue.circuit_open is True
+    session.close.assert_awaited_once()
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_release_close_failure_is_best_effort_and_still_opens_breaker(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    session.close = AsyncMock(side_effect=RuntimeError("close also failed"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.pool.release.side_effect = RuntimeError("release failed")
+
+    await fakes.queue.consume_one(intent())
+
+    session.close.assert_awaited_once()
     assert fakes.queue.circuit_open is True
     fakes.repository.retire_and_open_circuit.assert_awaited_once()
 

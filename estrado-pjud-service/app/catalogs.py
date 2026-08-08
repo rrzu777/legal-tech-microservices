@@ -12,6 +12,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
 
+import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
@@ -443,6 +444,12 @@ class CatalogService:
                 retry_transport=retry_transport,
             )
         except BlockedPageError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if 300 <= exc.response.status_code < 400:
+                raise CatalogContentError(
+                    f"PJUD redirected {catalog} catalog unexpectedly"
+                ) from exc
             raise
         except (TypeError, ValueError) as exc:
             raise CatalogContentError(
