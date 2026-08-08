@@ -28,7 +28,7 @@ class MemoryCookieStore:
         self.slots[str(slot_id)] = CookieBundle(
             cookies=cookies,
             user_agent=user_agent,
-            saved_at=0,
+            saved_at=time.time(),
             proxy_token=proxy_token,
         )
 

@@ -1,6 +1,7 @@
 # tests/test_familia_pool.py
 """Checkout de bundle F5 para el path Familia: presta el bundle de un slot
 sin tomar la guest OJVSession, con la misma semántica de re-mint reactivo."""
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -171,7 +172,12 @@ def test_api_pick_familia_bundle_none_when_empty():
 
 def test_api_pick_familia_bundle_returns_bundle():
     pool = _api_pool()
-    b = CookieBundle(cookies={"TSPD_101": "z"}, user_agent="UA", saved_at=0.0, proxy_url="http://p")
+    b = CookieBundle(
+        cookies={"TSPD_101": "z"},
+        user_agent="UA",
+        saved_at=time.time(),
+        proxy_url="http://p",
+    )
     pool._store = MagicMock()
     pool._store.load_all = MagicMock(return_value={"0": b})
     assert pool.pick_familia_bundle() is b
