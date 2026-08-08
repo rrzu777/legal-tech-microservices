@@ -1,11 +1,25 @@
 """Tests for Telegram alerting."""
+import fcntl
 import json
 import logging
+import multiprocessing
+import os
+import queue
 import stat
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 from starlette.datastructures import State
+
+
+def _claim_event_in_process(path, event, ready_queue, result_queue):
+    from app.alert_cooldown_store import AlertCooldownStore
+
+    ready_queue.put(event)
+    try:
+        result_queue.put((event, AlertCooldownStore(path).claim(event, 300), None))
+    except BaseException as exc:
+        result_queue.put((event, None, repr(exc)))
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +30,102 @@ def _env(monkeypatch):
 
 
 class TestTelegramAlerter:
+    def test_future_event_timestamp_fails_open_and_is_repaired(self, tmp_path, caplog):
+        from app.alert_cooldown_store import AlertCooldownStore
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        cooldown_path.write_text(json.dumps({"pool_unavailable": 1_800_000_001.0}))
+        store = AlertCooldownStore(str(cooldown_path))
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("app.alert_cooldown_store.time.time", return_value=1_800_000_000.0),
+        ):
+            assert store.claim("pool_unavailable", 300) is True
+
+        assert json.loads(cooldown_path.read_text()) == {
+            "pool_unavailable": 1_800_000_000.0
+        }
+        assert "future" in caplog.text.lower()
+
+    def test_claim_is_atomic_across_processes_and_preserves_distinct_events(
+        self, tmp_path
+    ):
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        lock_path = tmp_path / "alert-cooldowns.json.lock"
+        lock_path.touch(mode=0o640)
+        context = multiprocessing.get_context("spawn")
+        ready_queue = context.Queue()
+        result_queue = context.Queue()
+        events = ["pool_unavailable", "pool_unavailable", "mint_failed"]
+        processes = [
+            context.Process(
+                target=_claim_event_in_process,
+                args=(str(cooldown_path), event, ready_queue, result_queue),
+            )
+            for event in events
+        ]
+        results = []
+
+        with lock_path.open("r+") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                for process in processes:
+                    process.start()
+                for _ in events:
+                    ready_queue.get(timeout=10)
+                try:
+                    results.append(result_queue.get(timeout=1))
+                except queue.Empty:
+                    pass
+                result_arrived_while_locked = bool(results)
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        try:
+            while len(results) < len(events):
+                results.append(result_queue.get(timeout=10))
+            for process in processes:
+                process.join(timeout=10)
+            assert all(process.exitcode == 0 for process in processes)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        assert result_arrived_while_locked is False
+        assert all(error is None for _, _, error in results)
+        pool_claims = [
+            claimed for event, claimed, _ in results if event == "pool_unavailable"
+        ]
+        mint_claims = [claimed for event, claimed, _ in results if event == "mint_failed"]
+        assert sorted(pool_claims) == [False, True]
+        assert mint_claims == [True]
+        assert set(json.loads(cooldown_path.read_text())) == {
+            "pool_unavailable",
+            "mint_failed",
+        }
+
+    def test_store_fsyncs_file_and_parent_directory(self, tmp_path, monkeypatch):
+        from app import alert_cooldown_store
+
+        synced_types = []
+        real_fsync = alert_cooldown_store.os.fsync
+
+        def record_fsync(fd):
+            synced_types.append(stat.S_IFMT(os.fstat(fd).st_mode))
+            real_fsync(fd)
+
+        monkeypatch.setattr(alert_cooldown_store.os, "fsync", record_fsync)
+        store = alert_cooldown_store.AlertCooldownStore(
+            str(tmp_path / "alert-cooldowns.json")
+        )
+
+        assert store.claim("pool_unavailable", 300) is True
+        assert stat.S_IFREG in synced_types
+        assert stat.S_IFDIR in synced_types
+
     @pytest.mark.asyncio
     async def test_event_cooldown_survives_process_restart(self, tmp_path, caplog):
         from app.alert_cooldown_store import AlertCooldownStore
@@ -107,6 +217,8 @@ class TestTelegramAlerter:
             assert json.loads(persisted)["pool_unavailable"] > 0
             assert detail not in persisted
             assert stat.S_IMODE(cooldown_path.stat().st_mode) == 0o640
+            lock_path = cooldown_path.with_name(f"{cooldown_path.name}.lock")
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o640
             assert "corrupt" in caplog.text.lower()
         finally:
             await alerter.close()
