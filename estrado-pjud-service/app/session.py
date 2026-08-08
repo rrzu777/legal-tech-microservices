@@ -2,6 +2,7 @@ import logging
 import json
 import re
 import time
+import uuid
 
 import httpx
 
@@ -46,7 +47,15 @@ _AJAX_HEADERS = {
 class OJVSession:
     """Manages a single OJV session: cookies + CSRF token."""
 
-    def __init__(self, adapter: OJVHttpAdapter):
+    def __init__(
+        self,
+        adapter: OJVHttpAdapter,
+        *,
+        generation_id: uuid.UUID | None = None,
+    ):
+        # Correlation identifier for this in-memory generation only. It is
+        # deliberately random and contains no proxy, cookie or egress identity.
+        self.generation_id = generation_id or uuid.uuid4()
         self._adapter = adapter
         self.csrf_token: str | None = None
         self._created_at: float = time.monotonic()
@@ -115,9 +124,16 @@ class OJVSession:
         resp.raise_for_status()
         return _decode(resp)
 
-    async def catalog_json(self, path: str, data: dict[str, str]) -> list[dict]:
+    async def catalog_json(
+        self,
+        path: str,
+        data: dict[str, str],
+        *,
+        retry_transport: bool = True,
+    ) -> list[dict]:
         """Fetch a PJUD JSON combo using this session's authorized cookies."""
-        response = await self._adapter.post(path, data=data, headers=_AJAX_HEADERS)
+        post = self._adapter.post if retry_transport else self._adapter.post_once
+        response = await post(path, data=data, headers=_AJAX_HEADERS)
         response.raise_for_status()
         body = _decode(response)
         reject_empty_body(body, "catalog JSON")
@@ -130,9 +146,16 @@ class OJVSession:
             raise ValueError("PJUD catalog JSON response is not a list")
         return payload
 
-    async def catalog_html(self, path: str, data: dict[str, str]) -> str:
+    async def catalog_html(
+        self,
+        path: str,
+        data: dict[str, str],
+        *,
+        retry_transport: bool = True,
+    ) -> str:
         """Fetch PJUD's books combo fragment using this session's cookies."""
-        response = await self._adapter.post(path, data=data, headers=_AJAX_HEADERS)
+        post = self._adapter.post if retry_transport else self._adapter.post_once
+        response = await post(path, data=data, headers=_AJAX_HEADERS)
         response.raise_for_status()
         return _decode(response)
 

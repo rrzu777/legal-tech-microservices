@@ -1,9 +1,12 @@
+import hashlib
+import json
 import logging
 
 import httpx
 from fastapi import APIRouter, Request
 
 from app.auth import verify_api_key
+from app.catalog_observations import CatalogRefreshIntent
 from app.rate_limit import limiter
 from app.catalogs import normalize_catalog_label
 from app.matching import (
@@ -19,6 +22,7 @@ from app.metrics import api_metrics
 from app.errors import safe_error
 from app.failure_kind import reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
+from app.usage_context import current_usage_scope
 from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,87 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 
 class CanonicalCatalogResolutionError(ValueError):
     """A parsed v2 row cannot be tied to one loaded official identity."""
+
+
+def _catalog_refresh_intents(req: SearchRequest) -> list[CatalogRefreshIntent]:
+    """Build only the public catalog slices proven by one canonical request."""
+    if req.contract_version != 2 or req.competencia == "suprema" or req.corte is None:
+        return []
+
+    parsed = parse_search_identifier(req.case_type, req.case_number)
+    anno = int(parsed["anno"]) if parsed.get("anno") else None
+    resolved_book = (req.libro or parsed.get("tipo") or "").strip() or None
+    canonical_request = {
+        "allow_broad": req.allow_broad,
+        "anno": anno,
+        "case_number": req.case_number.strip().upper(),
+        "case_type": req.case_type,
+        "competencia": req.competencia,
+        "corte": req.corte,
+        "libro": resolved_book,
+        "search_mode": req.search_mode,
+        "tribunal": req.tribunal,
+    }
+    request_hash = hashlib.sha256(json.dumps(
+        canonical_request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    tenant = current_usage_scope()
+
+    intents: list[CatalogRefreshIntent] = []
+    if req.tribunal is not None:
+        intents.append(CatalogRefreshIntent(
+            slice_key=f"tribunals:{req.competencia}:{req.corte}",
+            catalog="tribunals",
+            competencia=req.competencia,
+            corte=req.corte,
+            anno=None,
+            law_firm_id=tenant["law_firm_id"],
+            case_id=tenant["case_id"],
+            sync_run_id=tenant["sync_run_id"],
+            request_hash=request_hash,
+        ))
+
+    uses_book_catalog = (
+        req.competencia in {"civil", "laboral", "cobranza"}
+        or (req.competencia == "penal" and req.case_type == "rit")
+        or (
+            req.competencia == "apelaciones"
+            and req.search_mode == "appeals_resource"
+        )
+    )
+    if uses_book_catalog and anno is not None:
+        intents.append(CatalogRefreshIntent(
+            slice_key=f"books:{req.competencia}:{req.corte}:{anno}",
+            catalog="books",
+            competencia=req.competencia,
+            corte=req.corte,
+            anno=anno,
+            law_firm_id=tenant["law_firm_id"],
+            case_id=tenant["case_id"],
+            sync_run_id=tenant["sync_run_id"],
+            request_hash=request_hash,
+        ))
+    return intents[:2]
+
+
+def _enqueue_catalog_refresh_after_release(
+    request: Request,
+    release_outcome,
+    intents: list[CatalogRefreshIntent],
+) -> None:
+    """Best-effort side effect; it cannot change the interactive response."""
+    if getattr(release_outcome, "requeued", False) is not True or not intents:
+        return
+    queue = getattr(request.app.state, "catalog_refresh_queue", None)
+    if queue is None:
+        return
+    try:
+        queue.enqueue_many(intents)
+    except Exception:
+        logger.exception("Could not enqueue opportunistic catalog refresh")
 
 
 def _resolve_loaded_tribunal_with_global_fallback(
@@ -147,6 +232,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
     session = await acquire_or_alert(pool, request, "search")
 
     healthy = True
+    refresh_intents: list[CatalogRefreshIntent] = []
     try:
         api_metrics.record_request("search")
 
@@ -267,7 +353,10 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
 
         api_metrics.record_success("search")
 
-        return build_search_response(matches, req, libro_used=libro_used)
+        response = build_search_response(matches, req, libro_used=libro_used)
+        if response.found:
+            refresh_intents = _catalog_refresh_intents(req)
+        return response
 
     except Exception as e:
         logger.exception("Search failed")
@@ -294,4 +383,10 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             status="pjud_blocked" if kind == "ojv" else "not_found",
         )
     finally:
-        await pool.release(session, healthy=healthy)
+        release_outcome = await pool.release(session, healthy=healthy)
+        if healthy:
+            _enqueue_catalog_refresh_after_release(
+                request,
+                release_outcome,
+                refresh_intents,
+            )

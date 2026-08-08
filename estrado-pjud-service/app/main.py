@@ -15,6 +15,8 @@ from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
+from app.catalog_observations import CatalogObservationRepository
+from app.catalog_refresh import CatalogRefreshQueue
 from app.routes import health, search, detail, familia, catalogs
 from app.session_pool import APISessionPool
 from supabase import create_client
@@ -50,6 +52,27 @@ async def lifespan(app: FastAPI):
     app.state.proxy_usage = proxy_usage
     app.state.proxy_control_required = proxy_control_required
     app.state.catalog_service = CatalogService(pool, proxy_usage=proxy_usage)
+    refresh_enabled = bool(
+        settings.PJUD_CATALOG_OPPORTUNISTIC_ENABLED
+        and proxy_supabase is not None
+    )
+    if settings.PJUD_CATALOG_OPPORTUNISTIC_ENABLED and proxy_supabase is None:
+        logging.getLogger(__name__).warning(
+            "PJUD catalog refresh disabled: Supabase service configuration is absent"
+        )
+    refresh_queue = CatalogRefreshQueue(
+        maxsize=settings.PJUD_CATALOG_QUEUE_SIZE,
+        enabled=refresh_enabled,
+        pool=pool,
+        repository=CatalogObservationRepository(
+            proxy_supabase,
+            lease_seconds=settings.PJUD_CATALOG_LEASE_SECONDS,
+            cooldown_seconds=settings.PJUD_CATALOG_COOLDOWN_SECONDS,
+        ),
+        catalog_service=app.state.catalog_service,
+        proxy_usage=proxy_usage,
+    )
+    app.state.catalog_refresh_queue = refresh_queue
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
         from app.alerting import TelegramAlerter
@@ -63,11 +86,17 @@ async def lifespan(app: FastAPI):
         app.state.alerter = None
 
     try:
+        await refresh_queue.start()
         yield
     finally:
-        await pool.close_all()
-        if hasattr(app.state, 'alerter') and app.state.alerter:
-            await app.state.alerter.close()
+        try:
+            await refresh_queue.stop(drain_timeout_seconds=2)
+        finally:
+            try:
+                await pool.close_all()
+            finally:
+                if hasattr(app.state, 'alerter') and app.state.alerter:
+                    await app.state.alerter.close()
 
 
 def create_app() -> FastAPI:

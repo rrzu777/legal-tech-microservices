@@ -1,10 +1,17 @@
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.catalogs import CatalogResult, CatalogService, parse_html_options, parse_json_options
+from app.catalogs import (
+    CatalogContentError,
+    CatalogResult,
+    CatalogService,
+    parse_html_options,
+    parse_json_options,
+)
 from app.failure_kind import BlockedPageError
 from app.session import OJVSession
 from tests.helpers import AdapterQueGraba
@@ -18,6 +25,131 @@ def test_snapshot_refresh_accepts_the_exact_current_17_court_codes():
     }
 
 
+@pytest.mark.asyncio
+async def test_fetch_with_session_never_acquires_pool_or_tracks_budget():
+    session = MagicMock()
+    session.catalog_json = AsyncMock(return_value=[{
+        "COD_TRIBUNAL": "123",
+        "GLS_TRIBUNAL": "2º Juzgado Civil de Santiago",
+    }])
+    pool = MagicMock()
+    tracker = MagicMock()
+    service = CatalogService(pool, snapshot={}, proxy_usage=tracker)
+
+    options = await service.fetch_with_session(
+        session,
+        "tribunals",
+        {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+        retry_transport=False,
+    )
+
+    assert options == [{"code": "123", "label": "2º Juzgado Civil de Santiago"}]
+    pool.acquire.assert_not_called()
+    tracker.track.assert_not_called()
+    session.catalog_json.assert_awaited_once_with(
+        "/combosJSON/leeTrib.php",
+        {"codCompetencia": "3", "codCorte": "90", "tipoBusqueda": "1"},
+        retry_transport=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_session_rejects_empty_options():
+    session = MagicMock()
+    session.catalog_html = AsyncMock(return_value="<option value='0'>Seleccione</option>")
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "books",
+            {"competencia": "civil", "corte": "90", "anno": "2026"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_session_classifies_invalid_payload_as_catalog_content_error():
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=ValueError("not JSON"))
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 308])
+async def test_fetch_with_session_classifies_redirect_as_invalid_catalog(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(
+        status,
+        headers={"location": "/unexpected"},
+        request=request,
+    )
+    session = MagicMock()
+    session.catalog_json = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "redirect",
+            request=request,
+            response=response,
+        )
+    )
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 405, 429])
+async def test_fetch_with_session_classifies_session_waf_status_as_invalid(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(status, request=request)
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "session rejected",
+        request=request,
+        response=response,
+    ))
+
+    with pytest.raises(CatalogContentError):
+        await CatalogService(MagicMock(), snapshot={}).fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [402, 500, 503])
+async def test_fetch_with_session_preserves_non_session_http_failures(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(status, request=request)
+    error = httpx.HTTPStatusError("upstream", request=request, response=response)
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=error)
+
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        await CatalogService(MagicMock(), snapshot={}).fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
+        )
+
+    assert raised.value.response.status_code == status
+
+
 def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text():
     """Catches a parser that would expose PJUD's "Seleccione" entry as a court."""
     raw = [
@@ -29,6 +161,14 @@ def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text(
     assert parse_json_options(raw, "COD_TRIBUNAL", "GLS_TRIBUNAL") == [
         {"code": "123", "label": "2º Juzgado"},
     ]
+
+
+def test_parse_json_options_rejects_conflicting_duplicate_codes():
+    with pytest.raises(CatalogContentError):
+        parse_json_options([
+            {"COD_TRIBUNAL": "123", "GLS_TRIBUNAL": "Alfa"},
+            {"COD_TRIBUNAL": "123", "GLS_TRIBUNAL": "Zeta"},
+        ], "COD_TRIBUNAL", "GLS_TRIBUNAL")
 
 
 def test_parse_html_options_rejects_non_option_html_and_keeps_utf8_labels():

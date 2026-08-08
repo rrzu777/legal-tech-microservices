@@ -27,7 +27,21 @@ def test_config_defaults(monkeypatch):
     assert s.RATE_LIMIT_MS == 2500
     assert s.LOG_LEVEL == "INFO"
     assert s.SESSION_POOL_SIZE == 2
+    assert s.PJUD_CATALOG_OPPORTUNISTIC_ENABLED is False
+    assert s.PJUD_CATALOG_QUEUE_SIZE == 16
     assert s.SESSION_MAX_AGE_S == 1200
+
+
+@pytest.mark.parametrize("field,value", [
+    ("PJUD_CATALOG_QUEUE_SIZE", 0),
+    ("PJUD_CATALOG_LEASE_SECONDS", 901),
+    ("PJUD_CATALOG_COOLDOWN_SECONDS", 2_592_001),
+])
+def test_catalog_refresh_limits_reject_unsafe_values(field, value):
+    from app.config import Settings
+
+    with pytest.raises(ValueError):
+        Settings(API_KEY="test", _env_file=None, **{field: value})
 
 
 def test_config_rejects_cookie_store_inside_production_checkout(monkeypatch):

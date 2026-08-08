@@ -12,9 +12,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Literal
 
+import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
+from app.failure_kind import BlockedPageError
 from app.parsers.normalizer import competencia_code
 from app.parsers.search_parser import detect_blocked
 from app.proxy_billing import is_proxy_billing_error
@@ -124,12 +126,17 @@ def _clean_option(code: object, label: object) -> dict[str, str] | None:
 
 def _unique_options(options: list[dict[str, str]]) -> CatalogOptions:
     result: CatalogOptions = []
-    seen_codes: set[str] = set()
+    seen_codes: dict[str, str] = {}
     for option in options:
         code = option["code"]
-        if code in seen_codes:
+        previous_label = seen_codes.get(code)
+        if previous_label is not None and previous_label != option["label"]:
+            raise CatalogContentError(
+                f"PJUD returned conflicting labels for catalog code {code!r}"
+            )
+        if previous_label is not None:
             continue
-        seen_codes.add(code)
+        seen_codes[code] = option["label"]
         result.append(option)
     return result
 
@@ -401,6 +408,99 @@ class CatalogService:
             return None
         return CatalogResult(options, "snapshot", fetched_at)
 
+    def snapshot_options(self, catalog: str, params: dict[str, str]) -> CatalogOptions:
+        """Return one bundled baseline slice without cache or network access."""
+        if catalog == "tribunals":
+            key = (
+                f"{params['competencia']}:{params['corte']}:"
+                f"{params.get('tipo_busqueda', '1')}"
+            )
+        elif catalog == "books":
+            key = (
+                f"{params['competencia']}:{params.get('corte', '')}:"
+                f"{params['anno']}"
+            )
+        else:
+            raise ValueError(f"Unsupported opportunistic catalog {catalog!r}")
+        result = self._from_snapshot(catalog, key)
+        return list(result.options) if result is not None else []
+
+    async def fetch_with_session(
+        self,
+        session,
+        catalog: str,
+        params: dict[str, str],
+        *,
+        retry_transport: bool = True,
+    ) -> CatalogOptions:
+        """Fetch one slice through a caller-owned, already-ready session."""
+        if catalog not in {"courts", "tribunals", "books"}:
+            raise ValueError(f"Unknown catalog {catalog!r}")
+        try:
+            options = await self._request_catalog(
+                session,
+                catalog,
+                params,
+                retry_transport=retry_transport,
+            )
+        except BlockedPageError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if 300 <= status < 400 or status in {401, 403, 405, 429}:
+                raise CatalogContentError(
+                    f"PJUD rejected {catalog} catalog session"
+                ) from exc
+            raise
+        except (TypeError, ValueError) as exc:
+            raise CatalogContentError(
+                f"PJUD returned malformed {catalog} catalog"
+            ) from exc
+        if not options:
+            raise CatalogContentError(f"PJUD returned invalid {catalog} catalog")
+        return options
+
+    async def _request_catalog(
+        self,
+        session,
+        catalog: str,
+        params: dict[str, str],
+        *,
+        retry_transport: bool,
+    ) -> CatalogOptions:
+        if catalog == "courts":
+            rows = await session.catalog_json(
+                "/combosJSON/leeCorte.php",
+                {"tipoBusqueda": params["tipo_busqueda"]},
+                retry_transport=retry_transport,
+            )
+            return parse_json_options(rows, "COD_CORTE", "GLS_CORTE")
+        if catalog == "tribunals":
+            rows = await session.catalog_json(
+                "/combosJSON/leeTrib.php",
+                {
+                    "codCompetencia": str(competencia_code(params["competencia"])),
+                    "codCorte": params["corte"],
+                    "tipoBusqueda": params["tipo_busqueda"],
+                },
+                retry_transport=retry_transport,
+            )
+            return parse_json_options(rows, "COD_TRIBUNAL", "GLS_TRIBUNAL")
+        if catalog == "books":
+            data = {
+                "codCompetencia": str(competencia_code(params["competencia"])),
+                "codAnho": params["anno"],
+            }
+            if "corte" in params:
+                data["codCorte"] = params["corte"]
+            html = await session.catalog_html(
+                "/ADIR_871/json/cmbTipos.php",
+                data,
+                retry_transport=retry_transport,
+            )
+            return parse_html_options(html)
+        raise ValueError(f"Unknown catalog {catalog!r}")
+
     async def _fetch_live(self, catalog: str, params: dict[str, str]) -> CatalogOptions:
         session = await self._pool.acquire()
         healthy = True
@@ -408,35 +508,7 @@ class CatalogService:
             # Reserve immediately before the catalog call. Pool acquisition can
             # mint for tens of seconds and has its own separately metered scope.
             async with self._proxy_usage.track(operation="catalog"):
-                if catalog == "courts":
-                    rows = await session.catalog_json(
-                        "/combosJSON/leeCorte.php",
-                        {"tipoBusqueda": params["tipo_busqueda"]},
-                    )
-                    options = parse_json_options(rows, "COD_CORTE", "GLS_CORTE")
-                elif catalog == "tribunals":
-                    rows = await session.catalog_json(
-                        "/combosJSON/leeTrib.php",
-                        {
-                            "codCompetencia": str(competencia_code(params["competencia"])),
-                            "codCorte": params["corte"],
-                            "tipoBusqueda": params["tipo_busqueda"],
-                        },
-                    )
-                    options = parse_json_options(rows, "COD_TRIBUNAL", "GLS_TRIBUNAL")
-                elif catalog == "books":
-                    data = {
-                        "codCompetencia": str(competencia_code(params["competencia"])),
-                        "codAnho": params["anno"],
-                    }
-                    if "corte" in params:
-                        data["codCorte"] = params["corte"]
-                    html = await session.catalog_html("/ADIR_871/json/cmbTipos.php", data)
-                    if detect_blocked(html):
-                        healthy = False
-                    options = parse_html_options(html)
-                else:
-                    raise ValueError(f"Unknown catalog {catalog!r}")
+                options = await self.fetch_with_session(session, catalog, params)
                 if not options:
                     healthy = False
                     raise CatalogContentError(f"PJUD returned invalid {catalog} catalog")

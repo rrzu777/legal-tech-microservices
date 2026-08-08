@@ -3,7 +3,8 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from collections import deque
+from dataclasses import dataclass
+from typing import Literal
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
@@ -33,10 +34,27 @@ logger = logging.getLogger(__name__)
 #: falla rápido —el challenge cortó en ~3 s— deja lugar para los otros bundles.
 _RETRY_BUDGET_S = 20.0
 _ON_DEMAND_MINT_ATTEMPTS = 3
+_CATALOG_RETIREMENT_CORRELATION_S = 10 * 60
 
 
 class ProxyTrafficDisabledError(RuntimeError):
     """Persistent control denied paid proxy traffic."""
+
+
+SessionRetiredReason = Literal["unhealthy", "expired", "full", "disabled"]
+
+
+@dataclass(frozen=True)
+class SessionReleaseOutcome:
+    requeued: bool
+    retired_reason: SessionRetiredReason | None
+
+
+@dataclass(frozen=True)
+class _CatalogRetirementMarker:
+    generation_id: uuid.UUID
+    expires_at: float
+    claim_token: uuid.UUID | None = None
 
 
 class APISessionPool:
@@ -51,10 +69,14 @@ class APISessionPool:
         proxy_usage=None,
     ):
         self._settings = settings
-        self._pool: deque[OJVSession] = deque()
+        self._max_size = settings.SESSION_POOL_SIZE
+        self._pool: asyncio.Queue[OJVSession] = asyncio.Queue(
+            maxsize=max(1, self._max_size),
+        )
         self._lock = asyncio.Lock()
         self._mint_lock = asyncio.Lock()
-        self._max_size = settings.SESSION_POOL_SIZE
+        self._catalog_retirement_marker: _CatalogRetirementMarker | None = None
+        self._closing_tasks: set[asyncio.Task[None]] = set()
         self._max_age = settings.SESSION_MAX_AGE_S
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
         self._rr_index = 0
@@ -83,13 +105,77 @@ class APISessionPool:
         if self._proxy_usage is None or not self._proxy_mode:
             yield None
             return
-        async with self._proxy_usage.track(
-            operation="mint",
-            transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
-        ) as usage:
-            if attempt > 1:
-                usage.retry_count += 1
-            yield usage
+        claim: tuple[uuid.UUID, uuid.UUID] | None = None
+        usage = None
+        try:
+            async with self._proxy_usage.track(
+                operation="mint",
+                transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
+            ) as usage:
+                def claim_catalog_cause(active_usage) -> None:
+                    nonlocal claim
+                    claim = self._claim_catalog_retirement_marker()
+                    if claim is not None:
+                        active_usage.cause_operation = "opportunistic_catalog_refresh"
+                        active_usage.cause_session_id = claim[0]
+
+                usage.on_first_request = claim_catalog_cause
+                if attempt > 1:
+                    usage.retry_count += 1
+                yield usage
+        finally:
+            if claim is not None:
+                if bool(getattr(usage, "causal_event_persisted", False)):
+                    self._commit_catalog_retirement_claim(claim[1])
+                else:
+                    self._restore_catalog_retirement_claim(claim[1])
+
+    async def record_catalog_retirement(self, generation_id: uuid.UUID) -> None:
+        """Correlate one near-term mint with a session retired by catalog work."""
+        expires_at = time.monotonic() + _CATALOG_RETIREMENT_CORRELATION_S
+        current = self._catalog_retirement_marker
+        if current is not None and current.expires_at > time.monotonic():
+            return
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=generation_id,
+            expires_at=expires_at,
+        )
+
+    def _claim_catalog_retirement_marker(
+        self,
+    ) -> tuple[uuid.UUID, uuid.UUID] | None:
+        marker = self._catalog_retirement_marker
+        if marker is None:
+            return None
+        if time.monotonic() >= marker.expires_at:
+            self._catalog_retirement_marker = None
+            return None
+        if marker.claim_token is not None:
+            return None
+        claim_token = uuid.uuid4()
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=marker.generation_id,
+            expires_at=marker.expires_at,
+            claim_token=claim_token,
+        )
+        return marker.generation_id, claim_token
+
+    def _commit_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
+        marker = self._catalog_retirement_marker
+        if marker is not None and marker.claim_token == claim_token:
+            self._catalog_retirement_marker = None
+
+    def _restore_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
+        marker = self._catalog_retirement_marker
+        if marker is None or marker.claim_token != claim_token:
+            return
+        if time.monotonic() >= marker.expires_at:
+            self._catalog_retirement_marker = None
+            return
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=marker.generation_id,
+            expires_at=marker.expires_at,
+        )
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
@@ -107,8 +193,11 @@ class APISessionPool:
         await self.assert_proxy_enabled()
         async with self._lock:
             # Try to get a valid session from the pool
-            while self._pool:
-                session = self._pool.popleft()
+            while True:
+                try:
+                    session = self._pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
                 if session.age_seconds < self._max_age:
                     return session
                 # Session expired, close it
@@ -395,22 +484,78 @@ class APISessionPool:
         estuviera vacío, y de paso llevar la causa camino a `suspended`."""
         return self._pick_bundle()
 
-    async def release(self, session: OJVSession, healthy: bool = True) -> None:
+    async def release(
+        self,
+        session: OJVSession,
+        healthy: bool = True,
+    ) -> SessionReleaseOutcome:
         """Return a session to the pool for reuse.
         If healthy=False the session is closed immediately and not recycled.
         """
         if not healthy:
             await session.close()
-            return
-        async with self._lock:
-            if len(self._pool) < self._max_size and session.age_seconds < self._max_age:
-                self._pool.append(session)
-            else:
-                await session.close()
+            return SessionReleaseOutcome(False, "unhealthy")
+        if self._max_size <= 0:
+            await session.close()
+            return SessionReleaseOutcome(False, "disabled")
+        if session.age_seconds >= self._max_age:
+            await session.close()
+            return SessionReleaseOutcome(False, "expired")
+        try:
+            self._pool.put_nowait(session)
+        except asyncio.QueueFull:
+            await session.close()
+            return SessionReleaseOutcome(False, "full")
+        return SessionReleaseOutcome(True, None)
+
+    async def try_acquire_ready(self) -> OJVSession | None:
+        """Return an already-queued valid session without waiting or creating one.
+
+        This intentionally bypasses the interactive lock, bundle store and mint
+        path. It is only for opportunistic work that must skip under contention
+        or when the pool is cold.
+        """
+        # A held lock means an interactive acquire is inspecting the queue.
+        # Skip instead of competing with it; never turn this into check+await.
+        if self._lock.locked():
+            return None
+
+        while True:
+            try:
+                session = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+            if session.age_seconds < self._max_age:
+                return session
+            logger.info(
+                "Closing expired ready-only API session (age=%.0fs)",
+                session.age_seconds,
+            )
+            self._close_in_background(session)
+
+    def _close_in_background(self, session: OJVSession) -> None:
+        """Close a stale ready-only entry without delaying the caller."""
+        task = asyncio.create_task(session.close())
+        self._closing_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._closing_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed to close expired ready-only API session")
+
+        task.add_done_callback(finished)
 
     async def close_all(self):
         """Close all pooled sessions (for app shutdown)."""
-        async with self._lock:
-            while self._pool:
-                session = self._pool.popleft()
-                await session.close()
+        while True:
+            try:
+                session = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            await session.close()
+        if self._closing_tasks:
+            await asyncio.gather(*tuple(self._closing_tasks), return_exceptions=True)

@@ -163,6 +163,239 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
+    def test_v2_found_search_releases_before_enqueuing_two_tenant_scoped_intents(
+        self, client,
+    ):
+        """A successful lookup may reuse its session only after the user path releases it."""
+        from app.catalogs import CatalogService
+        from app.routes import search as search_route
+        from app.session_pool import SessionReleaseOutcome
+
+        events = []
+        session = _make_mock_session(search_html="<html>resultados</html>")
+        pool = _make_mock_pool(session)
+
+        async def release(released_session, *, healthy):
+            assert released_session is session
+            assert healthy is True
+            events.append("release")
+            return SessionReleaseOutcome(requeued=True, retired_reason=None)
+
+        pool.release.side_effect = release
+        queue = MagicMock()
+        captured = []
+
+        def enqueue_many(intents):
+            events.append("enqueue")
+            captured.extend(intents)
+            return len(intents)
+
+        queue.enqueue_many.side_effect = enqueue_many
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+        client.app.state.catalog_service = CatalogService(pool, snapshot={
+            "tribunals": {"civil:90:1": {"options": [
+                {"code": "321", "label": "2º Juzgado Civil de Santiago"},
+            ]}},
+            "books": {"civil:90:2024": {"options": [
+                {"code": "C", "label": "Civil"},
+            ]}},
+        })
+        match = [{
+            "key": "fresh-jwt",
+            "rol": "C-1234-2024",
+            "tribunal": "2º Juzgado Civil de Santiago",
+            "caratulado": "Parte reservada",
+            "fecha_ingreso": "2024-01-01",
+        }]
+        headers = {
+            **AUTH,
+            "X-JurisTrack-Law-Firm-ID": "11111111-1111-4111-8111-111111111111",
+            "X-JurisTrack-Case-ID": "22222222-2222-4222-8222-222222222222",
+            "X-JurisTrack-Sync-Run-ID": "33333333-3333-4333-8333-333333333333",
+        }
+
+        with patch.object(search_route, "parse_search_results", return_value=match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                    "libro": "C",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "found"
+        assert events == ["release", "enqueue"]
+        assert [intent.slice_key for intent in captured] == [
+            "tribunals:civil:90",
+            "books:civil:90:2024",
+        ]
+        assert all(
+            intent.law_firm_id == "11111111-1111-4111-8111-111111111111"
+            and intent.case_id == "22222222-2222-4222-8222-222222222222"
+            and intent.sync_run_id == "33333333-3333-4333-8333-333333333333"
+            for intent in captured
+        )
+        assert {intent.request_hash for intent in captured} == {
+            "a6a55bca0c4e11555b0b5518b063e40960f0e71c7be375ba4f6e9c26c08d94c3"
+        }
+        assert "Parte reservada" not in repr(captured)
+        assert "options" not in repr(captured)
+
+    def test_blocked_search_does_not_enqueue(self, client):
+        session = _make_mock_session(
+            search_html='<script>window["bobcmn"] = "1"</script>',
+        )
+        pool = _make_mock_pool(session)
+        queue = MagicMock()
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+
+        response = client.post(
+            "/api/v1/search",
+            json={
+                "contract_version": 2,
+                "case_type": "rol",
+                "case_number": "C-1234-2024",
+                "competencia": "civil",
+                "corte": 90,
+                "tribunal": 321,
+                "libro": "C",
+            },
+            headers=AUTH,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["blocked"] is True
+        queue.enqueue_many.assert_not_called()
+
+    def test_definitive_not_found_search_does_not_enqueue(self, client):
+        from app.catalogs import CatalogService
+        from app.routes import search as search_route
+        from app.session_pool import SessionReleaseOutcome
+
+        session = _make_mock_session(
+            search_html="<div>No se encontraron causas</div>",
+        )
+        pool = _make_mock_pool(session)
+        pool.release.return_value = SessionReleaseOutcome(True, None)
+        queue = MagicMock()
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+        client.app.state.catalog_service = CatalogService(pool, snapshot={})
+
+        with patch.object(search_route, "parse_search_results", return_value=[]):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-9999-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                    "libro": "C",
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "not_found"
+        queue.enqueue_many.assert_not_called()
+
+    def test_found_search_does_not_enqueue_when_release_retires_session(self, client):
+        from app.catalogs import CatalogService
+        from app.routes import search as search_route
+        from app.session_pool import SessionReleaseOutcome
+
+        session = _make_mock_session(search_html="<html>resultados</html>")
+        pool = _make_mock_pool(session)
+        pool.release.return_value = SessionReleaseOutcome(
+            requeued=False,
+            retired_reason="expired",
+        )
+        queue = MagicMock()
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+        client.app.state.catalog_service = CatalogService(pool, snapshot={
+            "tribunals": {"civil:90:1": {"options": [
+                {"code": "321", "label": "2º Juzgado Civil de Santiago"},
+            ]}},
+            "books": {"civil:90:2024": {"options": [
+                {"code": "C", "label": "Civil"},
+            ]}},
+        })
+        match = [{
+            "key": "fresh-jwt",
+            "rol": "C-1234-2024",
+            "tribunal": "2º Juzgado Civil de Santiago",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2024-01-01",
+        }]
+
+        with patch.object(search_route, "parse_search_results", return_value=match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                    "libro": "C",
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["found"] is True
+        queue.enqueue_many.assert_not_called()
+
+    def test_successful_suprema_search_does_not_enqueue_public_catalog_intents(
+        self, client,
+    ):
+        from app.routes import search as search_route
+        from app.session_pool import SessionReleaseOutcome
+
+        session = _make_mock_session(search_html="<html>resultados</html>")
+        pool = _make_mock_pool(session)
+        pool.release.return_value = SessionReleaseOutcome(True, None)
+        queue = MagicMock()
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+        match = [{
+            "key": "fresh-jwt",
+            "rol": "1234-2024",
+            "tribunal": "Corte Suprema",
+            "caratulado": "Parte",
+            "fecha_ingreso": "2024-01-01",
+        }]
+
+        with patch.object(search_route, "parse_search_results", return_value=match):
+            response = client.post(
+                "/api/v1/search",
+                json={
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "1234-2024",
+                    "competencia": "suprema",
+                    "search_mode": "supreme_resource",
+                },
+                headers=AUTH,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["found"] is True
+        queue.enqueue_many.assert_not_called()
+
     def test_authentication_precedes_paid_usage_attribution_validation(self, client):
         client.app.state.proxy_control_required = True
         payload = {
@@ -279,9 +512,14 @@ class TestSearch:
     def test_v2_search_parser_value_error_is_upstream_changed(self, client):
         """Markup parser drift is not a missing case or an internal 5xx."""
         from app.routes import search as search_route
+        from app.session_pool import SessionReleaseOutcome
 
         mock_session = _make_mock_session(search_html="<html>nuevo markup</html>")
-        client.app.state.session_pool = _make_mock_pool(mock_session)
+        pool = _make_mock_pool(mock_session)
+        pool.release.return_value = SessionReleaseOutcome(True, None)
+        queue = MagicMock()
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
         with patch.object(search_route, "parse_search_results", side_effect=ValueError("unexpected table")):
             response = client.post(
                 "/api/v1/search",
@@ -298,6 +536,7 @@ class TestSearch:
 
         assert response.status_code == 200
         assert response.json()["status"] == "upstream_changed"
+        queue.enqueue_many.assert_not_called()
 
     def test_tribunal_label_resolution_requires_one_official_catalog_code(self):
         from app.catalogs import CatalogService
@@ -718,6 +957,74 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
+    def test_v2_usable_detail_releases_before_enqueue_without_hashing_detail_jwt(
+        self, client,
+    ):
+        from app.routes import detail as detail_route
+        from app.session_pool import SessionReleaseOutcome
+
+        events = []
+        session = _make_mock_session(
+            detail_html=_load("detail_Civil_C_1234_2024.html"),
+        )
+        pool = _make_mock_pool(session)
+
+        async def release(released_session, *, healthy):
+            assert released_session is session
+            assert healthy is True
+            events.append("release")
+            return SessionReleaseOutcome(requeued=True, retired_reason=None)
+
+        pool.release.side_effect = release
+        queue = MagicMock()
+        captured = []
+
+        def enqueue_many(intents):
+            events.append("enqueue")
+            captured.extend(intents)
+            return len(intents)
+
+        queue.enqueue_many.side_effect = enqueue_many
+        client.app.state.session_pool = pool
+        client.app.state.catalog_refresh_queue = queue
+        headers = {
+            **AUTH,
+            "X-JurisTrack-Law-Firm-ID": "11111111-1111-4111-8111-111111111111",
+            "X-JurisTrack-Case-ID": "22222222-2222-4222-8222-222222222222",
+        }
+
+        with patch.object(
+            detail_route,
+            "_search_for_fresh_jwt",
+            new=AsyncMock(return_value="fresh-secret-jwt"),
+        ):
+            response = client.post(
+                "/api/v1/detail",
+                json={
+                    "detail_key": "caller-secret-jwt",
+                    "contract_version": 2,
+                    "case_type": "rol",
+                    "case_number": "C-1234-2024",
+                    "competencia": "civil",
+                    "corte": 90,
+                    "tribunal": 321,
+                    "libro": "C",
+                },
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["error"] is None
+        assert events == ["release", "enqueue"]
+        assert [intent.slice_key for intent in captured] == [
+            "tribunals:civil:90",
+            "books:civil:90:2024",
+        ]
+        assert {intent.request_hash for intent in captured} == {
+            "a6a55bca0c4e11555b0b5518b063e40960f0e71c7be375ba4f6e9c26c08d94c3"
+        }
+        assert "secret-jwt" not in repr(captured)
+
     @pytest.mark.asyncio
     async def test_detail_affinity_correlates_selected_candidate_beyond_top_10(self):
         from app.models import DetailRequest
@@ -780,12 +1087,17 @@ class TestDetail:
         assert fresh_key == "fresh-ruc-jwt"
 
     def test_detail_affinity_explicit_not_found_is_valid_409_and_keeps_session_healthy(self, client):
+        from app.session_pool import SessionReleaseOutcome
+
         mock_session = _make_mock_session(
             search_html="<div>No se encontraron causas</div>",
             detail_html=_load("detail_Civil_C_1234_2024.html"),
         )
         mock_pool = _make_mock_pool(mock_session)
+        mock_pool.release.return_value = SessionReleaseOutcome(True, None)
         client.app.state.session_pool = mock_pool
+        queue = MagicMock()
+        client.app.state.catalog_refresh_queue = queue
 
         response = client.post(
             "/api/v1/detail",
@@ -801,6 +1113,7 @@ class TestDetail:
         assert response.status_code == 409
         mock_session.detail.assert_not_awaited()
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+        queue.enqueue_many.assert_not_called()
 
     @pytest.mark.parametrize("search_html", [
         " ",
