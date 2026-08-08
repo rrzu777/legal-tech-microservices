@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
@@ -17,13 +17,6 @@ class Settings(BaseSettings):
     SESSION_POOL_SIZE: int = 2
     SESSION_MAX_AGE_S: int = 1200
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
-    PJUD_CATALOG_QUEUE_SIZE: int = Field(default=16, ge=1, le=100)
-    PJUD_CATALOG_LEASE_SECONDS: int = Field(default=120, ge=1, le=900)
-    PJUD_CATALOG_COOLDOWN_SECONDS: int = Field(
-        default=604_800,
-        ge=0,
-        le=2_592_000,
-    )
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""
