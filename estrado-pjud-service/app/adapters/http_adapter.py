@@ -56,17 +56,28 @@ class OJVHttpAdapter:
     async def post(self, path: str, **kwargs) -> httpx.Response:
         return await self._request("post", path, **kwargs)
 
-    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    async def post_once(self, path: str, **kwargs) -> httpx.Response:
+        """POST exactly once; opportunistic work must never amplify traffic."""
+        return await self._request("post", path, max_attempts=1, **kwargs)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_attempts: int = 2,
+        **kwargs,
+    ) -> httpx.Response:
         url = f"{self._base}{path}"
         request = getattr(self._client, method)
-        for attempt in range(2):
+        for attempt in range(max_attempts):
             await self._rate_limit()
             logger.debug("%s %s", method.upper(), url)
             record_proxy_request(estimate_request_bytes(kwargs))
             try:
                 response = await request(url, **kwargs)
             except httpx.TransportError:
-                if attempt == 1:
+                if attempt + 1 >= max_attempts:
                     raise
                 record_proxy_retry()
                 logger.warning("OJV transport failed; retrying once")

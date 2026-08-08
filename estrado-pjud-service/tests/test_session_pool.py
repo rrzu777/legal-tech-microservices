@@ -23,27 +23,32 @@ def _make_mock_session(age=0):
 class TestAPISessionPool:
     @pytest.mark.asyncio
     async def test_release_healthy_returns_to_pool(self):
-        from app.session_pool import APISessionPool
+        from app.session_pool import APISessionPool, SessionReleaseOutcome
         from app.config import Settings
         settings = Settings(API_KEY="test", _env_file=None)
         pool = APISessionPool(settings)
 
         session = _make_mock_session(age=10)
-        await pool.release(session, healthy=True)
+        outcome = await pool.release(session, healthy=True)
 
+        assert outcome == SessionReleaseOutcome(requeued=True, retired_reason=None)
         assert pool._pool.qsize() == 1
         session.close.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_unhealthy_closes_session(self):
-        from app.session_pool import APISessionPool
+        from app.session_pool import APISessionPool, SessionReleaseOutcome
         from app.config import Settings
         settings = Settings(API_KEY="test", _env_file=None)
         pool = APISessionPool(settings)
 
         session = _make_mock_session(age=10)
-        await pool.release(session, healthy=False)
+        outcome = await pool.release(session, healthy=False)
 
+        assert outcome == SessionReleaseOutcome(
+            requeued=False,
+            retired_reason="unhealthy",
+        )
         assert pool._pool.qsize() == 0
         session.close.assert_awaited_once()
 
@@ -67,17 +72,41 @@ class TestAPISessionPool:
     ):
         """Nonpositive sizes preserve the old disabled-retention behavior."""
         from app.config import Settings
-        from app.session_pool import APISessionPool
+        from app.session_pool import APISessionPool, SessionReleaseOutcome
 
         settings = Settings(API_KEY="test", _env_file=None)
         settings.SESSION_POOL_SIZE = pool_size
         pool = APISessionPool(settings)
         session = _make_mock_session(age=10)
 
-        await pool.release(session)
+        outcome = await pool.release(session)
 
+        assert outcome == SessionReleaseOutcome(
+            requeued=False,
+            retired_reason="disabled",
+        )
         assert pool._pool.qsize() == 0
         session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_release_reports_expired_and_full_retirement_reasons(self):
+        from app.config import Settings
+        from app.session_pool import APISessionPool, SessionReleaseOutcome
+
+        pool = APISessionPool(Settings(API_KEY="test", _env_file=None))
+        expired = _make_mock_session(age=pool._max_age)
+        assert await pool.release(expired) == SessionReleaseOutcome(
+            requeued=False,
+            retired_reason="expired",
+        )
+
+        pool._pool.put_nowait(_make_mock_session(age=10))
+        pool._pool.put_nowait(_make_mock_session(age=10))
+        full = _make_mock_session(age=10)
+        assert await pool.release(full) == SessionReleaseOutcome(
+            requeued=False,
+            retired_reason="full",
+        )
 
     @pytest.mark.asyncio
     async def test_try_acquire_ready_never_mints_or_loads_store(self, monkeypatch):

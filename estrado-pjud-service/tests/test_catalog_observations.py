@@ -5,11 +5,13 @@ from uuid import UUID
 import pytest
 
 from app.catalog_observations import (
+    CatalogClaim,
     CatalogObservation,
     CatalogObservationRepository,
     CatalogRefreshIntent,
     canonical_catalog_options,
     catalog_options_hash,
+    CatalogOptionConflictError,
     is_partial_catalog,
 )
 
@@ -32,7 +34,7 @@ def test_catalog_options_are_canonical_and_hash_is_order_independent():
     first = [
         {"code": " 2 ", "label": "  Segundo   Juzgado "},
         {"code": "1", "label": "Primer Juzgado"},
-        {"code": "1", "label": "duplicado ignorado"},
+        {"code": "1", "label": "Primer   Juzgado"},
     ]
     second = [
         {"label": "Primer Juzgado", "code": "1"},
@@ -45,12 +47,20 @@ def test_catalog_options_are_canonical_and_hash_is_order_independent():
 
 def test_duplicate_codes_choose_the_same_label_regardless_of_response_order():
     first = [
-        {"code": "1", "label": "Zeta"},
+        {"code": "1", "label": "Alfa"},
         {"code": "1", "label": "Alfa"},
     ]
     second = list(reversed(first))
 
     assert catalog_options_hash(first) == catalog_options_hash(second)
+
+
+def test_conflicting_duplicate_codes_are_rejected_not_first_wins():
+    with pytest.raises(CatalogOptionConflictError):
+        canonical_catalog_options([
+            {"code": "1", "label": "Alfa"},
+            {"code": "1", "label": "Zeta"},
+        ])
 
 
 def test_missing_snapshot_codes_are_always_partial_but_additions_are_not():
@@ -87,6 +97,25 @@ async def test_repository_uses_run_query_and_never_logs_rpc_payloads():
     run_query.assert_awaited_once_with(rpc.return_value)
     logger.debug.assert_not_called()
     logger.info.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_denial_telemetry_failure_is_visible_to_queue():
+    supabase = MagicMock()
+    supabase.rpc.return_value = object()
+    with patch(
+        "app.catalog_observations.run_query",
+        side_effect=[
+            SimpleNamespace(data=[{
+                "allowed": False,
+                "reason": "lease_busy",
+                "lease_expires_at": None,
+            }]),
+            RuntimeError("telemetry unavailable"),
+        ],
+    ):
+        with pytest.raises(RuntimeError, match="telemetry unavailable"):
+            await CatalogObservationRepository(supabase).claim(_intent())
 
 
 @pytest.mark.asyncio
@@ -142,3 +171,46 @@ async def test_repository_complete_preserves_distinct_session_for_rpc_quorum():
     assert complete_payload["p_confirmed_by_full_refresh"] is False
     assert complete_payload["p_snapshot_options"] == [{"code": "1", "label": "Uno"}]
     assert complete_payload["p_options"] == [{"code": "1", "label": "Uno"}]
+
+
+@pytest.mark.asyncio
+async def test_repository_uses_atomic_retirement_breaker_rpc_contract():
+    supabase = MagicMock()
+    supabase.rpc.return_value = object()
+    originating_intent = _intent()
+    catalog_claim = CatalogClaim(
+        slice_key=originating_intent.slice_key,
+        token=UUID("44444444-4444-4444-8444-444444444444"),
+        lease_expires_at=None,
+        intent=originating_intent,
+    )
+    generation = UUID("33333333-3333-4333-8333-333333333333")
+
+    with patch(
+        "app.catalog_observations.run_query",
+        return_value=SimpleNamespace(data=[{
+            "claim_released": True,
+            "circuit_newly_opened": True,
+            "events_inserted": 2,
+        }]),
+    ) as run_query:
+        await CatalogObservationRepository(supabase).retire_and_open_circuit(
+            catalog_claim,
+            originating_intent,
+            "invalid_catalog",
+            generation,
+        )
+
+    assert supabase.rpc.call_args.args == (
+        "pjud_catalog_retire_and_open_circuit",
+        {
+            "p_slice_key": "tribunals:civil:90",
+            "p_claim_token": "44444444-4444-4444-8444-444444444444",
+            "p_reason": "invalid_catalog",
+            "p_session_generation_id": str(generation),
+            "p_law_firm_id": originating_intent.law_firm_id,
+            "p_case_id": originating_intent.case_id,
+            "p_request_hash": "a" * 64,
+        },
+    )
+    run_query.assert_awaited_once_with(supabase.rpc.return_value)

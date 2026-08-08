@@ -17,6 +17,10 @@ CatalogKind = Literal["tribunals", "books"]
 CatalogOptions = list[dict[str, str]]
 
 
+class CatalogOptionConflictError(ValueError):
+    """One catalog code was paired with more than one normalized label."""
+
+
 def canonical_catalog_options(options: object) -> CatalogOptions:
     """Return a stable, payload-safe catalog representation for hashing/storage."""
     if not isinstance(options, list):
@@ -31,12 +35,17 @@ def canonical_catalog_options(options: object) -> CatalogOptions:
             candidates.append({"code": code, "label": label})
 
     canonical: CatalogOptions = []
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     for option in sorted(candidates, key=lambda item: (item["code"], item["label"])):
         code = option["code"]
-        if code in seen:
+        previous_label = seen.get(code)
+        if previous_label is not None and previous_label != option["label"]:
+            raise CatalogOptionConflictError(
+                f"conflicting labels for catalog code {code!r}"
+            )
+        if previous_label is not None:
             continue
-        seen.add(code)
+        seen[code] = option["label"]
         canonical.append(option)
     return canonical
 
@@ -163,10 +172,9 @@ class CatalogObservationRepository:
         if row.get("allowed") is not True:
             reason = row.get("reason")
             if reason in {"cooldown", "lease_busy"}:
-                try:
-                    await self.record_event(intent, reason)
-                except Exception:
-                    logger.exception("Catalog claim-denial telemetry persistence failed")
+                # If this durable skip cannot be observed, expose the failure to
+                # the queue so it increments persistence_errors and does no PJUD.
+                await self.record_event(intent, reason)
             return None
         return CatalogClaim(
             slice_key=intent.slice_key,
@@ -215,6 +223,24 @@ class CatalogObservationRepository:
             "pjud_catalog_open_circuit",
             {"p_reason": reason[:500]},
         ))
+
+    async def retire_and_open_circuit(
+        self,
+        claim: CatalogClaim,
+        intent: CatalogRefreshIntent,
+        reason: str,
+        session_generation_id: uuid.UUID,
+    ) -> None:
+        """Atomically fence the lease, open the breaker, and persist incidents."""
+        await run_query(self._sb.rpc("pjud_catalog_retire_and_open_circuit", {
+            "p_slice_key": claim.slice_key,
+            "p_claim_token": str(claim.token),
+            "p_reason": reason[:500],
+            "p_session_generation_id": str(session_generation_id),
+            "p_law_firm_id": intent.law_firm_id,
+            "p_case_id": intent.case_id,
+            "p_request_hash": intent.request_hash,
+        }))
 
     async def record_event(self, intent: CatalogRefreshIntent, outcome: str) -> None:
         await run_query(self._sb.rpc(

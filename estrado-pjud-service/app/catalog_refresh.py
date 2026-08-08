@@ -16,6 +16,7 @@ from app.catalog_observations import (
 from app.catalogs import CatalogContentError
 from app.failure_kind import BlockedPageError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.session_pool import SessionReleaseOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class CatalogRefreshMetrics:
     enqueued: int = 0
     queue_full: int = 0
     persistence_errors: int = 0
+    session_release_errors: int = 0
     sessions_retired_by_catalog_refresh: int = 0
 
 
@@ -49,7 +51,9 @@ class CatalogRefreshQueue:
         self._proxy_usage = proxy_usage
         self._consumer_task: asyncio.Task[None] | None = None
         self._telemetry_tasks: set[asyncio.Task[None]] = set()
+        self._breaker_tasks: set[asyncio.Task[None]] = set()
         self._circuit_open = False
+        self._stopping = False
         self.metrics = CatalogRefreshMetrics()
 
     @property
@@ -111,6 +115,7 @@ class CatalogRefreshQueue:
         self._consumer_task = asyncio.create_task(self._consume_forever())
 
     async def stop(self, drain_timeout_seconds: float = 2) -> None:
+        self._stopping = True
         timeout = max(0.0, min(2.0, drain_timeout_seconds))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -126,7 +131,7 @@ class CatalogRefreshQueue:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._consumer_task = consumer if pending else None
-        tasks = tuple(self._telemetry_tasks)
+        tasks = tuple(self._telemetry_tasks | self._breaker_tasks)
         if not tasks:
             return
         remaining = max(0.0, deadline - loop.time())
@@ -140,6 +145,13 @@ class CatalogRefreshQueue:
             for task in tuple(self._telemetry_tasks):
                 if task.done():
                     self._telemetry_tasks.discard(task)
+                    try:
+                        task.result()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            for task in tuple(self._breaker_tasks):
+                if task.done():
+                    self._breaker_tasks.discard(task)
                     try:
                         task.result()
                     except (asyncio.CancelledError, Exception):
@@ -252,24 +264,49 @@ class CatalogRefreshQueue:
                         session,
                         intent.catalog,
                         params,
+                        retry_transport=False,
                     )
             except (ProxyBudgetExceededError, ProxyUsagePersistenceError) as exc:
                 await self._persist(self._repository.fail, claim, type(exc).__name__)
+                await self._release_session(
+                    session,
+                    healthy=True,
+                    claim=claim,
+                    intent=intent,
+                )
+                released = True
                 await self._persist(self._repository.record_event, intent, "error")
                 return
             except (CatalogContentError, BlockedPageError) as exc:
                 # Only blocked/invalid content is evidence that this session
                 # generation is unsafe to reuse.
                 healthy = False
-                await self._persist(self._repository.fail, claim, type(exc).__name__)
-                await self._release_session(session, healthy=False)
+                await self._open_retirement_circuit(
+                    claim,
+                    intent,
+                    session,
+                    f"{type(exc).__name__}: invalid catalog response",
+                )
+                await self._release_session(
+                    session,
+                    healthy=False,
+                    claim=claim,
+                    intent=intent,
+                    breaker_already_open=True,
+                )
                 released = True
-                await self._retire_and_open_circuit(intent, session, exc)
                 return
             except Exception as exc:
                 # Timeouts and other transient transport failures are not, by
                 # themselves, evidence that the session generation is corrupt.
                 await self._persist(self._repository.fail, claim, type(exc).__name__)
+                await self._release_session(
+                    session,
+                    healthy=True,
+                    claim=claim,
+                    intent=intent,
+                )
+                released = True
                 await self._persist(self._repository.record_event, intent, "error")
                 return
 
@@ -289,6 +326,13 @@ class CatalogRefreshQueue:
                 claim,
                 observation,
             )
+            await self._release_session(
+                session,
+                healthy=True,
+                claim=claim,
+                intent=intent,
+            )
+            released = True
             await self._persist(
                 self._repository.record_event,
                 intent,
@@ -296,23 +340,119 @@ class CatalogRefreshQueue:
             )
         finally:
             if not released:
-                await self._release_session(session, healthy=healthy)
+                await self._release_session(
+                    session,
+                    healthy=healthy,
+                    claim=claim,
+                    intent=intent,
+                )
 
-    async def _release_session(self, session, *, healthy: bool) -> None:
+    async def _release_session(
+        self,
+        session,
+        *,
+        healthy: bool,
+        claim,
+        intent,
+        breaker_already_open: bool = False,
+    ) -> SessionReleaseOutcome | None:
         try:
-            await self._pool.release(session, healthy=healthy)
+            outcome = await self._pool.release(session, healthy=healthy)
+        except Exception as exc:
+            self.metrics.session_release_errors += 1
+            logger.exception("Catalog refresh session release failed")
+            if not breaker_already_open:
+                await self._open_retirement_circuit(
+                    claim,
+                    intent,
+                    session,
+                    f"release_exception:{type(exc).__name__}",
+                )
+            return None
+
+        if not isinstance(outcome, SessionReleaseOutcome):
+            self.metrics.session_release_errors += 1
+            logger.error("Catalog refresh pool returned no typed release outcome")
+            if not breaker_already_open:
+                await self._open_retirement_circuit(
+                    claim,
+                    intent,
+                    session,
+                    "release_outcome_missing",
+                )
+            return None
+
+        if outcome.retired_reason is not None and not breaker_already_open:
+            await self._open_retirement_circuit(
+                claim,
+                intent,
+                session,
+                f"release:{outcome.retired_reason}",
+            )
+        return outcome
+
+    async def _open_retirement_circuit(
+        self,
+        claim,
+        intent,
+        session,
+        reason: str,
+    ) -> None:
+        # Fail closed locally before any persistence, release, or optional event.
+        self._circuit_open = True
+        self.metrics.sessions_retired_by_catalog_refresh += 1
+        try:
+            await self._repository.retire_and_open_circuit(
+                claim,
+                intent,
+                reason,
+                session.generation_id,
+            )
         except Exception:
             self.metrics.persistence_errors += 1
-            logger.exception("Catalog refresh session release failed")
+            logger.exception("Atomic catalog retirement breaker persistence failed")
+            self._schedule_breaker_retry(
+                claim,
+                intent,
+                reason,
+                session.generation_id,
+            )
 
-    async def _retire_and_open_circuit(self, intent, session, exc: Exception) -> None:
-        self.metrics.sessions_retired_by_catalog_refresh += 1
-        await self._persist(self._repository.record_event, intent, "session_retired")
-        # Stop locally even if the durable RPC is unavailable. When it succeeds,
-        # the one-way DB circuit stops all replicas on their next control load.
-        self._circuit_open = True
-        await self._persist(
-            self._repository.open_circuit,
-            f"{type(exc).__name__}: catalog session {session.generation_id} retired",
-        )
-        await self._persist(self._repository.record_event, intent, "circuit_opened")
+    def _schedule_breaker_retry(
+        self,
+        claim,
+        intent,
+        reason: str,
+        session_generation_id,
+    ) -> None:
+        task = asyncio.create_task(self._retry_breaker(
+            claim,
+            intent,
+            reason,
+            session_generation_id,
+        ))
+        self._breaker_tasks.add(task)
+        task.add_done_callback(self._breaker_tasks.discard)
+
+    async def _retry_breaker(
+        self,
+        claim,
+        intent,
+        reason: str,
+        session_generation_id,
+    ) -> None:
+        while not self._stopping:
+            try:
+                await self._repository.retire_and_open_circuit(
+                    claim,
+                    intent,
+                    reason,
+                    session_generation_id,
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.metrics.persistence_errors += 1
+                logger.exception("Catalog retirement breaker retry failed")
+                await asyncio.sleep(0.25)

@@ -96,3 +96,17 @@ async def test_adapter_stops_after_one_transient_transport_retry():
     assert adapter._client.get.await_count == 2
     assert usage.request_count == 2
     assert usage.retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_once_never_retries_transport_errors():
+    adapter = OJVHttpAdapter(_settings())
+    adapter._client.post = AsyncMock(side_effect=httpx.ConnectError("proxy down"))
+
+    with capture_proxy_usage() as usage:
+        with pytest.raises(httpx.ConnectError, match="proxy down"):
+            await adapter.post_once("/foo")
+
+    assert adapter._client.post.await_count == 1
+    assert usage.request_count == 1
+    assert usage.retry_count == 0

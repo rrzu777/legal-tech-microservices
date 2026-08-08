@@ -5,12 +5,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
+import httpx
 import pytest
 
 from app.catalog_observations import CatalogClaim, CatalogControl, CatalogRefreshIntent
 from app.catalog_refresh import CatalogRefreshQueue
 from app.catalogs import CatalogContentError
+from app.catalogs import CatalogService
+from app.config import Settings
+from app.session import OJVSession
+from app.adapters.http_adapter import OJVHttpAdapter
 from app.proxy_cost import ProxyBudgetExceededError
+from app.session_pool import SessionReleaseOutcome
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 
 def intent(slice_key: str = "tribunals:civil:90") -> CatalogRefreshIntent:
@@ -48,6 +55,10 @@ class Fakes:
 @pytest.fixture
 def fakes() -> Fakes:
     pool = AsyncMock()
+    pool.release.return_value = SessionReleaseOutcome(
+        requeued=True,
+        retired_reason=None,
+    )
     repository = AsyncMock()
     repository.control.return_value = CatalogControl(
         opportunistic_enabled=True,
@@ -184,7 +195,7 @@ async def test_budget_scope_wraps_only_the_real_catalog_request(fakes):
         yield SimpleNamespace(bytes_up=3, bytes_down=5)
         events.append("track_exit")
 
-    async def fetch(*_args):
+    async def fetch(*_args, **_kwargs):
         events.append("request")
         return [{"code": "1", "label": "Uno"}]
 
@@ -207,6 +218,9 @@ async def test_budget_scope_wraps_only_the_real_catalog_request(fakes):
         "track_exit",
     ]
     fakes.pool.release.assert_awaited_once_with(session, healthy=True)
+    assert fakes.catalogs.fetch_with_session.await_args.kwargs == {
+        "retry_transport": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -264,13 +278,83 @@ async def test_invalid_catalog_retires_session_opens_circuit_and_stops_consumer(
     fakes.pool.try_acquire_ready.return_value = session
     fakes.catalogs.fetch_with_session.side_effect = CatalogContentError("invalid")
 
+    events = []
+
+    async def durable_breaker(*_args):
+        assert fakes.queue.circuit_open is True
+        events.append("breaker")
+
+    async def release(*_args, **_kwargs):
+        events.append("release")
+        return SessionReleaseOutcome(requeued=False, retired_reason="unhealthy")
+
+    async def telemetry(*_args):
+        events.append("telemetry")
+
+    fakes.repository.retire_and_open_circuit.side_effect = durable_breaker
+    fakes.pool.release.side_effect = release
+    fakes.repository.record_event.side_effect = telemetry
+
     await fakes.queue.consume_one(intent())
 
     fakes.pool.release.assert_awaited_once_with(session, healthy=False)
-    fakes.repository.open_circuit.assert_awaited_once()
-    fakes.repository.record_event.assert_any_await(intent(), "session_retired")
-    fakes.repository.record_event.assert_any_await(intent(), "circuit_opened")
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
+    assert events[:2] == ["breaker", "release"]
     assert fakes.queue.circuit_open is True
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_breaker_retries_in_background_without_more_pjud(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.catalogs.fetch_with_session.side_effect = CatalogContentError("invalid")
+    fakes.repository.retire_and_open_circuit.side_effect = [
+        RuntimeError("database unavailable"),
+        None,
+    ]
+    fakes.pool.release.return_value = SessionReleaseOutcome(
+        requeued=False,
+        retired_reason="unhealthy",
+    )
+
+    await fakes.queue.consume_one(intent())
+    for _ in range(20):
+        if fakes.repository.retire_and_open_circuit.await_count == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert fakes.queue.circuit_open is True
+    assert fakes.repository.retire_and_open_circuit.await_count == 2
+    assert fakes.catalogs.fetch_with_session.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_refresh_opens_circuit_when_release_retires_session(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.pool.release.return_value = SessionReleaseOutcome(
+        requeued=False,
+        retired_reason="expired",
+    )
+
+    await fakes.queue.consume_one(intent())
+
+    assert fakes.queue.circuit_open is True
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_release_exception_has_its_own_metric_and_fails_closed(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.pool.release.side_effect = RuntimeError("close failed")
+
+    await fakes.queue.consume_one(intent())
+
+    assert fakes.queue.metrics.session_release_errors == 1
+    assert fakes.queue.metrics.persistence_errors == 0
+    assert fakes.queue.circuit_open is True
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -288,12 +372,71 @@ async def test_transient_network_failure_keeps_session_healthy_and_circuit_close
 
 
 @pytest.mark.asyncio
+async def test_two_intents_never_exceed_two_real_posts_on_transport_errors():
+    adapter = OJVHttpAdapter(Settings(
+        API_KEY="test",
+        OJV_BASE_URL="https://x",
+        RATE_LIMIT_MS=0,
+        _env_file=None,
+    ))
+    adapter._client.post = AsyncMock(side_effect=httpx.ConnectError("proxy down"))
+    session = OJVSession(adapter)
+    pool = AsyncMock()
+    pool.try_acquire_ready.return_value = session
+    pool.release.return_value = SessionReleaseOutcome(
+        requeued=True,
+        retired_reason=None,
+    )
+    repository = AsyncMock()
+    repository.control.return_value = CatalogControl(
+        opportunistic_enabled=True,
+        circuit_open=False,
+    )
+    repository.claim.side_effect = [
+        claim("tribunals:civil:90"),
+        claim("books:civil:90:2026"),
+    ]
+    catalogs = CatalogService(pool, snapshot={
+        "generated_at": "2026-08-07T12:00:00+00:00",
+        "tribunals": {
+            "civil:90:1": {
+                "fetched_at": "2026-08-07T12:00:00+00:00",
+                "options": [{"code": "1", "label": "Uno"}],
+            },
+        },
+        "books": {
+            "civil:90:2026": {
+                "fetched_at": "2026-08-07T12:00:00+00:00",
+                "options": [{"code": "C", "label": "Civil"}],
+            },
+        },
+    })
+    queue = CatalogRefreshQueue(
+        maxsize=2,
+        enabled=True,
+        pool=pool,
+        repository=repository,
+        catalog_service=catalogs,
+        proxy_usage=DISABLED_PROXY_USAGE,
+    )
+
+    try:
+        await queue.consume_one(intent("tribunals:civil:90"))
+        await queue.consume_one(intent("books:civil:90:2026"))
+    finally:
+        await adapter.close()
+
+    assert adapter._client.post.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_persistence_failures_never_escape_consumer(fakes):
     fakes.repository.claim.side_effect = RuntimeError("database unavailable")
 
     await fakes.queue.consume_one(intent())
 
     assert fakes.queue.metrics.persistence_errors == 1
+    fakes.pool.try_acquire_ready.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -39,11 +39,17 @@ async def test_fetch_with_session_never_acquires_pool_or_tracks_budget():
         session,
         "tribunals",
         {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+        retry_transport=False,
     )
 
     assert options == [{"code": "123", "label": "2º Juzgado Civil de Santiago"}]
     pool.acquire.assert_not_called()
     tracker.track.assert_not_called()
+    session.catalog_json.assert_awaited_once_with(
+        "/combosJSON/leeTrib.php",
+        {"codCompetencia": "3", "codCorte": "90", "tipoBusqueda": "1"},
+        retry_transport=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -85,6 +91,14 @@ def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text(
     assert parse_json_options(raw, "COD_TRIBUNAL", "GLS_TRIBUNAL") == [
         {"code": "123", "label": "2º Juzgado"},
     ]
+
+
+def test_parse_json_options_rejects_conflicting_duplicate_codes():
+    with pytest.raises(CatalogContentError):
+        parse_json_options([
+            {"COD_TRIBUNAL": "123", "GLS_TRIBUNAL": "Alfa"},
+            {"COD_TRIBUNAL": "123", "GLS_TRIBUNAL": "Zeta"},
+        ], "COD_TRIBUNAL", "GLS_TRIBUNAL")
 
 
 def test_parse_html_options_rejects_non_option_html_and_keeps_utf8_labels():

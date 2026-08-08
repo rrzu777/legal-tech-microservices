@@ -3,6 +3,8 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Literal
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
@@ -36,6 +38,15 @@ _ON_DEMAND_MINT_ATTEMPTS = 3
 
 class ProxyTrafficDisabledError(RuntimeError):
     """Persistent control denied paid proxy traffic."""
+
+
+SessionRetiredReason = Literal["unhealthy", "expired", "full", "disabled"]
+
+
+@dataclass(frozen=True)
+class SessionReleaseOutcome:
+    requeued: bool
+    retired_reason: SessionRetiredReason | None
 
 
 class APISessionPool:
@@ -400,23 +411,29 @@ class APISessionPool:
         estuviera vacío, y de paso llevar la causa camino a `suspended`."""
         return self._pick_bundle()
 
-    async def release(self, session: OJVSession, healthy: bool = True) -> None:
+    async def release(
+        self,
+        session: OJVSession,
+        healthy: bool = True,
+    ) -> SessionReleaseOutcome:
         """Return a session to the pool for reuse.
         If healthy=False the session is closed immediately and not recycled.
         """
         if not healthy:
             await session.close()
-            return
+            return SessionReleaseOutcome(False, "unhealthy")
         if self._max_size <= 0:
             await session.close()
-            return
+            return SessionReleaseOutcome(False, "disabled")
         if session.age_seconds >= self._max_age:
             await session.close()
-            return
+            return SessionReleaseOutcome(False, "expired")
         try:
             self._pool.put_nowait(session)
         except asyncio.QueueFull:
             await session.close()
+            return SessionReleaseOutcome(False, "full")
+        return SessionReleaseOutcome(True, None)
 
     async def try_acquire_ready(self) -> OJVSession | None:
         """Return an already-queued valid session without waiting or creating one.

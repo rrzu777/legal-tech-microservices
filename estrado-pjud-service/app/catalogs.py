@@ -125,12 +125,17 @@ def _clean_option(code: object, label: object) -> dict[str, str] | None:
 
 def _unique_options(options: list[dict[str, str]]) -> CatalogOptions:
     result: CatalogOptions = []
-    seen_codes: set[str] = set()
+    seen_codes: dict[str, str] = {}
     for option in options:
         code = option["code"]
-        if code in seen_codes:
+        previous_label = seen_codes.get(code)
+        if previous_label is not None and previous_label != option["label"]:
+            raise CatalogContentError(
+                f"PJUD returned conflicting labels for catalog code {code!r}"
+            )
+        if previous_label is not None:
             continue
-        seen_codes.add(code)
+        seen_codes[code] = option["label"]
         result.append(option)
     return result
 
@@ -424,12 +429,19 @@ class CatalogService:
         session,
         catalog: str,
         params: dict[str, str],
+        *,
+        retry_transport: bool = True,
     ) -> CatalogOptions:
         """Fetch one slice through a caller-owned, already-ready session."""
         if catalog not in {"courts", "tribunals", "books"}:
             raise ValueError(f"Unknown catalog {catalog!r}")
         try:
-            options = await self._request_catalog(session, catalog, params)
+            options = await self._request_catalog(
+                session,
+                catalog,
+                params,
+                retry_transport=retry_transport,
+            )
         except BlockedPageError:
             raise
         except (TypeError, ValueError) as exc:
@@ -445,11 +457,14 @@ class CatalogService:
         session,
         catalog: str,
         params: dict[str, str],
+        *,
+        retry_transport: bool,
     ) -> CatalogOptions:
         if catalog == "courts":
             rows = await session.catalog_json(
                 "/combosJSON/leeCorte.php",
                 {"tipoBusqueda": params["tipo_busqueda"]},
+                retry_transport=retry_transport,
             )
             return parse_json_options(rows, "COD_CORTE", "GLS_CORTE")
         if catalog == "tribunals":
@@ -460,6 +475,7 @@ class CatalogService:
                     "codCorte": params["corte"],
                     "tipoBusqueda": params["tipo_busqueda"],
                 },
+                retry_transport=retry_transport,
             )
             return parse_json_options(rows, "COD_TRIBUNAL", "GLS_TRIBUNAL")
         if catalog == "books":
@@ -469,7 +485,11 @@ class CatalogService:
             }
             if "corte" in params:
                 data["codCorte"] = params["corte"]
-            html = await session.catalog_html("/ADIR_871/json/cmbTipos.php", data)
+            html = await session.catalog_html(
+                "/ADIR_871/json/cmbTipos.php",
+                data,
+                retry_transport=retry_transport,
+            )
             return parse_html_options(html)
         raise ValueError(f"Unknown catalog {catalog!r}")
 
