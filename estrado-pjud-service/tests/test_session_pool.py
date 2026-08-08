@@ -178,6 +178,88 @@ class TestAPISessionPool:
         assert calls[1]["cause_session_id"] == session_id
 
     @pytest.mark.asyncio
+    async def test_cancellation_during_tracker_enter_restores_marker(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        enter_started = asyncio.Event()
+        never_enter = asyncio.Event()
+
+        @asynccontextmanager
+        async def blocked_track(**kwargs):
+            calls.append(kwargs)
+            enter_started.set()
+            await never_enter.wait()
+            yield MagicMock(retry_count=0)
+
+        pool._proxy_usage.track.side_effect = blocked_track
+        await pool.record_catalog_retirement(session_id)
+
+        async def mint_scope():
+            async with pool._mint_usage_scope(1):
+                pass
+
+        cancelled = asyncio.create_task(mint_scope())
+        await enter_started.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+
+        @asynccontextmanager
+        async def successful_track(**kwargs):
+            calls.append(kwargs)
+            yield MagicMock(retry_count=0)
+
+        pool._proxy_usage.track.side_effect = successful_track
+        await mint_scope()
+
+        assert calls[1]["cause_session_id"] == session_id
+
+    @pytest.mark.asyncio
+    async def test_blocked_commit_cannot_create_pre_mint_cancellation_window(
+        self,
+        monkeypatch,
+    ):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        body_started = asyncio.Event()
+        keep_mint_running = asyncio.Event()
+        commit_started = asyncio.Event()
+        permit_commit = asyncio.Event()
+        original_commit = pool._commit_catalog_retirement_claim
+
+        async def blocked_commit(claim_token):
+            commit_started.set()
+            await permit_commit.wait()
+            await original_commit(claim_token)
+
+        monkeypatch.setattr(pool, "_commit_catalog_retirement_claim", blocked_commit)
+        await pool.record_catalog_retirement(session_id)
+
+        async def mint_scope():
+            async with pool._mint_usage_scope(1):
+                body_started.set()
+                await keep_mint_running.wait()
+
+        mint = asyncio.create_task(mint_scope())
+        try:
+            await asyncio.sleep(0)
+            assert body_started.is_set()
+            mint.cancel()
+            await commit_started.wait()
+            permit_commit.set()
+            with pytest.raises(asyncio.CancelledError):
+                await mint
+        finally:
+            permit_commit.set()
+            if not mint.done():
+                mint.cancel()
+                await asyncio.gather(mint, return_exceptions=True)
+
+        async with pool._mint_usage_scope(1):
+            pass
+        assert "cause_session_id" not in calls[-1]
+
+    @pytest.mark.asyncio
     async def test_concurrent_scope_cannot_observe_marker_while_first_enter_is_pending(self):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")

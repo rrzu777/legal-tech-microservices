@@ -4,7 +4,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Awaitable, Literal
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
@@ -124,18 +124,35 @@ class APISessionPool:
                 **cause,
             ) as usage:
                 entered = True
-                if claim is not None:
-                    await asyncio.shield(
-                        self._commit_catalog_retirement_claim(claim[1])
-                    )
                 if attempt > 1:
                     usage.retry_count += 1
-                yield usage
+                try:
+                    # No await between a successful tracker enter and yielding:
+                    # the paid mint body starts before cancellation can consume
+                    # causal state without doing provider work.
+                    yield usage
+                finally:
+                    if claim is not None:
+                        await self._finish_catalog_marker_transition(
+                            self._commit_catalog_retirement_claim(claim[1])
+                        )
         except BaseException:
             if claim is not None and not entered:
-                await asyncio.shield(
+                await self._finish_catalog_marker_transition(
                     self._restore_catalog_retirement_claim(claim[1])
                 )
+            raise
+
+    async def _finish_catalog_marker_transition(
+        self,
+        operation: Awaitable[None],
+    ) -> None:
+        """Finish a tiny CAS even if its owning mint task is cancelled."""
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
             raise
 
     async def record_catalog_retirement(self, generation_id: uuid.UUID) -> None:
