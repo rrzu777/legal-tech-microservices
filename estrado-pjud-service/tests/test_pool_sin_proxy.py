@@ -96,6 +96,49 @@ def test_log_de_bundle_obsoleto_no_filtra_secretos(monkeypatch, caplog):
     assert "token-ultrasecreto" not in caplog.text
 
 
+def test_bundle_con_saved_at_texto_mintea_y_no_filtra_secretos(monkeypatch, caplog):
+    from app.cookie_store import CookieBundle
+    import logging
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "cookie-ultrasecreta"},
+        user_agent="UA",
+        saved_at="fecha-invalida",
+        proxy_url="http://usuario:password-ultrasecreto@proxy.test:1234",
+        proxy_token="token-ultrasecreto",
+    )
+    pool, capturados = pool_con_store(monkeypatch, {"7": bundle})
+    proxies = permitir_mint_residencial(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        asyncio.run(pool.acquire())
+
+    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert capturados[0]["proxy"] == proxies[0]
+    assert "persisted_bundle_invalid_saved_at slot=7" in caplog.text
+    assert "cookie-ultrasecreta" not in caplog.text
+    assert "password-ultrasecreto" not in caplog.text
+    assert "token-ultrasecreto" not in caplog.text
+
+
+def test_bundle_con_saved_at_nan_se_descarta(monkeypatch, caplog):
+    from app.cookie_store import CookieBundle
+    import logging
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "tok-nan"},
+        user_agent="UA",
+        saved_at=float("nan"),
+        proxy_url="http://u:p@sticky:1",
+    )
+    pool, _ = pool_con_store(monkeypatch, {"8": bundle})
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        assert pool._usable_bundles() == []
+
+    assert "persisted_bundle_invalid_saved_at slot=8" in caplog.text
+
+
 class TestNuncaSalirSinProxy:
     def test_con_proxy_configurado_y_store_vacio_no_sale_a_la_calle(self, monkeypatch):
         pool, capturados = pool_con_store(monkeypatch, {})

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -448,17 +449,23 @@ class APISessionPool:
         """
         bundles: list[CookieBundle] = []
         for slot_id, bundle in sorted(self._store.load_all().items()):
-            if (
-                self._proxy_mode
-                and bundle.age_seconds > self._persisted_bundle_max_age_s
-            ):
-                logger.warning(
-                    "persisted_bundle_stale slot=%s age_seconds=%.0f max_age_seconds=%d",
-                    slot_id,
-                    bundle.age_seconds,
-                    self._persisted_bundle_max_age_s,
-                )
-                continue
+            if self._proxy_mode:
+                try:
+                    age_seconds = bundle.age_seconds
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
+                    continue
+                if not math.isfinite(age_seconds):
+                    logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
+                    continue
+                if age_seconds > self._persisted_bundle_max_age_s:
+                    logger.warning(
+                        "persisted_bundle_stale slot=%s age_seconds=%.0f max_age_seconds=%d",
+                        slot_id,
+                        age_seconds,
+                        self._persisted_bundle_max_age_s,
+                    )
+                    continue
             if self._proxy_mode and bundle.proxy_token:
                 bundle = CookieBundle(
                     cookies=bundle.cookies,
