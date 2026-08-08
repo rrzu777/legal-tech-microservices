@@ -1,9 +1,171 @@
 import asyncio
+import logging
 from unittest.mock import MagicMock
 from app.cookie_store import CookieBundle
 
 
 from tests.helpers import FakeOJVSession as _FakeSession
+
+
+def test_release_then_ready_acquire_preserves_the_interactive_cookie_session():
+    """Opportunistic work must receive the exact released session, not a reminted shell."""
+    from app.config import Settings
+    from app.session_pool import APISessionPool
+
+    pool = APISessionPool(Settings(API_KEY="t", SESSION_POOL_SIZE=1, _env_file=None))
+    adapter = MagicMock()
+    adapter.cookies = {"TSPD_101": "interactive-cookie"}
+    session = _FakeSession(adapter)
+
+    async def run():
+        outcome = await pool.release(session, healthy=True)
+        ready = await pool.try_acquire_ready()
+        assert outcome.requeued is True
+        assert ready is session
+        assert ready.adapter.cookies == {"TSPD_101": "interactive-cookie"}
+        await ready.close()
+
+    asyncio.run(run())
+
+
+def test_lifespan_starts_queue_and_stops_it_before_pool_with_two_second_cap(
+    monkeypatch,
+):
+    """Shutdown must fence opportunistic work before closing its shared sessions."""
+    from fastapi.testclient import TestClient
+    from app.config import Settings
+    from app import main as main_module
+
+    events = []
+
+    class Pool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def close_all(self):
+            events.append("pool.close")
+
+    class Queue:
+        def __init__(self, **kwargs):
+            assert kwargs["enabled"] is True
+
+        async def start(self):
+            events.append("queue.start")
+
+        async def stop(self, drain_timeout_seconds):
+            events.append(f"queue.stop:{drain_timeout_seconds}")
+
+    settings = Settings(
+        API_KEY="t",
+        SUPABASE_URL="https://supabase.test",
+        SUPABASE_SERVICE_KEY="service-key",
+        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=True,
+        _env_file=None,
+    )
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "create_client", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "APISessionPool", Pool)
+    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
+
+    app = main_module.create_app()
+    with TestClient(app):
+        assert events == ["queue.start"]
+
+    assert events == ["queue.start", "queue.stop:2", "pool.close"]
+
+
+def test_lifespan_disables_queue_and_warns_once_without_service_configuration(
+    monkeypatch, caplog,
+):
+    """A deployment missing service credentials must never enable paid background traffic."""
+    from fastapi.testclient import TestClient
+    from app.config import Settings
+    from app import main as main_module
+
+    enabled_values = []
+
+    class Pool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def close_all(self):
+            pass
+
+    class Queue:
+        def __init__(self, **kwargs):
+            enabled_values.append(kwargs["enabled"])
+
+        async def start(self):
+            pass
+
+        async def stop(self, drain_timeout_seconds):
+            assert drain_timeout_seconds <= 2
+
+    settings = Settings(
+        API_KEY="t",
+        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=True,
+        SUPABASE_URL="",
+        SUPABASE_SERVICE_KEY="",
+        _env_file=None,
+    )
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "APISessionPool", Pool)
+    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
+    caplog.set_level(logging.WARNING)
+
+    app = main_module.create_app()
+    with TestClient(app):
+        pass
+
+    assert enabled_values == [False]
+    warnings = [
+        record for record in caplog.records
+        if "catalog" in record.getMessage().lower()
+        and "disabled" in record.getMessage().lower()
+    ]
+    assert len(warnings) == 1
+
+
+def test_lifespan_keeps_queue_disabled_when_feature_flag_is_false(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.config import Settings
+    from app import main as main_module
+
+    enabled_values = []
+
+    class Pool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def close_all(self):
+            pass
+
+    class Queue:
+        def __init__(self, **kwargs):
+            enabled_values.append(kwargs["enabled"])
+
+        async def start(self):
+            pass
+
+        async def stop(self, drain_timeout_seconds):
+            pass
+
+    settings = Settings(
+        API_KEY="t",
+        SUPABASE_URL="https://supabase.test",
+        SUPABASE_SERVICE_KEY="service-key",
+        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=False,
+        _env_file=None,
+    )
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "create_client", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "APISessionPool", Pool)
+    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
+
+    with TestClient(main_module.create_app()):
+        pass
+
+    assert enabled_values == [False]
 
 
 def test_acquire_injects_cookies_from_store(monkeypatch):
