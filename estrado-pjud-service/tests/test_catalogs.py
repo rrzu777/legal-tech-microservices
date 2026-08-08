@@ -109,6 +109,47 @@ async def test_fetch_with_session_classifies_redirect_as_invalid_catalog(status)
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 405, 429])
+async def test_fetch_with_session_classifies_session_waf_status_as_invalid(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(status, request=request)
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "session rejected",
+        request=request,
+        response=response,
+    ))
+
+    with pytest.raises(CatalogContentError):
+        await CatalogService(MagicMock(), snapshot={}).fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [402, 500, 503])
+async def test_fetch_with_session_preserves_non_session_http_failures(status):
+    request = httpx.Request("POST", "https://x/catalog")
+    response = httpx.Response(status, request=request)
+    error = httpx.HTTPStatusError("upstream", request=request, response=response)
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=error)
+
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        await CatalogService(MagicMock(), snapshot={}).fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+            retry_transport=False,
+        )
+
+    assert raised.value.response.status_code == status
+
+
 def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text():
     """Catches a parser that would expose PJUD's "Seleccione" entry as a court."""
     raw = [

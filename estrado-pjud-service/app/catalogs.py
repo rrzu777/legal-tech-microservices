@@ -446,9 +446,10 @@ class CatalogService:
         except BlockedPageError:
             raise
         except httpx.HTTPStatusError as exc:
-            if 300 <= exc.response.status_code < 400:
+            status = exc.response.status_code
+            if 300 <= status < 400 or status in {401, 403, 405, 429}:
                 raise CatalogContentError(
-                    f"PJUD redirected {catalog} catalog unexpectedly"
+                    f"PJUD rejected {catalog} catalog session"
                 ) from exc
             raise
         except (TypeError, ValueError) as exc:

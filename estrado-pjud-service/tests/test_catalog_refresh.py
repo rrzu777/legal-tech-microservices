@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import httpx
@@ -385,6 +385,155 @@ async def test_transient_network_failure_keeps_session_healthy_and_circuit_close
     fakes.repository.open_circuit.assert_not_awaited()
     fakes.repository.record_event.assert_any_await(intent(), "error")
     assert fakes.queue.circuit_open is False
+
+
+@pytest.mark.asyncio
+async def test_provider_402_stays_ops_only_and_does_not_retire_session(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.catalogs.fetch_with_session.side_effect = httpx.ProxyError(
+        "proxy tunnel: 402 Payment Required"
+    )
+
+    await fakes.queue.consume_one(intent())
+
+    fakes.pool.release.assert_awaited_once_with(session, healthy=True)
+    assert fakes.repository.fail.await_args.args[1] == "provider_billing"
+    fakes.repository.retire_and_open_circuit.assert_not_awaited()
+    assert fakes.queue.circuit_open is False
+
+
+@pytest.mark.asyncio
+async def test_http_503_remains_transient_and_releases_session_healthy(fakes):
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    request = httpx.Request("POST", "https://x/catalog")
+    fakes.catalogs.fetch_with_session.side_effect = httpx.HTTPStatusError(
+        "upstream down",
+        request=request,
+        response=httpx.Response(503, request=request),
+    )
+
+    await fakes.queue.consume_one(intent())
+
+    fakes.pool.release.assert_awaited_once_with(session, healthy=True)
+    fakes.repository.retire_and_open_circuit.assert_not_awaited()
+    assert fakes.queue.circuit_open is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_breaker_rpc_does_not_cancel_critical_persistence(fakes):
+    entered = asyncio.Event()
+    permit_finish = asyncio.Event()
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+
+    async def blocked_rpc(*_args):
+        entered.set()
+        await permit_finish.wait()
+
+    fakes.repository.retire_and_open_circuit.side_effect = blocked_rpc
+    outer = asyncio.create_task(fakes.queue._open_retirement_circuit(
+        claim(),
+        intent(),
+        session,
+        "invalid",
+    ))
+    await entered.wait()
+    outer.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert fakes.queue._breaker_tasks
+    critical = next(iter(fakes.queue._breaker_tasks))
+    assert critical.cancelled() is False
+
+    permit_finish.set()
+    for _ in range(10):
+        if not fakes.queue._breaker_tasks:
+            break
+        await asyncio.sleep(0)
+
+    fakes.repository.retire_and_open_circuit.assert_awaited_once()
+    assert not fakes.queue._breaker_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_invalid_consume_releases_once_without_duplicate_breaker(fakes):
+    entered = asyncio.Event()
+    permit_finish = asyncio.Event()
+    session = MagicMock(generation_id=UUID("22222222-2222-4222-8222-222222222222"))
+    fakes.pool.try_acquire_ready.return_value = session
+    fakes.catalogs.fetch_with_session.side_effect = CatalogContentError("invalid")
+    fakes.pool.release.return_value = SessionReleaseOutcome(
+        requeued=False,
+        retired_reason="unhealthy",
+    )
+
+    async def blocked_rpc(*_args):
+        entered.set()
+        await permit_finish.wait()
+
+    fakes.repository.retire_and_open_circuit.side_effect = blocked_rpc
+    consume = asyncio.create_task(fakes.queue.consume_one(intent()))
+    await entered.wait()
+    consume.cancel()
+    permit_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consume
+
+    fakes.pool.release.assert_awaited_once_with(session, healthy=False)
+    for _ in range(10):
+        if not fakes.queue._breaker_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert fakes.repository.retire_and_open_circuit.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_breaker_retry_uses_exponential_jitter_cap_and_rate_limited_logs():
+    sleeps = []
+    random_calls = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    def full_jitter():
+        random_calls.append(True)
+        return 1.0
+
+    repository = AsyncMock()
+    repository.retire_and_open_circuit.side_effect = [
+        RuntimeError("db down 1"),
+        RuntimeError("db down 2"),
+        RuntimeError("db down 3"),
+        None,
+    ]
+    queue = CatalogRefreshQueue(
+        maxsize=1,
+        enabled=True,
+        pool=AsyncMock(),
+        repository=repository,
+        catalog_service=MagicMock(),
+        proxy_usage=MagicMock(),
+        breaker_retry_base_seconds=1,
+        breaker_retry_cap_seconds=2,
+        breaker_retry_sleep=fake_sleep,
+        breaker_retry_random=full_jitter,
+        breaker_retry_clock=lambda: 0,
+    )
+
+    with patch("app.catalog_refresh.logger.exception") as log_exception:
+        await queue._retry_breaker(
+            claim(),
+            intent(),
+            "invalid",
+            UUID("22222222-2222-4222-8222-222222222222"),
+        )
+
+    assert sleeps == [1, 2, 2]
+    assert len(random_calls) == 3
+    assert log_exception.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 from dataclasses import dataclass
 
 from app.catalog_observations import (
@@ -15,6 +17,7 @@ from app.catalog_observations import (
 )
 from app.catalogs import CatalogContentError
 from app.failure_kind import BlockedPageError
+from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session_pool import SessionReleaseOutcome
 
@@ -40,6 +43,12 @@ class CatalogRefreshQueue:
         catalog_service,
         proxy_usage,
         enabled: bool = False,
+        breaker_retry_base_seconds: float = 0.25,
+        breaker_retry_cap_seconds: float = 30.0,
+        breaker_retry_sleep=asyncio.sleep,
+        breaker_retry_random=random.random,
+        breaker_retry_clock=time.monotonic,
+        breaker_log_interval_seconds: float = 60.0,
     ) -> None:
         self._enabled = bool(enabled)
         self._queue: asyncio.Queue[CatalogRefreshIntent] = asyncio.Queue(
@@ -54,6 +63,16 @@ class CatalogRefreshQueue:
         self._breaker_tasks: set[asyncio.Task[None]] = set()
         self._circuit_open = False
         self._stopping = False
+        self._breaker_retry_base_seconds = max(0.01, breaker_retry_base_seconds)
+        self._breaker_retry_cap_seconds = max(
+            self._breaker_retry_base_seconds,
+            breaker_retry_cap_seconds,
+        )
+        self._breaker_retry_sleep = breaker_retry_sleep
+        self._breaker_retry_random = breaker_retry_random
+        self._breaker_retry_clock = breaker_retry_clock
+        self._breaker_log_interval_seconds = max(0.0, breaker_log_interval_seconds)
+        self._last_breaker_failure_log_at: float | None = None
         self.metrics = CatalogRefreshMetrics()
 
     @property
@@ -234,6 +253,7 @@ class CatalogRefreshQueue:
 
         healthy = True
         released = False
+        breaker_opened_for_session = False
         try:
             params = intent.catalog_params()
             try:
@@ -281,6 +301,7 @@ class CatalogRefreshQueue:
                 # Only blocked/invalid content is evidence that this session
                 # generation is unsafe to reuse.
                 healthy = False
+                breaker_opened_for_session = True
                 await self._open_retirement_circuit(
                     claim,
                     intent,
@@ -292,19 +313,25 @@ class CatalogRefreshQueue:
                     healthy=False,
                     claim=claim,
                     intent=intent,
-                    breaker_already_open=True,
+                    breaker_already_open=breaker_opened_for_session,
                 )
                 released = True
                 return
             except Exception as exc:
                 # Timeouts and other transient transport failures are not, by
                 # themselves, evidence that the session generation is corrupt.
-                await self._persist(self._repository.fail, claim, type(exc).__name__)
+                failure_reason = (
+                    "provider_billing"
+                    if is_proxy_billing_error(exc)
+                    else type(exc).__name__
+                )
+                await self._persist(self._repository.fail, claim, failure_reason)
                 await self._release_session(
                     session,
                     healthy=True,
                     claim=claim,
                     intent=intent,
+                    breaker_already_open=breaker_opened_for_session,
                 )
                 released = True
                 await self._persist(self._repository.record_event, intent, "error")
@@ -345,6 +372,7 @@ class CatalogRefreshQueue:
                     healthy=healthy,
                     claim=claim,
                     intent=intent,
+                    breaker_already_open=breaker_opened_for_session,
                 )
 
     async def _release_session(
@@ -408,21 +436,48 @@ class CatalogRefreshQueue:
         # Fail closed locally before any persistence, release, or optional event.
         self._circuit_open = True
         self.metrics.sessions_retired_by_catalog_refresh += 1
+        critical = self._track_breaker_task(self._persist_breaker_once(
+            claim,
+            intent,
+            reason,
+            session.generation_id,
+        ))
+        # Outer cancellation must not cancel the durable breaker write. The
+        # strong task remains drainable by stop() for up to the shared 2s cap.
+        await asyncio.shield(critical)
+
+    def _track_breaker_task(self, coroutine) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine)
+        self._breaker_tasks.add(task)
+        task.add_done_callback(self._breaker_tasks.discard)
+        return task
+
+    async def _persist_breaker_once(
+        self,
+        claim,
+        intent,
+        reason: str,
+        session_generation_id,
+    ) -> None:
         try:
             await self._repository.retire_and_open_circuit(
                 claim,
                 intent,
                 reason,
-                session.generation_id,
+                session_generation_id,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             self.metrics.persistence_errors += 1
-            logger.exception("Atomic catalog retirement breaker persistence failed")
+            self._log_breaker_failure(
+                "Atomic catalog retirement breaker persistence failed"
+            )
             self._schedule_breaker_retry(
                 claim,
                 intent,
                 reason,
-                session.generation_id,
+                session_generation_id,
             )
 
     def _schedule_breaker_retry(
@@ -432,14 +487,20 @@ class CatalogRefreshQueue:
         reason: str,
         session_generation_id,
     ) -> None:
-        task = asyncio.create_task(self._retry_breaker(
+        self._track_breaker_task(self._retry_breaker(
             claim,
             intent,
             reason,
             session_generation_id,
         ))
-        self._breaker_tasks.add(task)
-        task.add_done_callback(self._breaker_tasks.discard)
+
+    def _log_breaker_failure(self, message: str) -> None:
+        now = self._breaker_retry_clock()
+        last = self._last_breaker_failure_log_at
+        if last is None or now - last >= self._breaker_log_interval_seconds:
+            # Static message only: never include reason, tenant IDs, or options.
+            logger.exception(message)
+            self._last_breaker_failure_log_at = now
 
     async def _retry_breaker(
         self,
@@ -448,6 +509,7 @@ class CatalogRefreshQueue:
         reason: str,
         session_generation_id,
     ) -> None:
+        ceiling = self._breaker_retry_base_seconds
         while not self._stopping:
             try:
                 await self._repository.retire_and_open_circuit(
@@ -461,5 +523,11 @@ class CatalogRefreshQueue:
                 raise
             except Exception:
                 self.metrics.persistence_errors += 1
-                logger.exception("Catalog retirement breaker retry failed")
-                await asyncio.sleep(0.25)
+                self._log_breaker_failure("Catalog retirement breaker retry failed")
+                random_value = min(1.0, max(0.0, self._breaker_retry_random()))
+                jittered_delay = ceiling * (0.5 + 0.5 * random_value)
+                await self._breaker_retry_sleep(jittered_delay)
+                ceiling = min(
+                    self._breaker_retry_cap_seconds,
+                    ceiling * 2,
+                )
