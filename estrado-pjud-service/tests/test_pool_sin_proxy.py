@@ -47,6 +47,23 @@ def test_bundle_mayor_a_dos_ttl_se_descarta(monkeypatch):
     assert pool._pick_bundle() is None
 
 
+def test_bundle_en_borde_exacto_de_dos_ttl_sigue_utilizable(monkeypatch):
+    """Cambiar el comparador de ``>`` a ``>=`` debe romper este test."""
+    from app import cookie_store
+    from app.cookie_store import CookieBundle
+
+    monkeypatch.setattr(cookie_store.time, "time", lambda: 10_000.0)
+    boundary = CookieBundle(
+        cookies={"TSPD_101": "tok-boundary"},
+        user_agent="UA-boundary",
+        saved_at=2_800.0,
+        proxy_url="http://u:p@sticky:1",
+    )
+    pool, _ = pool_con_store(monkeypatch, {"0": boundary})
+
+    assert pool._pick_bundle() is boundary
+
+
 def test_ttl_de_30m_descarta_despues_de_60m(monkeypatch):
     stale = cookie_bundle("stale", age_seconds=60 * 60 + 1)
     pool, _ = pool_con_store(monkeypatch, {"0": stale}, sticky_lifetime="30m")
@@ -137,6 +154,33 @@ def test_bundle_con_saved_at_nan_se_descarta(monkeypatch, caplog):
         assert pool._usable_bundles() == []
 
     assert "persisted_bundle_invalid_saved_at slot=8" in caplog.text
+
+
+def test_bundle_con_saved_at_futuro_se_descarta_y_mintea(monkeypatch, caplog):
+    """Aceptar una edad negativa evita el límite 2x y debe romper este test."""
+    from app.cookie_store import CookieBundle
+    import logging
+    import time
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "cookie-futura-ultrasecreta"},
+        user_agent="UA",
+        saved_at=time.time() + 3600,
+        proxy_url="http://usuario:password-futuro@proxy.test:1234",
+        proxy_token="token-futuro-ultrasecreto",
+    )
+    pool, capturados = pool_con_store(monkeypatch, {"9": bundle})
+    proxies = permitir_mint_residencial(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        asyncio.run(pool.acquire())
+
+    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert capturados[0]["proxy"] == proxies[0]
+    assert "persisted_bundle_invalid_saved_at slot=9" in caplog.text
+    assert "cookie-futura-ultrasecreta" not in caplog.text
+    assert "password-futuro" not in caplog.text
+    assert "token-futuro-ultrasecreto" not in caplog.text
 
 
 class TestNuncaSalirSinProxy:

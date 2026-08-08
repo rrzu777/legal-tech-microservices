@@ -455,7 +455,7 @@ class APISessionPool:
                 except (TypeError, ValueError, OverflowError):
                     logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
                     continue
-                if not math.isfinite(age_seconds):
+                if not math.isfinite(age_seconds) or age_seconds < 0:
                     logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
                     continue
                 if age_seconds > self._persisted_bundle_max_age_s:
@@ -497,6 +497,32 @@ class APISessionPool:
         `error_code="blocked"` con HTTP 200: culpar a OJV de que nuestro pool
         estuviera vacío, y de paso llevar la causa camino a `suspended`."""
         return self._pick_bundle()
+
+    async def acquire_familia_bundle(self) -> CookieBundle | None:
+        """Return a usable Familia bundle, minting one on demand when needed.
+
+        Familia consumes the persisted F5 cookies directly instead of an
+        ``OJVSession``, but it must recover through the same paid-proxy path as
+        ``acquire()``. Reusing ``_mint_on_demand`` preserves the persistent
+        proxy gate, cost attribution, mint lock and interactive retry budget.
+
+        Legacy mode deliberately keeps the previous behavior: it may return an
+        existing age-unfiltered bundle, but an empty store never triggers a
+        direct-egress mint.
+        """
+        deadline = time.monotonic() + _RETRY_BUDGET_S
+        await self.assert_proxy_enabled()
+        bundle = self.pick_familia_bundle()
+        if bundle is not None or not self._proxy_mode:
+            return bundle
+
+        session = await self._mint_on_demand(deadline=deadline)
+        if session is not None:
+            # The mint path initializes an OJVSession to validate its cookies.
+            # Keep that paid result available to search/detail instead of
+            # leaking or immediately discarding the initialized session.
+            await self.release(session)
+        return self.pick_familia_bundle()
 
     async def release(
         self,
