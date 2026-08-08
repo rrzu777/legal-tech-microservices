@@ -151,6 +151,65 @@ class TestAPISessionPool:
         assert "cause_session_id" not in calls[1]
 
     @pytest.mark.asyncio
+    async def test_tracker_enter_failure_restores_marker_for_next_mint(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        attempts = 0
+
+        @asynccontextmanager
+        async def track(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            calls.append(kwargs)
+            if attempts == 1:
+                raise RuntimeError("budget reservation unavailable")
+            yield MagicMock(retry_count=0)
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        with pytest.raises(RuntimeError, match="budget reservation unavailable"):
+            async with pool._mint_usage_scope(1):
+                pass
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert calls[0]["cause_session_id"] == session_id
+        assert calls[1]["cause_session_id"] == session_id
+
+    @pytest.mark.asyncio
+    async def test_concurrent_scope_cannot_observe_marker_while_first_enter_is_pending(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        first_entered = asyncio.Event()
+        permit_first = asyncio.Event()
+
+        @asynccontextmanager
+        async def track(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                first_entered.set()
+                await permit_first.wait()
+            yield MagicMock(retry_count=0)
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        async def mint_scope():
+            async with pool._mint_usage_scope(1):
+                pass
+
+        first = asyncio.create_task(mint_scope())
+        await first_entered.wait()
+        await mint_scope()
+        permit_first.set()
+        await first
+
+        attributed = [call for call in calls if "cause_session_id" in call]
+        assert len(attributed) == 1
+        assert attributed[0]["cause_session_id"] == session_id
+
+    @pytest.mark.asyncio
     async def test_catalog_retirement_marker_expires_after_fixed_window(self, monkeypatch):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
