@@ -28,10 +28,13 @@ def test_release_then_ready_acquire_preserves_the_interactive_cookie_session():
     asyncio.run(run())
 
 
-def test_lifespan_starts_queue_and_stops_it_before_pool_with_two_second_cap(
+def test_lifespan_never_constructs_catalog_refresh_queue_even_with_obsolete_env(
     monkeypatch,
 ):
-    """Shutdown must fence opportunistic work before closing its shared sessions."""
+    """An obsolete deployment env cannot restore opportunistic catalog traffic."""
+    monkeypatch.setenv("API_KEY", "t")
+    monkeypatch.setenv("PJUD_CATALOG_OPPORTUNISTIC_ENABLED", "true")
+
     from fastapi.testclient import TestClient
     from app.config import Settings
     from app import main as main_module
@@ -46,8 +49,8 @@ def test_lifespan_starts_queue_and_stops_it_before_pool_with_two_second_cap(
             events.append("pool.close")
 
     class Queue:
-        def __init__(self, **kwargs):
-            assert kwargs["enabled"] is True
+        def __init__(self, **_kwargs):
+            events.append("queue.constructed")
 
         async def start(self):
             events.append("queue.start")
@@ -55,117 +58,16 @@ def test_lifespan_starts_queue_and_stops_it_before_pool_with_two_second_cap(
         async def stop(self, drain_timeout_seconds):
             events.append(f"queue.stop:{drain_timeout_seconds}")
 
-    settings = Settings(
-        API_KEY="t",
-        SUPABASE_URL="https://supabase.test",
-        SUPABASE_SERVICE_KEY="service-key",
-        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=True,
-        _env_file=None,
-    )
+    settings = Settings(API_KEY="t", _env_file=None)
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(main_module, "create_client", lambda *_args: MagicMock())
     monkeypatch.setattr(main_module, "APISessionPool", Pool)
-    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
+    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue, raising=False)
 
     app = main_module.create_app()
     with TestClient(app):
-        assert events == ["queue.start"]
+        assert app.state.catalog_refresh_queue is None
 
-    assert events == ["queue.start", "queue.stop:2", "pool.close"]
-
-
-def test_lifespan_disables_queue_and_warns_once_without_service_configuration(
-    monkeypatch, caplog,
-):
-    """A deployment missing service credentials must never enable paid background traffic."""
-    from fastapi.testclient import TestClient
-    from app.config import Settings
-    from app import main as main_module
-
-    enabled_values = []
-
-    class Pool:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def close_all(self):
-            pass
-
-    class Queue:
-        def __init__(self, **kwargs):
-            enabled_values.append(kwargs["enabled"])
-
-        async def start(self):
-            pass
-
-        async def stop(self, drain_timeout_seconds):
-            assert drain_timeout_seconds <= 2
-
-    settings = Settings(
-        API_KEY="t",
-        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=True,
-        SUPABASE_URL="",
-        SUPABASE_SERVICE_KEY="",
-        _env_file=None,
-    )
-    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(main_module, "APISessionPool", Pool)
-    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
-    caplog.set_level(logging.WARNING)
-
-    app = main_module.create_app()
-    with TestClient(app):
-        pass
-
-    assert enabled_values == [False]
-    warnings = [
-        record for record in caplog.records
-        if "catalog" in record.getMessage().lower()
-        and "disabled" in record.getMessage().lower()
-    ]
-    assert len(warnings) == 1
-
-
-def test_lifespan_keeps_queue_disabled_when_feature_flag_is_false(monkeypatch):
-    from fastapi.testclient import TestClient
-    from app.config import Settings
-    from app import main as main_module
-
-    enabled_values = []
-
-    class Pool:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def close_all(self):
-            pass
-
-    class Queue:
-        def __init__(self, **kwargs):
-            enabled_values.append(kwargs["enabled"])
-
-        async def start(self):
-            pass
-
-        async def stop(self, drain_timeout_seconds):
-            pass
-
-    settings = Settings(
-        API_KEY="t",
-        SUPABASE_URL="https://supabase.test",
-        SUPABASE_SERVICE_KEY="service-key",
-        PJUD_CATALOG_OPPORTUNISTIC_ENABLED=False,
-        _env_file=None,
-    )
-    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(main_module, "create_client", lambda *_args: MagicMock())
-    monkeypatch.setattr(main_module, "APISessionPool", Pool)
-    monkeypatch.setattr(main_module, "CatalogRefreshQueue", Queue)
-
-    with TestClient(main_module.create_app()):
-        pass
-
-    assert enabled_values == [False]
+    assert events == ["pool.close"]
 
 
 def test_acquire_injects_cookies_from_store(monkeypatch):

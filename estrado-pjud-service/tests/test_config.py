@@ -27,9 +27,19 @@ def test_config_defaults(monkeypatch):
     assert s.RATE_LIMIT_MS == 2500
     assert s.LOG_LEVEL == "INFO"
     assert s.SESSION_POOL_SIZE == 2
-    assert s.PJUD_CATALOG_OPPORTUNISTIC_ENABLED is False
     assert s.PJUD_CATALOG_QUEUE_SIZE == 16
     assert s.SESSION_MAX_AGE_S == 1200
+
+
+def test_obsolete_catalog_refresh_env_cannot_enable_runtime(monkeypatch):
+    monkeypatch.setenv("API_KEY", "key")
+    monkeypatch.setenv("PJUD_CATALOG_OPPORTUNISTIC_ENABLED", "true")
+
+    from app.config import Settings
+
+    settings = Settings(_env_file=None)
+
+    assert not hasattr(settings, "PJUD_CATALOG_OPPORTUNISTIC_ENABLED")
 
 
 @pytest.mark.parametrize("field,value", [
