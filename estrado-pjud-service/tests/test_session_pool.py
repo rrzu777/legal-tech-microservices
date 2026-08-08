@@ -260,36 +260,87 @@ class TestAPISessionPool:
         assert "cause_session_id" not in calls[-1]
 
     @pytest.mark.asyncio
-    async def test_concurrent_scope_cannot_observe_marker_while_first_enter_is_pending(self):
+    async def test_concurrent_mint_waits_and_claims_after_first_tracker_enter_fails(self):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
         first_entered = asyncio.Event()
-        permit_first = asyncio.Event()
+        fail_first = asyncio.Event()
 
         @asynccontextmanager
         async def track(**kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
                 first_entered.set()
-                await permit_first.wait()
+                await fail_first.wait()
+                raise RuntimeError("reservation failed")
             yield MagicMock(retry_count=0)
 
         pool._proxy_usage.track.side_effect = track
         await pool.record_catalog_retirement(session_id)
 
-        async def mint_scope():
+        async def mint_scope(*, fails=False):
+            if fails:
+                with pytest.raises(RuntimeError, match="reservation failed"):
+                    async with pool._mint_usage_scope(1):
+                        pass
+                return
             async with pool._mint_usage_scope(1):
                 pass
 
-        first = asyncio.create_task(mint_scope())
+        first = asyncio.create_task(mint_scope(fails=True))
         await first_entered.wait()
-        await mint_scope()
-        permit_first.set()
+        second = asyncio.create_task(mint_scope())
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        fail_first.set()
         await first
+        await second
 
-        attributed = [call for call in calls if "cause_session_id" in call]
-        assert len(attributed) == 1
-        assert attributed[0]["cause_session_id"] == session_id
+        assert calls[0]["cause_session_id"] == session_id
+        assert calls[1]["cause_session_id"] == session_id
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mint_waits_for_successful_owner_then_runs_without_cause(self):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        first_body = asyncio.Event()
+        permit_first = asyncio.Event()
+        await pool.record_catalog_retirement(session_id)
+
+        async def first_mint():
+            async with pool._mint_usage_scope(1):
+                first_body.set()
+                await permit_first.wait()
+
+        async def second_mint():
+            async with pool._mint_usage_scope(1):
+                pass
+
+        first = asyncio.create_task(first_mint())
+        await first_body.wait()
+        second = asyncio.create_task(second_mint())
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+
+        permit_first.set()
+        await asyncio.gather(first, second)
+
+        assert calls[0]["cause_session_id"] == session_id
+        assert "cause_session_id" not in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_claimed_marker_expiry_bounds_concurrent_wait(self, monkeypatch):
+        pool, calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        monkeypatch.setattr("app.session_pool._CATALOG_RETIREMENT_CORRELATION_S", 0.01)
+        await pool.record_catalog_retirement(session_id)
+        assert await pool._claim_catalog_retirement_marker() is not None
+
+        async with asyncio.timeout(0.2):
+            async with pool._mint_usage_scope(1):
+                pass
+
+        assert "cause_session_id" not in calls[0]
 
     @pytest.mark.asyncio
     async def test_catalog_retirement_marker_expires_after_fixed_window(self, monkeypatch):
