@@ -1,4 +1,7 @@
 """Tests for Telegram alerting."""
+import json
+import logging
+import stat
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -13,6 +16,101 @@ def _env(monkeypatch):
 
 
 class TestTelegramAlerter:
+    @pytest.mark.asyncio
+    async def test_event_cooldown_survives_process_restart(self, tmp_path, caplog):
+        from app.alert_cooldown_store import AlertCooldownStore
+        from app.alerting import TelegramAlerter
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        first = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+        second = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+
+        try:
+            with (
+                caplog.at_level(logging.INFO),
+                patch.object(first, "_send", new_callable=AsyncMock),
+                patch.object(second, "_send", new_callable=AsyncMock),
+            ):
+                assert await first.alert_event("pool_unavailable", "pool exhausted") is True
+                assert await second.alert_event("pool_unavailable", "pool exhausted") is False
+            assert "alert cooldown store" in caplog.text.lower()
+        finally:
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_event_cooldowns_remain_independent_after_restart(self, tmp_path):
+        from app.alert_cooldown_store import AlertCooldownStore
+        from app.alerting import TelegramAlerter
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        first = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+        second = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+
+        try:
+            with (
+                patch.object(first, "_send", new_callable=AsyncMock),
+                patch.object(second, "_send", new_callable=AsyncMock),
+            ):
+                assert await first.alert_event("pool_unavailable", "pool exhausted") is True
+                assert await second.alert_event("mint_failed", "browser unavailable") is True
+                assert await second.alert_event("pool_unavailable", "pool exhausted") is False
+        finally:
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_corrupt_cooldown_store_fails_open_logs_and_repairs_without_detail(
+        self, tmp_path, caplog
+    ):
+        from app.alert_cooldown_store import AlertCooldownStore
+        from app.alerting import TelegramAlerter
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        cooldown_path.write_text("{not-json")
+        detail = "postgres://ops:secret@database/pjud"
+        alerter = TelegramAlerter(
+            bot_token="fake-token",
+            chat_id="-123456",
+            cooldown_seconds=300,
+            event_cooldown_store=AlertCooldownStore(str(cooldown_path)),
+        )
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING),
+                patch.object(alerter, "_send", new_callable=AsyncMock),
+            ):
+                assert await alerter.alert_event("pool_unavailable", detail) is True
+
+            persisted = cooldown_path.read_text()
+            assert json.loads(persisted)["pool_unavailable"] > 0
+            assert detail not in persisted
+            assert stat.S_IMODE(cooldown_path.stat().st_mode) == 0o640
+            assert "corrupt" in caplog.text.lower()
+        finally:
+            await alerter.close()
+
     @pytest.mark.asyncio
     async def test_alert_fires_when_blocked_rate_exceeds_threshold(self):
         from app.alerting import TelegramAlerter

@@ -53,12 +53,19 @@ async def lifespan(app: FastAPI):
     app.state.catalog_refresh_queue = None
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        from app.alert_cooldown_store import (
+            AlertCooldownStore,
+            DEFAULT_ALERT_COOLDOWN_STORE_PATH,
+        )
         from app.alerting import TelegramAlerter
         app.state.alerter = TelegramAlerter(
             bot_token=settings.TELEGRAM_BOT_TOKEN,
             chat_id=settings.TELEGRAM_CHAT_ID,
             blocked_rate_threshold=settings.TELEGRAM_BLOCKED_RATE_THRESHOLD,
             cooldown_seconds=settings.TELEGRAM_COOLDOWN_S,
+            event_cooldown_store=AlertCooldownStore(
+                DEFAULT_ALERT_COOLDOWN_STORE_PATH
+            ),
         )
     else:
         app.state.alerter = None
