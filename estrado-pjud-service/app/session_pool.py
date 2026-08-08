@@ -112,14 +112,16 @@ class APISessionPool:
                 operation="mint",
                 transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
             ) as usage:
-                claim = self._claim_catalog_retirement_marker()
-                if claim is not None:
-                    usage.cause_operation = "opportunistic_catalog_refresh"
-                    usage.cause_session_id = claim[0]
+                def claim_catalog_cause(active_usage) -> None:
+                    nonlocal claim
+                    claim = self._claim_catalog_retirement_marker()
+                    if claim is not None:
+                        active_usage.cause_operation = "opportunistic_catalog_refresh"
+                        active_usage.cause_session_id = claim[0]
+
+                usage.on_first_request = claim_catalog_cause
                 if attempt > 1:
                     usage.retry_count += 1
-                # Claim is synchronous and the next operation is the yield: no
-                # latency or cancellation window exists before provider work.
                 yield usage
         finally:
             if claim is not None:

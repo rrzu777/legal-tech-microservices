@@ -12,8 +12,8 @@ import json
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Callable, Literal
 from urllib.parse import urlencode
 
 
@@ -30,6 +30,20 @@ class ProxyUsageCapture:
     cause_operation: Literal["opportunistic_catalog_refresh"] | None = None
     cause_session_id: uuid.UUID | None = None
     causal_event_persisted: bool = False
+    on_first_request: Callable[["ProxyUsageCapture"], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def record_request(self, bytes_up: int = 0) -> None:
+        if self.request_count == 0:
+            on_first_request = self.on_first_request
+            self.on_first_request = None
+            if on_first_request is not None:
+                on_first_request(self)
+        self.request_count += 1
+        self.bytes_up += max(0, bytes_up)
 
 
 _ACTIVE_CAPTURE: ContextVar[ProxyUsageCapture | None] = ContextVar(
@@ -73,8 +87,7 @@ def estimate_request_bytes(kwargs: dict) -> int:
 def record_proxy_request(bytes_up: int = 0) -> None:
     capture = _ACTIVE_CAPTURE.get()
     if capture is not None:
-        capture.request_count += 1
-        capture.bytes_up += max(0, bytes_up)
+        capture.record_request(bytes_up)
 
 
 def record_proxy_response(bytes_down: int) -> None:
