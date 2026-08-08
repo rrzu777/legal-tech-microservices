@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.catalogs import CatalogResult, CatalogService, parse_html_options, parse_json_options
+from app.catalogs import (
+    CatalogContentError,
+    CatalogResult,
+    CatalogService,
+    parse_html_options,
+    parse_json_options,
+)
 from app.failure_kind import BlockedPageError
 from app.session import OJVSession
 from tests.helpers import AdapterQueGraba
@@ -16,6 +22,56 @@ def test_snapshot_refresh_accepts_the_exact_current_17_court_codes():
         "10", "11", "15", "20", "25", "30", "35", "40", "45", "46",
         "50", "55", "56", "60", "61", "90", "91",
     }
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_session_never_acquires_pool_or_tracks_budget():
+    session = MagicMock()
+    session.catalog_json = AsyncMock(return_value=[{
+        "COD_TRIBUNAL": "123",
+        "GLS_TRIBUNAL": "2º Juzgado Civil de Santiago",
+    }])
+    pool = MagicMock()
+    tracker = MagicMock()
+    service = CatalogService(pool, snapshot={}, proxy_usage=tracker)
+
+    options = await service.fetch_with_session(
+        session,
+        "tribunals",
+        {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+    )
+
+    assert options == [{"code": "123", "label": "2º Juzgado Civil de Santiago"}]
+    pool.acquire.assert_not_called()
+    tracker.track.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_session_rejects_empty_options():
+    session = MagicMock()
+    session.catalog_html = AsyncMock(return_value="<option value='0'>Seleccione</option>")
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "books",
+            {"competencia": "civil", "corte": "90", "anno": "2026"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_session_classifies_invalid_payload_as_catalog_content_error():
+    session = MagicMock()
+    session.catalog_json = AsyncMock(side_effect=ValueError("not JSON"))
+    service = CatalogService(MagicMock(), snapshot={})
+
+    with pytest.raises(CatalogContentError):
+        await service.fetch_with_session(
+            session,
+            "tribunals",
+            {"competencia": "civil", "corte": "90", "tipo_busqueda": "1"},
+        )
 
 
 def test_parse_json_options_discards_placeholder_duplicates_and_normalizes_text():
