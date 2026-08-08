@@ -18,10 +18,6 @@ from app.metrics import api_metrics
 from app.errors import safe_error
 from app.failure_kind import BlockedPageError, UpstreamChangedError, reject_empty_body
 from app.pool_guard import acquire_or_alert, classify_and_alert, record_blocked_and_alert
-from app.routes.search import (
-    _catalog_refresh_intents,
-    _enqueue_catalog_refresh_after_release,
-)
 from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
@@ -165,7 +161,6 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
     session = await acquire_or_alert(pool, request, "detail")
 
     healthy = True
-    refresh_intents = []
     try:
         api_metrics.record_request("detail")
 
@@ -237,16 +232,6 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             exhortos=parsed.get("exhortos", []),
             incompetencia=parsed.get("incompetencia", []),
         )
-        has_usable_content = bool(
-            any(str(value).strip() for value in parsed["metadata"].values())
-            or parsed["movements"]
-            or parsed["litigantes"]
-            or parsed.get("suprema_docs")
-            or parsed.get("exhortos")
-            or parsed.get("incompetencia")
-        )
-        if has_usable_content:
-            refresh_intents = _catalog_refresh_intents(req)
         return response
 
     except HTTPException:
@@ -266,10 +251,4 @@ async def case_detail(req: DetailRequest, request: Request, _api_key: str = veri
             error=safe_error(e),
         )
     finally:
-        release_outcome = await pool.release(session, healthy=healthy)
-        if healthy:
-            _enqueue_catalog_refresh_after_release(
-                request,
-                release_outcome,
-                refresh_intents,
-            )
+        await pool.release(session, healthy=healthy)

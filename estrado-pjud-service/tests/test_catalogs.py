@@ -471,8 +471,8 @@ async def test_catalog_cache_expires_after_24_hours(monkeypatch):
     assert result.options == [{"code": "91", "label": "C.A. de San Miguel"}]
 
 
-def test_catalog_routes_are_authenticated_and_publish_the_expected_schema(monkeypatch):
-    """Catches catalog routes being public or drifting away from the client contract."""
+def test_catalog_routes_are_not_exposed_by_the_local_only_runtime(monkeypatch):
+    """No authenticated request may reactivate live catalog traffic."""
     monkeypatch.setenv("API_KEY", "test-key")
     from app.config import get_settings
     get_settings.cache_clear()
@@ -481,42 +481,13 @@ def test_catalog_routes_are_authenticated_and_publish_the_expected_schema(monkey
     app = create_app()
     spec = app.openapi()
 
-    for path in [
+    catalog_paths = [
         "/api/v1/catalogs/courts",
         "/api/v1/catalogs/tribunals",
         "/api/v1/catalogs/books",
-    ]:
-        operation = spec["paths"][path]["get"]
-        assert operation["security"] == [{"HTTPBearer": []}]
-        schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
-        assert schema["$ref"] == "#/components/schemas/CatalogResponse"
+    ]
+    assert all(path not in spec["paths"] for path in catalog_paths)
 
     client = TestClient(app)
-    assert client.get("/api/v1/catalogs/courts").status_code == 401
-
-
-def test_catalog_routes_reject_suprema_for_catalogs_it_never_uses(monkeypatch):
-    """Catches issuing an impossible tribunal/books request for Suprema."""
-    monkeypatch.setenv("API_KEY", "test-key")
-    from app.config import get_settings
-    get_settings.cache_clear()
-    from app.main import create_app
-
-    app = create_app()
-    result = CatalogResult(
-        options=[{"code": "90", "label": "C.A. de Santiago"}],
-        source="snapshot",
-        fetched_at="2026-08-05T12:00:00+00:00",
-    )
-    app.state.catalog_service = MagicMock(
-        tribunals=AsyncMock(return_value=result), books=AsyncMock(return_value=result)
-    )
-    client = TestClient(app, raise_server_exceptions=False)
     auth = {"Authorization": "Bearer test-key"}
-
-    assert client.get(
-        "/api/v1/catalogs/tribunals?competencia=suprema&corte=90", headers=auth
-    ).status_code == 422
-    assert client.get(
-        "/api/v1/catalogs/books?competencia=suprema&anno=2025", headers=auth
-    ).status_code == 422
+    assert all(client.get(path, headers=auth).status_code == 404 for path in catalog_paths)

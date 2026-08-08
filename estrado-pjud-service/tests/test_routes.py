@@ -163,10 +163,10 @@ class TestHealth:
 # ===================================================================
 
 class TestSearch:
-    def test_v2_found_search_releases_before_enqueuing_two_tenant_scoped_intents(
+    def test_v2_found_search_never_enqueues_even_with_queue_injected(
         self, client,
     ):
-        """A successful lookup may reuse its session only after the user path releases it."""
+        """The local catalog policy leaves no opportunistic side effect in search."""
         from app.catalogs import CatalogService
         from app.routes import search as search_route
         from app.session_pool import SessionReleaseOutcome
@@ -182,17 +182,13 @@ class TestSearch:
             return SessionReleaseOutcome(requeued=True, retired_reason=None)
 
         pool.release.side_effect = release
-        queue = MagicMock()
-        captured = []
 
-        def enqueue_many(intents):
-            events.append("enqueue")
-            captured.extend(intents)
-            return len(intents)
+        class RecordingQueue:
+            def enqueue_many(self, _intents):
+                events.append("enqueue")
 
-        queue.enqueue_many.side_effect = enqueue_many
         client.app.state.session_pool = pool
-        client.app.state.catalog_refresh_queue = queue
+        client.app.state.catalog_refresh_queue = RecordingQueue()
         client.app.state.catalog_service = CatalogService(pool, snapshot={
             "tribunals": {"civil:90:1": {"options": [
                 {"code": "321", "label": "2º Juzgado Civil de Santiago"},
@@ -232,22 +228,7 @@ class TestSearch:
 
         assert response.status_code == 200
         assert response.json()["status"] == "found"
-        assert events == ["release", "enqueue"]
-        assert [intent.slice_key for intent in captured] == [
-            "tribunals:civil:90",
-            "books:civil:90:2024",
-        ]
-        assert all(
-            intent.law_firm_id == "11111111-1111-4111-8111-111111111111"
-            and intent.case_id == "22222222-2222-4222-8222-222222222222"
-            and intent.sync_run_id == "33333333-3333-4333-8333-333333333333"
-            for intent in captured
-        )
-        assert {intent.request_hash for intent in captured} == {
-            "a6a55bca0c4e11555b0b5518b063e40960f0e71c7be375ba4f6e9c26c08d94c3"
-        }
-        assert "Parte reservada" not in repr(captured)
-        assert "options" not in repr(captured)
+        assert events == ["release"]
 
     def test_blocked_search_does_not_enqueue(self, client):
         session = _make_mock_session(
@@ -957,7 +938,7 @@ class TestSearch:
 # ===================================================================
 
 class TestDetail:
-    def test_v2_usable_detail_releases_before_enqueue_without_hashing_detail_jwt(
+    def test_v2_usable_detail_never_enqueues_even_with_queue_injected(
         self, client,
     ):
         from app.routes import detail as detail_route
@@ -976,17 +957,13 @@ class TestDetail:
             return SessionReleaseOutcome(requeued=True, retired_reason=None)
 
         pool.release.side_effect = release
-        queue = MagicMock()
-        captured = []
 
-        def enqueue_many(intents):
-            events.append("enqueue")
-            captured.extend(intents)
-            return len(intents)
+        class RecordingQueue:
+            def enqueue_many(self, _intents):
+                events.append("enqueue")
 
-        queue.enqueue_many.side_effect = enqueue_many
         client.app.state.session_pool = pool
-        client.app.state.catalog_refresh_queue = queue
+        client.app.state.catalog_refresh_queue = RecordingQueue()
         headers = {
             **AUTH,
             "X-JurisTrack-Law-Firm-ID": "11111111-1111-4111-8111-111111111111",
@@ -1015,15 +992,7 @@ class TestDetail:
 
         assert response.status_code == 200
         assert response.json()["error"] is None
-        assert events == ["release", "enqueue"]
-        assert [intent.slice_key for intent in captured] == [
-            "tribunals:civil:90",
-            "books:civil:90:2024",
-        ]
-        assert {intent.request_hash for intent in captured} == {
-            "a6a55bca0c4e11555b0b5518b063e40960f0e71c7be375ba4f6e9c26c08d94c3"
-        }
-        assert "secret-jwt" not in repr(captured)
+        assert events == ["release"]
 
     @pytest.mark.asyncio
     async def test_detail_affinity_correlates_selected_candidate_beyond_top_10(self):

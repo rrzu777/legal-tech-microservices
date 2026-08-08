@@ -15,9 +15,7 @@ from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
-from app.catalog_observations import CatalogObservationRepository
-from app.catalog_refresh import CatalogRefreshQueue
-from app.routes import health, search, detail, familia, catalogs
+from app.routes import health, search, detail, familia
 from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
@@ -52,51 +50,34 @@ async def lifespan(app: FastAPI):
     app.state.proxy_usage = proxy_usage
     app.state.proxy_control_required = proxy_control_required
     app.state.catalog_service = CatalogService(pool, proxy_usage=proxy_usage)
-    refresh_enabled = bool(
-        settings.PJUD_CATALOG_OPPORTUNISTIC_ENABLED
-        and proxy_supabase is not None
-    )
-    if settings.PJUD_CATALOG_OPPORTUNISTIC_ENABLED and proxy_supabase is None:
-        logging.getLogger(__name__).warning(
-            "PJUD catalog refresh disabled: Supabase service configuration is absent"
-        )
-    refresh_queue = CatalogRefreshQueue(
-        maxsize=settings.PJUD_CATALOG_QUEUE_SIZE,
-        enabled=refresh_enabled,
-        pool=pool,
-        repository=CatalogObservationRepository(
-            proxy_supabase,
-            lease_seconds=settings.PJUD_CATALOG_LEASE_SECONDS,
-            cooldown_seconds=settings.PJUD_CATALOG_COOLDOWN_SECONDS,
-        ),
-        catalog_service=app.state.catalog_service,
-        proxy_usage=proxy_usage,
-    )
-    app.state.catalog_refresh_queue = refresh_queue
+    app.state.catalog_refresh_queue = None
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        from app.alert_cooldown_store import (
+            AlertCooldownStore,
+            DEFAULT_ALERT_COOLDOWN_STORE_PATH,
+        )
         from app.alerting import TelegramAlerter
         app.state.alerter = TelegramAlerter(
             bot_token=settings.TELEGRAM_BOT_TOKEN,
             chat_id=settings.TELEGRAM_CHAT_ID,
             blocked_rate_threshold=settings.TELEGRAM_BLOCKED_RATE_THRESHOLD,
             cooldown_seconds=settings.TELEGRAM_COOLDOWN_S,
+            event_cooldown_store=AlertCooldownStore(
+                DEFAULT_ALERT_COOLDOWN_STORE_PATH
+            ),
         )
     else:
         app.state.alerter = None
 
     try:
-        await refresh_queue.start()
         yield
     finally:
         try:
-            await refresh_queue.stop(drain_timeout_seconds=2)
+            await pool.close_all()
         finally:
-            try:
-                await pool.close_all()
-            finally:
-                if hasattr(app.state, 'alerter') and app.state.alerter:
-                    await app.state.alerter.close()
+            if hasattr(app.state, 'alerter') and app.state.alerter:
+                await app.state.alerter.close()
 
 
 def create_app() -> FastAPI:
@@ -153,8 +134,6 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(detail.router)
     app.include_router(familia.router)
-    app.include_router(catalogs.router)
-
     return app
 
 

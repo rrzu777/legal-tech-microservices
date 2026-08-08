@@ -4,6 +4,7 @@ import time
 import httpx
 from fastapi import Request
 
+from app.alert_cooldown_store import AlertCooldownStore
 from app.metrics import api_metrics
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class TelegramAlerter:
         chat_id: str,
         blocked_rate_threshold: float = 0.3,
         cooldown_seconds: int = 300,
+        event_cooldown_store: AlertCooldownStore | None = None,
     ):
         self._bot_token = bot_token
         self._chat_id = chat_id
@@ -25,6 +27,7 @@ class TelegramAlerter:
         self._cooldown = cooldown_seconds
         self._last_alert_time: float = 0.0
         self._last_event_alert: dict[str, float] = {}
+        self._event_cooldown_store = event_cooldown_store
         self._client = httpx.AsyncClient(timeout=10.0)
 
     async def alert_event(self, event: str, detail: str) -> bool:
@@ -45,14 +48,39 @@ class TelegramAlerter:
         Devuelve si mandó o si se lo comió el cooldown, para que el test lo pueda
         distinguir sin espiar atributos privados.
         """
-        now = time.monotonic()
-        last = self._last_event_alert.get(event)
-        if last is not None and now - last < self._cooldown:
-            return False
+        reservation: float | None = None
+        if self._event_cooldown_store is not None:
+            try:
+                reservation = self._event_cooldown_store.reserve(event, self._cooldown)
+                if reservation is None:
+                    return False
+            except Exception:
+                # Alertar es mas importante que deduplicar si el estado durable
+                # deja de estar disponible. Nunca registrar `detail`: puede
+                # contener respuestas del proveedor o datos operacionales.
+                logger.exception("Alert cooldown persistence failed; failing open for %s", event)
+        else:
+            # Compatibilidad para consumidores sin store inyectado. El reloj de
+            # pared mantiene la misma semantica que el estado durable; monotonic
+            # queda reservado al cooldown local del ratio en `check_and_alert`.
+            now = time.time()
+            last = self._last_event_alert.get(event)
+            if last is not None and now - last < self._cooldown:
+                return False
+            self._last_event_alert[event] = now
 
-        self._last_event_alert[event] = now
-        await self._send(ops_alert_text(event, detail))
-        return True
+        delivered = await self._send(ops_alert_text(event, detail))
+        if delivered:
+            return True
+
+        if self._event_cooldown_store is not None and reservation is not None:
+            try:
+                self._event_cooldown_store.rollback(event, reservation)
+            except Exception:
+                logger.exception("Alert cooldown rollback failed for %s", event)
+        else:
+            self._last_event_alert.pop(event, None)
+        return False
 
     async def check_and_alert(self):
         """Check metrics and send alert if blocked rate exceeds threshold."""
@@ -96,7 +124,7 @@ class TelegramAlerter:
         )
         await self._send(msg)
 
-    async def _send(self, text: str):
+    async def _send(self, text: str) -> bool:
         """Send message via Telegram Bot API."""
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         try:
@@ -106,8 +134,11 @@ class TelegramAlerter:
             })
             if resp.status_code != 200:
                 logger.warning("Telegram alert failed: %s", resp.text)
+                return False
+            return True
         except Exception:
             logger.exception("Failed to send Telegram alert")
+            return False
 
     async def close(self):
         """Close the underlying HTTP client."""

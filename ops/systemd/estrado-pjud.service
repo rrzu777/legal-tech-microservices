@@ -54,7 +54,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/opt/legal-tech-microservices/estrado-pjud-service
+ReadWritePaths=/var/lib/estrado-pjud
 
 [Install]
 WantedBy=multi-user.target

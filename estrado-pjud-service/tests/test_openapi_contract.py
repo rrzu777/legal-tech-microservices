@@ -56,8 +56,6 @@ CONSUMED = {
     ],
     "FamiliaSyncResponse": ["ok", "casos", "error_code", "error"],
     "FamiliaCaso": ["rit", "tribunal", "caratulado", "materia", "estado", "fecha_ingreso"],
-    "CatalogResponse": ["options", "source", "fetched_at"],
-    "CatalogOption": ["code", "label"],
 }
 
 
@@ -67,9 +65,11 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
     spec = json.loads(OUT.read_text())
     for path in [
         "/api/v1/search", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
-        "/api/v1/catalogs/courts", "/api/v1/catalogs/tribunals", "/api/v1/catalogs/books",
     ]:
         assert path in spec["paths"], f"el contrato perdió {path}"
+    assert not any(path.startswith("/api/v1/catalogs/") for path in spec["paths"]), (
+        "el runtime local-only no debe exponer endpoints que consulten catálogos PJUD"
+    )
 
     schemas = spec["components"]["schemas"]
     for schema, consumed in CONSUMED.items():
