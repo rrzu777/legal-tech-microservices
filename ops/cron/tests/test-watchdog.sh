@@ -87,6 +87,29 @@ expect_missing() { # <nombre> <salida> <texto que NO debe estar>
   fi
 }
 
+expect_equals() { # <nombre> <actual> <esperado>
+  if [ "$2" = "$3" ]; then
+    echo "  ok   $1"; PASS=$((PASS+1))
+  else
+    echo "  FAIL $1 — esperaba: $3"; echo "       salida: ${2:-<vacía>}"; FAIL=$((FAIL+1))
+  fi
+}
+
+# El snapshot es el contrato que el chequeo 10 normaliza y compara contra root.
+# Desde el checkout se lee el archivo hermano; en el VPS (donde este test se
+# copia a /tmp) se usa el snapshot que está desplegado. La variable permite
+# probar una copia explícita sin tocar el crontab vivo.
+TEST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CRON_SNAPSHOT_UNDER_TEST="${CRON_SNAPSHOT_UNDER_TEST:-$TEST_DIR/../crontab.snapshot}"
+if [ ! -r "$CRON_SNAPSHOT_UNDER_TEST" ]; then
+  CRON_SNAPSHOT_UNDER_TEST=/opt/legal-tech-microservices/ops/cron/crontab.snapshot
+fi
+normalizar_crontab() { grep -vE '^[[:space:]]*(#|$)' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | sort; }
+
+echo "== snapshot: stale-sync-alert en horario de oficina =="
+STALE_SYNC_ALERT=$(normalizar_crontab < "$CRON_SNAPSHOT_UNDER_TEST" | grep -F '/api/cron/stale-sync-alert' || true)
+expect_equals "solo agenda laboral Berlin para stale-sync-alert" "$STALE_SYNC_ALERT" "0 14,17,20 * * 1-5 /opt/estrado-cron/run-cron.sh /api/cron/stale-sync-alert"
+
 cat > "$TMP/systemctl-worker-disabled" <<'EOF'
 #!/bin/bash
 if [ "$1" = "is-enabled" ] && [ "$2" = "estrado-pjud-worker.service" ]; then echo disabled; exit 1; fi
