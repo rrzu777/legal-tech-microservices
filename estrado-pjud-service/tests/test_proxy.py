@@ -4,16 +4,30 @@ IMPORTANTE: solo URLs/credenciales DUMMY. Nunca credenciales reales de IPRoyal.
 """
 import string
 
+import pytest
+
 from app.proxy import (
-    generate_session_token,
     build_sticky_proxy_url,
-    split_proxy_for_playwright,
+    generate_session_token,
     redact_proxy_url,
+    split_proxy_for_playwright,
+    sticky_lifetime_seconds,
 )
 
 DUMMY_BASE_URL = "http://user123:pw_country-cl@geo.iproyal.com:12321"
 
 ALPHANUMERIC = set(string.ascii_lowercase + string.digits)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("30m", 1800), ("1h", 3600), ("12h", 43200)])
+def test_sticky_lifetime_seconds(value, expected):
+    assert sticky_lifetime_seconds(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "0m", "1d", "1.5h", "1H", " h", "-1h"])
+def test_sticky_lifetime_seconds_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="OJV_PROXY_STICKY_LIFETIME"):
+        sticky_lifetime_seconds(value)
 
 
 class TestGenerateSessionToken:

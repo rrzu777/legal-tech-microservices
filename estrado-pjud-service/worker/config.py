@@ -5,6 +5,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
+from app.proxy import sticky_lifetime_seconds
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 
@@ -59,5 +60,11 @@ class WorkerConfig(BaseSettings):
     _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
         validate_cookie_store_path
     )
+
+    @field_validator("OJV_PROXY_STICKY_LIFETIME")
+    @classmethod
+    def _valid_sticky_lifetime(cls, value: str) -> str:
+        sticky_lifetime_seconds(value)
+        return value
 
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

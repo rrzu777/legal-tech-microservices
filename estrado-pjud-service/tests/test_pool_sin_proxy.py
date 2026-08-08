@@ -7,13 +7,11 @@ reportado como "OJV bloqueo la consulta" — una decision NUESTRA facturada al
 Poder Judicial. Es el mismo defecto que #55, #21, #59 y #23 vinieron a cerrar,
 sobreviviendo en el unico camino que no habiamos revisado.
 
-⚠️ Lo que este archivo NO testea, a proposito: un techo por EDAD del bundle. La
-hipotesis de que un bundle deja de servir al vencer su IP sticky esta medida y
-REFUTADA — con bundles de 70-71 min y `OJV_PROXY_STICKY_LIFETIME=1h`, ocho
-vueltas de `initialize()` dieron 8/8 en verde, y la IP de salida habia cambiado
-respecto de la hora anterior. Las cookies TSPD siguieron valiendo desde otra IP.
-Un techo por edad habria rechazado bundles que funcionan y, como el worker solo
-re-mintea cuando procesa causas, habria fabricado la caida que decia prevenir.
+La evidencia de 70–71 minutos con `OJV_PROXY_STICKY_LIFETIME=1h` (ocho vueltas
+de `initialize()` en verde) conserva esos bundles como utilizables. Pero un
+bundle de 12,4 horas ya consumió un presupuesto prudente de `2×` el TTL: en
+modo proxy se descarta antes de inicializar y dispara un minteo residencial
+nuevo. El modo legacy no aplica este límite de edad.
 """
 
 import asyncio
@@ -36,6 +34,153 @@ def permitir_mint_residencial(monkeypatch):
 
     monkeypatch.setattr(sp, "CookieMinter", FakeMinter)
     return proxies
+
+
+def test_bundle_de_70_minutos_sigue_utilizable(monkeypatch):
+    pool, _ = pool_con_store(monkeypatch, {"0": cookie_bundle("70m", age_seconds=70 * 60)})
+    assert pool._pick_bundle() is not None
+
+
+def test_bundle_mayor_a_dos_ttl_se_descarta(monkeypatch):
+    stale = cookie_bundle("stale", age_seconds=2 * 3600 + 1)
+    pool, _ = pool_con_store(monkeypatch, {"0": stale})
+    assert pool._pick_bundle() is None
+
+
+def test_bundle_en_borde_exacto_de_dos_ttl_sigue_utilizable(monkeypatch):
+    """Cambiar el comparador de ``>`` a ``>=`` debe romper este test."""
+    from app import cookie_store
+    from app.cookie_store import CookieBundle
+
+    monkeypatch.setattr(cookie_store.time, "time", lambda: 10_000.0)
+    boundary = CookieBundle(
+        cookies={"TSPD_101": "tok-boundary"},
+        user_agent="UA-boundary",
+        saved_at=2_800.0,
+        proxy_url="http://u:p@sticky:1",
+    )
+    pool, _ = pool_con_store(monkeypatch, {"0": boundary})
+
+    assert pool._pick_bundle() is boundary
+
+
+def test_ttl_de_30m_descarta_despues_de_60m(monkeypatch):
+    stale = cookie_bundle("stale", age_seconds=60 * 60 + 1)
+    pool, _ = pool_con_store(monkeypatch, {"0": stale}, sticky_lifetime="30m")
+    assert pool._pick_bundle() is None
+
+
+def test_modo_legacy_no_descarta_por_edad(monkeypatch):
+    stale = cookie_bundle("legacy", age_seconds=24 * 3600)
+    pool, _ = pool_con_store(monkeypatch, {"0": stale}, proxy=None)
+    assert pool._pick_bundle() is stale
+
+
+def test_bundle_de_12_horas_mintea_antes_de_inicializar(monkeypatch):
+    stale = cookie_bundle("viejo", age_seconds=int(12.4 * 3600))
+    pool, capturados = pool_con_store(monkeypatch, {"0": stale})
+    proxies = permitir_mint_residencial(monkeypatch)
+
+    asyncio.run(pool.acquire())
+
+    assert len(capturados) == 1
+    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert capturados[0]["proxy"] == proxies[0]
+
+
+def test_log_de_bundle_obsoleto_no_filtra_secretos(monkeypatch, caplog):
+    from app.cookie_store import CookieBundle
+    import logging
+    import time
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "cookie-ultrasecreta"},
+        user_agent="UA",
+        saved_at=time.time() - 12 * 3600,
+        proxy_url="http://usuario:password-ultrasecreto@proxy.test:1234",
+        proxy_token="token-ultrasecreto",
+    )
+    pool, _ = pool_con_store(monkeypatch, {"7": bundle})
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        assert pool._usable_bundles() == []
+
+    assert "persisted_bundle_stale slot=7" in caplog.text
+    assert "age_seconds=" in caplog.text
+    assert "max_age_seconds=7200" in caplog.text
+    assert "cookie-ultrasecreta" not in caplog.text
+    assert "password-ultrasecreto" not in caplog.text
+    assert "token-ultrasecreto" not in caplog.text
+
+
+def test_bundle_con_saved_at_texto_mintea_y_no_filtra_secretos(monkeypatch, caplog):
+    from app.cookie_store import CookieBundle
+    import logging
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "cookie-ultrasecreta"},
+        user_agent="UA",
+        saved_at="fecha-invalida",
+        proxy_url="http://usuario:password-ultrasecreto@proxy.test:1234",
+        proxy_token="token-ultrasecreto",
+    )
+    pool, capturados = pool_con_store(monkeypatch, {"7": bundle})
+    proxies = permitir_mint_residencial(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        asyncio.run(pool.acquire())
+
+    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert capturados[0]["proxy"] == proxies[0]
+    assert "persisted_bundle_invalid_saved_at slot=7" in caplog.text
+    assert "cookie-ultrasecreta" not in caplog.text
+    assert "password-ultrasecreto" not in caplog.text
+    assert "token-ultrasecreto" not in caplog.text
+
+
+def test_bundle_con_saved_at_nan_se_descarta(monkeypatch, caplog):
+    from app.cookie_store import CookieBundle
+    import logging
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "tok-nan"},
+        user_agent="UA",
+        saved_at=float("nan"),
+        proxy_url="http://u:p@sticky:1",
+    )
+    pool, _ = pool_con_store(monkeypatch, {"8": bundle})
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        assert pool._usable_bundles() == []
+
+    assert "persisted_bundle_invalid_saved_at slot=8" in caplog.text
+
+
+def test_bundle_con_saved_at_futuro_se_descarta_y_mintea(monkeypatch, caplog):
+    """Aceptar una edad negativa evita el límite 2x y debe romper este test."""
+    from app.cookie_store import CookieBundle
+    import logging
+    import time
+
+    bundle = CookieBundle(
+        cookies={"TSPD_101": "cookie-futura-ultrasecreta"},
+        user_agent="UA",
+        saved_at=time.time() + 3600,
+        proxy_url="http://usuario:password-futuro@proxy.test:1234",
+        proxy_token="token-futuro-ultrasecreto",
+    )
+    pool, capturados = pool_con_store(monkeypatch, {"9": bundle})
+    proxies = permitir_mint_residencial(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="app.session_pool"):
+        asyncio.run(pool.acquire())
+
+    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert capturados[0]["proxy"] == proxies[0]
+    assert "persisted_bundle_invalid_saved_at slot=9" in caplog.text
+    assert "cookie-futura-ultrasecreta" not in caplog.text
+    assert "password-futuro" not in caplog.text
+    assert "token-futuro-ultrasecreto" not in caplog.text
 
 
 class TestNuncaSalirSinProxy:

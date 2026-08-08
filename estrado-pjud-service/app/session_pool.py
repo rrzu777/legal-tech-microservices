@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ from app.failure_kind import new_egress_may_help
 from app.minter import CookieMinter
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
-from app.proxy import build_sticky_proxy_url, generate_session_token
+from app.proxy import build_sticky_proxy_url, generate_session_token, sticky_lifetime_seconds
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 
@@ -78,6 +79,9 @@ class APISessionPool:
         self._catalog_retirement_marker: _CatalogRetirementMarker | None = None
         self._closing_tasks: set[asyncio.Task[None]] = set()
         self._max_age = settings.SESSION_MAX_AGE_S
+        self._persisted_bundle_max_age_s = 2 * sticky_lifetime_seconds(
+            settings.OJV_PROXY_STICKY_LIFETIME,
+        )
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
         self._rr_index = 0
         self._proxy_control = proxy_control
@@ -409,18 +413,11 @@ class APISessionPool:
         fallback que esta PR vino a borrar vuelve a entrar por la puerta de los
         datos.
 
-        ⚠️ NO hay techo por EDAD del bundle, y no es un olvido. Una versión previa
-        de este método lo tenía, sobre la hipótesis de que un bundle deja de
-        servir al vencer su IP sticky (`OJV_PROXY_STICKY_LIFETIME=1h`). El 1 de
-        agosto de 2026, con bundles de 70-71 min, ocho vueltas de `initialize()`
-        dieron 8/8 en verde, así que la hipótesis NO SE REPRODUJO en ese borde.
-        La evidencia es acotada —n=8, sobre `initialize()` y no sobre los POST de
-        search/detail, y a 10 minutos de cruzar la hora— o sea que no prueba que
-        la edad nunca importe; lo que sí deja claro es que no tenemos mecanismo.
-
-        Y el costo de equivocarse es asimétrico: el worker solo re-mintea cuando
-        procesa causas, así que un techo de más rechaza bundles que funcionan y
-        fabrica la caída que dice prevenir. Sin mecanismo medido, no hay techo.
+        La evidencia de 70–71 min con TTL de 1 h mantiene aceptados esos bundles.
+        En cambio, uno de 12,4 h ya agotó un presupuesto prudente de `2×` TTL:
+        `_usable_bundles()` lo descarta antes de reconstruir el proxy para que
+        `acquire()` mintee uno residencial nuevo. El límite sólo corre en modo
+        proxy; el modo legacy conserva sus bundles sin descartarlos por edad.
 
         `if bundle.proxy_url` y no `is not None`: un `proxy_url=""` es tan
         inservible como su ausencia y egresa igual por la IP del datacenter.
@@ -451,7 +448,24 @@ class APISessionPool:
         camino caliente para obtener lo mismo.
         """
         bundles: list[CookieBundle] = []
-        for _, bundle in sorted(self._store.load_all().items()):
+        for slot_id, bundle in sorted(self._store.load_all().items()):
+            if self._proxy_mode:
+                try:
+                    age_seconds = bundle.age_seconds
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
+                    continue
+                if not math.isfinite(age_seconds) or age_seconds < 0:
+                    logger.warning("persisted_bundle_invalid_saved_at slot=%s", slot_id)
+                    continue
+                if age_seconds > self._persisted_bundle_max_age_s:
+                    logger.warning(
+                        "persisted_bundle_stale slot=%s age_seconds=%.0f max_age_seconds=%d",
+                        slot_id,
+                        age_seconds,
+                        self._persisted_bundle_max_age_s,
+                    )
+                    continue
             if self._proxy_mode and bundle.proxy_token:
                 bundle = CookieBundle(
                     cookies=bundle.cookies,
@@ -483,6 +497,32 @@ class APISessionPool:
         `error_code="blocked"` con HTTP 200: culpar a OJV de que nuestro pool
         estuviera vacío, y de paso llevar la causa camino a `suspended`."""
         return self._pick_bundle()
+
+    async def acquire_familia_bundle(self) -> CookieBundle | None:
+        """Return a usable Familia bundle, minting one on demand when needed.
+
+        Familia consumes the persisted F5 cookies directly instead of an
+        ``OJVSession``, but it must recover through the same paid-proxy path as
+        ``acquire()``. Reusing ``_mint_on_demand`` preserves the persistent
+        proxy gate, cost attribution, mint lock and interactive retry budget.
+
+        Legacy mode deliberately keeps the previous behavior: it may return an
+        existing age-unfiltered bundle, but an empty store never triggers a
+        direct-egress mint.
+        """
+        deadline = time.monotonic() + _RETRY_BUDGET_S
+        await self.assert_proxy_enabled()
+        bundle = self.pick_familia_bundle()
+        if bundle is not None or not self._proxy_mode:
+            return bundle
+
+        session = await self._mint_on_demand(deadline=deadline)
+        if session is not None:
+            # The mint path initializes an OJVSession to validate its cookies.
+            # Keep that paid result available to search/detail instead of
+            # leaking or immediately discarding the initialized session.
+            await self.release(session)
+        return self.pick_familia_bundle()
 
     async def release(
         self,

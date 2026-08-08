@@ -104,31 +104,40 @@ async def acquire_or_alert(pool, request: Request, endpoint: str):
 
 
 async def familia_bundle_or_alert(pool, request: Request):
-    """El bundle F5 para el path Familia; si no hay, 503 en vez de "blocked".
+    """El bundle F5 para Familia; recupera on-demand o responde 503.
 
-    `pick_familia_bundle()` devuelve `None` cuando el worker todavía no minteó
-    ningún slot — o sea exactamente el escenario del 31 de julio. La ruta
-    contestaba a eso con `error_code="blocked"` y **HTTP 200**, que es la misma
-    falsa atribución que el resto de este trabajo vino a arreglar, pero peor: la
-    app la leía como una falla más de la causa, le sumaba al contador y, a las
-    10, la dejaba `suspended`. Terminal, y por una caída nuestra.
+    `acquire_familia_bundle()` intenta el minteo interactivo protegido cuando
+    el worker todavía no minteó ningún slot o cuando todos quedaron obsoletos.
+    Sólo si esa recuperación no entrega un bundle se conserva el 503 que evita
+    atribuir nuestra falla a un bloqueo real de OJV.
 
     El 503 es lo que hace que la app la clasifique como infra. Y va con la misma
     métrica y la misma alerta que `acquire_or_alert`, porque es el mismo hecho
     contado desde otra ruta: el pool no tiene con qué salir a la calle.
     """
     try:
-        await pool.assert_proxy_enabled()
-    except ProxyTrafficDisabledError as e:
+        bundle = await pool.acquire_familia_bundle()
+    except Exception as e:
+        control = getattr(request.app.state, "proxy_control", None)
+        if isinstance(e, ProxyUsagePersistenceError) and control is not None:
+            await control.pause_telemetry_unavailable()
+        elif isinstance(e, ProxyBudgetExceededError) and control is not None:
+            await control.refresh()
         await _trace_pool_failure(
-            request, "familia", "control operativo del proxy no disponible",
+            request, "familia",
+            f"el pool no pudo entregar bundle F5 ({type(e).__name__}: {e})",
         )
-        raise HTTPException(
-            status_code=503,
-            detail="Servicio de sincronizacion temporalmente no disponible",
-        ) from e
+        if isinstance(e, (
+            ProxyTrafficDisabledError,
+            ProxyBudgetExceededError,
+            ProxyUsagePersistenceError,
+        )):
+            raise HTTPException(
+                status_code=503,
+                detail="Servicio de sincronizacion temporalmente no disponible",
+            ) from e
+        raise
 
-    bundle = pool.pick_familia_bundle()
     if bundle is not None:
         return bundle
 

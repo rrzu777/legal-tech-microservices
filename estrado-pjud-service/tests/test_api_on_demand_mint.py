@@ -28,7 +28,7 @@ class MemoryCookieStore:
         self.slots[str(slot_id)] = CookieBundle(
             cookies=cookies,
             user_agent=user_agent,
-            saved_at=0,
+            saved_at=time.time(),
             proxy_token=proxy_token,
         )
 
@@ -41,6 +41,66 @@ class RecordingUsageTracker:
     async def track(self, **kwargs):
         self.operations.append(kwargs["operation"])
         yield SimpleNamespace(retry_count=0)
+
+
+@pytest.mark.asyncio
+async def test_familia_stale_bundle_mints_and_returns_fresh_bundle_on_demand(
+    monkeypatch, tmp_path,
+):
+    """Quitar la recuperación Familia stale→mint→bundle debe romper este test."""
+    from app import session_pool as pool_module
+    from app.pool_guard import familia_bundle_or_alert
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        OJV_PROXY_STICKY_LIFETIME="1h",
+        _env_file=None,
+    )
+    control = AsyncMock()
+    control.refresh.return_value = ProxyControlSnapshot(
+        allowed=True,
+        status="enabled",
+        reason_code="interactive",
+        revision=1,
+        source="database",
+    )
+    usage = RecordingUsageTracker()
+    store = MemoryCookieStore()
+    store.slots["0"] = CookieBundle(
+        cookies={"TSPD_101": "stale"},
+        user_agent="stale-UA",
+        saved_at=time.time() - 7201,
+        proxy_token="stale-token",
+    )
+    minted_proxies: list[str | None] = []
+
+    class FreshMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted_proxies.append(proxy)
+
+        async def mint(self):
+            return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
+
+    pool = APISessionPool(settings, proxy_control=control, proxy_usage=usage)
+    pool._store = store
+    request = MagicMock()
+    request.app.state.alerter = None
+
+    bundle = await familia_bundle_or_alert(pool, request)
+
+    assert bundle.cookies == {"TSPD_101": "fresh"}
+    assert bundle.proxy_url == minted_proxies[0]
+    assert len(minted_proxies) == 1
+    assert minted_proxies[0] is not None
+    assert usage.operations == ["mint"]
+    control.refresh.assert_awaited()
 
 
 @pytest.mark.asyncio

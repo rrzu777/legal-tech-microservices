@@ -70,7 +70,12 @@ class AdapterQueGraba:
         )
 
 
-def api_settings(store_path="/tmp/no-existe.json", *, proxy="http://u:p@residencial:9000"):
+def api_settings(
+    store_path="/tmp/no-existe.json",
+    *,
+    proxy="http://u:p@residencial:9000",
+    sticky_lifetime="1h",
+):
     """`Settings` de verdad para construir un `APISessionPool`, nunca un MagicMock.
 
     `APISessionPool.__init__` mira `OJV_PROXY_URL` para saber si está en modo
@@ -86,11 +91,12 @@ def api_settings(store_path="/tmp/no-existe.json", *, proxy="http://u:p@residenc
         API_KEY="t",
         COOKIE_STORE_PATH=str(store_path),
         OJV_PROXY_URL=proxy,
+        OJV_PROXY_STICKY_LIFETIME=sticky_lifetime,
         _env_file=None,
     )
 
 
-def cookie_bundle(tag, *, proxy_url="http://u:p@sticky:1"):
+def cookie_bundle(tag, *, proxy_url="http://u:p@sticky:1", age_seconds=0):
     """Un `CookieBundle` de test. Estaba escrito en tres archivos."""
     import time
 
@@ -99,12 +105,19 @@ def cookie_bundle(tag, *, proxy_url="http://u:p@sticky:1"):
     return CookieBundle(
         cookies={"TSPD_101": f"tok-{tag}"},
         user_agent=f"UA-{tag}",
-        saved_at=time.time(),
+        saved_at=time.time() - age_seconds,
         proxy_url=proxy_url,
     )
 
 
-def pool_con_store(monkeypatch, bundles, *, proxy="http://u:p@residencial:9000", session_cls=None):
+def pool_con_store(
+    monkeypatch,
+    bundles,
+    *,
+    proxy="http://u:p@residencial:9000",
+    sticky_lifetime="1h",
+    session_cls=None,
+):
     """`APISessionPool` con el store mockeado y el adapter/sesión falsos.
 
     Devuelve `(pool, capturados)`; `capturados` acumula los kwargs con los que se
@@ -122,7 +135,7 @@ def pool_con_store(monkeypatch, bundles, *, proxy="http://u:p@residencial:9000",
     from app.session_pool import APISessionPool
 
     pool = APISessionPool(
-        api_settings(proxy=proxy),
+        api_settings(proxy=proxy, sticky_lifetime=sticky_lifetime),
         allow_uncontrolled_proxy=True,
     )
     pool._store = MagicMock()

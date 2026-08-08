@@ -1,5 +1,7 @@
 import os
+
 import pytest
+from pydantic import ValidationError
 
 
 def test_app_settings_proxy_defaults(monkeypatch):
@@ -22,6 +24,16 @@ def test_app_settings_proxy_env_override(monkeypatch):
 
     assert s.OJV_PROXY_URL == "http://dummy:dummy_country-cl@geo.example.com:12321"
     assert s.OJV_PROXY_STICKY_LIFETIME == "30m"
+
+
+def test_app_settings_rejects_invalid_sticky_lifetime(monkeypatch):
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("OJV_PROXY_STICKY_LIFETIME", "1d")
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError, match="OJV_PROXY_STICKY_LIFETIME"):
+        Settings(_env_file=None)
 
 
 def test_worker_config_proxy_defaults(monkeypatch):
@@ -55,3 +67,14 @@ def test_worker_config_proxy_env_override(monkeypatch):
     assert config.OJV_PROXY_POOL_SIZE == 5
     assert config.OJV_PROXY_GB_BUDGET == 10.5
     assert config.OJV_PROXY_GB_ALERT_PCT == 90
+
+
+def test_worker_config_rejects_invalid_sticky_lifetime(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
+    monkeypatch.setenv("OJV_PROXY_STICKY_LIFETIME", "1d")
+
+    from worker.config import WorkerConfig
+
+    with pytest.raises(ValidationError, match="OJV_PROXY_STICKY_LIFETIME"):
+        WorkerConfig(_env_file=None)

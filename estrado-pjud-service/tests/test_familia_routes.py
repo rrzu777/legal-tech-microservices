@@ -29,8 +29,7 @@ async def test_sin_bundle_f5_es_503_y_no_un_bloqueo_de_ojv():
     from app.routes import familia as mod
 
     pool = MagicMock()
-    pool.assert_proxy_enabled = AsyncMock()
-    pool.pick_familia_bundle = MagicMock(return_value=None)
+    pool.acquire_familia_bundle = AsyncMock(return_value=None)
     request = MagicMock()
     request.app.state.alerter = None
 
