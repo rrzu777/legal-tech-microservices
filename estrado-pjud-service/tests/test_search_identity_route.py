@@ -1,6 +1,5 @@
 """Canonical v2 identity tests for the public PJUD search route."""
 
-from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -660,9 +659,10 @@ def test_real_one_slot_api_pool_uses_only_loaded_catalog_memory(client):
     from app.session_pool import APISessionPool
 
     session = _session()
-    pool = APISessionPool(api_settings(proxy=None))
-    pool._max_size = 1
-    pool._pool = deque([session])
+    settings = api_settings(proxy=None)
+    settings.SESSION_POOL_SIZE = 1
+    pool = APISessionPool(settings)
+    pool._pool.put_nowait(session)
     catalog = CatalogService(pool, snapshot=_snapshot())
     catalog.courts = AsyncMock(side_effect=AssertionError("nested live courts call"))
     catalog.tribunals = AsyncMock(side_effect=AssertionError("nested live tribunals call"))
@@ -688,4 +688,4 @@ def test_real_one_slot_api_pool_uses_only_loaded_catalog_memory(client):
     assert response.status_code == 200
     assert response.json()["status"] == "found"
     assert response.json()["matches"][0]["tribunal_code"] == 321
-    assert len(pool._pool) == 1
+    assert pool._pool.qsize() == 1
