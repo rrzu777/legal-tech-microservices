@@ -24,6 +24,7 @@ def _make_mock_session(age=0):
 class TestAPISessionPool:
     @staticmethod
     def _proxy_pool_with_captured_usage():
+        from app.bandwidth import ProxyUsageCapture
         from app.config import Settings
         from app.session_pool import APISessionPool
 
@@ -33,7 +34,15 @@ class TestAPISessionPool:
         @asynccontextmanager
         async def track(**kwargs):
             calls.append(kwargs)
-            yield MagicMock(retry_count=0)
+            usage = ProxyUsageCapture()
+            try:
+                yield usage
+            finally:
+                if usage.cause_operation is not None:
+                    kwargs["cause_operation"] = usage.cause_operation
+                if usage.cause_session_id is not None:
+                    kwargs["cause_session_id"] = usage.cause_session_id
+                    usage.causal_event_persisted = True
 
         tracker.track.side_effect = track
         settings = Settings(
@@ -151,7 +160,132 @@ class TestAPISessionPool:
         assert "cause_session_id" not in calls[1]
 
     @pytest.mark.asyncio
+    async def test_tracker_exit_failure_restores_claim_for_next_mint(self):
+        from app.bandwidth import ProxyUsageCapture
+
+        pool, _calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        usages = []
+        attempts = 0
+
+        @asynccontextmanager
+        async def track(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            usage = ProxyUsageCapture()
+            usages.append(usage)
+            yield usage
+            if attempts == 1:
+                raise RuntimeError("ledger exit failed")
+            usage.causal_event_persisted = usage.request_count > 0
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        with pytest.raises(RuntimeError, match="ledger exit failed"):
+            async with pool._mint_usage_scope(1) as usage:
+                usage.request_count = 1
+        async with pool._mint_usage_scope(1) as usage:
+            usage.request_count = 1
+
+        assert usages[1].cause_session_id == session_id
+
+    @pytest.mark.asyncio
+    async def test_finalize_failure_after_causal_insert_consumes_claim(self):
+        from app.bandwidth import ProxyUsageCapture
+
+        pool, _calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        usages = []
+        attempts = 0
+
+        @asynccontextmanager
+        async def track(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            usage = ProxyUsageCapture()
+            usages.append(usage)
+            yield usage
+            if attempts == 1:
+                usage.causal_event_persisted = True
+                raise RuntimeError("finalize unavailable")
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        with pytest.raises(RuntimeError, match="finalize unavailable"):
+            async with pool._mint_usage_scope(1):
+                pass
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert usages[0].cause_session_id == session_id
+        assert usages[1].cause_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_provider_error_with_persisted_ledger_consumes_claim(self):
+        from app.bandwidth import ProxyUsageCapture
+
+        pool, _calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        usages = []
+
+        @asynccontextmanager
+        async def track(**_kwargs):
+            usage = ProxyUsageCapture()
+            usages.append(usage)
+            try:
+                yield usage
+            except RuntimeError:
+                usage.causal_event_persisted = usage.request_count > 0
+                raise
+            else:
+                usage.causal_event_persisted = usage.request_count > 0
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        with pytest.raises(RuntimeError, match="provider failed"):
+            async with pool._mint_usage_scope(1) as usage:
+                usage.request_count = 1
+                raise RuntimeError("provider failed")
+        async with pool._mint_usage_scope(1):
+            pass
+
+        assert usages[0].cause_session_id == session_id
+        assert usages[0].causal_event_persisted is True
+        assert usages[1].cause_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_zero_provider_request_restores_claim_for_next_mint(self):
+        from app.bandwidth import ProxyUsageCapture
+
+        pool, _calls = self._proxy_pool_with_captured_usage()
+        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        usages = []
+
+        @asynccontextmanager
+        async def track(**_kwargs):
+            usage = ProxyUsageCapture()
+            usages.append(usage)
+            yield usage
+            usage.causal_event_persisted = usage.request_count > 0
+
+        pool._proxy_usage.track.side_effect = track
+        await pool.record_catalog_retirement(session_id)
+
+        async with pool._mint_usage_scope(1):
+            pass
+        async with pool._mint_usage_scope(1) as usage:
+            usage.request_count = 1
+
+        assert usages[0].causal_event_persisted is False
+        assert usages[1].cause_session_id == session_id
+
+    @pytest.mark.asyncio
     async def test_tracker_enter_failure_restores_marker_for_next_mint(self):
+        from app.bandwidth import ProxyUsageCapture
+
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
         attempts = 0
@@ -163,7 +297,10 @@ class TestAPISessionPool:
             calls.append(kwargs)
             if attempts == 1:
                 raise RuntimeError("budget reservation unavailable")
-            yield MagicMock(retry_count=0)
+            usage = ProxyUsageCapture()
+            yield usage
+            kwargs["cause_session_id"] = usage.cause_session_id
+            usage.causal_event_persisted = True
 
         pool._proxy_usage.track.side_effect = track
         await pool.record_catalog_retirement(session_id)
@@ -174,11 +311,13 @@ class TestAPISessionPool:
         async with pool._mint_usage_scope(1):
             pass
 
-        assert calls[0]["cause_session_id"] == session_id
+        assert "cause_session_id" not in calls[0]
         assert calls[1]["cause_session_id"] == session_id
 
     @pytest.mark.asyncio
     async def test_cancellation_during_tracker_enter_restores_marker(self):
+        from app.bandwidth import ProxyUsageCapture
+
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
         enter_started = asyncio.Event()
@@ -207,7 +346,10 @@ class TestAPISessionPool:
         @asynccontextmanager
         async def successful_track(**kwargs):
             calls.append(kwargs)
-            yield MagicMock(retry_count=0)
+            usage = ProxyUsageCapture()
+            yield usage
+            kwargs["cause_session_id"] = usage.cause_session_id
+            usage.causal_event_persisted = True
 
         pool._proxy_usage.track.side_effect = successful_track
         await mint_scope()
@@ -215,52 +357,9 @@ class TestAPISessionPool:
         assert calls[1]["cause_session_id"] == session_id
 
     @pytest.mark.asyncio
-    async def test_blocked_commit_cannot_create_pre_mint_cancellation_window(
-        self,
-        monkeypatch,
-    ):
-        pool, calls = self._proxy_pool_with_captured_usage()
-        session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
-        body_started = asyncio.Event()
-        keep_mint_running = asyncio.Event()
-        commit_started = asyncio.Event()
-        permit_commit = asyncio.Event()
-        original_commit = pool._commit_catalog_retirement_claim
+    async def test_concurrent_mint_claims_without_waiting_for_first_tracker_enter(self):
+        from app.bandwidth import ProxyUsageCapture
 
-        async def blocked_commit(claim_token):
-            commit_started.set()
-            await permit_commit.wait()
-            await original_commit(claim_token)
-
-        monkeypatch.setattr(pool, "_commit_catalog_retirement_claim", blocked_commit)
-        await pool.record_catalog_retirement(session_id)
-
-        async def mint_scope():
-            async with pool._mint_usage_scope(1):
-                body_started.set()
-                await keep_mint_running.wait()
-
-        mint = asyncio.create_task(mint_scope())
-        try:
-            await asyncio.sleep(0)
-            assert body_started.is_set()
-            mint.cancel()
-            await commit_started.wait()
-            permit_commit.set()
-            with pytest.raises(asyncio.CancelledError):
-                await mint
-        finally:
-            permit_commit.set()
-            if not mint.done():
-                mint.cancel()
-                await asyncio.gather(mint, return_exceptions=True)
-
-        async with pool._mint_usage_scope(1):
-            pass
-        assert "cause_session_id" not in calls[-1]
-
-    @pytest.mark.asyncio
-    async def test_concurrent_mint_waits_and_claims_after_first_tracker_enter_fails(self):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
         first_entered = asyncio.Event()
@@ -273,7 +372,10 @@ class TestAPISessionPool:
                 first_entered.set()
                 await fail_first.wait()
                 raise RuntimeError("reservation failed")
-            yield MagicMock(retry_count=0)
+            usage = ProxyUsageCapture()
+            yield usage
+            kwargs["cause_session_id"] = usage.cause_session_id
+            usage.causal_event_persisted = True
 
         pool._proxy_usage.track.side_effect = track
         await pool.record_catalog_retirement(session_id)
@@ -291,16 +393,16 @@ class TestAPISessionPool:
         await first_entered.wait()
         second = asyncio.create_task(mint_scope())
         await asyncio.sleep(0)
-        assert len(calls) == 1
+        assert len(calls) == 2
+        assert calls[1]["cause_session_id"] == session_id
         fail_first.set()
         await first
         await second
 
-        assert calls[0]["cause_session_id"] == session_id
-        assert calls[1]["cause_session_id"] == session_id
+        assert "cause_session_id" not in calls[0]
 
     @pytest.mark.asyncio
-    async def test_concurrent_mint_waits_for_successful_owner_then_runs_without_cause(self):
+    async def test_concurrent_mint_never_waits_for_successful_owner(self):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
         first_body = asyncio.Event()
@@ -320,7 +422,7 @@ class TestAPISessionPool:
         await first_body.wait()
         second = asyncio.create_task(second_mint())
         await asyncio.sleep(0)
-        assert len(calls) == 1
+        assert len(calls) == 2
 
         permit_first.set()
         await asyncio.gather(first, second)
@@ -329,16 +431,14 @@ class TestAPISessionPool:
         assert "cause_session_id" not in calls[1]
 
     @pytest.mark.asyncio
-    async def test_claimed_marker_expiry_bounds_concurrent_wait(self, monkeypatch):
+    async def test_claimed_marker_never_blocks_unattributed_concurrent_mint(self):
         pool, calls = self._proxy_pool_with_captured_usage()
         session_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
-        monkeypatch.setattr("app.session_pool._CATALOG_RETIREMENT_CORRELATION_S", 0.01)
         await pool.record_catalog_retirement(session_id)
-        assert await pool._claim_catalog_retirement_marker() is not None
+        assert pool._claim_catalog_retirement_marker() is not None
 
-        async with asyncio.timeout(0.2):
-            async with pool._mint_usage_scope(1):
-                pass
+        async with pool._mint_usage_scope(1):
+            pass
 
         assert "cause_session_id" not in calls[0]
 

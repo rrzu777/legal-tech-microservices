@@ -121,6 +121,58 @@ async def test_mint_persists_typed_catalog_cause():
 
 
 @pytest.mark.asyncio
+async def test_mint_persists_cause_attached_to_usage_after_tracker_enter():
+    """Pool attribution is decided after reservation, not in track arguments."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    session_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(operation="mint") as usage:
+            usage.cause_operation = "opportunistic_catalog_refresh"
+            usage.cause_session_id = session_id
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["cause_operation"] == "opportunistic_catalog_refresh"
+    assert payload["cause_session_id"] == str(session_id)
+    assert usage.causal_event_persisted is True
+
+
+@pytest.mark.asyncio
+async def test_causal_insert_survives_finalize_failure_without_becoming_retryable():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    session_id = UUID("22222222-2222-4222-8222-222222222222")
+    usage = None
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        RuntimeError("finalize unavailable"),
+    ]):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(operation="mint") as usage:
+                usage.cause_operation = "opportunistic_catalog_refresh"
+                usage.cause_session_id = session_id
+                record_proxy_request(10)
+
+    assert usage is not None
+    assert usage.causal_event_persisted is True
+
+
+@pytest.mark.asyncio
 async def test_usage_tracker_inherits_request_attribution_for_mint_search_and_detail():
     """Dropping request context must make paid API work unattributed again."""
     sb = _supabase()

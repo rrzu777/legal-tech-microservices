@@ -70,6 +70,8 @@ class ProxyUsageTracker:
         sync_run_id = sync_run_id or inherited["sync_run_id"]
         if not self._enabled:
             with capture_proxy_usage() as usage:
+                usage.cause_operation = cause_operation
+                usage.cause_session_id = cause_session_id
                 yield usage
             return
 
@@ -133,6 +135,8 @@ class ProxyUsageTracker:
         reservation_id = str(reservation["reservation_id"])
         caught: BaseException | None = None
         with capture_proxy_usage() as usage:
+            usage.cause_operation = cause_operation
+            usage.cause_session_id = cause_session_id
             try:
                 yield usage
             except BaseException as exc:
@@ -150,8 +154,6 @@ class ProxyUsageTracker:
                         case_id=case_id,
                         sync_run_id=sync_run_id,
                         movement_id=movement_id,
-                        cause_operation=cause_operation,
-                        cause_session_id=cause_session_id,
                         error=caught,
                         estimated_bytes=estimate,
                     )
@@ -176,8 +178,6 @@ class ProxyUsageTracker:
         case_id: str | None,
         sync_run_id: str | None,
         movement_id: str | None,
-        cause_operation: Literal["opportunistic_catalog_refresh"] | None,
-        cause_session_id: uuid.UUID | None,
         error: BaseException | None,
         estimated_bytes: int,
     ) -> None:
@@ -209,9 +209,11 @@ class ProxyUsageTracker:
             "case_id": case_id,
             "sync_run_id": sync_run_id,
             "movement_id": movement_id,
-            "cause_operation": cause_operation,
+            "cause_operation": usage.cause_operation,
             "cause_session_id": (
-                str(cause_session_id) if cause_session_id is not None else None
+                str(usage.cause_session_id)
+                if usage.cause_session_id is not None
+                else None
             ),
             "request_id": str(uuid.uuid4()),
             "component": self._component,
@@ -237,6 +239,15 @@ class ProxyUsageTracker:
         inserted = insert_response.data if isinstance(insert_response.data, list) else []
         if len(inserted) != 1:
             raise RuntimeError("usage ledger insert did not return one row")
+
+        # The append-only causal fact already exists once INSERT succeeds. A
+        # later reservation-finalize outage must not attribute the same marker
+        # to another mint and create a duplicate causal event.
+        usage.causal_event_persisted = bool(
+            has_provider_usage
+            and usage.cause_operation is not None
+            and usage.cause_session_id is not None
+        )
 
         await self._finalize(
             reservation_id,

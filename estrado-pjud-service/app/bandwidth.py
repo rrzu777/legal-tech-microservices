@@ -9,9 +9,11 @@ first cut (see docs/plans/2026-07-07-residential-proxy-pool.md, gap G5).
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlencode
 
 
@@ -25,6 +27,9 @@ class ProxyUsageCapture:
     documents_skipped: int = 0
     status: str | None = None
     error_kind: str | None = None
+    cause_operation: Literal["opportunistic_catalog_refresh"] | None = None
+    cause_session_id: uuid.UUID | None = None
+    causal_event_persisted: bool = False
 
 
 _ACTIVE_CAPTURE: ContextVar[ProxyUsageCapture | None] = ContextVar(

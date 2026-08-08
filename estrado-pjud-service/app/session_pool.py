@@ -4,7 +4,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Awaitable, Literal
+from typing import Literal
 
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
@@ -75,7 +75,6 @@ class APISessionPool:
         )
         self._lock = asyncio.Lock()
         self._mint_lock = asyncio.Lock()
-        self._catalog_retirement_condition = asyncio.Condition()
         self._catalog_retirement_marker: _CatalogRetirementMarker | None = None
         self._closing_tasks: set[asyncio.Task[None]] = set()
         self._max_age = settings.SESSION_MAX_AGE_S
@@ -106,120 +105,75 @@ class APISessionPool:
         if self._proxy_usage is None or not self._proxy_mode:
             yield None
             return
-        claim = await self._claim_catalog_retirement_marker()
-        cause_session_id = claim[0] if claim is not None else None
-        cause = (
-            {
-                "cause_operation": "opportunistic_catalog_refresh",
-                "cause_session_id": cause_session_id,
-            }
-            if cause_session_id is not None
-            else {}
-        )
-        entered = False
+        claim: tuple[uuid.UUID, uuid.UUID] | None = None
+        usage = None
         try:
             async with self._proxy_usage.track(
                 operation="mint",
                 transaction_key=f"api-pool:{attempt}:{uuid.uuid4()}",
-                **cause,
             ) as usage:
-                entered = True
+                claim = self._claim_catalog_retirement_marker()
+                if claim is not None:
+                    usage.cause_operation = "opportunistic_catalog_refresh"
+                    usage.cause_session_id = claim[0]
                 if attempt > 1:
                     usage.retry_count += 1
-                try:
-                    # No await between a successful tracker enter and yielding:
-                    # the paid mint body starts before cancellation can consume
-                    # causal state without doing provider work.
-                    yield usage
-                finally:
-                    if claim is not None:
-                        await self._finish_catalog_marker_transition(
-                            self._commit_catalog_retirement_claim(claim[1])
-                        )
-        except BaseException:
-            if claim is not None and not entered:
-                await self._finish_catalog_marker_transition(
+                # Claim is synchronous and the next operation is the yield: no
+                # latency or cancellation window exists before provider work.
+                yield usage
+        finally:
+            if claim is not None:
+                if bool(getattr(usage, "causal_event_persisted", False)):
+                    self._commit_catalog_retirement_claim(claim[1])
+                else:
                     self._restore_catalog_retirement_claim(claim[1])
-                )
-            raise
-
-    async def _finish_catalog_marker_transition(
-        self,
-        operation: Awaitable[None],
-    ) -> None:
-        """Finish a tiny CAS even if its owning mint task is cancelled."""
-        task = asyncio.create_task(operation)
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.shield(task)
-            raise
 
     async def record_catalog_retirement(self, generation_id: uuid.UUID) -> None:
         """Correlate one near-term mint with a session retired by catalog work."""
         expires_at = time.monotonic() + _CATALOG_RETIREMENT_CORRELATION_S
-        async with self._catalog_retirement_condition:
-            current = self._catalog_retirement_marker
-            if current is not None and current.expires_at > time.monotonic():
-                return
-            self._catalog_retirement_marker = _CatalogRetirementMarker(
-                generation_id=generation_id,
-                expires_at=expires_at,
-            )
-            self._catalog_retirement_condition.notify_all()
+        current = self._catalog_retirement_marker
+        if current is not None and current.expires_at > time.monotonic():
+            return
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=generation_id,
+            expires_at=expires_at,
+        )
 
-    async def _claim_catalog_retirement_marker(
+    def _claim_catalog_retirement_marker(
         self,
     ) -> tuple[uuid.UUID, uuid.UUID] | None:
-        async with self._catalog_retirement_condition:
-            while True:
-                marker = self._catalog_retirement_marker
-                if marker is None:
-                    return None
-                remaining = marker.expires_at - time.monotonic()
-                if remaining <= 0:
-                    self._catalog_retirement_marker = None
-                    self._catalog_retirement_condition.notify_all()
-                    return None
-                if marker.claim_token is None:
-                    claim_token = uuid.uuid4()
-                    self._catalog_retirement_marker = _CatalogRetirementMarker(
-                        generation_id=marker.generation_id,
-                        expires_at=marker.expires_at,
-                        claim_token=claim_token,
-                    )
-                    return marker.generation_id, claim_token
-                try:
-                    await asyncio.wait_for(
-                        self._catalog_retirement_condition.wait(),
-                        timeout=remaining,
-                    )
-                except TimeoutError:
-                    # Re-read under the condition: the owner may have resolved
-                    # exactly as the deadline fired, or the marker has expired.
-                    continue
+        marker = self._catalog_retirement_marker
+        if marker is None:
+            return None
+        if time.monotonic() >= marker.expires_at:
+            self._catalog_retirement_marker = None
+            return None
+        if marker.claim_token is not None:
+            return None
+        claim_token = uuid.uuid4()
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=marker.generation_id,
+            expires_at=marker.expires_at,
+            claim_token=claim_token,
+        )
+        return marker.generation_id, claim_token
 
-    async def _commit_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
-        async with self._catalog_retirement_condition:
-            marker = self._catalog_retirement_marker
-            if marker is not None and marker.claim_token == claim_token:
-                self._catalog_retirement_marker = None
-                self._catalog_retirement_condition.notify_all()
+    def _commit_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
+        marker = self._catalog_retirement_marker
+        if marker is not None and marker.claim_token == claim_token:
+            self._catalog_retirement_marker = None
 
-    async def _restore_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
-        async with self._catalog_retirement_condition:
-            marker = self._catalog_retirement_marker
-            if marker is None or marker.claim_token != claim_token:
-                return
-            if time.monotonic() >= marker.expires_at:
-                self._catalog_retirement_marker = None
-                self._catalog_retirement_condition.notify_all()
-                return
-            self._catalog_retirement_marker = _CatalogRetirementMarker(
-                generation_id=marker.generation_id,
-                expires_at=marker.expires_at,
-            )
-            self._catalog_retirement_condition.notify_all()
+    def _restore_catalog_retirement_claim(self, claim_token: uuid.UUID) -> None:
+        marker = self._catalog_retirement_marker
+        if marker is None or marker.claim_token != claim_token:
+            return
+        if time.monotonic() >= marker.expires_at:
+            self._catalog_retirement_marker = None
+            return
+        self._catalog_retirement_marker = _CatalogRetirementMarker(
+            generation_id=marker.generation_id,
+            expires_at=marker.expires_at,
+        )
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
