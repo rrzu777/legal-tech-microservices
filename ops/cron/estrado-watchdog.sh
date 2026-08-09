@@ -9,7 +9,11 @@ ENV="${WD_ENV:-/opt/legal-tech-microservices/estrado-pjud-service/.env}"
 set -a; . "$ENV"; set +a
 API="${SUPABASE_URL%/}/rest/v1"
 AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
-NOW=$(date -u +%Y-%m-%dT%H:%M:%S)
+WATCHDOG_NOW_EPOCH="${WD_NOW_EPOCH:-$(date -u +%s)}"
+case "$WATCHDOG_NOW_EPOCH" in
+  ''|*[!0-9]*) echo "WD_NOW_EPOCH inválido: debe ser un epoch UTC entero no negativo." >&2; exit 2 ;;
+esac
+NOW=$(date -u -d "@$WATCHDOG_NOW_EPOCH" +%Y-%m-%dT%H:%M:%S)
 SYSTEMCTL="${WD_SYSTEMCTL:-systemctl}"
 
 # Devuelve el conteo, o VACÍO si no se pudo consultar. Devolvía 0 en ese caso, y eso
@@ -49,7 +53,13 @@ SIG=""
 add() { local tag="${2-x}"; ANOMALIES+="- $1"$'\n'; SIG+="${tag:+$tag;}"; }
 # Rutas inyectables para poder testear el script sin tocar el estado real ni
 # mandar nada a Telegram. Ver ops/cron/tests/test-watchdog.sh.
-WD_STATE_DIR="${WD_STATE_DIR:-/var/tmp}"
+if [ "${DRY_RUN:-0}" = "1" ] && [ -z "${WD_STATE_DIR+x}" ]; then
+  WD_DRY_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/estrado-watchdog-dry-run.XXXXXX")
+  trap 'rm -rf "$WD_DRY_STATE_DIR"' EXIT
+  WD_STATE_DIR="$WD_DRY_STATE_DIR"
+else
+  WD_STATE_DIR="${WD_STATE_DIR:-${WD_DEFAULT_STATE_DIR:-/var/tmp}}"
+fi
 STATE="$WD_STATE_DIR/estrado-wd-state"
 COOLDOWN="${WD_COOLDOWN:-10800}"   # 3h: no re-alertar la MISMA anomalía dentro de esta ventana
 
@@ -115,6 +125,13 @@ sig_keyed() { # <slug de estado>
   f=$(firma_estado "$1")
   [ -n "$f" ] && SIG+="$1:$f;"
   true
+}
+
+stuck_window_open() {
+  local dow hour
+  dow=$(TZ=America/Santiago date -d "@$WATCHDOG_NOW_EPOCH" +%u)
+  hour=$(TZ=America/Santiago date -d "@$WATCHDOG_NOW_EPOCH" +%H)
+  [ "$dow" -le 5 ] && [ "$hour" -ge 10 ] && [ "$hour" -lt 18 ]
 }
 
 # Lo mismo, para causas: devuelve los `case_number` de las que matchean el filtro y
@@ -346,13 +363,22 @@ else
   fi
 fi
 
-# 8. Causas atascadas: next_sync_at vencido hace más de 2h.
+# 8. Causas atascadas: next_sync_at vencido hace más de 2h, solo mientras el
+#    worker está programado para procesarlas (lunes a viernes, 10:00–18:00 Chile).
 #    Se mira `next_sync_at` vencido y no "N horas sin sincronizar" porque la cadencia es
 #    por prioridad (_compute_next_sync_at): un umbral fijo daría falsos positivos en las
 #    causas de cadencia diaria. Las 2h son margen para un scheduler unos minutos atrasado.
-STUCK=$(cnt "cases?select=id&tracking_status=eq.active&next_sync_at=lt.$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%S)")
-conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
-  && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+STUCK_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 7200))" +%Y-%m-%dT%H:%M:%S)
+STUCK_FILTER="cases?select=id&tracking_status=eq.active&source_system=eq.pjud_ojv&next_sync_at=lt.$STUCK_CUTOFF&and=(or(sync_priority.is.null,sync_priority.lte.3),or(sync_blocked_until.is.null,sync_blocked_until.lt.$NOW))"
+if stuck_window_open; then
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    STUCK="${WD_STUCK_COUNT:-$(cnt "$STUCK_FILTER")}"
+  else
+    STUCK=$(cnt "$STUCK_FILTER")
+  fi
+  conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
+    && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+fi
 
 # 9. La API de scraping: viva no es lo mismo que útil.
 #    El chequeo 1 le pregunta a systemd, y systemd contestaba `active` mientras la

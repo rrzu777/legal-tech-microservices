@@ -30,6 +30,7 @@ cat > "$TMP/www/sano.json" <<'EOF'
  "total_errors":0,"total_blocked":0,"blocked_rate":0.0,"total_pool_failures":0}
 EOF
 SANO="http://127.0.0.1:$PORT/sano.json"
+printf 'SUPABASE_URL=http://127.0.0.1:%s/sb\nSUPABASE_SERVICE_KEY=fake-para-el-test\n' "$PORT" > "$TMP/watchdog.env"
 
 # Backup fresco y con peso: el chequeo 11 calla salvo en sus tests.
 mkdir -p "$TMP/backups-sanos"
@@ -68,6 +69,8 @@ run() {
     WD_SS_OUTPUT_FILE="${WD_SS_OUTPUT_FILE:-$TMP/ss-sano}" \
     WD_BACKUP_DIR="${WD_BACKUP_DIR:-$TMP/backups-sanos}" \
     WD_JOURNAL_FILE="${WD_JOURNAL_FILE:-$TMP/journal-sano}" \
+    WD_NOW_EPOCH="${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}" \
+    WD_STUCK_COUNT="${WD_STUCK_COUNT:-39}" \
     bash "$WD" 2>/dev/null
 }
 
@@ -256,6 +259,58 @@ expect_missing "sin rotado, sin fallas"   "$OUT" "cron-fail"
 # --- Chequeo 9: salud de la API de scraping ---------------------------------
 BASE="$TMP/base.log"
 printf '%s /api/cron/task-reminders - HTTP 200\n' "$HOY" > "$BASE"
+
+echo "== chequeo 8: stuck respeta la ventana programada del worker =="
+# Cada límite mata una mutación distinta: abrir antes de las 10, cerrar a las 18,
+# o contar durante el fin de semana. Los epochs son UTC y los resultados están
+# verificados contra America/Santiago (UTC-4 en agosto de 2026).
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-08T14:00:00Z' +%s) run "$BASE")
+expect_missing "sábado: no evalúa causas atascadas" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-10T13:59:00Z' +%s) run "$BASE")
+expect_missing "lunes 09:59: todavía no evalúa causas atascadas" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) run "$BASE")
+expect_contains "lunes 10:00: evalúa causas atascadas" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-14T21:59:00Z' +%s) run "$BASE")
+expect_contains "viernes 17:59: sigue evaluando causas atascadas" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-14T22:00:00Z' +%s) run "$BASE")
+expect_missing "viernes 18:00: deja de evaluar causas atascadas" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-08T14:00:00Z' +%s) run "$BASE" "http://127.0.0.1:1/health")
+expect_missing "fuera de horario no tapa stuck con health roto" "$OUT" "scheduler no las está tomando"
+expect_contains "fuera de horario conserva la alerta api-health" "$OUT" "api-health"
+
+echo "== chequeo 8: consulta sólo causas elegibles =="
+STUCK_BLOCK=$(awk '/^# 8\. Causas atascadas/{inside=1} /^# 9\. La API/{inside=0} inside' "$WD")
+for literal in \
+  'source_system=eq.pjud_ojv' \
+  'tracking_status=eq.active' \
+  'sync_priority.is.null' \
+  'sync_priority.lte.3' \
+  'sync_blocked_until.is.null' \
+  'sync_blocked_until.lt.'; do
+  expect_contains "el filtro stuck incluye $literal" "$STUCK_BLOCK" "$literal"
+done
+
+echo "== reloj y estado dry-run =="
+INVALID_ERR="$TMP/invalid-now.err"
+mkdir -p "$TMP/invalid-state"
+if DRY_RUN=1 WD_ENV="$TMP/watchdog.env" WD_STATE_DIR="$TMP/invalid-state" \
+  WD_NOW_EPOCH=invalido bash "$WD" >/dev/null 2>"$INVALID_ERR"; then
+  echo "  FAIL WD_NOW_EPOCH inválido termina con error"; FAIL=$((FAIL+1))
+else
+  echo "  ok   WD_NOW_EPOCH inválido termina con error"; PASS=$((PASS+1))
+fi
+expect_contains "WD_NOW_EPOCH inválido explica el problema" "$(<"$INVALID_ERR")" "WD_NOW_EPOCH inválido"
+
+DEFAULT_STATE_DIR=$(mktemp -d "$TMP/default-state-XXXXXX")
+printf 'no tocar\n' > "$DEFAULT_STATE_DIR/estrado-wd-state"
+DEFAULT_STATE_CHECKSUM=$(md5sum "$DEFAULT_STATE_DIR/estrado-wd-state")
+OUT=$(DRY_RUN=1 WD_ENV="$TMP/watchdog.env" WD_DEFAULT_STATE_DIR="$DEFAULT_STATE_DIR" CRON_LOG="$BASE" API_HEALTH_URL="$SANO" \
+  WD_CRONTAB_SNAPSHOT="$TMP/crontab-base" WD_CRONTAB_LIVE_FILE="$TMP/crontab-base" \
+  WD_SS_OUTPUT_FILE="$TMP/ss-sano" WD_BACKUP_DIR="$TMP/backups-sanos" \
+  WD_JOURNAL_FILE="$TMP/journal-sano" WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) \
+  WD_STUCK_COUNT=39 bash "$WD" 2>/dev/null)
+expect_equals "dry-run sin WD_STATE_DIR no toca el estado por defecto" \
+  "$(md5sum "$DEFAULT_STATE_DIR/estrado-wd-state")" "$DEFAULT_STATE_CHECKSUM"
 
 echo "== chequeo 9: una API ociosa NO es una API caída =="
 # ESTE es el test que sostiene el diseño. El fixture tiene total_requests=0 y

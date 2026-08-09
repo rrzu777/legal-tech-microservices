@@ -43,7 +43,9 @@ ssh legaltech-vps 'chmod +x /tmp/test-watchdog.sh && /tmp/test-watchdog.sh /tmp/
 El watchdog acepta estas variables para poder probarlo sin efectos: `DRY_RUN=1` (imprime lo que
 habría alertado y no llama ni a Luna ni a Telegram), `CRON_LOG`, `WD_STATE_DIR`, `API_HEALTH_URL`,
 `WD_CRONTAB_SNAPSHOT` y `WD_CRONTAB_LIVE_FILE` (fixtures del chequeo 10; sin la segunda lee
-`crontab -l` de verdad).
+`crontab -l` de verdad). Si `DRY_RUN=1` no recibe `WD_STATE_DIR`, crea estado efímero y no toca
+`WD_DEFAULT_STATE_DIR` ni `/var/tmp`. `WD_NOW_EPOCH` fija el reloj UTC para pruebas deterministas;
+debe ser un epoch entero no negativo.
 
 Los tests levantan un `python3 -m http.server` en un puerto alto para el chequeo 9. Cada corrida
 estrena directorio de estado a propósito: el cooldown anti-spam se evalúa **antes** del `DRY_RUN`,
@@ -73,7 +75,7 @@ Dos scripts, deliberadamente separados:
 | 5 | Errores del worker en el journal | 3 en 1h |
 | 6 | Servicios de Hermes | — |
 | 7 | Log de los crons de la app (lee el rotado también) | silencio 24h · último HTTP ≠ 200 |
-| 8 | `next_sync_at` vencido | 1 causa, 2h |
+| 8 | Causas PJUD activas y elegibles con `next_sync_at` vencido | 1 causa, 2h; lunes a viernes 10:00–18:00 Chile |
 | 9 | `/api/v1/health`: no contesta, o `total_pool_failures > 0` | por evento |
 | 10 | Crontab de root vs `crontab.snapshot` (líneas ejecutables) | por drift distinto |
 | 11 | Backup `estrado-*.tar.gz`: existe, fresco y con peso | 26h · 1KB |
