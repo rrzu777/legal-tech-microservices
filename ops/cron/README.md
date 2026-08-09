@@ -75,7 +75,7 @@ Dos scripts, deliberadamente separados:
 | 5 | Errores del worker en el journal | 3 en 1h |
 | 6 | Servicios de Hermes | — |
 | 7 | Log de los crons de la app (lee el rotado también) | silencio 24h · último HTTP ≠ 200 |
-| 8 | Causas PJUD activas y elegibles con `next_sync_at` vencido | 1 causa, 2h; lunes a viernes 10:00–18:00 Chile |
+| 8 | Causas PJUD activas y elegibles con `next_sync_at` vencido | 1 causa, 2h; lunes a viernes [10:00,18:00) Chile |
 | 9 | `/api/v1/health`: no contesta, o `total_pool_failures > 0` | por evento |
 | 10 | Crontab de root vs `crontab.snapshot` (líneas ejecutables) | por drift distinto |
 | 11 | Backup `estrado-*.tar.gz`: existe, fresco y con peso | 26h · 1KB |

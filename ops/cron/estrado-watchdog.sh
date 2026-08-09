@@ -13,8 +13,17 @@ WATCHDOG_NOW_EPOCH="${WD_NOW_EPOCH:-$(date -u +%s)}"
 case "$WATCHDOG_NOW_EPOCH" in
   ''|*[!0-9]*) echo "WD_NOW_EPOCH inválido: debe ser un epoch UTC entero no negativo." >&2; exit 2 ;;
 esac
+MAX_WATCHDOG_EPOCH=9223372036854775807
+if [ "${#WATCHDOG_NOW_EPOCH}" -gt "${#MAX_WATCHDOG_EPOCH}" ] || \
+   { [ "${#WATCHDOG_NOW_EPOCH}" -eq "${#MAX_WATCHDOG_EPOCH}" ] && [[ "$WATCHDOG_NOW_EPOCH" > "$MAX_WATCHDOG_EPOCH" ]]; }; then
+  echo "WD_NOW_EPOCH inválido: fuera del rango UTC soportado." >&2
+  exit 2
+fi
 WATCHDOG_NOW_EPOCH=$((10#$WATCHDOG_NOW_EPOCH))
-NOW=$(date -u -d "@$WATCHDOG_NOW_EPOCH" +%Y-%m-%dT%H:%M:%S)
+if ! NOW=$(date -u -d "@$WATCHDOG_NOW_EPOCH" +%Y-%m-%dT%H:%M:%S); then
+  echo "WD_NOW_EPOCH inválido: fuera del rango UTC soportado." >&2
+  exit 2
+fi
 SYSTEMCTL="${WD_SYSTEMCTL:-systemctl}"
 
 # Devuelve el conteo, o VACÍO si no se pudo consultar. Devolvía 0 en ese caso, y eso
@@ -54,8 +63,15 @@ SIG=""
 add() { local tag="${2-x}"; ANOMALIES+="- $1"$'\n'; SIG+="${tag:+$tag;}"; }
 # Rutas inyectables para poder testear el script sin tocar el estado real ni
 # mandar nada a Telegram. Ver ops/cron/tests/test-watchdog.sh.
-if [ "${DRY_RUN:-0}" = "1" ] && [ -z "${WD_STATE_DIR+x}" ]; then
-  WD_DRY_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/estrado-watchdog-dry-run.XXXXXX")
+if [ "${DRY_RUN:-0}" = "1" ] && [ -z "${WD_STATE_DIR:-}" ]; then
+  if ! WD_DRY_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/estrado-watchdog-dry-run.XXXXXX"); then
+    echo "No pude crear el directorio de estado efímero para DRY_RUN." >&2
+    exit 2
+  fi
+  if [ -z "$WD_DRY_STATE_DIR" ]; then
+    echo "No pude crear el directorio de estado efímero para DRY_RUN." >&2
+    exit 2
+  fi
   trap 'rm -rf "$WD_DRY_STATE_DIR"' EXIT
   WD_STATE_DIR="$WD_DRY_STATE_DIR"
 else
@@ -370,7 +386,8 @@ fi
 #    por prioridad (_compute_next_sync_at): un umbral fijo daría falsos positivos en las
 #    causas de cadencia diaria. Las 2h son margen para un scheduler unos minutos atrasado.
 STUCK_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 7200))" +%Y-%m-%dT%H:%M:%S)
-STUCK_FILTER="cases?select=id&tracking_status=eq.active&source_system=eq.pjud_ojv&next_sync_at=lt.$STUCK_CUTOFF&and=(or(sync_priority.is.null,sync_priority.lte.3),or(sync_blocked_until.is.null,sync_blocked_until.lt.$NOW))"
+STUCK_LEASE_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 14400))" +%Y-%m-%dT%H:%M:%S)
+STUCK_FILTER="cases?select=id&tracking_status=eq.active&source_system=eq.pjud_ojv&next_sync_at=lt.$STUCK_CUTOFF&and=(or(sync_priority.is.null,sync_priority.lte.3),or(sync_blocked_until.is.null,sync_blocked_until.lt.$NOW),or(sync_worker_id.is.null,sync_claimed_at.is.null,sync_claimed_at.lt.$STUCK_LEASE_CUTOFF))"
 if stuck_window_open; then
   if [ "${DRY_RUN:-0}" = "1" ]; then
     STUCK="${WD_STUCK_COUNT:-$(cnt "$STUCK_FILTER")}"
