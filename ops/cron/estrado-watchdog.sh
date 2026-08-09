@@ -13,6 +13,7 @@ WATCHDOG_NOW_EPOCH="${WD_NOW_EPOCH:-$(date -u +%s)}"
 case "$WATCHDOG_NOW_EPOCH" in
   ''|*[!0-9]*) echo "WD_NOW_EPOCH inválido: debe ser un epoch UTC entero no negativo." >&2; exit 2 ;;
 esac
+WATCHDOG_NOW_EPOCH=$((10#$WATCHDOG_NOW_EPOCH))
 NOW=$(date -u -d "@$WATCHDOG_NOW_EPOCH" +%Y-%m-%dT%H:%M:%S)
 SYSTEMCTL="${WD_SYSTEMCTL:-systemctl}"
 

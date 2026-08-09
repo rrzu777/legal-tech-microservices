@@ -301,6 +301,38 @@ else
 fi
 expect_contains "WD_NOW_EPOCH inválido explica el problema" "$(<"$INVALID_ERR")" "WD_NOW_EPOCH inválido"
 
+echo "== WD_NOW_EPOCH con ceros iniciales usa decimal =="
+mkdir -p "$TMP/date-bin"
+printf '%s\n' \
+  '#!/bin/bash' \
+  'printf "%s\\n" "$*" >> "$WD_DATE_LOG"' \
+  'exec /usr/bin/date "$@"' > "$TMP/date-bin/date"
+chmod +x "$TMP/date-bin/date"
+run_leading_zero_epoch() { # <epoch>
+  local state
+  state=$(mktemp -d "$TMP/leading-zero-state-XXXXXX")
+  PATH="$TMP/date-bin:$PATH" DRY_RUN=1 WD_ENV="$TMP/watchdog.env" WD_STATE_DIR="$state" \
+    CRON_LOG="$BASE" API_HEALTH_URL="$SANO" WD_CRONTAB_SNAPSHOT="$TMP/crontab-base" \
+    WD_CRONTAB_LIVE_FILE="$TMP/crontab-base" WD_SS_OUTPUT_FILE="$TMP/ss-sano" \
+    WD_BACKUP_DIR="$TMP/backups-sanos" WD_JOURNAL_FILE="$TMP/journal-sano" \
+    WD_NOW_EPOCH="$1" WD_STUCK_COUNT=39 bash "$WD" 2>/dev/null
+}
+EPOCH_DATE_LOG="$TMP/leading-zero-date.log"
+: > "$EPOCH_DATE_LOG"
+if WD_DATE_LOG="$EPOCH_DATE_LOG" run_leading_zero_epoch 010; then
+  echo "  ok   010 se acepta como epoch decimal"; PASS=$((PASS+1))
+else
+  echo "  FAIL 010 se acepta como epoch decimal"; FAIL=$((FAIL+1))
+fi
+expect_contains "010 resta dos horas desde 10 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @-7190"
+: > "$EPOCH_DATE_LOG"
+if WD_DATE_LOG="$EPOCH_DATE_LOG" run_leading_zero_epoch 08; then
+  echo "  ok   08 se acepta como epoch decimal"; PASS=$((PASS+1))
+else
+  echo "  FAIL 08 se acepta como epoch decimal"; FAIL=$((FAIL+1))
+fi
+expect_contains "08 resta dos horas desde 8 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @-7192"
+
 DEFAULT_STATE_DIR=$(mktemp -d "$TMP/default-state-XXXXXX")
 printf 'no tocar\n' > "$DEFAULT_STATE_DIR/estrado-wd-state"
 DEFAULT_STATE_CHECKSUM=$(md5sum "$DEFAULT_STATE_DIR/estrado-wd-state")
