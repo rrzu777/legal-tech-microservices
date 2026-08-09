@@ -15,6 +15,11 @@ from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
 from app.catalogs import CatalogService, normalize_catalog_label
 from app.document_downloader import download_documents, download_single_document
+from app.document_metadata import (
+    extract_pjud_document_sources,
+    sanitize_pjud_case_external_payload,
+    sanitize_pjud_movement_payload,
+)
 from app.failure_kind import (
     UpstreamChangedError,
     block_cause,
@@ -53,6 +58,7 @@ _BLOCK_DURATION_S = 3600  # 1 hour
 _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
 _MOVEMENT_PAGE_SIZE = 1_000
+_DOCUMENT_SOURCE_TIMEOUT_S = 2.0
 
 
 class InvalidCanonicalIdentityError(ValueError):
@@ -842,12 +848,6 @@ class SyncEngine:
             # Upsert movements
             new_count = await self._upsert_movements(case, detail)
 
-            # Download and store documents
-            if self._r2 and detail.get("movements"):
-                await self._download_and_store_documents(
-                    case, detail, session, sync_run_id=sync_run_id,
-                )
-
             # Update case
             latest_date = _get_latest_movement_date(detail["movements"])
 
@@ -868,10 +868,10 @@ class SyncEngine:
                     "consecutive_sync_failures": 0,
                     "canonical_identifier": canonical,
                     "external_case_key": case.get("external_case_key") or detail_key,
-                    "external_payload": {
+                    "external_payload": sanitize_pjud_case_external_payload({
                         "metadata": detail["metadata"],
                         "litigantes": detail["litigantes"],
-                    },
+                    }),
             }
             await run_query(self._sb.from_("cases").update(case_update).eq("id", case["id"]))
             # PostgreSQL lee is_urgent bajo row lock: un toggle concurrente no
@@ -1323,7 +1323,10 @@ class SyncEngine:
         )
 
         rows = []
+        sources_by_external_key: dict[str, list[dict]] = {}
         for mov, external_key in prepared:
+            sources = extract_pjud_document_sources(mov, external_key)
+            sources_by_external_key[external_key] = sources
             rows.append({
                 "law_firm_id": case["law_firm_id"],
                 "case_id": case["id"],
@@ -1332,11 +1335,14 @@ class SyncEngine:
                 "description": f"Cuaderno: {mov.get('cuaderno', '')} | Folio: {mov.get('folio', '')} | Etapa: {mov.get('etapa', '')}",
                 "movement_type": _map_tramite(mov.get("tramite", "")),
                 "source": "sync",
-                "document_url": mov.get("documento_url"),
+                # Provider URLs and JWTs are ephemeral credentials. Only the
+                # service-only registry receives stable availability metadata.
+                "document_url": None,
+                "has_remote_document": bool(sources),
                 "is_relevant": True,
                 "include_in_report": True,
                 "external_movement_key": external_key,
-                "raw_payload": mov,
+                "raw_payload": sanitize_pjud_movement_payload(mov),
             })
 
         base_keys = [
@@ -1364,7 +1370,7 @@ class SyncEngine:
         before_count = before_resp.count if before_resp.count is not None else 0
 
         # Upsert (update on conflict)
-        await run_query(
+        upsert_response = await run_query(
             self._sb.from_("case_movements").upsert(
                 rows,
                 on_conflict="case_id,external_movement_key",
@@ -1380,7 +1386,61 @@ class SyncEngine:
         )
         after_count = after_resp.count if after_resp.count is not None else 0
 
+        upserted_rows = (
+            upsert_response.data
+            if isinstance(getattr(upsert_response, "data", None), list)
+            else []
+        )
+        await self._persist_document_sources(
+            case,
+            upserted_rows,
+            sources_by_external_key,
+        )
+
         return after_count - before_count
+
+    async def _persist_document_sources(
+        self,
+        case: dict,
+        upserted_rows: list[dict],
+        sources_by_external_key: dict[str, list[dict]],
+    ) -> None:
+        """Best-effort service-only source registry update.
+
+        Expand deployments may briefly run before migration 00069 exists. A
+        missing registry must never turn a valid movement sync into a failure.
+        """
+        entries = []
+        for row in upserted_rows:
+            movement_id = row.get("id")
+            external_key = row.get("external_movement_key")
+            if not movement_id or external_key not in sources_by_external_key:
+                continue
+            entries.append({
+                "movement_id": movement_id,
+                "sources": sources_by_external_key[external_key],
+            })
+        if not entries:
+            return
+
+        try:
+            await asyncio.wait_for(
+                run_query(self._sb.rpc("upsert_pjud_document_source_batch", {
+                    "p_law_firm_id": case["law_firm_id"],
+                    "p_case_id": case["id"],
+                    "p_entries": entries,
+                })),
+                timeout=_DOCUMENT_SOURCE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "PJUD document source registry update skipped",
+                extra={
+                    "case_id": case.get("id"),
+                    "movement_count": len(entries),
+                    "source_count": sum(len(entry["sources"]) for entry in entries),
+                },
+            )
 
     async def _download_and_store_documents(
         self, case: dict, detail: dict, session, sync_run_id: str | None = None,

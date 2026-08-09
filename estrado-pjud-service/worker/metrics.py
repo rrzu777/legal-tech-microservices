@@ -90,6 +90,7 @@ class Metrics:
                 "proxy_control_reason": control.reason_code if control else "not_configured",
                 "proxy_control_revision": control.revision if control else None,
                 "proxy_control_source": control.source if control else "local",
+                "document_inline_enabled": False,
             },
         }
 
