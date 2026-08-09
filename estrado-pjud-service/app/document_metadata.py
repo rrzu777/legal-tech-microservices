@@ -144,7 +144,7 @@ def extract_pjud_document_sources(
             stable_code = _normalize_identity_part(candidate.get("codigo") or candidate.get("code"))
             identity_parts: list[str | int]
             if stable_code:
-                identity_parts = [identity, "certificate", "code", stable_code]
+                identity_parts = [identity, "certificate", "code", stable_code, ordinal]
             else:
                 identity_parts = [
                     identity,

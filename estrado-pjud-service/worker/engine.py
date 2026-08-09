@@ -58,6 +58,7 @@ _BLOCK_DURATION_S = 3600  # 1 hour
 _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
 _MOVEMENT_PAGE_SIZE = 1_000
+_DOCUMENT_SOURCE_TIMEOUT_S = 2.0
 
 
 class InvalidCanonicalIdentityError(ValueError):
@@ -1409,28 +1410,37 @@ class SyncEngine:
         Expand deployments may briefly run before migration 00069 exists. A
         missing registry must never turn a valid movement sync into a failure.
         """
+        entries = []
         for row in upserted_rows:
             movement_id = row.get("id")
             external_key = row.get("external_movement_key")
             if not movement_id or external_key not in sources_by_external_key:
                 continue
-            sources = sources_by_external_key[external_key]
-            try:
-                await run_query(self._sb.rpc("upsert_pjud_document_sources", {
+            entries.append({
+                "movement_id": movement_id,
+                "sources": sources_by_external_key[external_key],
+            })
+        if not entries:
+            return
+
+        try:
+            await asyncio.wait_for(
+                run_query(self._sb.rpc("upsert_pjud_document_source_batch", {
                     "p_law_firm_id": case["law_firm_id"],
                     "p_case_id": case["id"],
-                    "p_movement_id": movement_id,
-                    "p_sources": sources,
-                }))
-            except Exception:
-                logger.warning(
-                    "PJUD document source registry update skipped",
-                    extra={
-                        "case_id": case.get("id"),
-                        "movement_id": movement_id,
-                        "source_count": len(sources),
-                    },
-                )
+                    "p_entries": entries,
+                })),
+                timeout=_DOCUMENT_SOURCE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "PJUD document source registry update skipped",
+                extra={
+                    "case_id": case.get("id"),
+                    "movement_count": len(entries),
+                    "source_count": sum(len(entry["sources"]) for entry in entries),
+                },
+            )
 
     async def _download_and_store_documents(
         self, case: dict, detail: dict, session, sync_run_id: str | None = None,

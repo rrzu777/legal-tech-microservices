@@ -100,16 +100,18 @@ async def test_movement_upsert_sanitizes_credentials_and_persists_sources():
         "fecha": "2024-06-15",
         "foja": None,
     }
-    supabase.rpc.assert_any_call("upsert_pjud_document_sources", {
+    supabase.rpc.assert_any_call("upsert_pjud_document_source_batch", {
         "p_law_firm_id": "firm-uuid-1",
         "p_case_id": "case-uuid-1",
-        "p_movement_id": "movement-uuid-1",
-        "p_sources": [{
-            "document_kind": "principal",
-            "source_id": "43dede8dd697bf6231f393b75700fd3e0ded96e9ecdc78fa8e9779c063070bfd",
-            "ordinal": 0,
-            "label": "Documento principal",
-            "available": True,
+        "p_entries": [{
+            "movement_id": "movement-uuid-1",
+            "sources": [{
+                "document_kind": "principal",
+                "source_id": "43dede8dd697bf6231f393b75700fd3e0ded96e9ecdc78fa8e9779c063070bfd",
+                "ordinal": 0,
+                "label": "Documento principal",
+                "available": True,
+            }],
         }],
     })
 
@@ -141,6 +143,62 @@ async def test_source_registry_failure_does_not_fail_movement_sync():
     assert await engine._upsert_movements(
         _make_case(), {"movements": [movement]},
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_source_registry_uses_one_bounded_batch_for_many_movements(monkeypatch):
+    engine, _, supabase, *_ = _make_engine()
+    import worker.engine as engine_module
+
+    async def hanging_run_query(query):
+        if supabase.rpc.called:
+            await __import__("asyncio").sleep(60)
+        return await original_run_query(query)
+
+    original_run_query = engine_module.run_query
+    monkeypatch.setattr(engine_module, "run_query", hanging_run_query)
+    rows = [
+        {"id": f"movement-{index}", "external_movement_key": f"key-{index}"}
+        for index in range(50)
+    ]
+    sources = {f"key-{index}": [] for index in range(50)}
+
+    await engine._persist_document_sources(_make_case(), rows, sources)
+
+    supabase.rpc.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_registry_failure_still_finishes_and_schedules_full_case_sync():
+    engine, _, supabase, *_ = _make_engine()
+    chain = supabase.from_.return_value
+    chain.execute.side_effect = [
+        MagicMock(data={"id": "run-1"}),
+        MagicMock(data=[]),
+        MagicMock(data=[], count=0),
+        MagicMock(data=[
+            {"id": "movement-1", "external_movement_key": "C-1234-2024:Principal:1"},
+            {"id": "movement-2", "external_movement_key": "C-1234-2024:Principal:2"},
+        ]),
+        MagicMock(data=[], count=2),
+        RuntimeError("registry unavailable"),
+        MagicMock(data=[]),
+        MagicMock(data=[]),
+        MagicMock(data=[]),
+    ]
+
+    with patch("worker.engine.search_pjud_via_session", new=AsyncMock(
+        return_value=_mock_search_response(),
+    )), patch("worker.engine.detail_pjud_via_session", new=AsyncMock(
+        return_value=_mock_detail_response(),
+    )):
+        result = await engine.sync_case(_make_case())
+
+    assert result == {"success": True, "new_movements": 2}
+    supabase.rpc.assert_any_call("schedule_pjud_case_after_sync", {
+        "p_case_id": "case-uuid-1",
+        "p_latest_movement_date": "2024-07-01",
+    })
 
 
 @pytest.mark.asyncio
