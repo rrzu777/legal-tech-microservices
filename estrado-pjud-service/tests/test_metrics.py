@@ -168,6 +168,11 @@ class TestWorkerMetrics:
         assert meta["mint_failures"] == 6
         assert meta["mint_failure_rate"] == 0.12
 
+    def test_heartbeat_declara_descarga_inline_deshabilitada(self):
+        metadata = self._make(pool=self._fake_pool()).heartbeat_payload("running")["metadata"]
+
+        assert metadata["document_inline_enabled"] is False
+
     def test_tasa_de_minteo_sin_intentos_no_divide_por_cero(self):
         m = self._make(pool=self._fake_pool(attempts=0, failures=0))
         assert m.heartbeat_payload("running")["metadata"]["mint_failure_rate"] == 0.0

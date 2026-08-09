@@ -1,0 +1,155 @@
+[
+  {
+    "name": "primary certificates anexo and nested case credentials",
+    "movement_identity": "C-100-2026:Principal:12",
+    "movement_input": {
+      "folio": 12,
+      "cuaderno": "Principal",
+      "etapa": "Tramitación",
+      "tramite": "Resolución",
+      "descripcion": "Se resuelve presentación",
+      "fecha": "2026-08-06",
+      "foja": 7,
+      "sala": "Primera",
+      "estado": "Firmado",
+      "documento_url": "/documento/primary?jwt=secret",
+      "documento_token": "primary-secret",
+      "documento_param": "dtaDoc",
+      "documentos_adicionales": [
+        {
+          "codigo": " CERT-ENVIO ",
+          "label": "Certificado de envío",
+          "url": "/documento/certificate-one",
+          "token": "certificate-secret-one",
+          "param": "dtaCert"
+        },
+        {
+          "label": " Certificado  de firma ",
+          "url": "/documento/certificate-two",
+          "token": "certificate-secret-two",
+          "param": "dtaCert"
+        }
+      ],
+      "anexo_func": "anexoSolicitudCivil",
+      "anexo_token": "anexo-secret"
+    },
+    "case_input": {
+      "tribunal": "1° Juzgado Civil de Santiago",
+      "certificado_disponible": true,
+      "ebook_token": "ebook-secret",
+      "suprema_docs": [
+        {
+          "tipo": "Sentencia",
+          "nombre": "Fallo definitivo",
+          "url": "https://consulta.pjud.cl/file?token=secret",
+          "token": "suprema-secret",
+          "funcion_descarga": "descargarDocumento"
+        }
+      ],
+      "nested": {
+        "safe": "value",
+        "cookie": "session-secret",
+        "download": {
+          "document_url": "/nested-secret",
+          "jwt": "nested-jwt"
+        }
+      }
+    },
+    "expected_sources": [
+      {
+        "document_kind": "principal",
+        "source_id": "88c347d914900067e14f5631488df5ff6bc7a30fc54d94cb4b2f8a441a54354a",
+        "ordinal": 0,
+        "label": "Documento principal",
+        "available": true
+      },
+      {
+        "document_kind": "certificate",
+        "source_id": "509271aa51c90ccd2416552a8b2c683ee63f3db266c37322a06f49e617f0e27f",
+        "ordinal": 0,
+        "label": "Certificado de envío",
+        "available": true
+      },
+      {
+        "document_kind": "certificate",
+        "source_id": "4e40114684daa9fe6fd71cc54b959b377f710ff8d2eaeb971c9a97ee27d73d57",
+        "ordinal": 1,
+        "label": "Certificado de firma",
+        "available": true
+      },
+      {
+        "document_kind": "anexo_discovery",
+        "source_id": "2524f6a141b1e7f9bbaa07d5ac574c0f53581315f905ab671d15f271c11d08c1",
+        "ordinal": 0,
+        "label": "Anexos",
+        "available": true
+      }
+    ],
+    "expected_sanitized_movement": {
+      "folio": 12,
+      "cuaderno": "Principal",
+      "etapa": "Tramitación",
+      "tramite": "Resolución",
+      "descripcion": "Se resuelve presentación",
+      "fecha": "2026-08-06",
+      "foja": 7,
+      "sala": "Primera",
+      "estado": "Firmado"
+    },
+    "expected_sanitized_case": {
+      "tribunal": "1° Juzgado Civil de Santiago",
+      "certificado_disponible": true,
+      "suprema_docs": [
+        {
+          "tipo": "Sentencia",
+          "nombre": "Fallo definitivo"
+        }
+      ],
+      "nested": {
+        "safe": "value",
+        "download": {}
+      }
+    }
+  },
+  {
+    "name": "incomplete credentials are not advertised as available sources",
+    "movement_identity": "C-100-2026:Principal:13",
+    "movement_input": {
+      "folio": 13,
+      "cuaderno": "Principal",
+      "etapa": "Tramitación",
+      "tramite": "Escrito",
+      "descripcion": "Presentación incompleta",
+      "fecha": "2026-08-07",
+      "foja": null,
+      "documento_url": "/documento/missing-token",
+      "documento_token": null,
+      "documentos_adicionales": [
+        {
+          "label": "Certificado incompleto",
+          "url": null,
+          "token": "orphan-token"
+        }
+      ],
+      "anexo_func": "anexoSolicitudCivil",
+      "anexo_token": null
+    },
+    "case_input": {
+      "estado": "Vigente",
+      "ebook_token": null
+    },
+    "expected_sources": [],
+    "expected_sanitized_movement": {
+      "folio": 13,
+      "cuaderno": "Principal",
+      "etapa": "Tramitación",
+      "tramite": "Escrito",
+      "descripcion": "Presentación incompleta",
+      "fecha": "2026-08-07",
+      "foja": null
+    },
+    "expected_sanitized_case": {
+      "estado": "Vigente"
+    }
+  }
+]
