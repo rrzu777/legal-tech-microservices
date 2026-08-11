@@ -56,9 +56,27 @@ class AlertCooldownStore:
     @contextmanager
     def _interprocess_lock(self) -> Iterator[None]:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o660)
+        while True:
+            try:
+                lock_fd = os.open(
+                    self._lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                    0o660,
+                )
+            except FileExistsError:
+                try:
+                    lock_fd = os.open(self._lock_path, os.O_RDWR)
+                except FileNotFoundError:
+                    # Otro proceso pudo reemplazar el lock entre ambas
+                    # llamadas. Repetir mantiene el create/open atómico.
+                    continue
+                created = False
+            else:
+                created = True
+            break
         try:
-            os.fchmod(lock_fd, 0o660)
+            if created:
+                os.fchmod(lock_fd, 0o660)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
                 yield

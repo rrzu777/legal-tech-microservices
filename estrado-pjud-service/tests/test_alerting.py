@@ -30,6 +30,35 @@ def _env(monkeypatch):
 
 
 class TestTelegramAlerter:
+    def test_existing_group_writable_lock_is_not_rechmodded(self, tmp_path):
+        from app.alert_cooldown_store import AlertCooldownStore
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        lock_path = tmp_path / "alert-cooldowns.json.lock"
+        lock_path.touch(mode=0o660)
+        store = AlertCooldownStore(str(cooldown_path))
+
+        with patch("app.alert_cooldown_store.os.fchmod") as chmod:
+            with store._interprocess_lock():
+                pass
+
+        chmod.assert_not_called()
+
+    def test_new_lock_is_forced_group_writable_despite_umask(self, tmp_path):
+        from app.alert_cooldown_store import AlertCooldownStore
+
+        cooldown_path = tmp_path / "alert-cooldowns.json"
+        store = AlertCooldownStore(str(cooldown_path))
+
+        with patch(
+            "app.alert_cooldown_store.os.fchmod", wraps=os.fchmod
+        ) as chmod:
+            with store._interprocess_lock():
+                pass
+
+        chmod.assert_called_once()
+        assert chmod.call_args.args[1] == 0o660
+
     @pytest.mark.asyncio
     async def test_failed_event_delivery_rolls_back_durable_cooldown(self, tmp_path):
         from app.alert_cooldown_store import AlertCooldownStore
