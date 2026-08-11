@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock
+import httpx
 import pytest
 
 
@@ -114,7 +115,7 @@ async def test_mint_reintenta_y_sale_adelante(monkeypatch, _sin_dormir, tmp_path
     async def mint_flaky(_self):
         intentos["n"] += 1
         if intentos["n"] < 3:
-            raise RuntimeError("ERR_TUNNEL_CONNECTION_FAILED")
+            raise httpx.ConnectError("ERR_TUNNEL_CONNECTION_FAILED")
         return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
 
     _stub_camino_de_minteo(monkeypatch, mint_flaky)
@@ -142,7 +143,7 @@ async def test_cada_reintento_pide_una_ip_nueva(monkeypatch, _sin_dormir):
     async def mint_flaky(minter):
         proxies_vistos.append(minter.proxy)
         if len(proxies_vistos) < 3:
-            raise RuntimeError("ERR_TUNNEL_CONNECTION_FAILED")
+            raise httpx.ConnectError("ERR_TUNNEL_CONNECTION_FAILED")
         return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
 
     _stub_camino_de_minteo(monkeypatch, mint_flaky)
@@ -167,14 +168,14 @@ async def test_agotados_los_reintentos_conserva_la_sesion_vieja(monkeypatch, _si
 
     async def mint_siempre_falla(_self):
         intentos["n"] += 1
-        raise RuntimeError("ERR_TUNNEL_CONNECTION_FAILED")
+        raise httpx.ConnectError("ERR_TUNNEL_CONNECTION_FAILED")
 
     _stub_camino_de_minteo(monkeypatch, mint_siempre_falla)
 
     slot = sp._Slot(index=0, session=vieja)
     slot.last_mint_ts = -10_000  # evita el cooldown BLOCK_PAUSE_S
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(httpx.ConnectError):
         await pool._mint_slot(slot)
 
     assert intentos["n"] == 3, "tiene que agotar MINT_MAX_RETRIES"
@@ -197,7 +198,7 @@ async def test_el_retry_no_dispara_el_cooldown_de_bloqueo(monkeypatch, _sin_dorm
     async def mint_flaky(_self):
         intentos["n"] += 1
         if intentos["n"] < 3:
-            raise RuntimeError("boom")
+            raise httpx.ConnectError("proxy unavailable")
         return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
 
     _stub_camino_de_minteo(monkeypatch, mint_flaky)
@@ -221,7 +222,7 @@ async def test_cuenta_intentos_y_fallos_de_minteo(monkeypatch, _sin_dormir):
     async def mint_flaky(_self):
         intentos["n"] += 1
         if intentos["n"] < 3:
-            raise RuntimeError("boom")
+            raise httpx.ConnectError("proxy unavailable")
         return MintResult(cookies={"TSPD_101": "a"}, user_agent="UA")
 
     _stub_camino_de_minteo(monkeypatch, mint_flaky)

@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from app.minter import MintResult
+from app.failure_kind import MintUnavailableError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 
 
@@ -294,6 +295,131 @@ async def test_402_during_mint_never_retries(monkeypatch):
         await pool.initialize()
 
     assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    httpx.ConnectError("proxy transport unavailable"),
+    MintUnavailableError("navigation_failed"),
+])
+async def test_worker_rotates_once_for_retryable_egress_failures(monkeypatch, failure):
+    """Changing the shared predicate must stop the second sticky-IP attempt."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 2
+    calls = 0
+
+    def mint_side_effect(_proxy):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return failure
+        return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="UA")
+
+    captured, _ = _patch_pool_deps(monkeypatch, sp, mint_side_effect=mint_side_effect)
+    pool = sp.SessionPool(config)
+
+    await pool.initialize()
+
+    assert len(captured) == 2
+    assert captured[0] != captured[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    httpx.HTTPStatusError(
+        "503", request=httpx.Request("GET", "https://ojv.test"),
+        response=httpx.Response(503),
+    ),
+    ValueError("ambiguous_cookie_scope"),
+])
+async def test_worker_does_not_rotate_for_deterministic_or_pjud_failures(
+    monkeypatch, failure,
+):
+    """Retrying a PJUD answer or cookie invariant would spend another IP pointlessly."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 3
+    captured, _ = _patch_pool_deps(
+        monkeypatch, sp, mint_side_effect=lambda _proxy: failure,
+    )
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(type(failure)):
+        await pool.initialize()
+
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_never_allocates_more_than_three_new_sticky_ips(monkeypatch):
+    """A misconfigured retry count must not turn one mint into unbounded spend."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 4
+    captured, _ = _patch_pool_deps(
+        monkeypatch,
+        sp,
+        mint_side_effect=lambda _proxy: httpx.ConnectError("proxy unavailable"),
+    )
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(httpx.ConnectError):
+        await pool.initialize()
+
+    assert len(captured) == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_mint_deadline_cancels_traffic_and_finalizes_tracking(monkeypatch):
+    """A deadline must cancel a paid mint before it can allocate a second IP."""
+    from worker import session_pool as sp
+
+    cancelled = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    captured: list[str | None] = []
+
+    class BlockingMinter:
+        def __init__(self, _base_url, proxy=None):
+            captured.append(proxy)
+
+        async def mint(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                cleanup_finished.set()
+
+    class Tracker:
+        def __init__(self):
+            self.exited = False
+
+        @asynccontextmanager
+        async def track(self, **_kwargs):
+            try:
+                yield SimpleNamespace(retry_count=0)
+            finally:
+                self.exited = True
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_MAX_RETRIES = 3
+    monkeypatch.setattr(sp, "CookieMinter", BlockingMinter)
+    monkeypatch.setattr(sp, "_MINT_TRAFFIC_BUDGET_S", 0.02, raising=False)
+    pool = sp.SessionPool(config, proxy_usage=Tracker())
+
+    with pytest.raises(MintUnavailableError) as exc_info:
+        await pool.initialize()
+
+    assert exc_info.value.code == "deadline_exceeded"
+    assert cancelled.is_set()
+    assert cleanup_finished.is_set()
+    assert len(captured) == 1
+    assert pool._proxy_usage.exited is True
 
 
 @pytest.mark.asyncio

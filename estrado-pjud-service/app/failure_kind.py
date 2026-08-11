@@ -43,6 +43,12 @@ import httpx
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 
 FailureKind = Literal["infra", "ojv", "case"]
+MintFailureCode = Literal[
+    "browser_unavailable",
+    "navigation_failed",
+    "form_timeout",
+    "deadline_exceeded",
+]
 
 #: De quién fue la culpa de un bloqueo, para el texto que ve el abogado.
 BlockCause = Literal["ojv", "infra"]
@@ -51,6 +57,14 @@ BlockCause = Literal["ojv", "infra"]
 #: 429 es rate limiting. El resto de los 4xx —un 404 sobre el detalle— sí
 #: describe algo puntual del pedido.
 _OJV_REJECTION_STATUSES = frozenset({401, 403, 429})
+
+
+class MintUnavailableError(RuntimeError):
+    """A typed, retryable failure while creating a fresh PJUD session."""
+
+    def __init__(self, code: MintFailureCode):
+        self.code = code
+        super().__init__(code)
 
 
 class EmptyResponseError(Exception):
@@ -202,12 +216,9 @@ def new_egress_may_help(e: BaseException) -> bool:
     `MINT_MAX_RETRIES` veces con IP nueva — y ésa es toda la diferencia entre sus
     ~50 sesiones sanas en 10 días y los 3 de 4 `/api/v1/search` que se cayeron.
 
-    ⚠️ Hoy la regla la obedece UN solo loop. `worker/session_pool.py::_mint_slot`
-    reintenta sobre un `except Exception` pelado, así que un 5xx de OJV durante
-    el minteo le quema `MINT_MAX_RETRIES` IPs para cobrar el mismo no — que es
-    justo lo que esto dice que no hay que hacer. Es preexistente y cambiarlo
-    merece su propia medición; queda anotado para que nadie lea este predicado
-    como si ya rigiera en los dos lados.
+    La obedecen tanto `APISessionPool` como `worker.session_pool.SessionPool`.
+    Los dos cortan billing, presupuesto, telemetría y cualquier error para el
+    que otra IP no puede ayudar antes de asignar otro token sticky.
     """
     return classify_exception(e) == "infra" and not slot_still_healthy(e)
 
@@ -235,6 +246,7 @@ def classify_exception(e: BaseException) -> FailureKind:
             MissingCsrfTokenError,
             RejectedDetailSessionError,
             BlockedPageError,
+            MintUnavailableError,
             ProxyBudgetExceededError,
             ProxyUsagePersistenceError,
         ),

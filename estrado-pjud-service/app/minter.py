@@ -1,9 +1,10 @@
 import logging
 from dataclasses import dataclass
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from app.bandwidth import record_proxy_request, record_proxy_response
+from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,10 @@ class CookieMinter:
             launch_kwargs["proxy"] = split_proxy_for_playwright(self._proxy)
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(**launch_kwargs)
+            try:
+                browser = await pw.chromium.launch(**launch_kwargs)
+            except PlaywrightError:
+                raise MintUnavailableError("browser_unavailable") from None
             page = None
             observed_requests = 0
 
@@ -89,12 +93,21 @@ class CookieMinter:
                 # This fires as soon as Chromium starts a request, including
                 # navigations that later timeout before performance data can be read.
                 page.on("request", _record_started)
-                await page.goto(
-                    f"{self._base_url}{_CONSULTA_PATH}",
-                    wait_until="domcontentloaded",
-                    timeout=_MINT_TIMEOUT_MS,
-                )
-                await page.wait_for_selector(_FORM_READY_SELECTOR, timeout=_MINT_TIMEOUT_MS)
+                try:
+                    await page.goto(
+                        f"{self._base_url}{_CONSULTA_PATH}",
+                        wait_until="domcontentloaded",
+                        timeout=_MINT_TIMEOUT_MS,
+                    )
+                except PlaywrightError:
+                    raise MintUnavailableError("navigation_failed") from None
+                try:
+                    await page.wait_for_selector(
+                        _FORM_READY_SELECTOR,
+                        timeout=_MINT_TIMEOUT_MS,
+                    )
+                except PlaywrightError:
+                    raise MintUnavailableError("form_timeout") from None
                 ua = await page.evaluate("() => navigator.userAgent")
                 pw_cookies = await context.cookies()
                 cookies = cookies_to_dict(pw_cookies)
@@ -127,8 +140,8 @@ class CookieMinter:
                                     int(transfer.get("transferSize") or 0)
                                 )
                     except Exception:
-                        logger.warning(
-                            "No fue posible medir transferencia del minteo",
-                            exc_info=True,
-                        )
-                await browser.close()
+                        logger.warning("pjud_mint_transfer_telemetry_unavailable")
+                try:
+                    await browser.close()
+                except PlaywrightError:
+                    logger.warning("pjud_mint_browser_cleanup_unavailable")

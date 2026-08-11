@@ -12,10 +12,12 @@ import pytest
 from app.failure_kind import (
     BlockedPageError,
     EmptyResponseError,
+    MintUnavailableError,
     MissingCsrfTokenError,
     NoUsableBundleError,
     block_cause,
     classify_exception,
+    new_egress_may_help,
     slot_still_healthy,
 )
 from tests.helpers import http_status_error as _status, infra_exceptions
@@ -92,6 +94,20 @@ def test_un_bug_nuestro_sigue_siendo_de_la_causa():
     """El default. Sin esto, "no penalizar nunca" pasaría todos los otros tests
     y el techo de suspensión quedaría muerto en silencio."""
     assert classify_exception(ValueError("bug de parseo")) == "case"
+
+
+@pytest.mark.parametrize("code", [
+    "browser_unavailable",
+    "navigation_failed",
+    "form_timeout",
+    "deadline_exceeded",
+])
+def test_mint_unavailable_is_retryable_infra(code):
+    """Removing the typed mint classification must stop safe IP rotation."""
+    exc = MintUnavailableError(code)
+
+    assert classify_exception(exc) == "infra"
+    assert new_egress_may_help(exc) is True
 
 
 def test_block_cause_ante_la_duda_se_la_carga_a_nuestro_lado():

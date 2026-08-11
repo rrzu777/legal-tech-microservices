@@ -63,8 +63,13 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
             counter["n"] += 1
             return MintResult(cookies={"TSPD_101": f"cookie{i}"}, user_agent=f"UA{i}")
 
+    def snapshot_adapter(*_args, cookies=None, **_kwargs):
+        adapter = MagicMock()
+        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        return adapter
+
     monkeypatch.setattr(wsp, "CookieMinter", FakeMinter)
-    monkeypatch.setattr(wsp, "OJVHttpAdapter", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(wsp, "OJVHttpAdapter", snapshot_adapter)
     monkeypatch.setattr(wsp, "OJVSession", _FakeSession)
 
     pool = SessionPool(_worker_config(store_path, pool_size=3))
@@ -96,7 +101,9 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
 
     def capture_adapter(settings, proxy=None, user_agent=None, cookies=None):
         captured_proxies.append(proxy)
-        return MagicMock()
+        adapter = MagicMock()
+        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        return adapter
 
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)
@@ -143,7 +150,9 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
 
     def capture_adapter(settings, proxy=None, user_agent=None, cookies=None):
         captured.append(proxy)
-        return MagicMock()
+        adapter = MagicMock()
+        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        return adapter
 
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
     monkeypatch.setattr(asp, "OJVSession", _FakeSession)

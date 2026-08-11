@@ -12,6 +12,7 @@ import pytest
 from app.bandwidth import capture_proxy_usage
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
+from app.failure_kind import MintUnavailableError
 from app.minter import CookieMinter, cookies_to_dict
 
 _DUMMY_PROXY = (
@@ -273,3 +274,32 @@ async def test_navigation_failure_still_records_that_proxy_was_contacted():
                 ).mint()
 
     assert usage.request_count == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "code"),
+    [
+        ("launch", "browser_unavailable"),
+        ("navigation", "navigation_failed"),
+        ("selector", "form_timeout"),
+    ],
+)
+async def test_playwright_mint_boundaries_raise_allowlisted_unavailable_code(
+    boundary, code,
+):
+    """A raw Playwright outage would make retry policy depend on its message."""
+    factory, launch_mock, page = _make_playwright_mock()
+    from playwright.async_api import Error as PlaywrightError
+
+    if boundary == "launch":
+        launch_mock.side_effect = PlaywrightError("browser backend failed")
+    elif boundary == "navigation":
+        page.goto.side_effect = PlaywrightError("navigation backend failed")
+    else:
+        page.wait_for_selector.side_effect = PlaywrightError("selector backend failed")
+
+    with patch("app.minter.async_playwright", factory):
+        with pytest.raises(MintUnavailableError) as exc_info:
+            await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+
+    assert exc_info.value.code == code

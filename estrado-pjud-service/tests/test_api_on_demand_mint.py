@@ -494,6 +494,69 @@ async def test_on_demand_mint_does_not_start_more_ips_after_retry_budget(
 
 
 @pytest.mark.asyncio
+async def test_on_demand_mint_deadline_cancels_paid_traffic_and_finalizes_tracking(
+    monkeypatch, tmp_path,
+):
+    """Removing the in-flight deadline would let a timed-out request keep spending."""
+    from app import session_pool as pool_module
+    from app.failure_kind import MintUnavailableError
+    from app.session_pool import APISessionPool
+
+    cancelled = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    minted_proxies: list[str | None] = []
+
+    class BlockingMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted_proxies.append(proxy)
+
+        async def mint(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                cleanup_finished.set()
+
+    class Tracker:
+        def __init__(self):
+            self.exited = False
+
+        @asynccontextmanager
+        async def track(self, **_kwargs):
+            try:
+                yield SimpleNamespace(retry_count=0)
+            finally:
+                self.exited = True
+
+    monkeypatch.setattr(pool_module, "CookieMinter", BlockingMinter)
+    monkeypatch.setattr(pool_module, "_RETRY_BUDGET_S", 0.02)
+    tracker = Tracker()
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    pool = APISessionPool(
+        settings,
+        allow_uncontrolled_proxy=True,
+        proxy_usage=tracker,
+    )
+    pool._store = MemoryCookieStore()
+
+    with pytest.raises(MintUnavailableError) as exc_info:
+        await pool.acquire()
+
+    assert exc_info.value.code == "deadline_exceeded"
+    assert cancelled.is_set()
+    assert cleanup_finished.is_set()
+    assert len(minted_proxies) == 1
+    assert tracker.exited is True
+
+
+@pytest.mark.asyncio
 async def test_waiting_for_mint_lock_does_not_renew_deadline(monkeypatch, tmp_path):
     """A concurrent request cannot spend after its original deadline expires."""
     from app import session_pool as pool_module
