@@ -231,12 +231,22 @@ class SessionPool:
                 )
                 await asyncio.sleep(delay)
 
-        self._store.save_slot(
-            slot.index,
-            final_cookies,
-            creds.user_agent,
-            token,
-        )
+        try:
+            self._store.save_slot(
+                slot.index,
+                final_cookies,
+                creds.user_agent,
+                token,
+            )
+        except BaseException:
+            # Persistir es el commit del candidate: si falla, no se puede
+            # instalar la nueva sesión ni dejar su adapter abierto. El slot
+            # anterior sigue intacto porque el swap ocurre sólo más abajo.
+            try:
+                await new_session.close()
+            except Exception:
+                logger.debug("No se pudo cerrar la sesion no persistida del slot %d", slot.index)
+            raise
 
         old_session = slot.session
         slot.token = token

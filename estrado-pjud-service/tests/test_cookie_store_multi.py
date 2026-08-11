@@ -1,6 +1,9 @@
 import os
 import stat
 
+import pytest
+
+import app.cookie_store as cookie_store_module
 from app.cookie_store import CookieStore
 
 DUMMY_PROXY_0 = "http://user:pw_country-cl_session-tok0_lifetime-1h@geo.example.com:12321"
@@ -73,6 +76,55 @@ def test_saved_file_is_group_readable_but_not_world_readable(tmp_path):
     mode = stat.S_IMODE(os.stat(p).st_mode)
     assert oct(os.stat(p).st_mode)[-3:] == "640"
     assert mode == 0o640
+
+
+def test_new_lock_file_is_group_readable_but_not_world_readable(tmp_path):
+    p = tmp_path / "cookies.json"
+    CookieStore(path=str(p)).save_slot(
+        "0", cookies={"a": "1"}, user_agent="UA", proxy_token=DUMMY_TOKEN_0
+    )
+
+    mode = stat.S_IMODE(os.stat(f"{p}.lock").st_mode)
+
+    assert mode == 0o640
+
+
+def test_existing_lock_inode_is_not_repermissioned(tmp_path, monkeypatch):
+    p = tmp_path / "cookies.json"
+    lock_path = tmp_path / "cookies.json.lock"
+    lock_path.touch(mode=0o600)
+    os.chmod(lock_path, 0o600)
+    calls = []
+
+    def fail_if_repermissioned(*args):
+        calls.append(args)
+        raise AssertionError("existing_lock_inode_was_repermissioned")
+
+    monkeypatch.setattr(cookie_store_module.os, "fchmod", fail_if_repermissioned)
+
+    with CookieStore(path=str(p))._exclusive_write_lock():
+        pass
+
+    assert calls == []
+
+
+def test_existing_group_readable_lock_is_acquired_without_write_access(tmp_path, monkeypatch):
+    """The API's estrado group can lock the worker-owned 0640 inode read-only."""
+    p = tmp_path / "cookies.json"
+    lock_path = tmp_path / "cookies.json.lock"
+    lock_path.touch(mode=0o640)
+    os.chmod(lock_path, 0o640)
+    real_open = cookie_store_module.os.open
+
+    def deny_existing_lock_write(path, flags, *args):
+        if path == str(lock_path) and flags == os.O_RDWR:
+            raise PermissionError("group_has_no_write_bit")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(cookie_store_module.os, "open", deny_existing_lock_write)
+
+    with CookieStore(path=str(p))._exclusive_write_lock():
+        pass
 
 
 def test_store_never_persists_proxy_credentials(tmp_path):

@@ -279,6 +279,69 @@ async def test_slot_mint_ambiguous_cookie_snapshot_does_not_persist(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_slot_mint_save_failure_closes_candidate_and_keeps_previous_slot(monkeypatch):
+    """A persistence failure must not leak the initialized candidate or replace a usable slot."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    created_sessions = []
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "minted"}, user_agent="fresh-UA")
+
+    class SnapshotAdapter:
+        def __init__(self, _settings, **_kwargs):
+            pass
+
+        def snapshot_cookies(self):
+            return {"PHPSESSID": "initialized"}
+
+    class InitializedSession(_FakeSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def close(self):
+            self.close_count += 1
+            await super().close()
+
+    class FailingStore:
+        def save_slot(self, *_args):
+            raise OSError("cookie_store_lock_timeout")
+
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", SnapshotAdapter)
+    monkeypatch.setattr(sp, "OJVSession", InitializedSession)
+    monkeypatch.setattr(sp, "CookieStore", lambda _path: FailingStore())
+
+    pool = sp.SessionPool(config)
+    old_session = _FakeSession(MagicMock())
+    slot = sp._Slot(
+        index=0,
+        token="old-token",
+        proxy_url="http://old-proxy",
+        session=old_session,
+        last_mint_ts=0,
+    )
+
+    with pytest.raises(OSError, match="cookie_store_lock_timeout"):
+        await pool._mint_slot(slot)
+
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_count == 1
+    assert (slot.token, slot.proxy_url, slot.session, slot.last_mint_ts) == (
+        "old-token", "http://old-proxy", old_session, 0,
+    )
+    assert old_session.closed is False
+
+
+@pytest.mark.asyncio
 async def test_402_during_mint_never_retries(monkeypatch):
     from worker import session_pool as sp
 
