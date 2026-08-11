@@ -4,6 +4,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from postgrest.exceptions import APIError
 
 from app.bandwidth import record_proxy_request, record_proxy_response
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
@@ -21,6 +22,7 @@ def _supabase():
     sb.rpc.return_value = chain
     sb.from_.return_value = chain
     chain.insert.return_value = chain
+    chain.upsert.return_value = chain
     return sb
 
 
@@ -67,6 +69,146 @@ async def test_usage_tracker_reserves_persists_and_finalizes_actual_bytes():
     assert finalize.args[0] == "pjud_proxy_finalize_budget_reservation"
     assert finalize.args[1]["p_reservation_id"] == "reservation-1"
     assert finalize.args[1]["p_release"] is False
+
+
+@pytest.mark.asyncio
+async def test_transient_reservation_disconnect_retries_before_provider_work():
+    """Removing bounded retry would turn one lost HTTP/2 response into a global pause."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    entered = False
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([]),
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": "event-1"}]),
+            _response(None),
+        ]):
+        async with tracker.track(
+            operation="search",
+            transaction_key="run-1:search",
+        ):
+            entered = True
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    assert entered is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_reservation_response_recovers_same_claim_without_second_reserve():
+    """A committed reserve with a lost response must be recovered, not charged twice."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    entered = False
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([{
+                "id": "reservation-1",
+                "claim_token": str(claim_token),
+                "status": "reserved",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": "event-1"}]),
+            _response(None),
+        ]),
+    ):
+        async with tracker.track(
+            operation="detail",
+            transaction_key="run-1:detail",
+        ):
+            entered = True
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    assert entered is True
+    assert sb.rpc.call_args_list[0].args[0] == "pjud_proxy_reserve_budget"
+    assert len([
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reservation_retry_recovers_commit_that_appears_after_first_read():
+    """A late commit must be adopted only after the repeated RPC proves its identity."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+    entered = False
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([]),
+            _response([{
+                "allowed": False,
+                "reservation_id": "reservation-1",
+                "claim_status": "already_reserved",
+                "blocking_scope": None,
+            }]),
+            _response([{
+                "id": "reservation-1",
+                "claim_token": str(claim_token),
+                "status": "reserved",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": "event-1"}]),
+            _response(None),
+        ]),
+    ):
+        async with tracker.track(
+            operation="search",
+            transaction_key="run-1:search",
+        ):
+            entered = True
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    assert entered is True
+
+
+@pytest.mark.asyncio
+async def test_existing_reservation_with_foreign_claim_is_never_adopted():
+    """A PostgREST filtering regression must not let one worker adopt another claim."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+    entered = False
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": False,
+            "reservation_id": "reservation-1",
+            "claim_status": "already_reserved",
+            "blocking_scope": None,
+        }]),
+        _response([{
+            "id": "reservation-1",
+            "claim_token": "foreign-claim",
+            "status": "reserved",
+            "blocking_scope": None,
+        }]),
+    ]):
+        with pytest.raises(ProxyBudgetExceededError):
+            async with tracker.track(
+                operation="search",
+                transaction_key="run-1:search",
+            ):
+                entered = True
+
+    assert entered is False
 
 
 @pytest.mark.asyncio
@@ -173,6 +315,431 @@ async def test_causal_insert_survives_finalize_failure_without_becoming_retryabl
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_ledger_insert_accepts_only_the_persisted_immutable_event():
+    """A lost insert response must reconcile the exact event before finalization."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+    persisted_event = {
+        "idempotency_key": "ba434a67ea0be825573fbe923bb0147ad918d7f459bf843aa12097d1ea6438e0",
+        "reservation_id": "reservation-1",
+        "law_firm_id": None,
+        "case_id": None,
+        "sync_run_id": None,
+        "movement_id": None,
+        "cause_operation": None,
+        "cause_session_id": None,
+        "request_id": str(request_id),
+        "component": "worker",
+        "operation": "search",
+        "bytes_up": 10,
+        "bytes_down": 90,
+        "estimated_bytes_floor": 0,
+        "measurement_status": "measured",
+        "request_count": 1,
+        "retry_count": 0,
+        "documents_downloaded": 0,
+        "documents_skipped": 0,
+        "status": "success",
+        "error_kind": None,
+        "provider": "iproyal",
+        "price_per_gb_usd": 6.25,
+    }
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([persisted_event]),
+            _response(None),
+        ]),
+    ):
+        async with tracker.track(
+            operation="search",
+            transaction_key="run-1:search",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    assert sb.rpc.call_args_list[-1].args[0] == "pjud_proxy_finalize_budget_reservation"
+
+
+@pytest.mark.asyncio
+async def test_missing_ledger_after_lost_response_retries_with_ignore_duplicates(caplog):
+    """A confirmed missing event should retry safely instead of opening the circuit."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        httpx.RemoteProtocolError("server disconnected"),
+        _response([]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="search",
+            transaction_key="run-1:search",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    retry = sb.from_.return_value.upsert.call_args
+    assert retry.kwargs == {
+        "on_conflict": "idempotency_key",
+        "ignore_duplicates": True,
+    }
+    assert "boundary=ledger operation=search attempt=1/3" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transient_ledger_reconciliation_read_retries_the_safe_insert():
+    """A second transient read failure must remain inside the bounded recovery."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        httpx.RemoteProtocolError("insert response lost"),
+        httpx.RemoteProtocolError("reconciliation read disconnected"),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="detail",
+            transaction_key="run-1:detail",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+
+@pytest.mark.asyncio
+async def test_ledger_recovery_exhausts_exactly_three_write_attempts():
+    """Persistent ambiguity must fail closed after three writes, never loop forever."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+    calls = [
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+    ]
+    for _ in range(3):
+        calls.extend([
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([]),
+        ])
+
+    with patch("worker.proxy_usage.run_query", side_effect=calls) as query:
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="search",
+                transaction_key="run-1:search",
+            ):
+                record_proxy_request(10)
+                record_proxy_response(90)
+
+    assert query.await_count == 7
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_ledger_rejects_any_immutable_field_mismatch():
+    """A colliding event with different measured bytes must never be adopted."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+    mismatched_event = {
+        "idempotency_key": "ba434a67ea0be825573fbe923bb0147ad918d7f459bf843aa12097d1ea6438e0",
+        "reservation_id": "reservation-1",
+        "law_firm_id": None,
+        "case_id": None,
+        "sync_run_id": None,
+        "movement_id": None,
+        "cause_operation": None,
+        "cause_session_id": None,
+        "request_id": str(request_id),
+        "component": "worker",
+        "operation": "search",
+        "bytes_up": 10,
+        "bytes_down": 91,
+        "estimated_bytes_floor": 0,
+        "measurement_status": "measured",
+        "request_count": 1,
+        "retry_count": 0,
+        "documents_downloaded": 0,
+        "documents_skipped": 0,
+        "status": "success",
+        "error_kind": None,
+        "provider": "iproyal",
+        "price_per_gb_usd": 6.25,
+    }
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([mismatched_event]),
+        ]),
+    ):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="search",
+                transaction_key="run-1:search",
+            ):
+                record_proxy_request(10)
+                record_proxy_response(90)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_finalize_accepts_matching_terminal_reservation():
+    """A committed finalization with a lost response must not pause telemetry."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": "event-1"}]),
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([{
+                "id": "reservation-1",
+                "claim_token": str(claim_token),
+                "status": "finalized",
+            }]),
+        ]),
+    ):
+        async with tracker.track(
+            operation="detail",
+            transaction_key="run-1:detail",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+
+@pytest.mark.asyncio
+async def test_finalize_retry_reconciles_already_resolved_race():
+    """A late first commit may make the retry return 23514; durable state decides."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+    claim_token = UUID("11111111-1111-4111-8111-111111111111")
+    request_id = UUID("22222222-2222-4222-8222-222222222222")
+    already_resolved = APIError({
+        "message": "reservation is already resolved",
+        "code": "23514",
+        "hint": None,
+        "details": None,
+    })
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", side_effect=[claim_token, request_id]),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            _response([{"id": "event-1"}]),
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([{
+                "id": "reservation-1",
+                "claim_token": str(claim_token),
+                "status": "reserved",
+            }]),
+            already_resolved,
+            _response([{
+                "id": "reservation-1",
+                "claim_token": str(claim_token),
+                "status": "finalized",
+            }]),
+        ]),
+    ):
+        async with tracker.track(
+            operation="detail",
+            transaction_key="run-1:detail",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+
+@pytest.mark.asyncio
+async def test_finalize_constraint_error_is_reconciled_once_and_not_retried():
+    """A deterministic 23514 must never be mislabeled as a transient retry."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    constraint = APIError({
+        "message": "reservation with usage cannot be released",
+        "code": "23514",
+        "hint": None,
+        "details": None,
+    })
+    reserved = _response([{
+        "id": "reservation-1",
+        "claim_token": "11111111-1111-4111-8111-111111111111",
+        "status": "reserved",
+    }])
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", return_value=UUID(
+            "11111111-1111-4111-8111-111111111111"
+        )),
+        patch("worker.proxy_usage.run_query", side_effect=[
+            _response([{
+                "allowed": True,
+                "reservation_id": "reservation-1",
+                "claim_status": "claimed",
+                "blocking_scope": None,
+            }]),
+            constraint,
+            reserved,
+            constraint,
+            reserved,
+            constraint,
+            reserved,
+        ]),
+    ):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="health",
+                transaction_key="health-1",
+            ):
+                pass
+
+    finalize_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_finalize_budget_reservation"
+    ]
+    assert len(finalize_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_release_retries_when_reservation_is_still_reserved():
+    """A release that provably did not commit is safe to retry with the same claim."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        httpx.RemoteProtocolError("server disconnected"),
+        _response([{
+            "id": "reservation-1",
+            "claim_token": "11111111-1111-4111-8111-111111111111",
+            "status": "reserved",
+        }]),
+        _response(None),
+    ]):
+        with patch("worker.proxy_usage.uuid.uuid4", return_value=UUID(
+            "11111111-1111-4111-8111-111111111111"
+        )):
+            async with tracker.track(
+                operation="health",
+                transaction_key="health-1",
+            ):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_release_rejects_the_opposite_terminal_state():
+    """A finalized paid reservation cannot be reinterpreted as a release."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        httpx.RemoteProtocolError("server disconnected"),
+        _response([{
+            "id": "reservation-1",
+            "claim_token": "11111111-1111-4111-8111-111111111111",
+            "status": "finalized",
+        }]),
+    ]):
+        with patch("worker.proxy_usage.uuid.uuid4", return_value=UUID(
+            "11111111-1111-4111-8111-111111111111"
+        )):
+            with pytest.raises(ProxyUsagePersistenceError):
+                async with tracker.track(
+                    operation="health",
+                    transaction_key="health-1",
+                ):
+                    pass
+
+
+@pytest.mark.asyncio
+async def test_finalize_recovery_exhausts_exactly_three_attempts():
+    """Persistent finalize ambiguity remains fail-closed and bounded."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True)
+    calls = [_response([{
+        "allowed": True,
+        "reservation_id": "reservation-1",
+        "claim_status": "claimed",
+        "blocking_scope": None,
+    }])]
+    for _ in range(3):
+        calls.extend([
+            httpx.RemoteProtocolError("server disconnected"),
+            _response([{
+                "id": "reservation-1",
+                "claim_token": "11111111-1111-4111-8111-111111111111",
+                "status": "reserved",
+            }]),
+        ])
+
+    with (
+        patch("worker.proxy_usage.uuid.uuid4", return_value=UUID(
+            "11111111-1111-4111-8111-111111111111"
+        )),
+        patch("worker.proxy_usage.run_query", side_effect=calls) as query,
+    ):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="health",
+                transaction_key="health-1",
+            ):
+                pass
+
+    assert query.await_count == 7
+
+
+@pytest.mark.asyncio
 async def test_usage_tracker_inherits_request_attribution_for_mint_search_and_detail():
     """Dropping request context must make paid API work unattributed again."""
     sb = _supabase()
@@ -227,6 +794,40 @@ async def test_api_rejects_unknown_sync_run_before_reservation_or_provider_work(
 
     assert entered is False
     sb.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_api_transient_scope_read_retries_before_reservation():
+    """A transient attribution read must not mint or pause until bounded retry ends."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=True, component="api")
+    entered = False
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        httpx.RemoteProtocolError("server disconnected"),
+        _response([{"id": "33333333-3333-4333-8333-333333333333"}]),
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with usage_scope(
+            law_firm_id="11111111-1111-4111-8111-111111111111",
+            case_id="22222222-2222-4222-8222-222222222222",
+            sync_run_id="33333333-3333-4333-8333-333333333333",
+        ):
+            async with tracker.track(
+                operation="search",
+                transaction_key="run-1:search",
+            ):
+                entered = True
+                record_proxy_request(10)
+                record_proxy_response(90)
+
+    assert entered is True
 
 
 @pytest.mark.asyncio

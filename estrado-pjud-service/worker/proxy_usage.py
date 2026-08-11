@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
+
+import httpx
+from postgrest.exceptions import APIError
 
 from app.bandwidth import ProxyUsageCapture, capture_proxy_usage
 from app.proxy_billing import is_proxy_billing_error
@@ -32,6 +36,7 @@ ESTIMATED_OPERATION_BYTES = {
     "health": 1_000_000,
     "other": 5_000_000,
 }
+_TELEMETRY_RETRY_DELAYS_S = (0.1, 0.25)
 
 
 class ProxyUsageTracker:
@@ -49,6 +54,189 @@ class ProxyUsageTracker:
         self._component = component
         self._provider = provider
         self._price_per_gb_usd = price_per_gb_usd
+
+    async def _owned_reservation(
+        self, idempotency_key: str, claim_token: str,
+    ) -> dict | None:
+        response = await run_query(
+            self._sb.from_("pjud_proxy_budget_reservations")
+            .select("id,claim_token,status,blocking_scope")
+            .eq("idempotency_key", idempotency_key)
+            .eq("claim_token", claim_token)
+            .limit(1)
+        )
+        rows = response.data if isinstance(response.data, list) else []
+        if len(rows) != 1 or rows[0].get("claim_token") != claim_token:
+            return None
+        return rows[0]
+
+    async def _existing_usage_event(self, payload: dict) -> dict | None:
+        response = await run_query(
+            self._sb.from_("pjud_proxy_usage_events")
+            .select(",".join(payload))
+            .eq("idempotency_key", payload["idempotency_key"])
+            .limit(1)
+        )
+        rows = response.data if isinstance(response.data, list) else []
+        if not rows:
+            return None
+        if len(rows) != 1 or any(
+            rows[0].get(field) != value for field, value in payload.items()
+        ):
+            raise RuntimeError("usage ledger immutable event mismatch")
+        return rows[0]
+
+    async def _persist_usage_event(self, payload: dict) -> None:
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        operation = str(payload["operation"])
+        for attempt in range(attempts):
+            try:
+                query = (
+                    self._sb.from_("pjud_proxy_usage_events").insert(payload)
+                    if attempt == 0
+                    else self._sb.from_("pjud_proxy_usage_events").upsert(
+                        payload,
+                        on_conflict="idempotency_key",
+                        ignore_duplicates=True,
+                    )
+                )
+                response = await run_query(query)
+                rows = response.data if isinstance(response.data, list) else []
+                if len(rows) == 1:
+                    return
+                if len(rows) > 1:
+                    raise RuntimeError("usage ledger write returned multiple rows")
+                if await self._existing_usage_event(payload) is not None:
+                    return
+            except httpx.TransportError:
+                logger.warning(
+                    "Transient proxy telemetry boundary=ledger operation=%s "
+                    "attempt=%d/%d; reconciling",
+                    operation,
+                    attempt + 1,
+                    attempts,
+                )
+                try:
+                    if await self._existing_usage_event(payload) is not None:
+                        return
+                except httpx.TransportError:
+                    pass
+
+            if attempt == attempts - 1:
+                raise RuntimeError(
+                    "usage ledger insert outcome could not be reconciled"
+                )
+            await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+
+    async def _reserve_budget(
+        self,
+        *,
+        case_id: str | None,
+        law_firm_id: str | None,
+        estimated_cost: float,
+        idempotency_key: str,
+        claim_token: str,
+        operation: str,
+    ) -> dict:
+        payload = {
+            "p_case_id": case_id,
+            "p_law_firm_id": law_firm_id,
+            "p_estimated_cost_usd": estimated_cost,
+            "p_idempotency_key": idempotency_key,
+            "p_claim_token": claim_token,
+            "p_provider": self._provider,
+            "p_operation": operation,
+        }
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._sb.rpc("pjud_proxy_reserve_budget", payload)
+                )
+                rows = response.data if isinstance(response.data, list) else []
+                if len(rows) != 1:
+                    raise RuntimeError("budget reservation did not return one row")
+                reservation = rows[0]
+                if reservation.get("claim_status") == "already_reserved":
+                    existing = await self._owned_reservation(
+                        idempotency_key, claim_token,
+                    )
+                    if (
+                        existing is not None
+                        and existing.get("id") == reservation.get("reservation_id")
+                        and existing.get("status") == "reserved"
+                    ):
+                        return {
+                            **reservation,
+                            "allowed": True,
+                            "claim_status": "recovered_reserved",
+                        }
+                return reservation
+            except httpx.TransportError:
+                logger.warning(
+                    "Transient proxy telemetry boundary=reservation operation=%s "
+                    "attempt=%d/%d; reconciling",
+                    operation,
+                    attempt + 1,
+                    attempts,
+                )
+                try:
+                    existing = await self._owned_reservation(
+                        idempotency_key, claim_token,
+                    )
+                except httpx.TransportError:
+                    existing = None
+                if existing is not None:
+                    status = existing.get("status")
+                    if status in {"reserved", "blocked"}:
+                        return {
+                            "allowed": status == "reserved",
+                            "reservation_id": existing["id"],
+                            "claim_status": f"recovered_{status}",
+                            "blocking_scope": existing.get("blocking_scope"),
+                        }
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+
+        raise RuntimeError("unreachable telemetry reservation retry state")
+
+    async def _validate_sync_scope(
+        self,
+        *,
+        sync_run_id: str,
+        case_id: str | None,
+        law_firm_id: str | None,
+        operation: str,
+    ) -> None:
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._sb.from_("case_sync_runs")
+                    .select("id")
+                    .eq("id", sync_run_id)
+                    .eq("case_id", case_id)
+                    .eq("law_firm_id", law_firm_id)
+                    .limit(1)
+                )
+                rows = response.data if isinstance(response.data, list) else []
+                if len(rows) != 1:
+                    raise RuntimeError(
+                        "sync run attribution does not match case and law firm"
+                    )
+                return
+            except httpx.TransportError:
+                logger.warning(
+                    "Transient proxy telemetry boundary=scope operation=%s "
+                    "attempt=%d/%d",
+                    operation,
+                    attempt + 1,
+                    attempts,
+                )
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
 
     @asynccontextmanager
     async def track(
@@ -89,41 +277,20 @@ class ProxyUsageTracker:
 
         try:
             if self._component == "api" and sync_run_id is not None:
-                scope_response = await run_query(
-                    self._sb.from_("case_sync_runs")
-                    .select("id")
-                    .eq("id", sync_run_id)
-                    .eq("case_id", case_id)
-                    .eq("law_firm_id", law_firm_id)
-                    .limit(1)
+                await self._validate_sync_scope(
+                    sync_run_id=sync_run_id,
+                    case_id=case_id,
+                    law_firm_id=law_firm_id,
+                    operation=operation,
                 )
-                scope_rows = (
-                    scope_response.data
-                    if isinstance(scope_response.data, list)
-                    else []
-                )
-                if len(scope_rows) != 1:
-                    raise RuntimeError("sync run attribution does not match case and law firm")
-            reserve_response = await run_query(self._sb.rpc(
-                "pjud_proxy_reserve_budget",
-                {
-                    "p_case_id": case_id,
-                    "p_law_firm_id": law_firm_id,
-                    "p_estimated_cost_usd": estimated_cost,
-                    "p_idempotency_key": idempotency_key,
-                    "p_claim_token": claim_token,
-                    "p_provider": self._provider,
-                    "p_operation": operation,
-                },
-            ))
-            reserve_rows = (
-                reserve_response.data
-                if isinstance(reserve_response.data, list)
-                else []
+            reservation = await self._reserve_budget(
+                case_id=case_id,
+                law_firm_id=law_firm_id,
+                estimated_cost=estimated_cost,
+                idempotency_key=idempotency_key,
+                claim_token=claim_token,
+                operation=operation,
             )
-            if len(reserve_rows) != 1:
-                raise RuntimeError("budget reservation did not return one row")
-            reservation = reserve_rows[0]
         except Exception as exc:
             raise ProxyUsagePersistenceError(
                 "proxy budget reservation unavailable"
@@ -184,7 +351,9 @@ class ProxyUsageTracker:
         has_provider_usage = usage.request_count > 0
         has_savings_event = usage.documents_skipped > 0
         if not has_provider_usage and not has_savings_event:
-            await self._finalize(reservation_id, claim_token, release=True)
+            await self._finalize(
+                reservation_id, claim_token, release=True, operation=operation,
+            )
             return
 
         if error is not None:
@@ -233,12 +402,7 @@ class ProxyUsageTracker:
             "provider": self._provider,
             "price_per_gb_usd": self._price_per_gb_usd,
         }
-        insert_response = await run_query(
-            self._sb.from_("pjud_proxy_usage_events").insert(payload)
-        )
-        inserted = insert_response.data if isinstance(insert_response.data, list) else []
-        if len(inserted) != 1:
-            raise RuntimeError("usage ledger insert did not return one row")
+        await self._persist_usage_event(payload)
 
         # The append-only causal fact already exists once INSERT succeeds. A
         # later reservation-finalize outage must not attribute the same marker
@@ -253,19 +417,87 @@ class ProxyUsageTracker:
             reservation_id,
             claim_token,
             release=not has_provider_usage,
+            operation=operation,
         )
 
     async def _finalize(
-        self, reservation_id: str, claim_token: str, *, release: bool,
+        self,
+        reservation_id: str,
+        claim_token: str,
+        *,
+        release: bool,
+        operation: str,
     ) -> None:
-        await run_query(self._sb.rpc(
-            "pjud_proxy_finalize_budget_reservation",
-            {
-                "p_reservation_id": reservation_id,
-                "p_claim_token": claim_token,
-                "p_release": release,
-            },
-        ))
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        expected_status = "released" if release else "finalized"
+        payload = {
+            "p_reservation_id": reservation_id,
+            "p_claim_token": claim_token,
+            "p_release": release,
+        }
+        for attempt in range(attempts):
+            failure: Exception | None = None
+            retryable = True
+            try:
+                await run_query(self._sb.rpc(
+                    "pjud_proxy_finalize_budget_reservation", payload,
+                ))
+                return
+            except httpx.TransportError as exc:
+                failure = exc
+            except APIError as exc:
+                if exc.code != "23514":
+                    raise
+                failure = exc
+                retryable = False
+
+            if retryable:
+                logger.warning(
+                    "Transient proxy telemetry boundary=finalize operation=%s "
+                    "attempt=%d/%d; reconciling",
+                    operation,
+                    attempt + 1,
+                    attempts,
+                )
+            else:
+                logger.warning(
+                    "Proxy telemetry boundary=finalize operation=%s "
+                    "constraint; reconciling once",
+                    operation,
+                )
+            try:
+                response = await run_query(
+                    self._sb.from_("pjud_proxy_budget_reservations")
+                    .select("id,claim_token,status")
+                    .eq("id", reservation_id)
+                    .eq("claim_token", claim_token)
+                    .limit(1)
+                )
+            except httpx.TransportError:
+                response = None
+
+            if response is not None:
+                rows = response.data if isinstance(response.data, list) else []
+                if len(rows) != 1:
+                    raise RuntimeError(
+                        "budget finalization reservation ownership was not found"
+                    ) from failure
+                status = rows[0].get("status")
+                if status == expected_status:
+                    return
+                if status not in {"reserved", "unresolved"}:
+                    raise RuntimeError(
+                        "budget finalization reached an unexpected terminal state"
+                    ) from failure
+
+            if not retryable:
+                raise failure
+
+            if attempt == attempts - 1:
+                raise RuntimeError(
+                    "budget finalization outcome could not be reconciled"
+                ) from failure
+            await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
 
 
 DISABLED_PROXY_USAGE = ProxyUsageTracker(None, enabled=False, component="api")
