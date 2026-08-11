@@ -110,3 +110,108 @@ class TestScheduler:
         assert is_scheduled_processing_window(
             datetime(2026, 8, 6, 19, 0, tzinfo=timezone.utc)
         ) is True
+
+    @pytest.mark.asyncio
+    async def test_release_prefers_fenced_rpc(self):
+        from worker.scheduler import Scheduler
+
+        mock_sb = MagicMock()
+        rpc_query = MagicMock()
+        mock_sb.rpc.return_value = rpc_query
+        rpc_query.execute.return_value = MagicMock(data=["case-1"])
+
+        await Scheduler(_mock_config(), mock_sb).release_batch(["case-1"])
+
+        mock_sb.rpc.assert_called_once_with("release_pjud_sync_claims", {
+            "p_worker_id": "test-worker",
+            "p_case_ids": ["case-1"],
+        })
+        mock_sb.from_.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_release_falls_back_to_cas_update_before_rpc_migration(self):
+        from worker.scheduler import Scheduler
+
+        missing_rpc = RuntimeError({"code": "PGRST202", "message": "not found"})
+        mock_sb = MagicMock()
+        rpc_query = MagicMock()
+        direct_query = MagicMock()
+        mock_sb.rpc.return_value = rpc_query
+        mock_sb.from_.return_value.update.return_value.in_.return_value.eq.return_value = direct_query
+        rpc_query.execute.side_effect = missing_rpc
+        direct_query.execute.return_value = MagicMock(data=[{"id": "case-1"}])
+
+        await Scheduler(_mock_config(), mock_sb).release_batch(["case-1"])
+
+        mock_sb.from_.return_value.update.assert_called_once_with({
+            "sync_worker_id": None,
+            "sync_claimed_at": None,
+        })
+        mock_sb.from_.return_value.update.return_value.in_.assert_called_once_with(
+            "id", ["case-1"]
+        )
+        mock_sb.from_.return_value.update.return_value.in_.return_value.eq.assert_called_once_with(
+            "sync_worker_id", "test-worker"
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_retries_rpc_if_migration_lands_before_direct_fallback(self):
+        from worker.scheduler import Scheduler
+
+        missing_rpc = RuntimeError({"code": "PGRST202", "message": "not found"})
+        trigger_rejected = RuntimeError({"code": "42501", "message": "fenced"})
+        mock_sb = MagicMock()
+        first_rpc = MagicMock()
+        stale_cache_rpc = MagicMock()
+        second_stale_cache_rpc = MagicMock()
+        refreshed_rpc = MagicMock()
+        direct_query = MagicMock()
+        mock_sb.rpc.side_effect = [
+            first_rpc,
+            stale_cache_rpc,
+            second_stale_cache_rpc,
+            refreshed_rpc,
+        ]
+        mock_sb.from_.return_value.update.return_value.in_.return_value.eq.return_value = direct_query
+        first_rpc.execute.side_effect = missing_rpc
+        direct_query.execute.side_effect = trigger_rejected
+        stale_cache_rpc.execute.side_effect = missing_rpc
+        second_stale_cache_rpc.execute.side_effect = missing_rpc
+        refreshed_rpc.execute.return_value = MagicMock(data=["case-1"])
+
+        with patch("worker.scheduler.asyncio.sleep", new=AsyncMock()) as sleep:
+            await Scheduler(_mock_config(), mock_sb).release_batch(["case-1"])
+
+        assert mock_sb.rpc.call_count == 4
+        assert [call.args[0] for call in sleep.await_args_list] == [0.25, 0.5]
+
+    @pytest.mark.asyncio
+    async def test_release_preserves_direct_error_after_schema_cache_retry_exhaustion(self):
+        from worker.scheduler import RELEASE_SCHEMA_CACHE_RETRY_DELAYS, Scheduler
+
+        missing_rpc = RuntimeError({"code": "PGRST202", "message": "not found"})
+        trigger_rejected = RuntimeError({"code": "42501", "message": "fenced"})
+        mock_sb = MagicMock()
+        mock_sb.rpc.return_value.execute.side_effect = missing_rpc
+        mock_sb.from_.return_value.update.return_value.in_.return_value.eq.return_value.execute.side_effect = trigger_rejected
+
+        with patch("worker.scheduler.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(RuntimeError, match="fenced"):
+                await Scheduler(_mock_config(), mock_sb).release_batch(["case-1"])
+
+        assert mock_sb.rpc.call_count == 2 + len(RELEASE_SCHEMA_CACHE_RETRY_DELAYS)
+        assert sleep.await_count == len(RELEASE_SCHEMA_CACHE_RETRY_DELAYS)
+
+    @pytest.mark.asyncio
+    async def test_release_does_not_hide_non_missing_rpc_failure(self):
+        from worker.scheduler import Scheduler
+
+        mock_sb = MagicMock()
+        mock_sb.rpc.return_value.execute.side_effect = RuntimeError(
+            {"code": "PGRST301", "message": "database unavailable"}
+        )
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await Scheduler(_mock_config(), mock_sb).release_batch(["case-1"])
+
+        mock_sb.from_.assert_not_called()
