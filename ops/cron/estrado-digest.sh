@@ -40,7 +40,41 @@ RUNS_SUCCESS_24=$(cnt "case_sync_runs?select=id&created_at=gte.$SINCE&status=eq.
 RUNS_ERROR_24=$(cnt "case_sync_runs?select=id&created_at=gte.$SINCE&status=eq.error")
 RUNS_BLOCKED_24=$(cnt "case_sync_runs?select=id&created_at=gte.$SINCE&status=eq.blocked")
 
-HB=$(curl -s -m 20 "$API/sync_worker_heartbeats?select=worker_id,status,last_heartbeat_at,cases_synced_today,errors_today,pool_size&order=last_heartbeat_at.desc&limit=1" "${AUTH[@]}" 2>/dev/null)
+# El heartbeat se cruza desde PostgREST, pero su respuesta nunca es material para
+# Luna/Telegram: un 401/500 puede traer `hint`, `message` o detalles internos. Sólo
+# aceptamos HTTP 200 y una fila exactamente con el esquema que el worker publica;
+# el resultado es un resumen propio y allowlisted, o "sin datos".
+heartbeat_summary() {
+  local response body http
+  response=$(curl -s -m 20 -w $'\n%{http_code}' \
+    "$API/sync_worker_heartbeats?select=worker_id,status,last_heartbeat_at,cases_synced_today,errors_today,pool_size&order=last_heartbeat_at.desc&limit=1" \
+    "${AUTH[@]}" 2>/dev/null || true)
+  http=${response##*$'\n'}
+  body=${response%$'\n'*}
+  [ "$http" = "200" ] || { echo "sin datos"; return; }
+
+  printf '%s' "$body" | jq -er '
+    def non_negative_integer:
+      type == "number" and . >= 0 and floor == .;
+    def timestamp:
+      type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$");
+    if type == "array" and length == 1 and
+       (.[0] | type == "object") and
+       (.[0] | keys | sort) == ["cases_synced_today", "errors_today", "last_heartbeat_at", "pool_size", "status", "worker_id"] and
+       (.[0].worker_id | type == "string") and
+       (.[0].status | IN("starting", "paused", "running", "backoff", "idle_off_hours", "stopped")) and
+       (.[0].last_heartbeat_at | timestamp) and
+       (.[0].cases_synced_today | non_negative_integer) and
+       (.[0].errors_today | non_negative_integer) and
+       (.[0].pool_size | non_negative_integer)
+    then .[0] |
+      "estado \(.status) | última señal \(.last_heartbeat_at) | causas hoy \(.cases_synced_today) | errores hoy \(.errors_today) | pool \(.pool_size)"
+    else empty
+    end
+  ' 2>/dev/null || echo "sin datos"
+}
+
+HB=$(heartbeat_summary)
 
 METRICS="Fecha (UTC): $DIGEST_DATE_UTC
 Estudios (law_firms): $FIRMS

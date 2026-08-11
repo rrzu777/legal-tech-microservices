@@ -376,6 +376,41 @@ OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
 expect_contains "recaída tras recuperación vuelve a alertar" "$OUT" "proxy-control:telemetry-unavailable"
 unset WDS
 
+echo "== chequeo 8: la recuperación fuera de ventana reinicia sólo con evidencia =="
+# Esta secuencia mata la mutación que deja de observar el control fuera de horario:
+# una pausa avisada el viernes debe poder recuperarse el fin de semana, para que una
+# recaída idéntica del lunes sea una alerta nueva. No se consulta `stuck` fuera de
+# horario ni se emite una alerta por esa lectura de control.
+WDS=$(mktemp -d "$TMP/proxy-control-off-hours-recovery-XXXXXX")
+VIERNES_1759=$(date -u -d '2026-08-14T21:59:00Z' +%s)
+SABADO_1000=$(date -u -d '2026-08-15T14:00:00Z' +%s)
+LUNES_1000=$(date -u -d '2026-08-17T14:00:00Z' +%s)
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$VIERNES_1759" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "viernes Chile alerta la pausa" "$OUT" "proxy-control:telemetry-unavailable"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$SABADO_1000" \
+  WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' run "$BASE")
+expect_missing "enabled fuera de ventana no alerta" "$OUT" "proxy-control:"
+expect_missing "enabled fuera de ventana no ejecuta stuck" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$LUNES_1000" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "misma pausa el lunes vuelve a alertar tras recuperación" "$OUT" "proxy-control:telemetry-unavailable"
+unset WDS
+
+echo "== chequeo 8: control incierto fuera de ventana no borra ni alerta =="
+WDS=$(mktemp -d "$TMP/proxy-control-off-hours-unavailable-XXXXXX")
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$VIERNES_1759" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "viernes deja una causa deduplicada" "$OUT" "proxy-control:telemetry-unavailable"
+STATE_BEFORE=$(cksum "$WDS/estrado-wd-proxy-control-root")
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$SABADO_1000" \
+  WD_PROXY_CONTROL_JSON='{"message":"401 sentinel secreto"}' run "$BASE")
+expect_missing "control incierto fuera de ventana no genera alerta ciega" "$OUT" "proxy-control-unavailable"
+expect_missing "control incierto fuera de ventana no filtra sentinel" "$OUT" "401 sentinel secreto"
+expect_equals "control incierto fuera de ventana conserva la causa deduplicada" \
+  "$(cksum "$WDS/estrado-wd-proxy-control-root")" "$STATE_BEFORE"
+unset WDS
+
 echo "== chequeo 8: consulta sólo causas elegibles =="
 STUCK_BLOCK=$(awk '/^# 8\. Causas atascadas/{inside=1} /^# 9\. La API/{inside=0} inside' "$WD")
 for literal in \

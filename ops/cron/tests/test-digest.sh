@@ -53,7 +53,12 @@ if [[ " $* " == *" -I "* ]]; then
     printf 'HTTP/1.1 200 OK\r\n\r\n'
   fi
 else
-  printf '[]'
+  if [[ " $* " == *'sync_worker_heartbeats?'* ]]; then
+    printf '%s' "${DIGEST_HEARTBEAT_BODY:-[]}"
+    [[ " $* " == *' -w '* ]] && printf '\n%s' "${DIGEST_HEARTBEAT_STATUS:-200}"
+  else
+    printf '[]'
+  fi
 fi
 EOF
 cat > "$TMP/bin/sudo" <<'EOF'
@@ -68,7 +73,7 @@ cat > "$TMP/bin/hermes" <<'EOF'
 #!/bin/bash
 if [ "$1" = '-z' ]; then
   printf '%s' "$2" > "$DIGEST_PROMPT_CAPTURE"
-  printf 'digest simulado'
+  [ "${DIGEST_HERMES_EMPTY:-0}" = 1 ] || printf 'digest simulado'
 else
   cat > "$DIGEST_SEND_CAPTURE"
 fi
@@ -118,6 +123,34 @@ DIGEST_FAKE_CONTENT_RANGE='malformed/99' run
 PROMPT=$(<"$TMP/prompt")
 expect_contains 'header corrupto se mantiene como sin datos' "$PROMPT" 'sin datos'
 expect_missing 'header corrupto no se convierte en noventa y nueve' "$PROMPT" 'Corridas últimas 24h: 99 total'
+
+echo '== digest: heartbeat normalizado no reenvía respuestas PostgREST =='
+DIGEST_HEARTBEAT_BODY='[{"worker_id":"worker-1","status":"running","last_heartbeat_at":"2026-08-10T11:59:00-04:00","cases_synced_today":7,"errors_today":1,"pool_size":3}]' run
+PROMPT=$(<"$TMP/prompt")
+expect_contains 'heartbeat válido se resume con campos seguros' "$PROMPT" \
+  'Worker heartbeat (más reciente): estado running | última señal 2026-08-10T11:59:00-04:00 | causas hoy 7 | errores hoy 1 | pool 3'
+expect_missing 'heartbeat válido no expone worker_id' "$PROMPT" 'worker-1'
+
+assert_heartbeat_is_safe() { # <nombre> <body> <status> <sentinel>
+  local prompt sent
+  DIGEST_HEARTBEAT_BODY="$2" DIGEST_HEARTBEAT_STATUS="$3" DIGEST_HERMES_EMPTY=1 run
+  prompt=$(<"$TMP/prompt")
+  sent=$(<"$TMP/send")
+  expect_contains "$1 muestra sin datos" "$prompt" 'Worker heartbeat (más reciente): sin datos'
+  expect_missing "$1 no llega a Luna" "$prompt" "$4"
+  expect_missing "$1 no llega al fallback Telegram" "$sent" "$4"
+}
+
+assert_heartbeat_is_safe '401' \
+  '{"message":"401 unauthorized https://secret.invalid","hint":"no filtrar"}' 401 'https://secret.invalid'
+assert_heartbeat_is_safe '500' \
+  '{"message":"500 upstream sentinel"}' 500 'upstream sentinel'
+assert_heartbeat_is_safe 'JSON malformado' \
+  '[{"worker_id":"worker-1"' 200 'worker-1'
+assert_heartbeat_is_safe 'error con hint' \
+  '{"code":"PGRST","hint":"raw hint sentinel"}' 200 'raw hint sentinel'
+assert_heartbeat_is_safe 'campo allowlisted con sentinel' \
+  '[{"worker_id":"worker-1","status":"https://secret.invalid/status","last_heartbeat_at":"2026-08-10T11:59:00-04:00","cases_synced_today":7,"errors_today":1,"pool_size":3}]' 200 'https://secret.invalid/status'
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

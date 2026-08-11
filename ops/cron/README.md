@@ -104,7 +104,9 @@ siguiente volvía a alertar por causas viejas.
 
 Antes del chequeo 8, dentro de la ventana laboral lunes a viernes [10:00,18:00) Chile, el watchdog
 consulta una sola fila `pjud_proxy_control` de IPRoyal. Sólo `enabled` permite diagnosticar un atraso
-como scheduler. Las causas allowlisted `billing_exhausted`, `budget_exhausted`,
+como scheduler. Fuera de esa ventana no corre la consulta `stuck` ni emite alertas de control, pero
+una lectura `enabled` sí limpia la deduplicación previa: una recaída posterior vuelve a ser visible.
+Una respuesta ausente o inválida fuera de horario no borra ese estado ni inventa una alerta. Las causas allowlisted `billing_exhausted`, `budget_exhausted`,
 `paused/telemetry_unavailable` y `paused/ops_pause` emiten su causa raíz y suprimen ese falso
 warning. Fila ausente, JSON inválido, error de PostgREST o sentinels desconocidos se tratan como
 `proxy-control-unavailable`: el chequeo queda ciego y tampoco culpa al scheduler. Nunca se copia el
@@ -113,6 +115,8 @@ texto crudo de la base al mensaje o a la firma.
 El digest separa las corridas creadas en las últimas 24 horas (`success`, `error`, `blocked`) del
 estado actual de causas (`last_sync_status=error` y `sync_blocked_until` futuro). Un `Content-Range`
 ausente, wildcard o inválido aparece como `sin datos`, nunca como cero; Luna recibe esa misma regla.
+El heartbeat exige HTTP 200 y el esquema allowlisted del worker antes de resumirse; 401, 500,
+JSON malformado, hints y sentinels se vuelven `sin datos` y nunca salen a Luna o Telegram.
 El dashboard web ya suprime el aviso de atraso cuando su evidencia de worker/proxy no está sana; esta
 correlación mantiene al watchdog y al digest en la misma precedencia.
 

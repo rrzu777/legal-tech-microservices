@@ -464,6 +464,15 @@ if stuck_window_open; then
       [ -n "${PROXY_CONTROL_NEW// }" ] && add "No pude confirmar el control persistente de IPRoyal; el chequeo de causas vencidas queda ciego y no atribuye el atraso al scheduler." "proxy-control-unavailable"
       ;;
   esac
+else
+  # Fuera de la ventana no hay oportunidad de que el scheduler procese `stuck`,
+  # por lo que no se consulta ni se alerta. Aun así, una confirmación `enabled`
+  # es evidencia suficiente para olvidar una causa raíz anterior: sin este
+  # refresh una recaída idéntica tras recuperación nocturna quedaría deduplicada
+  # hasta la próxima firma distinta. Cualquier respuesta incierta conserva el
+  # estado y permanece silenciosa; no inventamos recuperación ni una alerta extra.
+  read_proxy_control
+  [ "$?" -eq 0 ] && nuevas_claves proxy-control-root "" >/dev/null
 fi
 
 # 9. La API de scraping: viva no es lo mismo que útil.
@@ -533,7 +542,7 @@ else
     # El uptime va en el mensaje porque el contador se resetea con el proceso: sin él,
     # una falla vieja y una tormenta de hace diez minutos se leen igual.
     UP_H=$(jq -r 'if (.uptime_seconds|type)=="number" then (.uptime_seconds/3600|floor) else "?" end' < "$API_BODY" 2>/dev/null || echo "?")
-    add "El pool no pudo entregar sesión ${POOL_FAIL} vez(ces) en las últimas ${UP_H}h de uptime de la API. No es un bloqueo de OJV: es nuestro lado (sin bundle F5, sin proxy, initialize() que revienta). La API devuelve 500 a toda consulta mientras dure." "pool-fail"
+    add "El pool no pudo entregar sesión ${POOL_FAIL} vez(ces) en las últimas ${UP_H}h de uptime de la API. No es un bloqueo de OJV: es nuestro lado (sin bundle F5, sin proxy, initialize() que revienta). La indisponibilidad operacional tipada responde 503; un defecto inesperado sigue siendo 500 interno." "pool-fail"
   fi
 fi
 rm -f "$API_BODY"
