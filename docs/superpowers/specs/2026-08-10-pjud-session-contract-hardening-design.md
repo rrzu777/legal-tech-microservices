@@ -93,12 +93,20 @@ IP. No se cambiará de IP por status HTTP atribuible a PJUD, errores de parser,
 validación determinista, billing, presupuesto ni telemetría. Sí se permitirá
 para fallos de túnel, transporte o challenge que una nueva salida pueda resolver.
 
-La adquisición interactiva usará un deadline monotónico total de 20 segundos.
-Navegación, espera de formulario, inicialización y retries consumirán el mismo
-presupuesto; ninguna fase podrá iniciar ni continuar fuera de él. La cancelación
-deberá cerrar siempre page, context/browser y adapter. Se mantiene el máximo
-actual de tres IP nuevas, subordinado al deadline: agotados los 20 segundos no
-se inicia otro intento aunque queden IP disponibles.
+La adquisición interactiva usará un deadline monotónico de 20 segundos para
+todo trabajo pagado contra PJUD/proxy. Navegación, espera de formulario,
+inicialización y retries consumirán el mismo presupuesto; ninguna llamada a
+PJUD podrá iniciar ni continuar fuera de él. Se mantiene el máximo actual de
+tres IP nuevas, subordinado al deadline: agotados los 20 segundos no se inicia
+otro intento aunque queden IP disponibles.
+
+El cierre de page/context/browser/adapter y la finalización durable de
+telemetría ocurrirán después del corte si fuese necesario: no se cancelarán para
+simular una respuesta más rápida, porque eso dejaría consumo sin registrar o
+recursos abiertos. Esas tareas conservarán sus timeouts y retries acotados. Por
+lo tanto, 20 segundos es el máximo de tráfico pagado de la adquisición, no una
+promesa de wall clock exacto para la respuesta HTTP bajo una caída simultánea de
+telemetría.
 
 ### Track 3: store compartido sin actualizaciones perdidas
 
@@ -214,7 +222,9 @@ nombres variables ya son representables por `dict[str, str]`.
   se acepta y funciona aunque no exista `TSPD_101`.
 - Un challenge HTTP 200 sin formulario o detectado durante `initialize()` se
   rechaza y sólo rota IP cuando corresponde.
-- Ninguna adquisición interactiva supera el deadline total definido.
+- Ninguna adquisición interactiva inicia o mantiene tráfico pagado contra PJUD
+  después del deadline de 20 segundos; cleanup y telemetría durable se completan
+  sin abrir tráfico PJUD adicional.
 - Dos escritores concurrentes no pierden slots ni producen JSON inválido.
 - Los fallos operacionales conocidos devuelven `503`; los bugs continúan visibles
   como `500` interno.
