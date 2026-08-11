@@ -12,6 +12,13 @@ DEFAULT_COOKIE_STORE_PATH = "/var/lib/estrado-pjud/cookies.json"
 PRODUCTION_CHECKOUT = Path("/opt/legal-tech-microservices")
 
 
+class CookieStoreLockTimeoutError(TimeoutError):
+    """The local shared-store lock remained unavailable within its safe bound."""
+
+    def __init__(self):
+        super().__init__("cookie_store_lock_timeout")
+
+
 def validate_cookie_store_path(value: str) -> str:
     """Fail closed if production would persist runtime state inside Git."""
     path = Path(value)
@@ -84,7 +91,7 @@ class CookieStore:
                 except (BlockingIOError, InterruptedError):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError("cookie_store_lock_timeout")
+                        raise CookieStoreLockTimeoutError()
                     time.sleep(min(0.01, remaining))
             yield
         finally:

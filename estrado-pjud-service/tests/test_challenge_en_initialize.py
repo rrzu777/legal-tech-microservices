@@ -229,7 +229,7 @@ async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_reintenta_cuando_otro_egreso_no_ayuda(monkeypatch):
+async def test_known_ojv_5xx_exhaustion_is_safe_pool_unavailable_without_ip_rotation(monkeypatch):
     """Ante un 500 de OJV se sale al primer intento.
 
     Reintentar acá quemaría las tres IPs residenciales para cobrar el mismo no
@@ -241,9 +241,10 @@ async def test_no_reintenta_cuando_otro_egreso_no_ayuda(monkeypatch):
         session_cls=_sesion_guionada([http_status_error(500)]),
     )
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(PoolUnavailableError) as exc_info:
         await pool.acquire()
 
+    assert exc_info.value.code == "upstream_unavailable"
     assert len(capturados) == 1
 
 

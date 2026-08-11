@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.cookie_store import CookieBundle
+from app.cookie_store import CookieBundle, CookieStoreLockTimeoutError
 from app.minter import MintResult
 from app.failure_kind import (
     BlockedPageError,
@@ -65,7 +65,7 @@ class SnapshotAdapter:
 )
 async def test_acquire_wraps_only_exhausted_operational_failures(monkeypatch, tmp_path, failure, expected_code):
     """Removing the API acquisition boundary would leak raw operational failures."""
-    from app.session_pool import APISessionPool
+    from app.session_pool import APISessionPool, _API_COOKIE_STORE_SLOT
 
     settings = Settings(
         API_KEY="t",
@@ -125,7 +125,7 @@ async def test_acquire_preserves_non_operational_failure_identity(monkeypatch, t
 async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, tmp_path):
     """Persisting Playwright cookies after OJV refresh would lose renewed session state."""
     from app import session_pool as pool_module
-    from app.session_pool import APISessionPool
+    from app.session_pool import APISessionPool, _API_COOKIE_STORE_SLOT
 
     settings = Settings(
         API_KEY="t",
@@ -166,7 +166,170 @@ async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, 
 
     await pool._mint_new_bundle()
 
-    assert store.slots["0"].cookies == {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+    assert store.slots["0"].cookies == {"PHPSESSID": "old", "TS-old": "old-f5"}
+    assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {
+        "PHPSESSID": "renewed", "TS-current": "renewed-f5",
+    }
+
+
+@pytest.mark.asyncio
+async def test_on_demand_store_lock_timeout_closes_candidate_without_a_second_ip(monkeypatch, tmp_path):
+    """A local persistence conflict must not spend a second proxy token."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool, _API_COOKIE_STORE_SLOT
+
+    minted_proxies: list[str | None] = []
+    created_sessions = []
+
+    class FreshMinter:
+        def __init__(self, _base_url, proxy=None):
+            minted_proxies.append(proxy)
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "fresh"}, user_agent="fresh-UA")
+
+    class ClosableSession(FakeOJVSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def close(self):
+            self.close_count += 1
+
+    class LockedStore(MemoryCookieStore):
+        def save_slot(self, *_args):
+            raise CookieStoreLockTimeoutError()
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", ClosableSession)
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = LockedStore()
+
+    with pytest.raises(CookieStoreLockTimeoutError):
+        await pool._mint_on_demand()
+
+    assert len(minted_proxies) == 1
+    assert created_sessions[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_during_initialize_closes_api_candidate_once(monkeypatch, tmp_path):
+    """Disconnecting a request cannot leave its initialized HTTP adapter alive."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    started = asyncio.Event()
+    created_sessions = []
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "fresh"}, user_agent="fresh-UA")
+
+    class BlockingSession(FakeOJVSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def initialize(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.close_count += 1
+
+    class Tracker:
+        exited = False
+
+        @asynccontextmanager
+        async def track(self, **_kwargs):
+            try:
+                yield SimpleNamespace(retry_count=0)
+            finally:
+                self.exited = True
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", BlockingSession)
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    tracker = Tracker()
+    pool = APISessionPool(
+        settings,
+        allow_uncontrolled_proxy=True,
+        proxy_usage=tracker,
+    )
+    pool._store = MemoryCookieStore()
+
+    task = asyncio.create_task(pool._mint_new_bundle())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert created_sessions[0].close_count == 1
+    assert tracker.exited is True
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_during_stored_bundle_initialize_closes_session_once(
+    monkeypatch, tmp_path,
+):
+    """The same cleanup applies before a persisted bundle can enter the API pool."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    started = asyncio.Event()
+    created_sessions = []
+
+    class BlockingSession(FakeOJVSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def initialize(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.close_count += 1
+
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", BlockingSession)
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    store = MemoryCookieStore()
+    store.save_slot(0, {"PHPSESSID": "stored"}, "stored-UA", "stored-token")
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = store
+
+    task = asyncio.create_task(pool.acquire())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert created_sessions[0].close_count == 1
 
 
 @pytest.mark.asyncio
@@ -460,7 +623,7 @@ async def test_challenged_stored_bundle_falls_back_to_fresh_on_demand_mint(
 ):
     """A single persisted but challenged IP must not bypass fresh-IP retries."""
     from app import session_pool as pool_module
-    from app.session_pool import APISessionPool
+    from app.session_pool import APISessionPool, _API_COOKIE_STORE_SLOT
 
     settings = Settings(
         API_KEY="t",
@@ -517,7 +680,8 @@ async def test_challenged_stored_bundle_falls_back_to_fresh_on_demand_mint(
         {"TSPD_101": "fresh"},
     ]
     assert len(minted_proxies) == 1
-    assert store.slots["0"].cookies == {"TSPD_101": "fresh"}
+    assert store.slots["0"].cookies == {"TSPD_101": "stale"}
+    assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {"TSPD_101": "fresh"}
     assert api_metrics.snapshot()["total_bundle_retries"] == 1
 
 

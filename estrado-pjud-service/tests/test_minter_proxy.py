@@ -3,8 +3,10 @@ SEPARADAS (server/username/password), nunca embebidas en la URL del
 `server`. Embebidas rompe Chromium con net::ERR_INVALID_AUTH_CREDENTIALS
 (verificado empíricamente en el VPS).
 """
+import asyncio
 from copy import copy
 from http.cookiejar import CookieJar
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -243,10 +245,65 @@ async def test_mint_attributes_chromium_transfer_sizes_to_active_operation():
     assert usage.bytes_down == 1_200
 
 
+async def test_cancelled_mint_closes_browser_before_any_cleanup_telemetry():
+    """A cancelled paid navigation must close Chromium without awaiting page JS."""
+    navigation_started = asyncio.Event()
+    browser_closed = asyncio.Event()
+    telemetry_release = asyncio.Event()
+
+    class Page:
+        def on(self, *_args):
+            pass
+
+        async def goto(self, *_args, **_kwargs):
+            navigation_started.set()
+            await asyncio.Event().wait()
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            raise AssertionError("selector must not run after cancelled navigation")
+
+        async def evaluate(self, *_args, **_kwargs):
+            await telemetry_release.wait()
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+    class Browser:
+        async def new_context(self):
+            return Context()
+
+        async def close(self):
+            browser_closed.set()
+
+    class PlaywrightContext:
+        chromium = SimpleNamespace(launch=AsyncMock(return_value=Browser()))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    with patch("app.minter.async_playwright", return_value=PlaywrightContext()):
+        task = asyncio.create_task(
+            CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint(),
+        )
+        await navigation_started.wait()
+        task.cancel()
+        try:
+            await asyncio.wait_for(browser_closed.wait(), timeout=0.1)
+        finally:
+            telemetry_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_failed_mint_still_attributes_paid_transfer_sizes():
     async_playwright_factory, _, page = _make_playwright_mock()
+    request = MagicMock(post_data_buffer=None)
+    page.on.side_effect = lambda event, callback: callback(request)
     page.wait_for_selector.side_effect = TimeoutError("challenge timeout")
-    page.evaluate.return_value = [{"transferSize": 1_500}]
 
     with patch("app.minter.async_playwright", async_playwright_factory):
         with capture_proxy_usage() as usage:
@@ -256,7 +313,7 @@ async def test_failed_mint_still_attributes_paid_transfer_sizes():
                 ).mint()
 
     assert usage.request_count == 1
-    assert usage.bytes_down == 1_500
+    assert usage.bytes_down == 0
 
 
 async def test_navigation_failure_still_records_that_proxy_was_contacted():

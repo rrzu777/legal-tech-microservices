@@ -27,6 +27,7 @@ _MINT_RETRY_BASE_S = 2.0
 _MINT_RETRY_JITTER_S = 1.0
 _MINT_TRAFFIC_BUDGET_S = 20.0
 _MAX_NEW_STICKY_IPS_PER_MINT = 3
+_CANDIDATE_CLOSE_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -194,13 +195,15 @@ class SessionPool:
                             raise MintUnavailableError("deadline_exceeded") from None
                         raise
                 break
-            except Exception as exc:
+            except BaseException as exc:
                 self.mint_failures += 1
                 if new_session is not None:
                     # La sesion a medio construir se cierra acá: si no, cada
                     # reintento deja un adapter httpx colgado.
                     try:
-                        await new_session.close()
+                        await asyncio.wait_for(
+                            new_session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+                        )
                     except Exception:
                         logger.debug("No se pudo cerrar la sesion fallida del slot %d", slot.index)
                 if (
@@ -243,7 +246,9 @@ class SessionPool:
             # instalar la nueva sesión ni dejar su adapter abierto. El slot
             # anterior sigue intacto porque el swap ocurre sólo más abajo.
             try:
-                await new_session.close()
+                await asyncio.wait_for(
+                    new_session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+                )
             except Exception:
                 logger.debug("No se pudo cerrar la sesion no persistida del slot %d", slot.index)
             raise

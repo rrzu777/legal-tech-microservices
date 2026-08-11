@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 _RETRY_BUDGET_S = 20.0
 _ON_DEMAND_MINT_ATTEMPTS = 3
 _CATALOG_RETIREMENT_CORRELATION_S = 10 * 60
+_CANDIDATE_CLOSE_TIMEOUT_S = 1.0
+# API acquisitions are not worker slots. Keeping this namespace stable avoids
+# replacing slot 0's cookies while the worker still pairs that slot with its
+# in-memory sticky proxy URL for Familia.
+_API_COOKIE_STORE_SLOT = "api_on_demand"
 
 
 class ProxyTrafficDisabledError(RuntimeError):
@@ -266,8 +271,8 @@ class APISessionPool:
                 async with self._mint_usage_scope(intento):
                     await self._initialize_with_deadline(session, limite)
                 return session
-            except Exception as e:
-                await session.close()
+            except BaseException as e:
+                await self._close_candidate_session(session)
                 if is_proxy_billing_error(e):
                     if self._proxy_control is not None:
                         await self._proxy_control.trip_billing_exhausted()
@@ -320,6 +325,15 @@ class APISessionPool:
                 )
 
         raise RuntimeError("unreachable")  # el loop retorna o re-lanza
+
+    async def _close_candidate_session(self, session: OJVSession) -> None:
+        """Bound cleanup for a session that was never handed to a caller."""
+        try:
+            await asyncio.wait_for(
+                session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning("api_mint_candidate_cleanup_unavailable")
 
     async def _mint_on_demand(
         self,
@@ -414,15 +428,15 @@ class APISessionPool:
                             raise MintUnavailableError("deadline_exceeded") from None
                         raise
             self._store.save_slot(
-                0,
+                _API_COOKIE_STORE_SLOT,
                 adapter.snapshot_cookies(),
                 credentials.user_agent,
                 token,
             )
             return session
-        except Exception as exc:
+        except BaseException as exc:
             if session is not None:
-                await session.close()
+                await self._close_candidate_session(session)
             if is_proxy_billing_error(exc) and self._proxy_control is not None:
                 await self._proxy_control.trip_billing_exhausted()
             raise

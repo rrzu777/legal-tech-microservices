@@ -40,6 +40,7 @@ from typing import Literal
 
 import httpx
 
+from app.cookie_store import CookieStoreLockTimeoutError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.proxy_billing import is_proxy_billing_error
 
@@ -56,6 +57,7 @@ PoolFailureCode = Literal[
     "proxy_transport",
     "upstream_unavailable",
     "deadline_exceeded",
+    "cookie_store_unavailable",
 ]
 
 #: De quién fue la culpa de un bloqueo, para el texto que ve el abogado.
@@ -212,6 +214,14 @@ def pool_unavailable_error(error: BaseException) -> PoolUnavailableError | None:
             if error.code == "deadline_exceeded"
             else "upstream_unavailable",
         )
+    if isinstance(error, CookieStoreLockTimeoutError):
+        return PoolUnavailableError("cookie_store_unavailable")
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        if status in {401, 403}:
+            return PoolUnavailableError("session_blocked")
+        if status >= 500 or status == 429:
+            return PoolUnavailableError("upstream_unavailable")
     if isinstance(error, TimeoutError):
         return PoolUnavailableError("deadline_exceeded")
     if isinstance(error, httpx.TransportError) and not is_proxy_billing_error(error):
@@ -268,7 +278,11 @@ def new_egress_may_help(e: BaseException) -> bool:
     Los dos cortan billing, presupuesto, telemetría y cualquier error para el
     que otra IP no puede ayudar antes de asignar otro token sticky.
     """
-    return classify_exception(e) == "infra" and not slot_still_healthy(e)
+    return (
+        not isinstance(e, CookieStoreLockTimeoutError)
+        and classify_exception(e) == "infra"
+        and not slot_still_healthy(e)
+    )
 
 
 def classify_exception(e: BaseException) -> FailureKind:
@@ -288,6 +302,7 @@ def classify_exception(e: BaseException) -> FailureKind:
         (
             httpx.TransportError,
             TimeoutError,
+            CookieStoreLockTimeoutError,
             EmptyResponseError,
             UpstreamChangedError,
             NoUsableBundleError,

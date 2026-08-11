@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from app.minter import MintResult
+from app.cookie_store import CookieStoreLockTimeoutError
 from app.failure_kind import MintUnavailableError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 
@@ -150,6 +151,36 @@ async def test_slot_mint_persists_cookie_jar_after_initialize(monkeypatch):
 
     saved_cookies = fake_store.save_slot.call_args.args[1]
     assert saved_cookies == {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+
+@pytest.mark.asyncio
+async def test_worker_familia_slot_never_reads_api_on_demand_namespace(tmp_path):
+    """The API candidate cannot overwrite cookies paired with worker slot 0's IP."""
+    from app.cookie_store import CookieStore
+    from app.session_pool import _API_COOKIE_STORE_SLOT
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://worker-proxy", proxy_pool_size=1)
+    config.COOKIE_STORE_PATH = str(tmp_path / "cookies.json")
+    pool = sp.SessionPool(config)
+    worker_proxy = "http://worker-slot-zero-proxy"
+    pool._slots = [sp._Slot(index=0, proxy_url=worker_proxy, session=_FakeSession(MagicMock()))]
+
+    store = CookieStore(config.COOKIE_STORE_PATH)
+    store.save_slot(0, {"PHPSESSID": "worker-cookie"}, "worker-UA", "worker-token")
+    store.save_slot(
+        _API_COOKIE_STORE_SLOT,
+        {"PHPSESSID": "api-cookie"},
+        "api-UA",
+        "api-token",
+    )
+
+    bundle, slot = await pool.acquire_familia_bundle()
+    try:
+        assert bundle.cookies == {"PHPSESSID": "worker-cookie"}
+        assert bundle.proxy_url == worker_proxy
+    finally:
+        await pool.release_familia_bundle(slot)
 
 
 @pytest.mark.asyncio
@@ -312,7 +343,7 @@ async def test_slot_mint_save_failure_closes_candidate_and_keeps_previous_slot(m
 
     class FailingStore:
         def save_slot(self, *_args):
-            raise OSError("cookie_store_lock_timeout")
+            raise CookieStoreLockTimeoutError()
 
     monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
     monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
@@ -330,7 +361,7 @@ async def test_slot_mint_save_failure_closes_candidate_and_keeps_previous_slot(m
         last_mint_ts=0,
     )
 
-    with pytest.raises(OSError, match="cookie_store_lock_timeout"):
+    with pytest.raises(CookieStoreLockTimeoutError):
         await pool._mint_slot(slot)
 
     assert len(created_sessions) == 1
@@ -339,6 +370,61 @@ async def test_slot_mint_save_failure_closes_candidate_and_keeps_previous_slot(m
         "old-token", "http://old-proxy", old_session, 0,
     )
     assert old_session.closed is False
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_during_initialize_closes_worker_candidate_once(monkeypatch):
+    """Worker cancellation must close its candidate before propagating it."""
+    from worker import session_pool as sp
+
+    started = asyncio.Event()
+    created_sessions = []
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "fresh"}, user_agent="fresh-UA")
+
+    class BlockingSession(_FakeSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def initialize(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.close_count += 1
+
+    class Tracker:
+        exited = False
+
+        @asynccontextmanager
+        async def track(self, **_kwargs):
+            try:
+                yield SimpleNamespace(retry_count=0)
+            finally:
+                self.exited = True
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", _SnapshotAdapter)
+    monkeypatch.setattr(sp, "OJVSession", BlockingSession)
+    pool = sp.SessionPool(config, proxy_usage=Tracker())
+
+    task = asyncio.create_task(pool.initialize())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert created_sessions[0].close_count == 1
+    assert pool._proxy_usage.exited is True
 
 
 @pytest.mark.asyncio

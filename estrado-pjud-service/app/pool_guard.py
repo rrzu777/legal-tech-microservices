@@ -18,15 +18,16 @@ fallas a la causa—, pero antes salían sin dejar rastro:
 - `maybe_alert()` mira el ratio de bloqueos y su primera guardia es
   `total_requests == 0`, o sea que ese cero la hacía salir antes de mirar nada.
 
-El resultado medido el 31 de julio de 2026: la instancia llevaba 3 días y 18
-horas devolviendo 500 a todas las consultas y `/api/v1/health` respondía
+Antes de esta frontera tipada, el resultado medido el 31 de julio de 2026 fue
+una instancia que llevaba 3 días y 18 horas devolviendo 500 a todas las
+consultas y `/api/v1/health` respondía
 `{"status": "ok", "total_requests": 0, "total_errors": 0, "blocked_rate": 0.0}`.
 Un servicio totalmente caído indistinguible de uno ocioso. Nos enteramos porque
 un tester mandó una captura de la pantalla de una causa.
 
 Este módulo cierra las dos: cuenta el fallo en una métrica propia y manda una
-alerta por el HECHO (no por la proporción), conservando 500 para defectos
-inesperados y entregando 503 sólo para indisponibilidad operacional conocida.
+alerta por el HECHO (no por la proporción), reserva 500 para defectos
+inesperados y entrega 503 sólo para indisponibilidad operacional conocida.
 """
 
 import logging
