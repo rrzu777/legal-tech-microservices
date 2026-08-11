@@ -78,7 +78,9 @@ avanza_origin() { # avanza_origin [archivo] — commit B en origin
 
 # Sin set -e en este archivo: RC se captura a mano y los asserts guardan solos.
 run_deploy() { # run_deploy — usa REPO/SYSCTL/HEALTH; deja RC y OUT
+  mkdir -p "$TMP/state"
   OUT=$(DEPLOY_REPO_DIR="$REPO" DEPLOY_SYSTEMCTL="$SYSCTL" DEPLOY_HEALTH_URL="$HEALTH" \
+        DEPLOY_STATE_DIR="$TMP/state" \
         DEPLOY_KEEP_WORKER_STOPPED="${KEEP_WORKER_STOPPED:-0}" \
         DEPLOY_HEALTH_RETRIES=2 DEPLOY_HEALTH_SLEEP=0 bash "$DEPLOY" 2>&1)
   RC=$?
@@ -91,7 +93,11 @@ sha_repo()   { git -C "$REPO" rev-parse HEAD; }
 restarts()   { grep -c '^restart ' "$LOG_SYSCTL" || true; }
 
 echo "== deploy feliz: avanza HEAD, una ronda de restart, exit 0"
-setup feliz; avanza_origin; health_ok; run_deploy
+setup feliz; avanza_origin; health_ok
+mkdir -p "$TMP/state"
+touch "$TMP/state/alert-cooldowns.json" "$TMP/state/alert-cooldowns.json.lock"
+chmod 640 "$TMP/state/alert-cooldowns.json" "$TMP/state/alert-cooldowns.json.lock"
+run_deploy
 expect_eq "exit 0" "$RC" "0"
 expect_eq "HEAD avanzó al de origin" "$(sha_repo)" "$(sha_origin)"
 expect_eq "una ronda de restart" "$(restarts)" "1"
@@ -99,6 +105,8 @@ expect_contains "las dos units en la misma invocación" "$(cat "$LOG_SYSCTL")" "
 expect_contains "verifica is-active" "$(cat "$LOG_SYSCTL")" "is-active"
 expect_eq "no instala deps sin cambio de requirements" "$(cat "$LOG_PIP")" ""
 expect_missing "no avisa de ops/cron si no cambió" "$OUT" "ops/cron"
+expect_eq "repara permisos del estado compartido" "$(stat -f '%Lp' "$TMP/state/alert-cooldowns.json" 2>/dev/null || stat -c '%a' "$TMP/state/alert-cooldowns.json")" "660"
+expect_eq "repara permisos del lock compartido" "$(stat -f '%Lp' "$TMP/state/alert-cooldowns.json.lock" 2>/dev/null || stat -c '%a' "$TMP/state/alert-cooldowns.json.lock")" "660"
 
 echo "== deploy seguro: actualiza API y mantiene worker detenido"
 setup workerstop; avanza_origin; health_ok

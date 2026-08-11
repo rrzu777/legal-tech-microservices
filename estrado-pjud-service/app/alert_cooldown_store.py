@@ -56,9 +56,9 @@ class AlertCooldownStore:
     @contextmanager
     def _interprocess_lock(self) -> Iterator[None]:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+        lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o660)
         try:
-            os.fchmod(lock_fd, 0o640)
+            os.fchmod(lock_fd, 0o660)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
                 yield
@@ -98,7 +98,7 @@ class AlertCooldownStore:
             suffix=".tmp",
         )
         try:
-            os.fchmod(fd, 0o640)
+            os.fchmod(fd, 0o660)
             with os.fdopen(fd, "w") as handle:
                 json.dump(cooldowns, handle, sort_keys=True, separators=(",", ":"))
                 handle.write("\n")
