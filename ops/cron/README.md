@@ -32,13 +32,25 @@ chequeo #7 del watchdog avisa dentro de los 15 minutos.
 
 ## Tests
 
-`tests/test-watchdog.sh` corre **en el VPS**: necesita systemd, el journal y el `.env` del
-microservicio, porque los chequeos 1-6 se apoyan en eso. En un laptop da falsos positivos.
+`tests/test-watchdog.sh` requiere **Linux** por GNU `date -d` y `stat -c`; en macOS no es una
+validación equivalente. Por defecto es un harness unitario hermético: inyecta `.env`, systemd,
+sudo, journal, control de proxy y artefactos sanos, por lo que no prueba servicios reales. Para un
+smoke read-only del VPS que use el `.env`, systemd, journal y `pjud_proxy_control` reales, sin
+enviar alertas ni tocar el estado persistente, usar `WD_LIVE=1`:
 
 ```bash
 scp ops/cron/estrado-watchdog.sh ops/cron/tests/test-watchdog.sh legaltech-vps:/tmp/
 ssh legaltech-vps 'chmod +x /tmp/test-watchdog.sh && /tmp/test-watchdog.sh /tmp/estrado-watchdog.sh'
 ```
+
+```bash
+ssh legaltech-vps 'WD_LIVE=1 /tmp/test-watchdog.sh /tmp/estrado-watchdog.sh'
+```
+
+Incluso en `WD_LIVE=1`, los fixtures de log de cron, crontab, sockets y backups siguen aislados:
+el smoke cubre los binarios/servicios y la lectura del control, no reemplaza una auditoría completa
+de la máquina. `tests/test-digest.sh` es portátil: inyecta `curl`, `sudo` y `hermes` mediante
+`PATH`, y no toca servicios ni credenciales reales.
 
 El watchdog acepta estas variables para poder probarlo sin efectos: `DRY_RUN=1` (imprime lo que
 habría alertado y no llama ni a Luna ni a Telegram), `CRON_LOG`, `WD_STATE_DIR`, `API_HEALTH_URL`,
@@ -89,6 +101,20 @@ Ninguna consulta que falla se lee como "no hay nada mal": si Supabase no contest
 que no es una lista, el chequeo lo dice (`cases-query-fail`, `count-fail`) y **no** toca el archivo
 de "ya avisado". Antes lo reescribía en vacío, así que un timeout borraba la memoria y la corrida
 siguiente volvía a alertar por causas viejas.
+
+Antes del chequeo 8, dentro de la ventana laboral lunes a viernes [10:00,18:00) Chile, el watchdog
+consulta una sola fila `pjud_proxy_control` de IPRoyal. Sólo `enabled` permite diagnosticar un atraso
+como scheduler. Las causas allowlisted `billing_exhausted`, `budget_exhausted`,
+`paused/telemetry_unavailable` y `paused/ops_pause` emiten su causa raíz y suprimen ese falso
+warning. Fila ausente, JSON inválido, error de PostgREST o sentinels desconocidos se tratan como
+`proxy-control-unavailable`: el chequeo queda ciego y tampoco culpa al scheduler. Nunca se copia el
+texto crudo de la base al mensaje o a la firma.
+
+El digest separa las corridas creadas en las últimas 24 horas (`success`, `error`, `blocked`) del
+estado actual de causas (`last_sync_status=error` y `sync_blocked_until` futuro). Un `Content-Range`
+ausente, wildcard o inválido aparece como `sin datos`, nunca como cero; Luna recibe esa misma regla.
+El dashboard web ya suprime el aviso de atraso cuando su evidencia de worker/proxy no está sana; esta
+correlación mantiene al watchdog y al digest en la misma precedencia.
 
 El chequeo 9 deliberadamente **no** alerta por `total_requests == 0` ni por
 `last_successful_request: null`. En 7 días la API recibió dos búsquedas reales — el resto del
