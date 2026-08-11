@@ -176,6 +176,7 @@ class SessionPool:
                     )
                     new_session = OJVSession(adapter)
                     await new_session.initialize()
+                    final_cookies = adapter.snapshot_cookies()
                 break
             except Exception as exc:
                 self.mint_failures += 1
@@ -204,7 +205,7 @@ class SessionPool:
 
         self._store.save_slot(
             slot.index,
-            adapter.snapshot_cookies(),
+            final_cookies,
             creds.user_agent,
             token,
         )

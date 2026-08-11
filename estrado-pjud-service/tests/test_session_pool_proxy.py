@@ -206,7 +206,7 @@ async def test_slot_mint_failed_initialize_does_not_persist(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_slot_mint_ambiguous_cookie_snapshot_does_not_persist(monkeypatch):
-    """An ambiguous jar must not replace the slot's last persisted cookie map."""
+    """An ambiguous jar closes its candidate and preserves the previous slot."""
     from worker import session_pool as sp
 
     config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
@@ -226,6 +226,18 @@ async def test_slot_mint_ambiguous_cookie_snapshot_does_not_persist(monkeypatch)
         def snapshot_cookies(self):
             raise ValueError("ambiguous_cookie_scope")
 
+    created_sessions = []
+
+    class InitializedSession(_FakeSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            self.close_count = 0
+            created_sessions.append(self)
+
+        async def close(self):
+            self.close_count += 1
+            await super().close()
+
     class MemoryStore:
         def __init__(self):
             self.slots = {0: old_cookies}
@@ -239,16 +251,30 @@ async def test_slot_mint_ambiguous_cookie_snapshot_does_not_persist(monkeypatch)
     monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
     monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
     monkeypatch.setattr(sp, "OJVHttpAdapter", AmbiguousJarAdapter)
-    monkeypatch.setattr(sp, "OJVSession", _FakeSession)
+    monkeypatch.setattr(sp, "OJVSession", InitializedSession)
     monkeypatch.setattr(sp, "CookieStore", lambda _path: fake_store)
 
     pool = sp.SessionPool(config)
+    old_session = _FakeSession(MagicMock())
+    slot = sp._Slot(
+        index=0,
+        token="old-token",
+        proxy_url="http://old-proxy",
+        session=old_session,
+        last_mint_ts=0,
+    )
 
     with pytest.raises(ValueError, match="ambiguous_cookie_scope"):
-        await pool.initialize()
+        await pool._mint_slot(slot)
 
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_count == 1
     assert fake_store.save_calls == []
     assert fake_store.slots[0] == old_cookies
+    assert (slot.token, slot.proxy_url, slot.session, slot.last_mint_ts) == (
+        "old-token", "http://old-proxy", old_session, 0,
+    )
+    assert old_session.closed is False
 
 
 @pytest.mark.asyncio
