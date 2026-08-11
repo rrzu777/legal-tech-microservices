@@ -36,7 +36,17 @@ class MintResult:
 
 
 def cookies_to_dict(pw_cookies: list[dict]) -> dict[str, str]:
-    return {c["name"]: c["value"] for c in pw_cookies}
+    cookies: dict[str, str] = {}
+    scopes: dict[str, tuple[str, str, str]] = {}
+    for cookie in pw_cookies:
+        name = cookie["name"]
+        scope = (cookie["value"], cookie.get("domain", ""), cookie.get("path", ""))
+        previous_scope = scopes.get(name)
+        if previous_scope is not None and previous_scope != scope:
+            raise ValueError("ambiguous_cookie_scope")
+        scopes[name] = scope
+        cookies[name] = cookie["value"]
+    return cookies
 
 
 class CookieMinter:

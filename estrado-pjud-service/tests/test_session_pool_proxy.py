@@ -205,6 +205,53 @@ async def test_slot_mint_failed_initialize_does_not_persist(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_slot_mint_ambiguous_cookie_snapshot_does_not_persist(monkeypatch):
+    """An ambiguous jar must not replace the slot's last persisted cookie map."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    old_cookies = {"PHPSESSID": "old", "TS-old": "old-f5"}
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "minted"}, user_agent="fresh-UA")
+
+    class AmbiguousJarAdapter:
+        def __init__(self, _settings, **_kwargs):
+            pass
+
+        def snapshot_cookies(self):
+            raise ValueError("ambiguous_cookie_scope")
+
+    class MemoryStore:
+        def __init__(self):
+            self.slots = {0: old_cookies}
+            self.save_calls = []
+
+        def save_slot(self, *args):
+            self.save_calls.append(args)
+            self.slots[args[0]] = args[1]
+
+    fake_store = MemoryStore()
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", AmbiguousJarAdapter)
+    monkeypatch.setattr(sp, "OJVSession", _FakeSession)
+    monkeypatch.setattr(sp, "CookieStore", lambda _path: fake_store)
+
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(ValueError, match="ambiguous_cookie_scope"):
+        await pool.initialize()
+
+    assert fake_store.save_calls == []
+    assert fake_store.slots[0] == old_cookies
+
+
+@pytest.mark.asyncio
 async def test_402_during_mint_never_retries(monkeypatch):
     from worker import session_pool as sp
 

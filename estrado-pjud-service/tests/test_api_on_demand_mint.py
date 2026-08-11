@@ -146,6 +146,55 @@ async def test_on_demand_failed_initialize_keeps_existing_bundle(monkeypatch, tm
     assert store.slots["0"].cookies == old_cookies
 
 
+@pytest.mark.asyncio
+async def test_on_demand_ambiguous_cookie_snapshot_keeps_existing_bundle(monkeypatch, tmp_path):
+    """An ambiguous jar must fail before it can overwrite a persisted bundle."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    store = MemoryCookieStore()
+    old_cookies = {"PHPSESSID": "old", "TS-old": "old-f5"}
+    store.slots["0"] = CookieBundle(
+        cookies=old_cookies,
+        user_agent="old-UA",
+        saved_at=time.time(),
+        proxy_token="old-token",
+    )
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "minted"}, user_agent="fresh-UA")
+
+    class AmbiguousJarAdapter:
+        def __init__(self, _settings, **_kwargs):
+            pass
+
+        def snapshot_cookies(self):
+            raise ValueError("ambiguous_cookie_scope")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", AmbiguousJarAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
+
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = store
+
+    with pytest.raises(ValueError, match="ambiguous_cookie_scope"):
+        await pool._mint_new_bundle()
+
+    assert store.save_calls == []
+    assert store.slots["0"].cookies == old_cookies
+
+
 class RecordingUsageTracker:
     def __init__(self):
         self.operations: list[str] = []
