@@ -42,6 +42,7 @@ main() {
   local health_retries="${DEPLOY_HEALTH_RETRIES:-60}"
   local health_sleep="${DEPLOY_HEALTH_SLEEP:-1}"
   local systemctl_bin="${DEPLOY_SYSTEMCTL:-systemctl}"
+  local shared_state_dir="${DEPLOY_STATE_DIR:-/var/lib/estrado-pjud}"
   local keep_worker_stopped="${DEPLOY_KEEP_WORKER_STOPPED:-0}"
   local services=(estrado-pjud.service)
   local worker_enabled=0
@@ -67,6 +68,20 @@ main() {
     echo "ABORTA: hay cambios sin commitear en $repo_dir — resolvelos antes de desplegar" >&2
     exit 1
   fi
+
+  # API (www-data:estrado) y worker (estrado:estrado) comparten estos dos
+  # archivos. Una versión anterior los dejó 0640: el creador podía escribir,
+  # pero el otro proceso sólo leer, convirtiendo una alerta en un 500. Sanar
+  # los archivos existentes además del modo de creación evita depender de que
+  # sean borrados o recreados durante este despliegue.
+  local shared_state_file
+  for shared_state_file in alert-cooldowns.json alert-cooldowns.json.lock; do
+    if [ -e "$shared_state_dir/$shared_state_file" ] \
+      && ! chmod 0660 "$shared_state_dir/$shared_state_file"; then
+      echo "ABORTA: no se pudieron reparar los permisos del estado compartido de alertas" >&2
+      exit 1
+    fi
+  done
 
   if [ "$keep_worker_stopped" = "1" ]; then
     if ! "$systemctl_bin" disable --now estrado-pjud-worker.service; then

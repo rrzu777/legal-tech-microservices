@@ -245,9 +245,9 @@ class TestTelegramAlerter:
             persisted = cooldown_path.read_text()
             assert json.loads(persisted)["pool_unavailable"] > 0
             assert detail not in persisted
-            assert stat.S_IMODE(cooldown_path.stat().st_mode) == 0o640
+            assert stat.S_IMODE(cooldown_path.stat().st_mode) == 0o660
             lock_path = cooldown_path.with_name(f"{cooldown_path.name}.lock")
-            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o640
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o660
             assert "corrupt" in caplog.text.lower()
         finally:
             await alerter.close()
