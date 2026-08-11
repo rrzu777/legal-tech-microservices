@@ -20,17 +20,130 @@ from worker.proxy_control import ProxyControlSnapshot
 class MemoryCookieStore:
     def __init__(self):
         self.slots: dict[str, CookieBundle] = {}
+        self.save_calls: list[tuple] = []
 
     def load_all(self):
         return dict(self.slots)
 
     def save_slot(self, slot_id, cookies, user_agent, proxy_token):
+        self.save_calls.append((slot_id, cookies, user_agent, proxy_token))
         self.slots[str(slot_id)] = CookieBundle(
             cookies=cookies,
             user_agent=user_agent,
             saved_at=time.time(),
             proxy_token=proxy_token,
         )
+
+
+class SnapshotAdapter:
+    """Adapter fake that keeps the cookie jar contract used by the pools."""
+
+    def __init__(self, _settings, *, cookies=None, **_kwargs):
+        self.cookies = dict(cookies or {})
+
+    def snapshot_cookies(self):
+        return dict(self.cookies)
+
+
+@pytest.mark.asyncio
+async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, tmp_path):
+    """Persisting Playwright cookies after OJV refresh would lose renewed session state."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    store = MemoryCookieStore()
+    store.save_slot(0, {"PHPSESSID": "old", "TS-old": "old-f5"}, "old-UA", "old-token")
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(
+                cookies={"PHPSESSID": "minted", "TS-minted": "minted-f5"},
+                user_agent="fresh-UA",
+            )
+
+    class JarAdapter:
+        def __init__(self, _settings, *, cookies=None, **_kwargs):
+            self.jar = dict(cookies or {})
+
+        def snapshot_cookies(self):
+            return dict(self.jar)
+
+    class SessionThatRenewsCookies(FakeOJVSession):
+        async def initialize(self):
+            self.adapter.jar = {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", JarAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", SessionThatRenewsCookies)
+
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = store
+
+    await pool._mint_new_bundle()
+
+    assert store.slots["0"].cookies == {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+
+@pytest.mark.asyncio
+async def test_on_demand_failed_initialize_keeps_existing_bundle(monkeypatch, tmp_path):
+    """A blocked refreshed session must not overwrite the last known bundle."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    store = MemoryCookieStore()
+    old_cookies = {"PHPSESSID": "old", "TS-old": "old-f5"}
+    store.slots["0"] = CookieBundle(
+        cookies=old_cookies,
+        user_agent="old-UA",
+        saved_at=time.time(),
+        proxy_token="old-token",
+    )
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "minted"}, user_agent="fresh-UA")
+
+    class JarAdapter:
+        def __init__(self, _settings, **_kwargs):
+            pass
+
+        def snapshot_cookies(self):
+            return {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+    class BlockedSession(FakeOJVSession):
+        async def initialize(self):
+            raise BlockedPageError("challenge remains")
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", JarAdapter)
+    monkeypatch.setattr(pool_module, "OJVSession", BlockedSession)
+
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = store
+
+    with pytest.raises(BlockedPageError, match="challenge remains"):
+        await pool._mint_new_bundle()
+
+    assert store.save_calls == []
+    assert store.slots["0"].cookies == old_cookies
 
 
 class RecordingUsageTracker:
@@ -85,7 +198,7 @@ async def test_familia_stale_bundle_mints_and_returns_fresh_bundle_on_demand(
             return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
 
     monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
-    monkeypatch.setattr(pool_module, "OJVHttpAdapter", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
     monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
 
     pool = APISessionPool(settings, proxy_control=control, proxy_usage=usage)
@@ -142,7 +255,7 @@ async def test_empty_proxy_pool_mints_and_persists_one_bundle_on_demand(monkeypa
 
     def fake_adapter(_settings, **kwargs):
         adapter_calls.append(kwargs)
-        return MagicMock()
+        return SnapshotAdapter(_settings, **kwargs)
 
     monkeypatch.setattr(pool_module, "CookieMinter", FakeMinter, raising=False)
     monkeypatch.setattr(pool_module, "OJVHttpAdapter", fake_adapter)
@@ -202,7 +315,7 @@ async def test_on_demand_mint_rotates_ip_after_f5_challenge(monkeypatch, tmp_pat
             return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
 
     monkeypatch.setattr(pool_module, "CookieMinter", FlakyMinter)
-    monkeypatch.setattr(pool_module, "OJVHttpAdapter", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
     monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
 
     pool = APISessionPool(settings, proxy_control=control, proxy_usage=usage)
@@ -258,7 +371,7 @@ async def test_challenged_stored_bundle_falls_back_to_fresh_on_demand_mint(
                 raise BlockedPageError("stored IP challenged")
 
     def fake_adapter(_settings, **kwargs):
-        return SimpleNamespace(**kwargs)
+        return SnapshotAdapter(_settings, **kwargs)
 
     monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
     monkeypatch.setattr(pool_module, "OJVHttpAdapter", fake_adapter)
@@ -406,7 +519,7 @@ async def test_concurrent_empty_pool_mints_only_one_bundle(monkeypatch, tmp_path
             return MintResult(cookies={"TSPD_101": "fresh"}, user_agent="fresh-UA")
 
     monkeypatch.setattr(pool_module, "CookieMinter", SlowMinter)
-    monkeypatch.setattr(pool_module, "OJVHttpAdapter", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(pool_module, "OJVHttpAdapter", SnapshotAdapter)
     monkeypatch.setattr(pool_module, "OJVSession", FakeOJVSession)
 
     pool = APISessionPool(

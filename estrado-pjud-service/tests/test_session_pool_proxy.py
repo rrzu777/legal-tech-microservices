@@ -55,6 +55,16 @@ class _FakeSession:
         return self._age
 
 
+class _SnapshotAdapter:
+    """Minimal adapter fake that preserves the pool's cookie snapshot contract."""
+
+    def __init__(self, _settings, *, cookies=None, **_kwargs):
+        self.cookies = dict(cookies or {})
+
+    def snapshot_cookies(self):
+        return dict(self.cookies)
+
+
 def _patch_pool_deps(monkeypatch, sp, mint_side_effect=None, patch_sleep=True):
     """Patch CookieMinter/OJVHttpAdapter/OJVSession/Settings/store with fakes.
 
@@ -89,7 +99,7 @@ def _patch_pool_deps(monkeypatch, sp, mint_side_effect=None, patch_sleep=True):
 
     monkeypatch.setattr(sp, "CookieMinter", FakeMinter)
     monkeypatch.setattr(sp, "Settings", lambda **k: MagicMock())
-    monkeypatch.setattr(sp, "OJVHttpAdapter", lambda *a, **k: MagicMock(kwargs=k))
+    monkeypatch.setattr(sp, "OJVHttpAdapter", _SnapshotAdapter)
     monkeypatch.setattr(sp, "OJVSession", _FakeSession)
 
     fake_store = MagicMock()
@@ -97,6 +107,101 @@ def _patch_pool_deps(monkeypatch, sp, mint_side_effect=None, patch_sleep=True):
     monkeypatch.setattr(sp, "CookieStore", lambda path: fake_store)
 
     return captured_proxies, fake_store
+
+
+@pytest.mark.asyncio
+async def test_slot_mint_persists_cookie_jar_after_initialize(monkeypatch):
+    """Saving browser cookies after OJV initialize would discard the refreshed jar."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(
+                cookies={"PHPSESSID": "minted", "TS-minted": "minted-f5"},
+                user_agent="fresh-UA",
+            )
+
+    class JarAdapter:
+        def __init__(self, _settings, *, cookies=None, **_kwargs):
+            self.jar = dict(cookies or {})
+
+        def snapshot_cookies(self):
+            return dict(self.jar)
+
+    class SessionThatRenewsCookies(_FakeSession):
+        async def initialize(self):
+            self.adapter.jar = {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+    fake_store = MagicMock()
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", JarAdapter)
+    monkeypatch.setattr(sp, "OJVSession", SessionThatRenewsCookies)
+    monkeypatch.setattr(sp, "CookieStore", lambda _path: fake_store)
+
+    pool = sp.SessionPool(config)
+    await pool.initialize()
+
+    saved_cookies = fake_store.save_slot.call_args.args[1]
+    assert saved_cookies == {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+
+@pytest.mark.asyncio
+async def test_slot_mint_failed_initialize_does_not_persist(monkeypatch):
+    """A blocked slot candidate must leave its previous persisted bundle untouched."""
+    from app.failure_kind import BlockedPageError
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "minted"}, user_agent="fresh-UA")
+
+    class JarAdapter:
+        def __init__(self, _settings, **_kwargs):
+            pass
+
+        def snapshot_cookies(self):
+            return {"PHPSESSID": "renewed", "TS-current": "renewed-f5"}
+
+    class BlockedSession(_FakeSession):
+        async def initialize(self):
+            raise BlockedPageError("challenge remains")
+
+    old_cookies = {"PHPSESSID": "old", "TS-old": "old-f5"}
+
+    class MemoryStore:
+        def __init__(self):
+            self.slots = {0: old_cookies}
+            self.save_calls = []
+
+        def save_slot(self, *args):
+            self.save_calls.append(args)
+            self.slots[args[0]] = args[1]
+
+    fake_store = MemoryStore()
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", JarAdapter)
+    monkeypatch.setattr(sp, "OJVSession", BlockedSession)
+    monkeypatch.setattr(sp, "CookieStore", lambda _path: fake_store)
+
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(BlockedPageError, match="challenge remains"):
+        await pool.initialize()
+
+    assert fake_store.save_calls == []
+    assert fake_store.slots[0] == old_cookies
 
 
 @pytest.mark.asyncio

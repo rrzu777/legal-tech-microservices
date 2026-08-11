@@ -94,5 +94,8 @@ class OJVHttpAdapter:
     def cookies(self) -> httpx.Cookies:
         return self._client.cookies
 
+    def snapshot_cookies(self) -> dict[str, str]:
+        return {cookie.name: cookie.value for cookie in self._client.cookies.jar}
+
     async def close(self):
         await self._client.aclose()

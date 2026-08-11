@@ -88,9 +88,11 @@ class CookieMinter:
                 ua = await page.evaluate("() => navigator.userAgent")
                 pw_cookies = await context.cookies()
                 cookies = cookies_to_dict(pw_cookies)
-                if "TSPD_101" not in cookies:
-                    raise RuntimeError("Minteo sin TSPD_101 — challenge no superado")
-                logger.info("Cookies minteados (TSPD_101 presente), UA=%s", ua[:40])
+                logger.info(
+                    "PJUD form ready; cookie_count=%d has_php_session=%s has_ts_family=%s",
+                    len(cookies), "PHPSESSID" in cookies,
+                    any(name.startswith("TS") for name in cookies),
+                )
                 return MintResult(cookies=cookies, user_agent=ua)
             finally:
                 if page is not None:

@@ -202,7 +202,12 @@ class SessionPool:
                 )
                 await asyncio.sleep(delay)
 
-        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, token)
+        self._store.save_slot(
+            slot.index,
+            adapter.snapshot_cookies(),
+            creds.user_agent,
+            token,
+        )
 
         old_session = slot.session
         slot.token = token

@@ -373,7 +373,7 @@ class APISessionPool:
                 await session.initialize()
             self._store.save_slot(
                 0,
-                credentials.cookies,
+                adapter.snapshot_cookies(),
                 credentials.user_agent,
                 token,
             )

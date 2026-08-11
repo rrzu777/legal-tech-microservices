@@ -15,7 +15,7 @@ _DUMMY_PROXY = (
 )
 
 
-def _make_playwright_mock():
+def _make_playwright_mock(*, cookies=None, user_agent="Mozilla/5.0 Test UA"):
     """Construye un mock chain de async_playwright que soporta
     `async with async_playwright() as pw` y captura los kwargs de
     `pw.chromium.launch(**kwargs)`.
@@ -23,13 +23,13 @@ def _make_playwright_mock():
     Devuelve (async_playwright_mock, launch_mock) para poder inspeccionar
     las llamadas después.
     """
-    pw_cookies = [
+    pw_cookies = cookies or [
         {"name": "TSPD_101", "value": "abc", "domain": "oficinajudicialvirtual.pjud.cl"},
     ]
 
     page = AsyncMock()
     page.on = MagicMock()
-    page.evaluate = AsyncMock(return_value="Mozilla/5.0 Test UA")
+    page.evaluate = AsyncMock(return_value=user_agent)
 
     context = AsyncMock()
     context.new_page = AsyncMock(return_value=page)
@@ -53,6 +53,35 @@ def _make_playwright_mock():
     async_playwright_factory = MagicMock(return_value=async_playwright_cm)
 
     return async_playwright_factory, launch_mock, page
+
+
+async def test_mint_accepts_real_form_with_renamed_f5_cookies(caplog):
+    """Changing the F5 cookie suffix must not reject a form-ready PJUD session."""
+    sentinel_ua = "UA-SENTINEL-DO-NOT-LOG"
+    sentinel_cookie_name = "TSa2ac8a0a027"
+    sentinel_cookie_value = "f5-value-sentinel"
+    factory, _, _ = _make_playwright_mock(
+        cookies=[
+            {"name": "PHPSESSID", "value": "php", "domain": "oficinajudicialvirtual.pjud.cl"},
+            {"name": "TS01262d1d", "value": "f5-a", "domain": "oficinajudicialvirtual.pjud.cl"},
+            {
+                "name": sentinel_cookie_name,
+                "value": sentinel_cookie_value,
+                "domain": "oficinajudicialvirtual.pjud.cl",
+            },
+        ],
+        user_agent=sentinel_ua,
+    )
+
+    with patch("app.minter.async_playwright", factory):
+        with caplog.at_level("INFO", logger="app.minter"):
+            result = await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+
+    assert set(result.cookies) == {"PHPSESSID", "TS01262d1d", sentinel_cookie_name}
+    log_output = caplog.text
+    assert sentinel_cookie_name not in log_output
+    assert sentinel_cookie_value not in log_output
+    assert sentinel_ua not in log_output
 
 
 async def test_mint_passes_separated_proxy_credentials_to_playwright():
