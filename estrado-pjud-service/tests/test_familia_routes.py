@@ -5,7 +5,9 @@ import pytest
 from fastapi import HTTPException
 
 from app.cookie_store import CookieBundle
+from app.failure_kind import PoolUnavailableError
 from app.familia.models import FamiliaSyncRequest
+from app.pool_guard import PUBLIC_POOL_UNAVAILABLE_DETAIL
 
 
 def _bundle():
@@ -37,7 +39,27 @@ async def test_sin_bundle_f5_es_503_y_no_un_bloqueo_de_ojv():
         await mod.familia_bundle_or_alert(pool, request)
 
     assert exc.value.status_code == 503
+    assert exc.value.detail == PUBLIC_POOL_UNAVAILABLE_DETAIL
     assert api_metrics.snapshot()["total_pool_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_familia_operational_pool_failure_is_safe_503_without_exception_text():
+    """Familia must use the same public failure boundary as search and detail."""
+    from app.routes import familia as mod
+
+    pool = MagicMock()
+    pool.acquire_familia_bundle = AsyncMock(
+        side_effect=PoolUnavailableError("session_blocked"),
+    )
+    request = MagicMock()
+    request.app.state.alerter = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await mod.familia_bundle_or_alert(pool, request)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == PUBLIC_POOL_UNAVAILABLE_DETAIL
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,12 @@ from typing import Literal
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
-from app.failure_kind import MintUnavailableError, new_egress_may_help
+from app.failure_kind import (
+    MintUnavailableError,
+    PoolUnavailableError,
+    pool_unavailable_error,
+    new_egress_may_help,
+)
 from app.minter import CookieMinter
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
@@ -183,9 +188,17 @@ class APISessionPool:
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
-        return await self._acquire_with_deadline(
-            time.monotonic() + _RETRY_BUDGET_S,
-        )
+        try:
+            return await self._acquire_with_deadline(
+                time.monotonic() + _RETRY_BUDGET_S,
+            )
+        except Exception as error:
+            unavailable = pool_unavailable_error(error)
+            if unavailable is not None:
+                if unavailable is error:
+                    raise
+                raise unavailable from error
+            raise
 
     async def _acquire_with_deadline(
         self,
@@ -554,19 +567,27 @@ class APISessionPool:
         existing age-unfiltered bundle, but an empty store never triggers a
         direct-egress mint.
         """
-        deadline = time.monotonic() + _RETRY_BUDGET_S
-        await self.assert_proxy_enabled()
-        bundle = self.pick_familia_bundle()
-        if bundle is not None or not self._proxy_mode:
-            return bundle
+        try:
+            deadline = time.monotonic() + _RETRY_BUDGET_S
+            await self.assert_proxy_enabled()
+            bundle = self.pick_familia_bundle()
+            if bundle is not None or not self._proxy_mode:
+                return bundle
 
-        session = await self._mint_on_demand(deadline=deadline)
-        if session is not None:
-            # The mint path initializes an OJVSession to validate its cookies.
-            # Keep that paid result available to search/detail instead of
-            # leaking or immediately discarding the initialized session.
-            await self.release(session)
-        return self.pick_familia_bundle()
+            session = await self._mint_on_demand(deadline=deadline)
+            if session is not None:
+                # The mint path initializes an OJVSession to validate its cookies.
+                # Keep that paid result available to search/detail instead of
+                # leaking or immediately discarding the initialized session.
+                await self.release(session)
+            return self.pick_familia_bundle()
+        except Exception as error:
+            unavailable = pool_unavailable_error(error)
+            if unavailable is not None:
+                if unavailable is error:
+                    raise
+                raise unavailable from error
+            raise
 
     async def release(
         self,

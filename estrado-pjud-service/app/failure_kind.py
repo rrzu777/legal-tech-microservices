@@ -41,12 +41,20 @@ from typing import Literal
 import httpx
 
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.proxy_billing import is_proxy_billing_error
 
 FailureKind = Literal["infra", "ojv", "case"]
 MintFailureCode = Literal[
     "browser_unavailable",
     "navigation_failed",
     "form_timeout",
+    "deadline_exceeded",
+]
+PoolFailureCode = Literal[
+    "mint_exhausted",
+    "session_blocked",
+    "proxy_transport",
+    "upstream_unavailable",
     "deadline_exceeded",
 ]
 
@@ -63,6 +71,14 @@ class MintUnavailableError(RuntimeError):
     """A typed, retryable failure while creating a fresh PJUD session."""
 
     def __init__(self, code: MintFailureCode):
+        self.code = code
+        super().__init__(code)
+
+
+class PoolUnavailableError(RuntimeError):
+    """A known operational failure that leaves the API pool unusable."""
+
+    def __init__(self, code: PoolFailureCode):
         self.code = code
         super().__init__(code)
 
@@ -176,6 +192,38 @@ class RejectedDetailSessionError(Exception):
     """
 
 
+def pool_unavailable_error(error: BaseException) -> PoolUnavailableError | None:
+    """Translate only known exhausted acquisition failures to a safe code.
+
+    This boundary deliberately stays narrower than ``classify_exception``:
+    parser defects, assertion failures, paid-traffic control and provider billing
+    must retain their original type so the caller can preserve their controls or
+    expose a real 500 to observability.
+    """
+    if isinstance(error, PoolUnavailableError):
+        return error
+    if isinstance(error, NoUsableBundleError):
+        return PoolUnavailableError("mint_exhausted")
+    if isinstance(error, BlockedPageError):
+        return PoolUnavailableError("session_blocked")
+    if isinstance(error, MintUnavailableError):
+        return PoolUnavailableError(
+            "deadline_exceeded"
+            if error.code == "deadline_exceeded"
+            else "upstream_unavailable",
+        )
+    if isinstance(error, TimeoutError):
+        return PoolUnavailableError("deadline_exceeded")
+    if isinstance(error, httpx.TransportError) and not is_proxy_billing_error(error):
+        return PoolUnavailableError("proxy_transport")
+    return None
+
+
+def is_expected_acquisition_failure(error: BaseException) -> bool:
+    """Whether an exhausted acquisition may cross the HTTP boundary as 503."""
+    return pool_unavailable_error(error) is not None
+
+
 def slot_still_healthy(e: BaseException) -> bool:
     """¿El slot F5 sigue sirviendo pese a esta excepción?
 
@@ -247,6 +295,7 @@ def classify_exception(e: BaseException) -> FailureKind:
             RejectedDetailSessionError,
             BlockedPageError,
             MintUnavailableError,
+            PoolUnavailableError,
             ProxyBudgetExceededError,
             ProxyUsagePersistenceError,
         ),

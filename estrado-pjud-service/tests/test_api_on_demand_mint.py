@@ -10,7 +10,13 @@ import pytest
 from app.config import Settings
 from app.cookie_store import CookieBundle
 from app.minter import MintResult
-from app.failure_kind import BlockedPageError
+from app.failure_kind import (
+    BlockedPageError,
+    MintUnavailableError,
+    NoUsableBundleError,
+    PoolUnavailableError,
+    is_expected_acquisition_failure,
+)
 from app.metrics import api_metrics
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from tests.helpers import FakeOJVSession
@@ -43,6 +49,76 @@ class SnapshotAdapter:
 
     def snapshot_cookies(self):
         return dict(self.cookies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (MintUnavailableError("navigation_failed"), "upstream_unavailable"),
+        (MintUnavailableError("deadline_exceeded"), "deadline_exceeded"),
+        (NoUsableBundleError(), "mint_exhausted"),
+        (BlockedPageError("F5 response sentinel"), "session_blocked"),
+        (httpx.ProxyError("proxy credential sentinel"), "proxy_transport"),
+        (TimeoutError("deadline sentinel"), "deadline_exceeded"),
+    ],
+)
+async def test_acquire_wraps_only_exhausted_operational_failures(monkeypatch, tmp_path, failure, expected_code):
+    """Removing the API acquisition boundary would leak raw operational failures."""
+    from app.session_pool import APISessionPool
+
+    settings = Settings(
+        API_KEY="t",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._acquire_with_deadline = AsyncMock(side_effect=failure)
+
+    with pytest.raises(PoolUnavailableError) as exc_info:
+        await pool.acquire()
+
+    assert exc_info.value.code == expected_code
+    assert str(exc_info.value) == expected_code
+    assert is_expected_acquisition_failure(failure) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("parser invariant sentinel"),
+        AssertionError("assertion invariant sentinel"),
+        httpx.ProxyError("402 Payment Required"),
+        ProxyBudgetExceededError("global"),
+        ProxyUsagePersistenceError("telemetry sentinel"),
+    ],
+)
+async def test_acquire_preserves_non_operational_failure_identity(monkeypatch, tmp_path, failure):
+    """Wrapping all exceptions would mask billing, telemetry and programming defects."""
+    from app.session_pool import APISessionPool, ProxyTrafficDisabledError
+
+    settings = Settings(
+        API_KEY="t",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._acquire_with_deadline = AsyncMock(side_effect=failure)
+
+    with pytest.raises(type(failure)) as exc_info:
+        await pool.acquire()
+
+    assert exc_info.value is failure
+    assert is_expected_acquisition_failure(failure) is False
+
+    control_failure = ProxyTrafficDisabledError("control disabled")
+    pool._acquire_with_deadline = AsyncMock(side_effect=control_failure)
+    with pytest.raises(ProxyTrafficDisabledError) as control_exc_info:
+        await pool.acquire()
+
+    assert control_exc_info.value is control_failure
+    assert is_expected_acquisition_failure(control_failure) is False
 
 
 @pytest.mark.asyncio
@@ -487,9 +563,10 @@ async def test_on_demand_mint_does_not_start_more_ips_after_retry_budget(
     )
     pool._store = MemoryCookieStore()
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(PoolUnavailableError) as exc_info:
         await pool.acquire()
 
+    assert exc_info.value.code == "deadline_exceeded"
     assert attempts == 0
 
 
@@ -499,7 +576,6 @@ async def test_on_demand_mint_deadline_cancels_paid_traffic_and_finalizes_tracki
 ):
     """Removing the in-flight deadline would let a timed-out request keep spending."""
     from app import session_pool as pool_module
-    from app.failure_kind import MintUnavailableError
     from app.session_pool import APISessionPool
 
     cancelled = asyncio.Event()
@@ -546,7 +622,7 @@ async def test_on_demand_mint_deadline_cancels_paid_traffic_and_finalizes_tracki
     )
     pool._store = MemoryCookieStore()
 
-    with pytest.raises(MintUnavailableError) as exc_info:
+    with pytest.raises(PoolUnavailableError) as exc_info:
         await pool.acquire()
 
     assert exc_info.value.code == "deadline_exceeded"

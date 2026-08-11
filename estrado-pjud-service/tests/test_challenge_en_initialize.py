@@ -23,6 +23,7 @@ from app.failure_kind import (
     BlockedPageError,
     EmptyResponseError,
     MissingCsrfTokenError,
+    PoolUnavailableError,
     new_egress_may_help,
 )
 from app.adapters.http_adapter import OJVHttpAdapter
@@ -193,11 +194,11 @@ async def test_el_reintento_queda_contado(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
-    """Tras agotar bundles guardados y minteos frescos, sale la excepción.
+    """Tras agotar bundles guardados y minteos frescos, sale 503 tipado.
 
     Los bundles existentes se prueban una vez. Después el camino interactivo
-    tiene su propio techo de tres IPs frescas y la última excepción llega entera
-    a `acquire_or_alert` para que la clasifique.
+    tiene su propio techo de tres IPs frescas y el agotamiento llega a
+    `acquire_or_alert` como indisponibilidad operacional segura.
     """
     from app import session_pool as pool_module
 
@@ -219,9 +220,10 @@ async def test_con_todos_los_bundles_quemados_levanta(monkeypatch):
         session_cls=_sesion_guionada([BlockedPageError("challenge")] * 3),
     )
 
-    with pytest.raises(BlockedPageError):
+    with pytest.raises(PoolUnavailableError) as exc_info:
         await pool.acquire()
 
+    assert exc_info.value.code == "session_blocked"
     assert len(capturados) == 3, "un intento por bundle, ni uno más"
     assert mint_attempts == 3, "el minteo interactivo también debe ser acotado"
 
@@ -285,7 +287,8 @@ async def test_el_presupuesto_de_tiempo_corta_el_reintento(monkeypatch):
         session_cls=_sesion_guionada([httpx.ReadTimeout("lento"), None]),
     )
 
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(PoolUnavailableError) as exc_info:
         await pool.acquire()
 
+    assert exc_info.value.code == "proxy_transport"
     assert len(capturados) == 1, "el presupuesto agotado no arranca otro intento"
