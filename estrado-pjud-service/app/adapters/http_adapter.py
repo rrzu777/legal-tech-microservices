@@ -94,5 +94,17 @@ class OJVHttpAdapter:
     def cookies(self) -> httpx.Cookies:
         return self._client.cookies
 
+    def snapshot_cookies(self) -> dict[str, str]:
+        cookies: dict[str, str] = {}
+        scopes: dict[str, tuple[str, str, str]] = {}
+        for cookie in self._client.cookies.jar:
+            scope = (cookie.value, cookie.domain, cookie.path)
+            previous_scope = scopes.get(cookie.name)
+            if previous_scope is not None and previous_scope != scope:
+                raise ValueError("ambiguous_cookie_scope")
+            scopes[cookie.name] = scope
+            cookies[cookie.name] = cookie.value
+        return cookies
+
     async def close(self):
         await self._client.aclose()

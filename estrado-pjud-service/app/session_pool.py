@@ -10,7 +10,12 @@ from typing import Literal
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
-from app.failure_kind import new_egress_may_help
+from app.failure_kind import (
+    MintUnavailableError,
+    PoolUnavailableError,
+    pool_unavailable_error,
+    new_egress_may_help,
+)
 from app.minter import CookieMinter
 from app.metrics import api_metrics
 from app.proxy_billing import is_proxy_billing_error
@@ -20,22 +25,27 @@ from app.session import OJVSession
 
 logger = logging.getLogger(__name__)
 
-#: Cuánto tiempo puede gastar `acquire()` antes de dejar de EMPEZAR reintentos.
+#: Límite monotónico de todo tráfico PJUD/proxy de una acción interactiva.
 #:
-#: No es un timeout: no cancela el intento en curso, sólo decide si vale la pena
-#: arrancar el siguiente. Cancelar a mitad de un `initialize()` dejaría la sesión
-#: colgada, y el corte por adentro ya lo pone `httpx.Timeout(30.0)` del adapter.
+#: Cada `initialize()` y minteo nuevo corre bajo este deadline: al agotarse,
+#: cancela el tráfico en curso y no abre otra IP. El cierre de la sesión y la
+#: finalización durable del tracker quedan fuera del scope cancelable.
 #:
 #: Existe porque el reintento vive en el camino de una request HTTP con un
 #: abogado esperando, no en un job de fondo como el del worker. `ReadTimeout` y
 #: `ConnectTimeout` pasan el filtro de `new_egress_may_help` —y hacen bien, otra
 #: IP puede andar—, pero son justo los lentos: 3 bundles x (GET + POST) x 30 s
 #: son hasta 3 minutos donde antes se fallaba en 60. Con este presupuesto, un
-#: primer intento que se cuelga los 30 s ya no arranca un segundo, y uno que
-#: falla rápido —el challenge cortó en ~3 s— deja lugar para los otros bundles.
+#: intento lento se cancela a los 20 s y uno que falla rápido deja lugar para
+#: los otros bundles.
 _RETRY_BUDGET_S = 20.0
 _ON_DEMAND_MINT_ATTEMPTS = 3
 _CATALOG_RETIREMENT_CORRELATION_S = 10 * 60
+_CANDIDATE_CLOSE_TIMEOUT_S = 1.0
+# API acquisitions are not worker slots. Keeping this namespace stable avoids
+# replacing slot 0's cookies while the worker still pairs that slot with its
+# in-memory sticky proxy URL for Familia.
+_API_COOKIE_STORE_SLOT = "api_on_demand"
 
 
 class ProxyTrafficDisabledError(RuntimeError):
@@ -183,9 +193,17 @@ class APISessionPool:
 
     async def acquire(self) -> OJVSession:
         """Get a session from the pool, creating or refreshing as needed."""
-        return await self._acquire_with_deadline(
-            time.monotonic() + _RETRY_BUDGET_S,
-        )
+        try:
+            return await self._acquire_with_deadline(
+                time.monotonic() + _RETRY_BUDGET_S,
+            )
+        except Exception as error:
+            unavailable = pool_unavailable_error(error)
+            if unavailable is not None:
+                if unavailable is error:
+                    raise
+                raise unavailable from error
+            raise
 
     async def _acquire_with_deadline(
         self,
@@ -251,10 +269,10 @@ class APISessionPool:
             session = OJVSession(adapter)
             try:
                 async with self._mint_usage_scope(intento):
-                    await session.initialize()
+                    await self._initialize_with_deadline(session, limite)
                 return session
-            except Exception as e:
-                await session.close()
+            except BaseException as e:
+                await self._close_candidate_session(session)
                 if is_proxy_billing_error(e):
                     if self._proxy_control is not None:
                         await self._proxy_control.trip_billing_exhausted()
@@ -298,12 +316,24 @@ class APISessionPool:
                 # vuelta siguiente, el bundle quemado igual quedó contado.
                 api_metrics.record_bundle_retry()
                 logger.warning(
-                    "Sesión API fallida por este bundle (intento %d/%d: %s: %s); "
+                    "api_bundle_retry attempt=%d total=%d failure_type=%s failure_code=%s "
                     "reintento por otra IP residencial",
-                    intento, intentos, type(e).__name__, e,
+                    intento,
+                    intentos,
+                    type(e).__name__,
+                    e.code if isinstance(e, MintUnavailableError) else "none",
                 )
 
         raise RuntimeError("unreachable")  # el loop retorna o re-lanza
+
+    async def _close_candidate_session(self, session: OJVSession) -> None:
+        """Bound cleanup for a session that was never handed to a caller."""
+        try:
+            await asyncio.wait_for(
+                session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning("api_mint_candidate_cleanup_unavailable")
 
     async def _mint_on_demand(
         self,
@@ -327,7 +357,7 @@ class APISessionPool:
                 return None
             for attempt in range(1, _ON_DEMAND_MINT_ATTEMPTS + 1):
                 try:
-                    return await self._mint_new_bundle(attempt)
+                    return await self._mint_new_bundle(attempt, deadline=deadline)
                 except Exception as exc:
                     if (
                         attempt >= _ON_DEMAND_MINT_ATTEMPTS
@@ -347,7 +377,12 @@ class APISessionPool:
                     )
             raise RuntimeError("unreachable")
 
-    async def _mint_new_bundle(self, attempt: int = 1) -> OJVSession:
+    async def _mint_new_bundle(
+        self,
+        attempt: int = 1,
+        *,
+        deadline: float | None = None,
+    ) -> OJVSession:
         """Mint and persist one residential bundle after winning the mint lock."""
         await self.assert_proxy_enabled()
         token = generate_session_token()
@@ -359,30 +394,66 @@ class APISessionPool:
         session = None
         try:
             async with self._mint_usage_scope(attempt):
-                credentials = await CookieMinter(
-                    self._settings.OJV_BASE_URL,
-                    proxy=proxy_url,
-                ).mint()
-                adapter = OJVHttpAdapter(
-                    self._settings,
-                    proxy=proxy_url,
-                    user_agent=credentials.user_agent,
-                    cookies=credentials.cookies,
-                )
-                session = OJVSession(adapter)
-                await session.initialize()
+                if deadline is None:
+                    credentials = await CookieMinter(
+                        self._settings.OJV_BASE_URL,
+                        proxy=proxy_url,
+                    ).mint()
+                    adapter = OJVHttpAdapter(
+                        self._settings,
+                        proxy=proxy_url,
+                        user_agent=credentials.user_agent,
+                        cookies=credentials.cookies,
+                    )
+                    session = OJVSession(adapter)
+                    await session.initialize()
+                else:
+                    timer = asyncio.timeout_at(deadline)
+                    try:
+                        async with timer:
+                            credentials = await CookieMinter(
+                                self._settings.OJV_BASE_URL,
+                                proxy=proxy_url,
+                            ).mint()
+                            adapter = OJVHttpAdapter(
+                                self._settings,
+                                proxy=proxy_url,
+                                user_agent=credentials.user_agent,
+                                cookies=credentials.cookies,
+                            )
+                            session = OJVSession(adapter)
+                            await session.initialize()
+                    except TimeoutError:
+                        if timer.expired():
+                            raise MintUnavailableError("deadline_exceeded") from None
+                        raise
             self._store.save_slot(
-                0,
-                credentials.cookies,
+                _API_COOKIE_STORE_SLOT,
+                adapter.snapshot_cookies(),
                 credentials.user_agent,
                 token,
             )
             return session
-        except Exception as exc:
+        except BaseException as exc:
             if session is not None:
-                await session.close()
+                await self._close_candidate_session(session)
             if is_proxy_billing_error(exc) and self._proxy_control is not None:
                 await self._proxy_control.trip_billing_exhausted()
+            raise
+
+    async def _initialize_with_deadline(
+        self,
+        session: OJVSession,
+        deadline: float,
+    ) -> None:
+        """Limit PJUD traffic, while letting durable tracker teardown finish."""
+        timer = asyncio.timeout_at(deadline)
+        try:
+            async with timer:
+                await session.initialize()
+        except TimeoutError:
+            if timer.expired():
+                raise MintUnavailableError("deadline_exceeded") from None
             raise
 
     async def assert_proxy_enabled(self) -> None:
@@ -510,19 +581,27 @@ class APISessionPool:
         existing age-unfiltered bundle, but an empty store never triggers a
         direct-egress mint.
         """
-        deadline = time.monotonic() + _RETRY_BUDGET_S
-        await self.assert_proxy_enabled()
-        bundle = self.pick_familia_bundle()
-        if bundle is not None or not self._proxy_mode:
-            return bundle
+        try:
+            deadline = time.monotonic() + _RETRY_BUDGET_S
+            await self.assert_proxy_enabled()
+            bundle = self.pick_familia_bundle()
+            if bundle is not None or not self._proxy_mode:
+                return bundle
 
-        session = await self._mint_on_demand(deadline=deadline)
-        if session is not None:
-            # The mint path initializes an OJVSession to validate its cookies.
-            # Keep that paid result available to search/detail instead of
-            # leaking or immediately discarding the initialized session.
-            await self.release(session)
-        return self.pick_familia_bundle()
+            session = await self._mint_on_demand(deadline=deadline)
+            if session is not None:
+                # The mint path initializes an OJVSession to validate its cookies.
+                # Keep that paid result available to search/detail instead of
+                # leaking or immediately discarding the initialized session.
+                await self.release(session)
+            return self.pick_familia_bundle()
+        except Exception as error:
+            unavailable = pool_unavailable_error(error)
+            if unavailable is not None:
+                if unavailable is error:
+                    raise
+                raise unavailable from error
+            raise
 
     async def release(
         self,

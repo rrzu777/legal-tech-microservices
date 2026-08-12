@@ -9,14 +9,18 @@ por eso el mismo 503 de OJV suspendía la causa o no según quién la tomara.
 import httpx
 import pytest
 
+from app.cookie_store import CookieStoreLockTimeoutError
 from app.failure_kind import (
     BlockedPageError,
     EmptyResponseError,
+    MintUnavailableError,
     MissingCsrfTokenError,
     NoUsableBundleError,
     block_cause,
     classify_exception,
+    new_egress_may_help,
     slot_still_healthy,
+    pool_unavailable_error,
 )
 from tests.helpers import http_status_error as _status, infra_exceptions
 
@@ -92,6 +96,39 @@ def test_un_bug_nuestro_sigue_siendo_de_la_causa():
     """El default. Sin esto, "no penalizar nunca" pasaría todos los otros tests
     y el techo de suspensión quedaría muerto en silencio."""
     assert classify_exception(ValueError("bug de parseo")) == "case"
+
+
+@pytest.mark.parametrize("code", [
+    "browser_unavailable",
+    "navigation_failed",
+    "form_timeout",
+    "deadline_exceeded",
+])
+def test_mint_unavailable_is_retryable_infra(code):
+    """Removing the typed mint classification must stop safe IP rotation."""
+    exc = MintUnavailableError(code)
+
+    assert classify_exception(exc) == "infra"
+    assert new_egress_may_help(exc) is True
+
+
+def test_cookie_store_lock_timeout_is_infra_but_never_buys_another_ip():
+    """A local store lock cannot be fixed by spending on a new sticky proxy."""
+    error = CookieStoreLockTimeoutError()
+
+    assert classify_exception(error) == "infra"
+    assert new_egress_may_help(error) is False
+    assert pool_unavailable_error(error).code == "cookie_store_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(500, "upstream_unavailable"), (401, "session_blocked"),
+     (403, "session_blocked"), (429, "upstream_unavailable")],
+)
+def test_known_ojv_http_statuses_become_safe_exhausted_pool_codes(status, code):
+    """A known upstream answer is not a programming 500 after pool exhaustion."""
+    assert pool_unavailable_error(_status(status)).code == code
 
 
 def test_block_cause_ante_la_duda_se_la_carga_a_nuestro_lado():

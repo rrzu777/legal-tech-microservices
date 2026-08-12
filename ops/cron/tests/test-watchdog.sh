@@ -62,16 +62,44 @@ EOF
 # `WDS` es la excepción, para los tests que justamente prueban que algo se avisa una
 # sola vez y necesitan que el estado sobreviva entre corridas.
 run() {
-  local st="${WDS:-$(mktemp -d "$TMP/run-XXXXXX")}"
-  DRY_RUN=1 WD_STATE_DIR="$st" CRON_LOG="$1" API_HEALTH_URL="${2:-$SANO}" \
-    WD_CRONTAB_SNAPSHOT="${WD_CRONTAB_SNAPSHOT:-$TMP/crontab-base}" \
-    WD_CRONTAB_LIVE_FILE="${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}" \
-    WD_SS_OUTPUT_FILE="${WD_SS_OUTPUT_FILE:-$TMP/ss-sano}" \
-    WD_BACKUP_DIR="${WD_BACKUP_DIR:-$TMP/backups-sanos}" \
-    WD_JOURNAL_FILE="${WD_JOURNAL_FILE:-$TMP/journal-sano}" \
-    WD_NOW_EPOCH="${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}" \
-    WD_STUCK_COUNT="${WD_STUCK_COUNT:-39}" \
-    bash "$WD" 2>/dev/null
+  local st="${WDS:-$(mktemp -d "$TMP/run-XXXXXX")}" proxy_control_json use_proxy_seam=0
+  local default_env default_systemctl default_sudo default_journal
+  local -a run_env
+  if [ "${WD_LIVE:-0}" = "1" ]; then
+    default_env=/opt/legal-tech-microservices/estrado-pjud-service/.env
+    default_systemctl=systemctl
+    default_sudo=sudo
+    default_journal=""
+  else
+    default_env="$TMP/watchdog.env"
+    default_systemctl="$TMP/systemctl-sano"
+    default_sudo="$TMP/sudo-sano"
+    default_journal="$TMP/journal-sano"
+  fi
+  if [ "${WD_PROXY_CONTROL_JSON+x}" = x ]; then
+    proxy_control_json="$WD_PROXY_CONTROL_JSON"
+    use_proxy_seam=1
+  elif [ "${WD_LIVE:-0}" != "1" ]; then
+    proxy_control_json='[{"status":"enabled","reason_code":null}]'
+    use_proxy_seam=1
+  fi
+  run_env=(env
+    "DRY_RUN=1"
+    "WD_ENV=${WD_ENV:-$default_env}"
+    "WD_STATE_DIR=$st"
+    "CRON_LOG=$1"
+    "API_HEALTH_URL=${2:-$SANO}"
+    "WD_CRONTAB_SNAPSHOT=${WD_CRONTAB_SNAPSHOT:-$TMP/crontab-base}"
+    "WD_CRONTAB_LIVE_FILE=${WD_CRONTAB_LIVE_FILE:-$TMP/crontab-base}"
+    "WD_SS_OUTPUT_FILE=${WD_SS_OUTPUT_FILE:-$TMP/ss-sano}"
+    "WD_BACKUP_DIR=${WD_BACKUP_DIR:-$TMP/backups-sanos}"
+    "WD_JOURNAL_FILE=${WD_JOURNAL_FILE:-$default_journal}"
+    "WD_SYSTEMCTL=${WD_SYSTEMCTL:-$default_systemctl}"
+    "WD_SUDO=${WD_SUDO:-$default_sudo}"
+    "WD_NOW_EPOCH=${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}"
+    "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}")
+  [ "$use_proxy_seam" = "1" ] && run_env+=("WD_PROXY_CONTROL_JSON=$proxy_control_json")
+  "${run_env[@]}" bash "$WD" 2>/dev/null
 }
 
 expect_contains() { # <nombre> <salida> <texto esperado>
@@ -136,7 +164,15 @@ if [ "$1" = "is-enabled" ]; then exit 4; fi
 if [ "$1" = "is-active" ] && [ "$3" = "estrado-pjud.service" ]; then exit 0; fi
 exit 4
 EOF
-chmod +x "$TMP"/systemctl-worker-*
+cat > "$TMP/systemctl-sano" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+cat > "$TMP/sudo-sano" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$TMP"/systemctl-worker-* "$TMP/systemctl-sano" "$TMP/sudo-sano"
 
 echo "== chequeo 1: pausa deliberada no es falso incidente =="
 OUT=$(WD_SYSTEMCTL="$TMP/systemctl-worker-disabled" run "$TMP/crontab-base")
@@ -282,6 +318,99 @@ OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-08T14:00:00Z
 expect_missing "fuera de horario no tapa stuck con health roto" "$OUT" "scheduler no las está tomando"
 expect_contains "fuera de horario conserva la alerta api-health" "$OUT" "api-health"
 
+echo "== chequeo 8: el control del proxy precede al scheduler =="
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' run "$BASE")
+expect_contains "proxy enabled conserva la alerta del scheduler" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "pausa por telemetría explica la causa raíz" "$OUT" "proxy-control:telemetry-unavailable"
+expect_missing "pausa por telemetría suprime scheduler contradictorio" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"billing_exhausted","reason_code":"proxy_balance_exhausted"}]' run "$BASE")
+expect_contains "billing explica la causa raíz" "$OUT" "proxy-control:billing-exhausted"
+expect_missing "billing suprime scheduler contradictorio" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"budget_exhausted","reason_code":"hard_budget_exhausted"}]' run "$BASE")
+expect_contains "presupuesto explica la causa raíz" "$OUT" "proxy-control:budget-exhausted"
+expect_missing "presupuesto suprime scheduler contradictorio" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"budget_config_missing"}]' run "$BASE")
+expect_contains "configuración de presupuesto explica la causa raíz" "$OUT" "proxy-control:budget-exhausted"
+expect_missing "configuración de presupuesto suprime scheduler" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"ops_pause"}]' run "$BASE")
+expect_contains "pausa operacional explica la causa raíz" "$OUT" "proxy-control:operational-pause"
+expect_missing "pausa operacional suprime scheduler" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"https://secret.invalid/raw-sentinel"}]' run "$BASE")
+expect_contains "sentinel desconocido deja el chequeo ciego" "$OUT" "proxy-control-unavailable"
+expect_missing "sentinel desconocido nunca se filtra" "$OUT" "https://secret.invalid/raw-sentinel"
+expect_missing "control desconocido suprime scheduler" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='' run "$BASE")
+expect_contains "fila vacía deja el chequeo ciego" "$OUT" "proxy-control-unavailable"
+expect_missing "fila vacía suprime scheduler" "$OUT" "scheduler no las está tomando"
+
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='{no-es-json}' run "$BASE")
+expect_contains "JSON malformado deja el chequeo ciego" "$OUT" "proxy-control-unavailable"
+expect_missing "JSON malformado suprime scheduler" "$OUT" "scheduler no las está tomando"
+
+WDS=$(mktemp -d "$TMP/proxy-control-recovery-XXXXXX")
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "primera pausa queda registrada" "$OUT" "proxy-control:telemetry-unavailable"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' run "$BASE")
+expect_contains "recuperación vuelve a evaluar scheduler" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "recaída tras recuperación vuelve a alertar" "$OUT" "proxy-control:telemetry-unavailable"
+unset WDS
+
+echo "== chequeo 8: la recuperación fuera de ventana reinicia sólo con evidencia =="
+# Esta secuencia mata la mutación que deja de observar el control fuera de horario:
+# una pausa avisada el viernes debe poder recuperarse el fin de semana, para que una
+# recaída idéntica del lunes sea una alerta nueva. No se consulta `stuck` fuera de
+# horario ni se emite una alerta por esa lectura de control.
+WDS=$(mktemp -d "$TMP/proxy-control-off-hours-recovery-XXXXXX")
+VIERNES_1759=$(date -u -d '2026-08-14T21:59:00Z' +%s)
+SABADO_1000=$(date -u -d '2026-08-15T14:00:00Z' +%s)
+LUNES_1000=$(date -u -d '2026-08-17T14:00:00Z' +%s)
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$VIERNES_1759" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "viernes Chile alerta la pausa" "$OUT" "proxy-control:telemetry-unavailable"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$SABADO_1000" \
+  WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' run "$BASE")
+expect_missing "enabled fuera de ventana no alerta" "$OUT" "proxy-control:"
+expect_missing "enabled fuera de ventana no ejecuta stuck" "$OUT" "scheduler no las está tomando"
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$LUNES_1000" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "misma pausa el lunes vuelve a alertar tras recuperación" "$OUT" "proxy-control:telemetry-unavailable"
+unset WDS
+
+echo "== chequeo 8: control incierto fuera de ventana no borra ni alerta =="
+WDS=$(mktemp -d "$TMP/proxy-control-off-hours-unavailable-XXXXXX")
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$VIERNES_1759" \
+  WD_PROXY_CONTROL_JSON='[{"status":"paused","reason_code":"telemetry_unavailable"}]' run "$BASE")
+expect_contains "viernes deja una causa deduplicada" "$OUT" "proxy-control:telemetry-unavailable"
+STATE_BEFORE=$(cksum "$WDS/estrado-wd-proxy-control-root")
+OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH="$SABADO_1000" \
+  WD_PROXY_CONTROL_JSON='{"message":"401 sentinel secreto"}' run "$BASE")
+expect_missing "control incierto fuera de ventana no genera alerta ciega" "$OUT" "proxy-control-unavailable"
+expect_missing "control incierto fuera de ventana no filtra sentinel" "$OUT" "401 sentinel secreto"
+expect_equals "control incierto fuera de ventana conserva la causa deduplicada" \
+  "$(cksum "$WDS/estrado-wd-proxy-control-root")" "$STATE_BEFORE"
+unset WDS
+
 echo "== chequeo 8: consulta sólo causas elegibles =="
 STUCK_BLOCK=$(awk '/^# 8\. Causas atascadas/{inside=1} /^# 9\. La API/{inside=0} inside' "$WD")
 for literal in \
@@ -304,6 +433,7 @@ printf '%s\n' \
   'printf "%s\\n" "$*" >> "$WD_CURL_LOG"' \
   'case " $* " in' \
   '  *" -I "*) printf "HTTP/1.1 200 OK\\r\\nContent-Range: 0-0/0\\r\\n\\r\\n" ;;' \
+  "  *\"pjud_proxy_control?\"*) printf '[{\"status\":\"enabled\",\"reason_code\":null}]' ;;" \
   '  *) printf "[]" ;;' \
   'esac' > "$TMP/curl-bin/curl"
 chmod +x "$TMP/curl-bin/curl"
@@ -314,7 +444,8 @@ run_with_captured_queries() { # <epoch>
     CRON_LOG="$BASE" API_HEALTH_URL="$SANO" WD_CRONTAB_SNAPSHOT="$TMP/crontab-base" \
     WD_CRONTAB_LIVE_FILE="$TMP/crontab-base" WD_SS_OUTPUT_FILE="$TMP/ss-sano" \
     WD_BACKUP_DIR="$TMP/backups-sanos" WD_JOURNAL_FILE="$TMP/journal-sano" \
-    WD_NOW_EPOCH="$1" WD_STUCK_COUNT= bash "$WD" 2>/dev/null
+    WD_NOW_EPOCH="$1" WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' \
+    WD_STUCK_COUNT= bash "$WD" 2>/dev/null
 }
 STUCK_QUERY_LOG="$TMP/stuck-query.log"
 : > "$STUCK_QUERY_LOG"
@@ -324,6 +455,18 @@ expect_contains "consulta abierta excluye lease activo" "$(<"$STUCK_QUERY_LOG")"
 : > "$STUCK_QUERY_LOG"
 OUT=$(WD_CURL_LOG="$STUCK_QUERY_LOG" run_with_captured_queries "$(date -u -d '2026-08-08T14:00:00Z' +%s)")
 expect_missing "fuera de horario no consulta casos stuck" "$(<"$STUCK_QUERY_LOG")" 'next_sync_at=lt.'
+
+echo "== smoke WD_LIVE: consulta control real, no el seam unitario =="
+: > "$STUCK_QUERY_LOG"
+WD_LIVE=1
+WD_ENV="$TMP/watchdog.env"
+WD_CURL_LOG="$STUCK_QUERY_LOG"
+export WD_CURL_LOG
+PATH="$TMP/curl-bin:$PATH"
+OUT=$(run "$BASE")
+PATH="${PATH#"$TMP/curl-bin:"}"
+unset WD_LIVE WD_ENV WD_CURL_LOG
+expect_contains "modo live consulta pjud_proxy_control" "$(<"$STUCK_QUERY_LOG")" 'pjud_proxy_control?select=status,reason_code&provider=eq.iproyal&limit=1'
 
 echo "== reloj y estado dry-run =="
 INVALID_ERR="$TMP/invalid-now.err"
@@ -464,7 +607,9 @@ printf 'SUPABASE_URL=http://127.0.0.1:1\nSUPABASE_SERVICE_KEY=fake-para-el-test\
 CAIDO=$(mktemp -d "$TMP/caido-XXXX")
 FAKE_ID="11111111-2222-3333-4444-555555555555"
 printf '%s\n' "$FAKE_ID" > "$CAIDO/estrado-wd-suspended"
-OUT=$(DRY_RUN=1 WD_ENV="$TMP/roto.env" WD_STATE_DIR="$CAIDO" CRON_LOG="$BASE" API_HEALTH_URL="$SANO" bash "$WD" 2>/dev/null)
+WDS="$CAIDO"
+OUT=$(WD_ENV="$TMP/roto.env" run "$BASE" "$SANO")
+unset WDS
 expect_contains "avisa que no pudo consultar las causas" "$OUT" "cases-query-fail"
 expect_contains "avisa que no pudo contar"               "$OUT" "count-fail"
 expect_missing  "no inventa causas suspendidas"          "$OUT" "monitoreo SUSPENDIDO"

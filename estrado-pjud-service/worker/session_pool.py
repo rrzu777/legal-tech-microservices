@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.cookie_store import CookieBundle, CookieStore
+from app.failure_kind import MintUnavailableError, new_egress_may_help
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
 from app.proxy_billing import is_proxy_billing_error
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 # para otra cosa (un slot re-minteando en loop) y no debe confundirse con esto.
 _MINT_RETRY_BASE_S = 2.0
 _MINT_RETRY_JITTER_S = 1.0
+_MINT_TRAFFIC_BUDGET_S = 20.0
+_MAX_NEW_STICKY_IPS_PER_MINT = 3
+_CANDIDATE_CLOSE_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -146,63 +150,108 @@ class SessionPool:
         # El retry vive DESPUES del cooldown BLOCK_PAUSE_S de arriba y no lo
         # re-dispara: ese cooldown es para un slot que re-mintea en loop, no para
         # los reintentos de un mismo minteo.
-        attempts = max(1, self._config.MINT_MAX_RETRIES)
+        attempts = min(
+            _MAX_NEW_STICKY_IPS_PER_MINT,
+            max(1, self._config.MINT_MAX_RETRIES),
+        )
+        deadline = time.monotonic() + _MINT_TRAFFIC_BUDGET_S
         for attempt in range(1, attempts + 1):
+            if time.monotonic() >= deadline:
+                raise MintUnavailableError("deadline_exceeded")
             token = None
             proxy_url = None
             new_session = None
             self.mint_attempts += 1
             try:
                 async with self._mint_usage_scope(slot, attempt):
-                    if self._proxy_base:
-                        token = generate_session_token()
-                        proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
-                        minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
-                    else:
-                        minter = CookieMinter(self._config.PJUD_BASE_URL)
+                    timer = asyncio.timeout_at(deadline)
+                    try:
+                        async with timer:
+                            if self._proxy_base:
+                                token = generate_session_token()
+                                proxy_url = build_sticky_proxy_url(self._proxy_base, token, self._sticky_lifetime)
+                                minter = CookieMinter(self._config.PJUD_BASE_URL, proxy=proxy_url)
+                            else:
+                                minter = CookieMinter(self._config.PJUD_BASE_URL)
 
-                    creds = await minter.mint()
+                            creds = await minter.mint()
 
-                    settings = Settings(
-                        API_KEY="unused-by-worker",
-                        OJV_BASE_URL=self._config.PJUD_BASE_URL,
-                        RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
-                    )
-                    adapter = OJVHttpAdapter(
-                        settings,
-                        proxy=proxy_url,
-                        user_agent=creds.user_agent,
-                        cookies=creds.cookies,
-                    )
-                    new_session = OJVSession(adapter)
-                    await new_session.initialize()
+                            settings = Settings(
+                                API_KEY="unused-by-worker",
+                                OJV_BASE_URL=self._config.PJUD_BASE_URL,
+                                RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
+                            )
+                            adapter = OJVHttpAdapter(
+                                settings,
+                                proxy=proxy_url,
+                                user_agent=creds.user_agent,
+                                cookies=creds.cookies,
+                            )
+                            new_session = OJVSession(adapter)
+                            await new_session.initialize()
+                            final_cookies = adapter.snapshot_cookies()
+                    except TimeoutError:
+                        if timer.expired():
+                            raise MintUnavailableError("deadline_exceeded") from None
+                        raise
                 break
-            except Exception as exc:
+            except BaseException as exc:
                 self.mint_failures += 1
                 if new_session is not None:
                     # La sesion a medio construir se cierra acá: si no, cada
                     # reintento deja un adapter httpx colgado.
                     try:
-                        await new_session.close()
+                        await asyncio.wait_for(
+                            new_session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+                        )
                     except Exception:
                         logger.debug("No se pudo cerrar la sesion fallida del slot %d", slot.index)
                 if (
                     is_proxy_billing_error(exc)
                     or isinstance(exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError))
+                    or not new_egress_may_help(exc)
+                    or time.monotonic() >= deadline
                     or attempt >= attempts
                 ):
                     logger.error(
-                        "Slot %d: minteo fallido tras %d intentos", slot.index, attempts
+                        "worker_mint_failed slot=%d attempts=%d failure_type=%s failure_code=%s",
+                        slot.index,
+                        attempt,
+                        type(exc).__name__,
+                        exc.code if isinstance(exc, MintUnavailableError) else "none",
                     )
                     raise
                 delay = _MINT_RETRY_BASE_S * 2 ** (attempt - 1) + random.uniform(0, _MINT_RETRY_JITTER_S)
                 logger.warning(
-                    "Slot %d: minteo fallido (intento %d/%d: %s); reintento en %.1fs con IP nueva",
-                    slot.index, attempt, attempts, exc, delay,
+                    "worker_mint_retry slot=%d attempt=%d total=%d failure_type=%s "
+                    "failure_code=%s delay_seconds=%.1f",
+                    slot.index,
+                    attempt,
+                    attempts,
+                    type(exc).__name__,
+                    exc.code if isinstance(exc, MintUnavailableError) else "none",
+                    delay,
                 )
                 await asyncio.sleep(delay)
 
-        self._store.save_slot(slot.index, creds.cookies, creds.user_agent, token)
+        try:
+            self._store.save_slot(
+                slot.index,
+                final_cookies,
+                creds.user_agent,
+                token,
+            )
+        except BaseException:
+            # Persistir es el commit del candidate: si falla, no se puede
+            # instalar la nueva sesión ni dejar su adapter abierto. El slot
+            # anterior sigue intacto porque el swap ocurre sólo más abajo.
+            try:
+                await asyncio.wait_for(
+                    new_session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+                )
+            except Exception:
+                logger.debug("No se pudo cerrar la sesion no persistida del slot %d", slot.index)
+            raise
 
         old_session = slot.session
         slot.token = token

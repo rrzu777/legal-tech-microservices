@@ -40,9 +40,25 @@ from typing import Literal
 
 import httpx
 
+from app.cookie_store import CookieStoreLockTimeoutError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.proxy_billing import is_proxy_billing_error
 
 FailureKind = Literal["infra", "ojv", "case"]
+MintFailureCode = Literal[
+    "browser_unavailable",
+    "navigation_failed",
+    "form_timeout",
+    "deadline_exceeded",
+]
+PoolFailureCode = Literal[
+    "mint_exhausted",
+    "session_blocked",
+    "proxy_transport",
+    "upstream_unavailable",
+    "deadline_exceeded",
+    "cookie_store_unavailable",
+]
 
 #: De quién fue la culpa de un bloqueo, para el texto que ve el abogado.
 BlockCause = Literal["ojv", "infra"]
@@ -51,6 +67,22 @@ BlockCause = Literal["ojv", "infra"]
 #: 429 es rate limiting. El resto de los 4xx —un 404 sobre el detalle— sí
 #: describe algo puntual del pedido.
 _OJV_REJECTION_STATUSES = frozenset({401, 403, 429})
+
+
+class MintUnavailableError(RuntimeError):
+    """A typed, retryable failure while creating a fresh PJUD session."""
+
+    def __init__(self, code: MintFailureCode):
+        self.code = code
+        super().__init__(code)
+
+
+class PoolUnavailableError(RuntimeError):
+    """A known operational failure that leaves the API pool unusable."""
+
+    def __init__(self, code: PoolFailureCode):
+        self.code = code
+        super().__init__(code)
 
 
 class EmptyResponseError(Exception):
@@ -162,6 +194,46 @@ class RejectedDetailSessionError(Exception):
     """
 
 
+def pool_unavailable_error(error: BaseException) -> PoolUnavailableError | None:
+    """Translate only known exhausted acquisition failures to a safe code.
+
+    This boundary deliberately stays narrower than ``classify_exception``:
+    parser defects, assertion failures, paid-traffic control and provider billing
+    must retain their original type so the caller can preserve their controls or
+    expose a real 500 to observability.
+    """
+    if isinstance(error, PoolUnavailableError):
+        return error
+    if isinstance(error, NoUsableBundleError):
+        return PoolUnavailableError("mint_exhausted")
+    if isinstance(error, BlockedPageError):
+        return PoolUnavailableError("session_blocked")
+    if isinstance(error, MintUnavailableError):
+        return PoolUnavailableError(
+            "deadline_exceeded"
+            if error.code == "deadline_exceeded"
+            else "upstream_unavailable",
+        )
+    if isinstance(error, CookieStoreLockTimeoutError):
+        return PoolUnavailableError("cookie_store_unavailable")
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        if status in {401, 403}:
+            return PoolUnavailableError("session_blocked")
+        if status >= 500 or status == 429:
+            return PoolUnavailableError("upstream_unavailable")
+    if isinstance(error, TimeoutError):
+        return PoolUnavailableError("deadline_exceeded")
+    if isinstance(error, httpx.TransportError) and not is_proxy_billing_error(error):
+        return PoolUnavailableError("proxy_transport")
+    return None
+
+
+def is_expected_acquisition_failure(error: BaseException) -> bool:
+    """Whether an exhausted acquisition may cross the HTTP boundary as 503."""
+    return pool_unavailable_error(error) is not None
+
+
 def slot_still_healthy(e: BaseException) -> bool:
     """¿El slot F5 sigue sirviendo pese a esta excepción?
 
@@ -202,14 +274,15 @@ def new_egress_may_help(e: BaseException) -> bool:
     `MINT_MAX_RETRIES` veces con IP nueva — y ésa es toda la diferencia entre sus
     ~50 sesiones sanas en 10 días y los 3 de 4 `/api/v1/search` que se cayeron.
 
-    ⚠️ Hoy la regla la obedece UN solo loop. `worker/session_pool.py::_mint_slot`
-    reintenta sobre un `except Exception` pelado, así que un 5xx de OJV durante
-    el minteo le quema `MINT_MAX_RETRIES` IPs para cobrar el mismo no — que es
-    justo lo que esto dice que no hay que hacer. Es preexistente y cambiarlo
-    merece su propia medición; queda anotado para que nadie lea este predicado
-    como si ya rigiera en los dos lados.
+    La obedecen tanto `APISessionPool` como `worker.session_pool.SessionPool`.
+    Los dos cortan billing, presupuesto, telemetría y cualquier error para el
+    que otra IP no puede ayudar antes de asignar otro token sticky.
     """
-    return classify_exception(e) == "infra" and not slot_still_healthy(e)
+    return (
+        not isinstance(e, CookieStoreLockTimeoutError)
+        and classify_exception(e) == "infra"
+        and not slot_still_healthy(e)
+    )
 
 
 def classify_exception(e: BaseException) -> FailureKind:
@@ -229,12 +302,15 @@ def classify_exception(e: BaseException) -> FailureKind:
         (
             httpx.TransportError,
             TimeoutError,
+            CookieStoreLockTimeoutError,
             EmptyResponseError,
             UpstreamChangedError,
             NoUsableBundleError,
             MissingCsrfTokenError,
             RejectedDetailSessionError,
             BlockedPageError,
+            MintUnavailableError,
+            PoolUnavailableError,
             ProxyBudgetExceededError,
             ProxyUsagePersistenceError,
         ),

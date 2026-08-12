@@ -25,6 +25,7 @@ if ! NOW=$(date -u -d "@$WATCHDOG_NOW_EPOCH" +%Y-%m-%dT%H:%M:%S); then
   exit 2
 fi
 SYSTEMCTL="${WD_SYSTEMCTL:-systemctl}"
+SUDO_BIN="${WD_SUDO:-sudo}"
 
 # Devuelve el conteo, o VACÍO si no se pudo consultar. Devolvía 0 en ese caso, y eso
 # es la misma enfermedad que el resto del archivo viene a curar: una consulta que
@@ -151,6 +152,55 @@ stuck_window_open() {
   [ "$dow" -le 5 ] && [ "$hour" -ge 10 ] && [ "$hour" -lt 18 ]
 }
 
+# Lee el control persistente antes de culpar al scheduler. Sólo deja salir
+# etiquetas propias y allowlisted: el contenido de PostgREST puede contener
+# detalles operacionales que no pertenecen al aviso ni a su firma.
+#
+# Return: 0 enabled; 2 disabled con causa conocida; 1 fila ausente, respuesta
+# inválida o sentinel desconocido. En los dos últimos casos se falla cerrado.
+read_proxy_control() {
+  local json status reason
+  if [ "${WD_PROXY_CONTROL_JSON+x}" = x ]; then
+    json="$WD_PROXY_CONTROL_JSON"
+  else
+    json=$(curl -s -m 20 "$API/pjud_proxy_control?select=status,reason_code&provider=eq.iproyal&limit=1" "${AUTH[@]}" 2>/dev/null || true)
+  fi
+
+  status=$(printf '%s' "$json" | jq -er '
+    if type == "array" and length == 1 and (.[0] | type == "object") and (.[0].status | type == "string")
+    then .[0].status else empty end
+  ' 2>/dev/null) || return 1
+  reason=$(printf '%s' "$json" | jq -er '
+    if type == "array" and length == 1 and (.[0] | type == "object") and
+       ((.[0].reason_code | type) == "string" or .[0].reason_code == null)
+    then (.[0].reason_code // "") else empty end
+  ' 2>/dev/null) || return 1
+
+  PROXY_CONTROL_TAG=""
+  PROXY_CONTROL_MESSAGE=""
+  case "$status:$reason" in
+    enabled:*) return 0 ;;
+    paused:telemetry_unavailable)
+      PROXY_CONTROL_TAG="proxy-control:telemetry-unavailable"
+      PROXY_CONTROL_MESSAGE="El control persistente de IPRoyal pausó el sync por telemetría indisponible; no atribuir causas vencidas al scheduler."
+      ;;
+    billing_exhausted:proxy_balance_exhausted)
+      PROXY_CONTROL_TAG="proxy-control:billing-exhausted"
+      PROXY_CONTROL_MESSAGE="El control persistente de IPRoyal detuvo el sync por facturación agotada; no atribuir causas vencidas al scheduler."
+      ;;
+    budget_exhausted:hard_budget_exhausted|paused:budget_config_missing)
+      PROXY_CONTROL_TAG="proxy-control:budget-exhausted"
+      PROXY_CONTROL_MESSAGE="El control persistente de IPRoyal detuvo el sync por presupuesto; no atribuir causas vencidas al scheduler."
+      ;;
+    paused:ops_pause)
+      PROXY_CONTROL_TAG="proxy-control:operational-pause"
+      PROXY_CONTROL_MESSAGE="El control persistente de IPRoyal está en pausa operacional; no atribuir causas vencidas al scheduler."
+      ;;
+    *) return 1 ;;
+  esac
+  return 2
+}
+
 # Lo mismo, para causas: devuelve los `case_number` de las que matchean el filtro y
 # no estaban antes. Alerta por causa y no por cantidad, que es lo que permite bajar
 # los umbrales sin inundar el canal.
@@ -172,7 +222,7 @@ nuevas_causas() { # <slug de estado> <filtro postgrest sobre cases>
   # llama dentro de `$(...)`, o sea en un subshell, donde `add` mutaría una copia de
   # ANOMALIES que muere con el subshell. Sería una falla muda —el chequeo se ve andando
   # y no alerta nunca—, que es la familia de bug que este archivo entero persigue.
-  printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  [ -n "${json// }" ] && printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
   ids=$(printf '%s' "$json" | jq -r '.[]?.id' 2>/dev/null | sin_vacias)
   nuevos=$(nuevas_claves "$1" "$ids")
   [ -z "${nuevos// }" ] && return 0
@@ -302,7 +352,7 @@ fi
 
 # 6. Salud del propio Hermes (gateway + dashboard son servicios de usuario de hermes)
 for hsvc in hermes-gateway hermes-dashboard; do
-  sudo -u hermes XDG_RUNTIME_DIR=/run/user/1002 systemctl --user is-active --quiet "$hsvc.service" \
+  "$SUDO_BIN" -u hermes XDG_RUNTIME_DIR=/run/user/1002 systemctl --user is-active --quiet "$hsvc.service" \
     || add "Servicio de Hermes caído: ${hsvc}.service" "hermes-$hsvc"
 done
 
@@ -389,13 +439,40 @@ STUCK_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 7200))" +%Y-%m-%dT%H:%M:%S)
 STUCK_LEASE_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 14400))" +%Y-%m-%dT%H:%M:%S)
 STUCK_FILTER="cases?select=id&tracking_status=eq.active&source_system=eq.pjud_ojv&next_sync_at=lt.$STUCK_CUTOFF&and=(or(sync_priority.is.null,sync_priority.lte.3),or(sync_blocked_until.is.null,sync_blocked_until.lt.$NOW),or(sync_worker_id.is.null,sync_claimed_at.is.null,sync_claimed_at.lt.$STUCK_LEASE_CUTOFF))"
 if stuck_window_open; then
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    STUCK="${WD_STUCK_COUNT:-$(cnt "$STUCK_FILTER")}"
-  else
-    STUCK=$(cnt "$STUCK_FILTER")
-  fi
-  conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
-    && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+  read_proxy_control
+  PROXY_CONTROL_STATE=$?
+  case "$PROXY_CONTROL_STATE" in
+    0)
+      # Recuperación: permite que una recaída de control sea una alerta nueva.
+      nuevas_claves proxy-control-root "" >/dev/null
+      if [ "${DRY_RUN:-0}" = "1" ]; then
+        STUCK="${WD_STUCK_COUNT:-$(cnt "$STUCK_FILTER")}" # dry-run seam
+      else
+        STUCK=$(cnt "$STUCK_FILTER")
+      fi
+      conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
+        && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+      ;;
+    2)
+      PROXY_CONTROL_NEW=$(nuevas_claves proxy-control-root "$PROXY_CONTROL_TAG")
+      sig_keyed proxy-control-root
+      [ -n "${PROXY_CONTROL_NEW// }" ] && add "$PROXY_CONTROL_MESSAGE" "$PROXY_CONTROL_TAG"
+      ;;
+    *)
+      PROXY_CONTROL_NEW=$(nuevas_claves proxy-control-root "proxy-control-unavailable")
+      sig_keyed proxy-control-root
+      [ -n "${PROXY_CONTROL_NEW// }" ] && add "No pude confirmar el control persistente de IPRoyal; el chequeo de causas vencidas queda ciego y no atribuye el atraso al scheduler." "proxy-control-unavailable"
+      ;;
+  esac
+else
+  # Fuera de la ventana no hay oportunidad de que el scheduler procese `stuck`,
+  # por lo que no se consulta ni se alerta. Aun así, una confirmación `enabled`
+  # es evidencia suficiente para olvidar una causa raíz anterior: sin este
+  # refresh una recaída idéntica tras recuperación nocturna quedaría deduplicada
+  # hasta la próxima firma distinta. Cualquier respuesta incierta conserva el
+  # estado y permanece silenciosa; no inventamos recuperación ni una alerta extra.
+  read_proxy_control
+  [ "$?" -eq 0 ] && nuevas_claves proxy-control-root "" >/dev/null
 fi
 
 # 9. La API de scraping: viva no es lo mismo que útil.
@@ -465,7 +542,7 @@ else
     # El uptime va en el mensaje porque el contador se resetea con el proceso: sin él,
     # una falla vieja y una tormenta de hace diez minutos se leen igual.
     UP_H=$(jq -r 'if (.uptime_seconds|type)=="number" then (.uptime_seconds/3600|floor) else "?" end' < "$API_BODY" 2>/dev/null || echo "?")
-    add "El pool no pudo entregar sesión ${POOL_FAIL} vez(ces) en las últimas ${UP_H}h de uptime de la API. No es un bloqueo de OJV: es nuestro lado (sin bundle F5, sin proxy, initialize() que revienta). La API devuelve 500 a toda consulta mientras dure." "pool-fail"
+    add "El pool no pudo entregar sesión ${POOL_FAIL} vez(ces) en las últimas ${UP_H}h de uptime de la API. No es un bloqueo de OJV: es nuestro lado (sin bundle F5, sin proxy, initialize() que revienta). La indisponibilidad operacional tipada responde 503; un defecto inesperado sigue siendo 500 interno." "pool-fail"
   fi
 fi
 rm -f "$API_BODY"
@@ -602,7 +679,7 @@ degradado, decilo. No inventes; razoná solo sobre esto:
 $ANOMALIES
 EOF
 
-DIAG=$(sudo -u hermes bash -lc "cd ~ && timeout 120 hermes -z \"\$(cat '$PROMPT_FILE')\"" 2>/dev/null)
+DIAG=$("$SUDO_BIN" -u hermes bash -lc "cd ~ && timeout 120 hermes -z \"\$(cat '$PROMPT_FILE')\"" 2>/dev/null)
 rm -f "$PROMPT_FILE"
 
 MSG="🚨 *Estrado watchdog* — $(date -u +'%F %H:%M UTC')
@@ -612,9 +689,9 @@ ${ANOMALIES}
 🧠 Diagnóstico:
 ${DIAG:-（Luna no respondió; revisar manualmente.)}"
 
-CHATID=$(sudo -u hermes bash -lc 'grep -E "^TELEGRAM_ALLOWED_USERS=" ~/.hermes/.env | sed -E "s/^[^=]+=//; s/^[^0-9-]*//; s/[^0-9-].*$//"')
+CHATID=$("$SUDO_BIN" -u hermes bash -lc 'grep -E "^TELEGRAM_ALLOWED_USERS=" ~/.hermes/.env | sed -E "s/^[^=]+=//; s/^[^0-9-]*//; s/[^0-9-].*$//"')
 if [ -n "$CHATID" ]; then
-  printf '%s' "$MSG" | sudo -u hermes bash -lc "cd ~ && hermes send -t 'telegram:${CHATID}'"
+  printf '%s' "$MSG" | "$SUDO_BIN" -u hermes bash -lc "cd ~ && hermes send -t 'telegram:${CHATID}'"
 else
-  printf '%s' "$MSG" | sudo -u hermes bash -lc "cd ~ && hermes send -t telegram"
+  printf '%s' "$MSG" | "$SUDO_BIN" -u hermes bash -lc "cd ~ && hermes send -t telegram"
 fi

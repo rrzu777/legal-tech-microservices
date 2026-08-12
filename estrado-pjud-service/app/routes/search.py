@@ -142,8 +142,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
     pool = request.app.state.session_pool
     # Fuera del `try` de abajo a proposito: ese try devuelve 200 con `error` para
     # TODO lo que falla adentro, asi que un fallo de pool ahi seria invisible.
-    # `acquire_or_alert` lo cuenta, alerta y re-lanza — el 500 es lo unico que le
-    # dice a la app que el problema es nuestro y no de la causa.
+    # `acquire_or_alert` lo cuenta, alerta y convierte indisponibilidad conocida
+    # en 503; un 500 queda reservado para defectos inesperados.
     session = await acquire_or_alert(pool, request, "search")
 
     healthy = True
@@ -178,7 +178,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 usage.error_kind = "ojv"
 
         # Cuerpo de cero bytes: infra, no bloqueo. Sale por el `except` de abajo
-        # como 500. Sin esto, `parse_search_results` de un cuerpo vacio devuelve
+        # como fallo de infraestructura. Sin esto, `parse_search_results` de un cuerpo vacio devuelve
         # [] y la app escribe "No encontrada en OJV — revisa el rol".
         if blocked_response:
             healthy = False

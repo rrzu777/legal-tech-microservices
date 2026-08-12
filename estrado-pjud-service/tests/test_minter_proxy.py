@@ -3,19 +3,36 @@ SEPARADAS (server/username/password), nunca embebidas en la URL del
 `server`. Embebidas rompe Chromium con net::ERR_INVALID_AUTH_CREDENTIALS
 (verificado empíricamente en el VPS).
 """
+import asyncio
+from copy import copy
+from http.cookiejar import CookieJar
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.bandwidth import capture_proxy_usage
-from app.minter import CookieMinter
+from app.adapters.http_adapter import OJVHttpAdapter
+from app.config import Settings
+from app.failure_kind import MintUnavailableError
+from app.minter import CookieMinter, cookies_to_dict
 
 _DUMMY_PROXY = (
     "http://user123:pw_country-cl_session-abc_lifetime-1h@geo.iproyal.com:12321"
 )
 
 
-def _make_playwright_mock():
+class _DuplicateCookieJar(CookieJar):
+    """CookieJar iterable for the impossible-to-store same-scope value conflict."""
+
+    def __init__(self, records):
+        self._records = records
+
+    def __iter__(self):
+        return iter(self._records)
+
+
+def _make_playwright_mock(*, cookies=None, user_agent="Mozilla/5.0 Test UA"):
     """Construye un mock chain de async_playwright que soporta
     `async with async_playwright() as pw` y captura los kwargs de
     `pw.chromium.launch(**kwargs)`.
@@ -23,13 +40,13 @@ def _make_playwright_mock():
     Devuelve (async_playwright_mock, launch_mock) para poder inspeccionar
     las llamadas después.
     """
-    pw_cookies = [
+    pw_cookies = cookies or [
         {"name": "TSPD_101", "value": "abc", "domain": "oficinajudicialvirtual.pjud.cl"},
     ]
 
     page = AsyncMock()
     page.on = MagicMock()
-    page.evaluate = AsyncMock(return_value="Mozilla/5.0 Test UA")
+    page.evaluate = AsyncMock(return_value=user_agent)
 
     context = AsyncMock()
     context.new_page = AsyncMock(return_value=page)
@@ -53,6 +70,127 @@ def _make_playwright_mock():
     async_playwright_factory = MagicMock(return_value=async_playwright_cm)
 
     return async_playwright_factory, launch_mock, page
+
+
+async def test_mint_accepts_real_form_with_renamed_f5_cookies(caplog):
+    """Changing the F5 cookie suffix must not reject a form-ready PJUD session."""
+    sentinel_ua = "UA-SENTINEL-DO-NOT-LOG"
+    sentinel_cookie_name = "TSa2ac8a0a027"
+    sentinel_cookie_value = "f5-value-sentinel"
+    factory, _, _ = _make_playwright_mock(
+        cookies=[
+            {"name": "PHPSESSID", "value": "php", "domain": "oficinajudicialvirtual.pjud.cl"},
+            {"name": "TS01262d1d", "value": "f5-a", "domain": "oficinajudicialvirtual.pjud.cl"},
+            {
+                "name": sentinel_cookie_name,
+                "value": sentinel_cookie_value,
+                "domain": "oficinajudicialvirtual.pjud.cl",
+            },
+        ],
+        user_agent=sentinel_ua,
+    )
+
+    with patch("app.minter.async_playwright", factory):
+        with caplog.at_level("INFO", logger="app.minter"):
+            result = await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+
+    assert set(result.cookies) == {"PHPSESSID", "TS01262d1d", sentinel_cookie_name}
+    log_output = caplog.text
+    assert sentinel_cookie_name not in log_output
+    assert sentinel_cookie_value not in log_output
+    assert sentinel_ua not in log_output
+
+
+@pytest.mark.parametrize("changed_field", ["value", "domain", "path"])
+async def test_mint_rejects_ambiguous_scoped_cookie_without_disclosing_it(
+    caplog, changed_field,
+):
+    """A browser jar with conflicting scoped values cannot be flattened safely."""
+    sentinel_name = "cookie-name-sentinel"
+    sentinel_value = "cookie-value-sentinel"
+    sentinel_domain = "cookie-domain-sentinel.test"
+    sentinel_path = "/cookie-path-sentinel"
+    first_cookie = {
+        "name": sentinel_name,
+        "value": sentinel_value,
+        "domain": sentinel_domain,
+        "path": sentinel_path,
+    }
+    second_cookie = dict(first_cookie)
+    second_cookie[changed_field] = f"other-{changed_field}-sentinel"
+    factory, _, _ = _make_playwright_mock(cookies=[first_cookie, second_cookie])
+
+    with patch("app.minter.async_playwright", factory):
+        with caplog.at_level("INFO", logger="app.minter"):
+            with pytest.raises(ValueError, match="ambiguous_cookie_scope") as exc_info:
+                await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+
+    output = f"{exc_info.value}\n{caplog.text}"
+    for sentinel in (*first_cookie.values(), *second_cookie.values()):
+        assert sentinel not in output
+
+
+def test_cookie_conversion_allows_exact_scoped_duplicates_and_distinct_names():
+    """Identical browser records and independently named cookies are unambiguous."""
+    result = cookies_to_dict([
+        {"name": "PHPSESSID", "value": "php", "domain": "ojv.test", "path": "/"},
+        {"name": "PHPSESSID", "value": "php", "domain": "ojv.test", "path": "/"},
+        {"name": "TS-current", "value": "f5", "domain": "ojv.test", "path": "/"},
+    ])
+
+    assert result == {"PHPSESSID": "php", "TS-current": "f5"}
+
+
+async def test_snapshot_accepts_identical_scoped_duplicates_and_distinct_names():
+    """Identical jar records can flatten safely alongside independently named cookies."""
+    adapter = OJVHttpAdapter(Settings(API_KEY="t", _env_file=None))
+    adapter.cookies.set("PHPSESSID", "php", domain="ojv.test", path="/")
+    adapter.cookies.set("TS-current", "f5", domain="ojv.test", path="/")
+    records = list(adapter.cookies.jar)
+    php_session = next(cookie for cookie in records if cookie.name == "PHPSESSID")
+    adapter.cookies.jar = _DuplicateCookieJar([php_session, copy(php_session), *records])
+
+    try:
+        assert adapter.snapshot_cookies() == {"PHPSESSID": "php", "TS-current": "f5"}
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.parametrize("changed_field", ["value", "domain", "path"])
+async def test_snapshot_rejects_ambiguous_httpx_cookie_scopes_without_disclosing_them(
+    changed_field,
+):
+    """A real httpx jar must fail closed before a name-only snapshot loses scope."""
+    sentinel_name = "jar-name-sentinel"
+    sentinel_value = "jar-value-sentinel"
+    sentinel_domain = "jar-domain-sentinel.test"
+    sentinel_path = "/jar-path-sentinel"
+    first_cookie = {
+        "value": sentinel_value,
+        "domain": sentinel_domain,
+        "path": sentinel_path,
+    }
+    second_cookie = dict(first_cookie)
+    second_cookie[changed_field] = f"jar-other-{changed_field}-sentinel"
+    adapter = OJVHttpAdapter(Settings(API_KEY="t", _env_file=None))
+    adapter.cookies.set(sentinel_name, **first_cookie)
+    if changed_field == "value":
+        first_record = next(iter(adapter.cookies.jar))
+        second_record = copy(first_record)
+        second_record.value = second_cookie["value"]
+        adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
+    else:
+        adapter.cookies.set(sentinel_name, **second_cookie)
+
+    try:
+        with pytest.raises(ValueError, match="ambiguous_cookie_scope") as exc_info:
+            adapter.snapshot_cookies()
+    finally:
+        await adapter.close()
+
+    output = str(exc_info.value)
+    for sentinel in (sentinel_name, *first_cookie.values(), *second_cookie.values()):
+        assert sentinel not in output
 
 
 async def test_mint_passes_separated_proxy_credentials_to_playwright():
@@ -107,10 +245,65 @@ async def test_mint_attributes_chromium_transfer_sizes_to_active_operation():
     assert usage.bytes_down == 1_200
 
 
+async def test_cancelled_mint_closes_browser_before_any_cleanup_telemetry():
+    """A cancelled paid navigation must close Chromium without awaiting page JS."""
+    navigation_started = asyncio.Event()
+    browser_closed = asyncio.Event()
+    telemetry_release = asyncio.Event()
+
+    class Page:
+        def on(self, *_args):
+            pass
+
+        async def goto(self, *_args, **_kwargs):
+            navigation_started.set()
+            await asyncio.Event().wait()
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            raise AssertionError("selector must not run after cancelled navigation")
+
+        async def evaluate(self, *_args, **_kwargs):
+            await telemetry_release.wait()
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+    class Browser:
+        async def new_context(self):
+            return Context()
+
+        async def close(self):
+            browser_closed.set()
+
+    class PlaywrightContext:
+        chromium = SimpleNamespace(launch=AsyncMock(return_value=Browser()))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    with patch("app.minter.async_playwright", return_value=PlaywrightContext()):
+        task = asyncio.create_task(
+            CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint(),
+        )
+        await navigation_started.wait()
+        task.cancel()
+        try:
+            await asyncio.wait_for(browser_closed.wait(), timeout=0.1)
+        finally:
+            telemetry_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_failed_mint_still_attributes_paid_transfer_sizes():
     async_playwright_factory, _, page = _make_playwright_mock()
+    request = MagicMock(post_data_buffer=None)
+    page.on.side_effect = lambda event, callback: callback(request)
     page.wait_for_selector.side_effect = TimeoutError("challenge timeout")
-    page.evaluate.return_value = [{"transferSize": 1_500}]
 
     with patch("app.minter.async_playwright", async_playwright_factory):
         with capture_proxy_usage() as usage:
@@ -120,7 +313,7 @@ async def test_failed_mint_still_attributes_paid_transfer_sizes():
                 ).mint()
 
     assert usage.request_count == 1
-    assert usage.bytes_down == 1_500
+    assert usage.bytes_down == 0
 
 
 async def test_navigation_failure_still_records_that_proxy_was_contacted():
@@ -138,3 +331,32 @@ async def test_navigation_failure_still_records_that_proxy_was_contacted():
                 ).mint()
 
     assert usage.request_count == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "code"),
+    [
+        ("launch", "browser_unavailable"),
+        ("navigation", "navigation_failed"),
+        ("selector", "form_timeout"),
+    ],
+)
+async def test_playwright_mint_boundaries_raise_allowlisted_unavailable_code(
+    boundary, code,
+):
+    """A raw Playwright outage would make retry policy depend on its message."""
+    factory, launch_mock, page = _make_playwright_mock()
+    from playwright.async_api import Error as PlaywrightError
+
+    if boundary == "launch":
+        launch_mock.side_effect = PlaywrightError("browser backend failed")
+    elif boundary == "navigation":
+        page.goto.side_effect = PlaywrightError("navigation backend failed")
+    else:
+        page.wait_for_selector.side_effect = PlaywrightError("selector backend failed")
+
+    with patch("app.minter.async_playwright", factory):
+        with pytest.raises(MintUnavailableError) as exc_info:
+            await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+
+    assert exc_info.value.code == code

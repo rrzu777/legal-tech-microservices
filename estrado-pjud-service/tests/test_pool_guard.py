@@ -15,10 +15,16 @@ peor estaba el servicio, más callado.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from app.alerting import TelegramAlerter
+from app.failure_kind import PoolUnavailableError
 from app.metrics import api_metrics
-from app.pool_guard import POOL_UNAVAILABLE_EVENT, acquire_or_alert
+from app.pool_guard import (
+    POOL_UNAVAILABLE_EVENT,
+    PUBLIC_POOL_UNAVAILABLE_DETAIL,
+    acquire_or_alert,
+)
 
 
 class _BrokenPool:
@@ -31,6 +37,19 @@ class _BrokenPool:
 class _WorkingPool:
     async def acquire(self):
         return "session"
+
+
+class _OperationalBrokenPool:
+    async def acquire(self):
+        raise PoolUnavailableError("mint_exhausted")
+
+
+class _BuggyPool:
+    def __init__(self, error):
+        self.error = error
+
+    async def acquire(self):
+        raise self.error
 
 
 def _request_with_alerter(alerter):
@@ -57,6 +76,38 @@ async def test_relanza_para_que_la_app_lo_clasifique_como_infra():
     # `PjudInfraError`, y por eso NO le suma fallas a la causa.
     with pytest.raises(RuntimeError, match="Connection refused"):
         await acquire_or_alert(_BrokenPool(), _request_with_alerter(None), "search")
+
+
+@pytest.mark.asyncio
+async def test_operational_pool_failure_is_a_safe_503_and_alert_code():
+    """Removing the typed 503 boundary would expose the acquisition failure."""
+    alerter = TelegramAlerter("token", "chat")
+    alerter._send = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await acquire_or_alert(_OperationalBrokenPool(), _request_with_alerter(alerter), "search")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == PUBLIC_POOL_UNAVAILABLE_DETAIL
+    alert = alerter._send.await_args.args[0]
+    assert "pool_failure=mint_exhausted" in alert
+    assert "mint_exhausted" not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_unexpected_pool_exception_preserves_identity_and_uses_safe_alert_code():
+    """A catch-all 503 mapping would hide programming defects from the API."""
+    sentinel = RuntimeError("programming invariant sentinel")
+    alerter = TelegramAlerter("token", "chat")
+    alerter._send = AsyncMock()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await acquire_or_alert(_BuggyPool(sentinel), _request_with_alerter(alerter), "detail")
+
+    assert exc_info.value is sentinel
+    alert = alerter._send.await_args.args[0]
+    assert "pool_failure=unexpected_exception" in alert
+    assert "programming invariant sentinel" not in alert
 
 
 @pytest.mark.asyncio
