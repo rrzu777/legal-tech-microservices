@@ -9,6 +9,9 @@
 set -uo pipefail
 
 WD="${1:-/tmp/estrado-watchdog.sh}"
+LIVE_SMOKE="${WD_LIVE:-0}"
+LIVE_ENV="${WD_ENV:-/opt/legal-tech-microservices/estrado-pjud-service/.env}"
+unset WD_LIVE WD_ENV
 TMP=$(mktemp -d)
 PASS=0; FAIL=0
 
@@ -457,16 +460,26 @@ OUT=$(WD_CURL_LOG="$STUCK_QUERY_LOG" run_with_captured_queries "$(date -u -d '20
 expect_missing "fuera de horario no consulta casos stuck" "$(<"$STUCK_QUERY_LOG")" 'next_sync_at=lt.'
 
 echo "== smoke WD_LIVE: consulta control real, no el seam unitario =="
-: > "$STUCK_QUERY_LOG"
-WD_LIVE=1
-WD_ENV="$TMP/watchdog.env"
-WD_CURL_LOG="$STUCK_QUERY_LOG"
-export WD_CURL_LOG
-PATH="$TMP/curl-bin:$PATH"
-OUT=$(run "$BASE")
-PATH="${PATH#"$TMP/curl-bin:"}"
-unset WD_LIVE WD_ENV WD_CURL_LOG
-expect_contains "modo live consulta pjud_proxy_control" "$(<"$STUCK_QUERY_LOG")" 'pjud_proxy_control?select=status,reason_code&provider=eq.iproyal&limit=1'
+if [ "$LIVE_SMOKE" = "1" ]; then
+  WD_LIVE=1
+  WD_ENV="$LIVE_ENV"
+  OUT=$(run "$BASE")
+  unset WD_LIVE WD_ENV
+  expect_missing "modo live puede leer pjud_proxy_control" "$OUT" \
+    "No pude confirmar el control persistente de IPRoyal"
+else
+  : > "$STUCK_QUERY_LOG"
+  WD_LIVE=1
+  WD_ENV="$TMP/watchdog.env"
+  WD_CURL_LOG="$STUCK_QUERY_LOG"
+  export WD_CURL_LOG
+  PATH="$TMP/curl-bin:$PATH"
+  OUT=$(run "$BASE")
+  PATH="${PATH#"$TMP/curl-bin:"}"
+  unset WD_LIVE WD_ENV WD_CURL_LOG
+  expect_contains "modo live consulta pjud_proxy_control" "$(<"$STUCK_QUERY_LOG")" \
+    'pjud_proxy_control?select=status,reason_code&provider=eq.iproyal&limit=1'
+fi
 
 echo "== reloj y estado dry-run =="
 INVALID_ERR="$TMP/invalid-now.err"
