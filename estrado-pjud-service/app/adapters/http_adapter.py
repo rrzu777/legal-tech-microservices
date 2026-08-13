@@ -10,6 +10,7 @@ from app.bandwidth import (
     record_proxy_response,
     record_proxy_retry,
 )
+from app.cookie_scope import flatten_cookie_name_values
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -95,16 +96,9 @@ class OJVHttpAdapter:
         return self._client.cookies
 
     def snapshot_cookies(self) -> dict[str, str]:
-        cookies: dict[str, str] = {}
-        scopes: dict[str, tuple[str, str, str]] = {}
-        for cookie in self._client.cookies.jar:
-            scope = (cookie.value, cookie.domain, cookie.path)
-            previous_scope = scopes.get(cookie.name)
-            if previous_scope is not None and previous_scope != scope:
-                raise ValueError("ambiguous_cookie_scope")
-            scopes[cookie.name] = scope
-            cookies[cookie.name] = cookie.value
-        return cookies
+        return flatten_cookie_name_values(
+            (cookie.name, cookie.value) for cookie in self._client.cookies.jar
+        )
 
     async def close(self):
         await self._client.aclose()

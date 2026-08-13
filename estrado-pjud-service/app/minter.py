@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from app.bandwidth import record_proxy_request, record_proxy_response
+from app.cookie_scope import flatten_cookie_name_values
 from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
 
@@ -39,17 +40,9 @@ class MintResult:
 
 
 def cookies_to_dict(pw_cookies: list[dict]) -> dict[str, str]:
-    cookies: dict[str, str] = {}
-    scopes: dict[str, tuple[str, str, str]] = {}
-    for cookie in pw_cookies:
-        name = cookie["name"]
-        scope = (cookie["value"], cookie.get("domain", ""), cookie.get("path", ""))
-        previous_scope = scopes.get(name)
-        if previous_scope is not None and previous_scope != scope:
-            raise ValueError("ambiguous_cookie_scope")
-        scopes[name] = scope
-        cookies[name] = cookie["value"]
-    return cookies
+    return flatten_cookie_name_values(
+        (cookie["name"], cookie["value"]) for cookie in pw_cookies
+    )
 
 
 class CookieMinter:

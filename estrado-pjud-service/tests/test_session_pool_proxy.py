@@ -154,6 +154,49 @@ async def test_slot_mint_persists_cookie_jar_after_initialize(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_worker_mint_persists_equivalent_cookie_scopes(monkeypatch):
+    """A valid PJUD jar duplicated by scope must reach the worker slot store."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"TS-current": "f5"}, user_agent="fresh-UA")
+
+    class SessionWithEquivalentScopes(_FakeSession):
+        async def initialize(self):
+            self.adapter.cookies.set(
+                "PHPSESSID", "renewed", domain="oficinajudicialvirtual.pjud.cl", path="/",
+            )
+            self.adapter.cookies.set(
+                "PHPSESSID", "renewed", domain=".pjud.cl", path="/consultaUnificada.php",
+            )
+
+        async def close(self):
+            await self.adapter.close()
+            await super().close()
+
+    fake_store = MagicMock()
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "OJVSession", SessionWithEquivalentScopes)
+    monkeypatch.setattr(sp, "CookieStore", lambda _path: fake_store)
+
+    pool = sp.SessionPool(config)
+    try:
+        await pool.initialize()
+        assert fake_store.save_slot.call_args.args[1] == {
+            "TS-current": "f5",
+            "PHPSESSID": "renewed",
+        }
+    finally:
+        await pool.close_all()
+
+
+@pytest.mark.asyncio
 async def test_worker_familia_slot_never_reads_api_on_demand_namespace(tmp_path):
     """The API candidate cannot overwrite cookies paired with worker slot 0's IP."""
     from app.cookie_store import CookieStore
