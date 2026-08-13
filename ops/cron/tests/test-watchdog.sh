@@ -692,6 +692,21 @@ OUT=$(WD_JOURNAL_FILE="$TMP/journal-tres-eventos.log" run "$BASE")
 expect_contains "tres eventos estructurados sí alertan" "$OUT" "3 errores del worker"
 expect_contains "la firma identifica el chequeo"        "$OUT" "journal-err"
 
+cat > "$TMP/journal-cookie-scope.log" <<'EOF'
+Aug 12 worker: {"level": "ERROR", "msg": "worker_mint_failed slot=0 attempts=1 failure_type=ValueError failure_code=none"}
+Aug 12 worker: Traceback (most recent call last):
+Aug 12 worker: ValueError: ambiguous_cookie_scope
+Aug 12 worker: {"level": "ERROR", "msg": "Fallo al inicializar el pool (intento 2/3)"}
+Aug 12 worker: {"level": "ERROR", "msg": "No se pudo inicializar el pool tras 3 reintentos"}
+EOF
+OUT=$(WD_JOURNAL_FILE="$TMP/journal-cookie-scope.log" run "$BASE")
+expect_contains "cookie scope se atribuye a regresión local" "$OUT" \
+  "Regresión local confirmada al normalizar cookies"
+expect_contains "cookie scope prohíbe rotar IPs" "$OUT" \
+  "No rotar IPs ni atribuirlo a F5"
+expect_contains "la firma identifica cookie scope local" "$OUT" \
+  "cookie-scope-local"
+
 echo "== chequeo 11: el backup como artefacto =="
 OUT=$(WD_BACKUP_DIR="$TMP/backups-vacios" run "$BASE")
 expect_contains "sin ningún tar: alerta" "$OUT" "backup-missing"

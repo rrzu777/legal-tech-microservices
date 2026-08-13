@@ -342,7 +342,12 @@ worker_journal() {
     journalctl -u estrado-pjud.service -u estrado-pjud-worker.service --since "-1 hour" --no-pager 2>/dev/null || true
   fi
 }
-JERR=$(worker_journal \
+WORKER_JOURNAL=$(worker_journal)
+COOKIE_SCOPE_N=$(printf '%s' "$WORKER_JOURNAL" | grep -c 'ambiguous_cookie_scope' || true)
+if [ "${COOKIE_SCOPE_N:-0}" -gt 0 ]; then
+  add "Regresión local confirmada al normalizar cookies PJUD (ambiguous_cookie_scope). No rotar IPs ni atribuirlo a F5; desplegar/corregir el contrato de cookies y reiniciar una sola vez." "cookie-scope-local"
+fi
+JERR=$(printf '%s' "$WORKER_JOURNAL" \
         | grep -E '"level": "(ERROR|CRITICAL)"' \
         | grep -vE 'Refresh de slot [0-9]+ fall' || true)
 JERR_N=$(printf '%s' "$JERR" | grep -c . || true)
@@ -674,7 +679,8 @@ cat > "$PROMPT_FILE" <<EOF
 Sos el SRE de guardia de Estrado (SaaS legal chileno; el sync PJUD usa un pool de IPs residenciales
 con challenge anti-bot F5). Detecté estas anomalías en el VPS. Dame un diagnóstico BREVE en español
 chileno: (1) causa más probable, (2) acción concreta sugerida. Si parece F5/soft-block o pool
-degradado, decilo. No inventes; razoná solo sobre esto:
+degradado, decilo. Si aparece ambiguous_cookie_scope, es una regresión local confirmada: no sugieras
+rotar IPs ni atribuirla a F5. No inventes; razoná solo sobre esto:
 
 $ANOMALIES
 EOF
