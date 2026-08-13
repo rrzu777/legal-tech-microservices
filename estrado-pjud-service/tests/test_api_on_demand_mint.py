@@ -173,6 +173,54 @@ async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_on_demand_mint_persists_equivalent_cookie_scopes(monkeypatch, tmp_path):
+    """A valid PJUD jar duplicated by scope must reach the API bundle store."""
+    from app import session_pool as pool_module
+    from app.session_pool import APISessionPool, _API_COOKIE_STORE_SLOT
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"TS-current": "f5"}, user_agent="fresh-UA")
+
+    class SessionWithEquivalentScopes(FakeOJVSession):
+        async def initialize(self):
+            self.adapter.cookies.set(
+                "PHPSESSID", "renewed", domain="oficinajudicialvirtual.pjud.cl", path="/",
+            )
+            self.adapter.cookies.set(
+                "PHPSESSID", "renewed", domain=".pjud.cl", path="/consultaUnificada.php",
+            )
+
+        async def close(self):
+            await self.adapter.close()
+            await super().close()
+
+    monkeypatch.setattr(pool_module, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(pool_module, "OJVSession", SessionWithEquivalentScopes)
+    settings = Settings(
+        API_KEY="t",
+        OJV_PROXY_URL="http://user:password@geo.iproyal.com:12321",
+        COOKIE_STORE_PATH=str(tmp_path / "cookies.json"),
+        _env_file=None,
+    )
+    store = MemoryCookieStore()
+    pool = APISessionPool(settings, allow_uncontrolled_proxy=True)
+    pool._store = store
+
+    session = await pool._mint_new_bundle()
+    try:
+        assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {
+            "TS-current": "f5",
+            "PHPSESSID": "renewed",
+        }
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_on_demand_store_lock_timeout_closes_candidate_without_a_second_ip(monkeypatch, tmp_path):
     """A local persistence conflict must not spend a second proxy token."""
     from app import session_pool as pool_module

@@ -101,11 +101,8 @@ async def test_mint_accepts_real_form_with_renamed_f5_cookies(caplog):
     assert sentinel_ua not in log_output
 
 
-@pytest.mark.parametrize("changed_field", ["value", "domain", "path"])
-async def test_mint_rejects_ambiguous_scoped_cookie_without_disclosing_it(
-    caplog, changed_field,
-):
-    """A browser jar with conflicting scoped values cannot be flattened safely."""
+async def test_mint_rejects_conflicting_cookie_value_without_disclosing_it(caplog):
+    """The same cookie name with different values cannot be flattened safely."""
     sentinel_name = "cookie-name-sentinel"
     sentinel_value = "cookie-value-sentinel"
     sentinel_domain = "cookie-domain-sentinel.test"
@@ -117,7 +114,7 @@ async def test_mint_rejects_ambiguous_scoped_cookie_without_disclosing_it(
         "path": sentinel_path,
     }
     second_cookie = dict(first_cookie)
-    second_cookie[changed_field] = f"other-{changed_field}-sentinel"
+    second_cookie["value"] = "other-value-sentinel"
     factory, _, _ = _make_playwright_mock(cookies=[first_cookie, second_cookie])
 
     with patch("app.minter.async_playwright", factory):
@@ -128,6 +125,26 @@ async def test_mint_rejects_ambiguous_scoped_cookie_without_disclosing_it(
     output = f"{exc_info.value}\n{caplog.text}"
     for sentinel in (*first_cookie.values(), *second_cookie.values()):
         assert sentinel not in output
+
+
+@pytest.mark.parametrize("changed_field", ["domain", "path"])
+def test_cookie_conversion_accepts_same_value_across_scopes(changed_field):
+    """Equivalent cookie values remain usable when PJUD duplicates their scope."""
+    first_cookie = {
+        "name": "PHPSESSID",
+        "value": "same-session",
+        "domain": "oficinajudicialvirtual.pjud.cl",
+        "path": "/",
+    }
+    second_cookie = dict(first_cookie)
+    second_cookie[changed_field] = {
+        "domain": ".pjud.cl",
+        "path": "/consultaUnificada.php",
+    }[changed_field]
+
+    assert cookies_to_dict([first_cookie, second_cookie]) == {
+        "PHPSESSID": "same-session",
+    }
 
 
 def test_cookie_conversion_allows_exact_scoped_duplicates_and_distinct_names():
@@ -156,10 +173,7 @@ async def test_snapshot_accepts_identical_scoped_duplicates_and_distinct_names()
         await adapter.close()
 
 
-@pytest.mark.parametrize("changed_field", ["value", "domain", "path"])
-async def test_snapshot_rejects_ambiguous_httpx_cookie_scopes_without_disclosing_them(
-    changed_field,
-):
+async def test_snapshot_rejects_conflicting_httpx_cookie_value_without_disclosing_it():
     """A real httpx jar must fail closed before a name-only snapshot loses scope."""
     sentinel_name = "jar-name-sentinel"
     sentinel_value = "jar-value-sentinel"
@@ -171,16 +185,13 @@ async def test_snapshot_rejects_ambiguous_httpx_cookie_scopes_without_disclosing
         "path": sentinel_path,
     }
     second_cookie = dict(first_cookie)
-    second_cookie[changed_field] = f"jar-other-{changed_field}-sentinel"
+    second_cookie["value"] = "jar-other-value-sentinel"
     adapter = OJVHttpAdapter(Settings(API_KEY="t", _env_file=None))
     adapter.cookies.set(sentinel_name, **first_cookie)
-    if changed_field == "value":
-        first_record = next(iter(adapter.cookies.jar))
-        second_record = copy(first_record)
-        second_record.value = second_cookie["value"]
-        adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
-    else:
-        adapter.cookies.set(sentinel_name, **second_cookie)
+    first_record = next(iter(adapter.cookies.jar))
+    second_record = copy(first_record)
+    second_record.value = second_cookie["value"]
+    adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
 
     try:
         with pytest.raises(ValueError, match="ambiguous_cookie_scope") as exc_info:
@@ -191,6 +202,30 @@ async def test_snapshot_rejects_ambiguous_httpx_cookie_scopes_without_disclosing
     output = str(exc_info.value)
     for sentinel in (sentinel_name, *first_cookie.values(), *second_cookie.values()):
         assert sentinel not in output
+
+
+@pytest.mark.parametrize("changed_field", ["domain", "path"])
+async def test_snapshot_accepts_same_value_across_httpx_cookie_scopes(changed_field):
+    """The final httpx jar may contain equivalent values in multiple scopes."""
+    adapter = OJVHttpAdapter(Settings(API_KEY="t", _env_file=None))
+    adapter.cookies.set(
+        "PHPSESSID",
+        "same-session",
+        domain="oficinajudicialvirtual.pjud.cl",
+        path="/",
+    )
+    first_record = next(iter(adapter.cookies.jar))
+    second_record = copy(first_record)
+    setattr(second_record, changed_field, {
+        "domain": ".pjud.cl",
+        "path": "/consultaUnificada.php",
+    }[changed_field])
+    adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
+
+    try:
+        assert adapter.snapshot_cookies() == {"PHPSESSID": "same-session"}
+    finally:
+        await adapter.close()
 
 
 async def test_mint_passes_separated_proxy_credentials_to_playwright():
