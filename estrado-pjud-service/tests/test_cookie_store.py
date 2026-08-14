@@ -1,11 +1,22 @@
+from app.cookie_scope import CookieRecord
 from app.cookie_store import CookieStore
+
+
+def _legacy_record(name: str, value: str) -> CookieRecord:
+    return CookieRecord(
+        name=name,
+        value=value,
+        domain="oficinajudicialvirtual.pjud.cl",
+        path="/",
+        secure=True,
+    )
 
 
 def test_save_and_load_roundtrip(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
     store.save(cookies={"TSPD_101": "abc"}, user_agent="UA/1.0")
     bundle = store.load()
-    assert bundle.cookies == {"TSPD_101": "abc"}
+    assert bundle.cookies == (_legacy_record("TSPD_101", "abc"),)
     assert bundle.user_agent == "UA/1.0"
 
 

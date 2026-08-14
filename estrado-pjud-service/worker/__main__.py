@@ -158,9 +158,9 @@ async def safe_initialize_pool(
     return False
 
 
-def can_initialize_paid_pool(now=None) -> bool:
+def can_initialize_paid_pool(now=None, *, validation_once: bool = False) -> bool:
     """El pool residencial solo puede mintear cuando el scheduler puede trabajar."""
-    return is_scheduled_processing_window(now)
+    return validation_once or is_scheduled_processing_window(now)
 
 
 async def safe_get_next_batch(scheduler, metrics, backoff):
@@ -211,6 +211,12 @@ async def refresh_proxy_gate(
 
 async def main():
     config = WorkerConfig()
+    validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
+    if validation_once:
+        # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
+        # en el proceso transitorio y acota el tráfico de adquisición a un slot.
+        config.OJV_PROXY_POOL_SIZE = 1
+        config.POOL_SIZE = 1
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
@@ -273,7 +279,7 @@ async def main():
                     pass
                 continue
 
-            if not can_initialize_paid_pool():
+            if not can_initialize_paid_pool(validation_once=validation_once):
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 try:
@@ -311,6 +317,9 @@ async def main():
                 "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
             )
             if not backoff.is_permanently_open:
+                if validation_once:
+                    logger.error("One-shot validation stopped after mint failure")
+                    return
                 await shutdown_event.wait()
                 return
 
@@ -346,7 +355,7 @@ async def main():
                     pass
                 continue
 
-            if not is_scheduled_processing_window():
+            if not validation_once and not is_scheduled_processing_window():
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 try:
@@ -374,6 +383,9 @@ async def main():
             if batch is None:
                 metrics.set_status("backoff")
                 notify_status("scheduler unavailable; pool kept alive")
+                if validation_once:
+                    logger.error("One-shot validation stopped after scheduler failure")
+                    return
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -383,6 +395,9 @@ async def main():
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
                 await maybe_alert_bandwidth(config, bandwidth_alert_state)
+                if validation_once:
+                    logger.info("One-shot validation found no eligible case")
+                    return
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -399,10 +414,17 @@ async def main():
                 shutdown_event,
                 backoff,
                 proxy_control=proxy_control,
+                processing_window=(
+                    (lambda: True) if validation_once
+                    else is_scheduled_processing_window
+                ),
             )
 
             await scheduler.release_batch(case_ids)
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
+            if validation_once:
+                logger.info("One-shot validation completed one batch")
+                return
 
     finally:
         notify_stopping()

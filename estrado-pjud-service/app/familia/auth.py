@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping, Sequence
 
 import httpx
 from bs4 import BeautifulSoup
 
 from app.adapters.http_adapter import _USER_AGENT
 from app.bandwidth import estimate_request_bytes, record_proxy_request, record_proxy_response
+from app.cookie_scope import (
+    CookieRecord,
+    cookie_jar_from_records,
+    legacy_cookie_records,
+    legacy_cookie_scope,
+)
 from app.parsers.search_parser import detect_blocked
 
 logger = logging.getLogger(__name__)
@@ -89,15 +96,21 @@ class FamiliaAuthSession:
     def __init__(
         self,
         proxy_url: str | None = None,
-        cookies: dict[str, str] | None = None,
+        cookies: Sequence[CookieRecord] | Mapping[str, str] | None = None,
         user_agent: str | None = None,
         rate_limit_s: float = 2.5,
     ):
         self._rate_s = rate_limit_s
         self._last: float = 0.0
+        cookie_records = cookies or ()
+        if isinstance(cookie_records, Mapping):
+            domain, secure = legacy_cookie_scope(_OJV_BASE)
+            cookie_records = legacy_cookie_records(
+                cookie_records, domain=domain, secure=secure,
+            )
         self._client = httpx.AsyncClient(
             proxy=proxy_url,
-            cookies=cookies or {},
+            cookies=cookie_jar_from_records(cookie_records),
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             headers={

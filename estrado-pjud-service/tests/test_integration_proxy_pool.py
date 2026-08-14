@@ -16,7 +16,7 @@ from app.minter import MintResult
 from app.cookie_store import CookieStore
 from worker.session_pool import SessionPool
 from app.session_pool import APISessionPool
-from tests.helpers import FakeOJVSession, api_settings
+from tests.helpers import FakeOJVSession, api_settings, cookie_values
 
 DUMMY_BASE = "http://user123:pw_country-cl@geo.example.com:12321"
 
@@ -65,7 +65,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
 
     def snapshot_adapter(*_args, cookies=None, **_kwargs):
         adapter = MagicMock()
-        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        adapter.snapshot_cookies.return_value = cookie_values(cookies)
         return adapter
 
     monkeypatch.setattr(wsp, "CookieMinter", FakeMinter)
@@ -84,7 +84,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     assert "user123" not in raw_store
     assert "pw_country" not in raw_store
     # cookies distintas por slot (cada slot minteó lo suyo)
-    assert {tuple(b.cookies.items()) for b in bundles.values()} == {
+    assert {tuple(cookie_values(b.cookies).items()) for b in bundles.values()} == {
         (("TSPD_101", "cookie0"),), (("TSPD_101", "cookie1"),), (("TSPD_101", "cookie2"),),
     }
 
@@ -102,7 +102,7 @@ async def test_worker_writes_slots_api_egresses_same_proxy_urls(tmp_path, monkey
     def capture_adapter(settings, proxy=None, user_agent=None, cookies=None):
         captured_proxies.append(proxy)
         adapter = MagicMock()
-        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        adapter.snapshot_cookies.return_value = cookie_values(cookies)
         return adapter
 
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)
@@ -151,7 +151,7 @@ async def test_api_no_sale_a_la_calle_si_el_worker_nunca_minteo(tmp_path, monkey
     def capture_adapter(settings, proxy=None, user_agent=None, cookies=None):
         captured.append(proxy)
         adapter = MagicMock()
-        adapter.snapshot_cookies.return_value = dict(cookies or {})
+        adapter.snapshot_cookies.return_value = cookie_values(cookies)
         return adapter
 
     monkeypatch.setattr(asp, "OJVHttpAdapter", capture_adapter)

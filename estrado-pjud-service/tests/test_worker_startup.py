@@ -20,6 +20,14 @@ def test_paid_pool_initialization_only_during_office_window():
     assert can_initialize_paid_pool(datetime(2026, 3, 1, 10, 0, tzinfo=tz)) is False
 
 
+def test_one_shot_validation_can_initialize_outside_office_window():
+    tz = ZoneInfo("America/Santiago")
+
+    assert can_initialize_paid_pool(
+        datetime(2026, 3, 2, 22, 0, tzinfo=tz), validation_once=True,
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_scheduler_failure_stays_alive_without_reinitializing_pool():
     scheduler = AsyncMock()

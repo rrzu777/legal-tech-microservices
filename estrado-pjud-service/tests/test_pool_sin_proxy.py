@@ -16,7 +16,7 @@ nuevo. El modo legacy no aplica este límite de edad.
 
 import asyncio
 from app.minter import MintResult
-from tests.helpers import cookie_bundle, pool_con_store
+from tests.helpers import cookie_bundle, cookie_values, pool_con_store
 
 
 def permitir_mint_residencial(monkeypatch):
@@ -84,7 +84,7 @@ def test_bundle_de_12_horas_mintea_antes_de_inicializar(monkeypatch):
     asyncio.run(pool.acquire())
 
     assert len(capturados) == 1
-    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert cookie_values(capturados[0]["cookies"]) == {"TSPD_101": "tok-nuevo"}
     assert capturados[0]["proxy"] == proxies[0]
 
 
@@ -130,7 +130,7 @@ def test_bundle_con_saved_at_texto_mintea_y_no_filtra_secretos(monkeypatch, capl
     with caplog.at_level(logging.WARNING, logger="app.session_pool"):
         asyncio.run(pool.acquire())
 
-    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert cookie_values(capturados[0]["cookies"]) == {"TSPD_101": "tok-nuevo"}
     assert capturados[0]["proxy"] == proxies[0]
     assert "persisted_bundle_invalid_saved_at slot=7" in caplog.text
     assert "cookie-ultrasecreta" not in caplog.text
@@ -175,7 +175,7 @@ def test_bundle_con_saved_at_futuro_se_descarta_y_mintea(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="app.session_pool"):
         asyncio.run(pool.acquire())
 
-    assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+    assert cookie_values(capturados[0]["cookies"]) == {"TSPD_101": "tok-nuevo"}
     assert capturados[0]["proxy"] == proxies[0]
     assert "persisted_bundle_invalid_saved_at slot=9" in caplog.text
     assert "cookie-futura-ultrasecreta" not in caplog.text
@@ -206,7 +206,7 @@ class TestNuncaSalirSinProxy:
         asyncio.run(pool.acquire())
         assert capturados[0]["proxy"] == proxies[0]
         assert capturados[0]["proxy"] is not None
-        assert capturados[0]["cookies"] == {"TSPD_101": "tok-nuevo"}
+        assert cookie_values(capturados[0]["cookies"]) == {"TSPD_101": "tok-nuevo"}
 
     def test_un_proxy_url_vacio_tampoco_sirve(self, monkeypatch):
         # `""` es tan inservible como `None` y egresa igual por la IP del
@@ -232,7 +232,7 @@ class TestNuncaSalirSinProxy:
         for _ in range(6):
             elegido = pool._pick_bundle()
             assert elegido is not None
-            assert elegido.cookies == {"TSPD_101": "tok-bueno"}
+            assert cookie_values(elegido.cookies) == {"TSPD_101": "tok-bueno"}
 
     def test_en_modo_proxy_sigue_rotando_entre_los_utilizables(self, monkeypatch):
         # El control del test de arriba: con un solo bundle bueno, "devolver
@@ -274,4 +274,4 @@ class TestNuncaSalirSinProxy:
         asyncio.run(pool.acquire())
 
         assert capturados[0]["proxy"] == "http://u:p@sticky:1"
-        assert capturados[0]["cookies"] == {"TSPD_101": "tok-bueno"}
+        assert cookie_values(capturados[0]["cookies"]) == {"TSPD_101": "tok-bueno"}

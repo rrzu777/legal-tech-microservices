@@ -15,7 +15,8 @@ from app.bandwidth import capture_proxy_usage
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
 from app.failure_kind import MintUnavailableError
-from app.minter import CookieMinter, cookies_to_dict
+from app.cookie_scope import CookieRecord
+from app.minter import CookieMinter
 
 _DUMMY_PROXY = (
     "http://user123:pw_country-cl_session-abc_lifetime-1h@geo.iproyal.com:12321"
@@ -94,15 +95,17 @@ async def test_mint_accepts_real_form_with_renamed_f5_cookies(caplog):
         with caplog.at_level("INFO", logger="app.minter"):
             result = await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
 
-    assert set(result.cookies) == {"PHPSESSID", "TS01262d1d", sentinel_cookie_name}
+    assert {record.name for record in result.cookies} == {
+        "PHPSESSID", "TS01262d1d", sentinel_cookie_name,
+    }
     log_output = caplog.text
     assert sentinel_cookie_name not in log_output
     assert sentinel_cookie_value not in log_output
     assert sentinel_ua not in log_output
 
 
-async def test_mint_rejects_conflicting_cookie_value_without_disclosing_it(caplog):
-    """The same cookie name with different values cannot be flattened safely."""
+async def test_mint_preserves_conflicting_values_when_cookie_scopes_differ(caplog):
+    """The real PJUD shape must survive Playwright without name-only flattening."""
     sentinel_name = "cookie-name-sentinel"
     sentinel_value = "cookie-value-sentinel"
     sentinel_domain = "cookie-domain-sentinel.test"
@@ -115,47 +118,20 @@ async def test_mint_rejects_conflicting_cookie_value_without_disclosing_it(caplo
     }
     second_cookie = dict(first_cookie)
     second_cookie["value"] = "other-value-sentinel"
+    second_cookie["path"] = "/other-scope"
     factory, _, _ = _make_playwright_mock(cookies=[first_cookie, second_cookie])
 
     with patch("app.minter.async_playwright", factory):
         with caplog.at_level("INFO", logger="app.minter"):
-            with pytest.raises(ValueError, match="ambiguous_cookie_scope") as exc_info:
-                await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
+            result = await CookieMinter("https://oficinajudicialvirtual.pjud.cl").mint()
 
-    output = f"{exc_info.value}\n{caplog.text}"
+    assert [(c.name, c.value, c.domain, c.path) for c in result.cookies] == [
+        (sentinel_name, sentinel_value, sentinel_domain, sentinel_path),
+        (sentinel_name, "other-value-sentinel", sentinel_domain, "/other-scope"),
+    ]
+    output = caplog.text
     for sentinel in (*first_cookie.values(), *second_cookie.values()):
         assert sentinel not in output
-
-
-@pytest.mark.parametrize("changed_field", ["domain", "path"])
-def test_cookie_conversion_accepts_same_value_across_scopes(changed_field):
-    """Equivalent cookie values remain usable when PJUD duplicates their scope."""
-    first_cookie = {
-        "name": "PHPSESSID",
-        "value": "same-session",
-        "domain": "oficinajudicialvirtual.pjud.cl",
-        "path": "/",
-    }
-    second_cookie = dict(first_cookie)
-    second_cookie[changed_field] = {
-        "domain": ".pjud.cl",
-        "path": "/consultaUnificada.php",
-    }[changed_field]
-
-    assert cookies_to_dict([first_cookie, second_cookie]) == {
-        "PHPSESSID": "same-session",
-    }
-
-
-def test_cookie_conversion_allows_exact_scoped_duplicates_and_distinct_names():
-    """Identical browser records and independently named cookies are unambiguous."""
-    result = cookies_to_dict([
-        {"name": "PHPSESSID", "value": "php", "domain": "ojv.test", "path": "/"},
-        {"name": "PHPSESSID", "value": "php", "domain": "ojv.test", "path": "/"},
-        {"name": "TS-current", "value": "f5", "domain": "ojv.test", "path": "/"},
-    ])
-
-    assert result == {"PHPSESSID": "php", "TS-current": "f5"}
 
 
 async def test_snapshot_accepts_identical_scoped_duplicates_and_distinct_names():
@@ -168,13 +144,15 @@ async def test_snapshot_accepts_identical_scoped_duplicates_and_distinct_names()
     adapter.cookies.jar = _DuplicateCookieJar([php_session, copy(php_session), *records])
 
     try:
-        assert adapter.snapshot_cookies() == {"PHPSESSID": "php", "TS-current": "f5"}
+        assert adapter.snapshot_cookies() == (
+            CookieRecord("PHPSESSID", "php", "ojv.test", "/", http_only=True),
+            CookieRecord("TS-current", "f5", "ojv.test", "/", http_only=True),
+        )
     finally:
         await adapter.close()
 
 
-async def test_snapshot_rejects_conflicting_httpx_cookie_value_without_disclosing_it():
-    """A real httpx jar must fail closed before a name-only snapshot loses scope."""
+async def test_snapshot_preserves_conflicting_values_across_httpx_scopes():
     sentinel_name = "jar-name-sentinel"
     sentinel_value = "jar-value-sentinel"
     sentinel_domain = "jar-domain-sentinel.test"
@@ -191,17 +169,18 @@ async def test_snapshot_rejects_conflicting_httpx_cookie_value_without_disclosin
     first_record = next(iter(adapter.cookies.jar))
     second_record = copy(first_record)
     second_record.value = second_cookie["value"]
+    second_record.path = "/other-scope"
     adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
 
     try:
-        with pytest.raises(ValueError, match="ambiguous_cookie_scope") as exc_info:
-            adapter.snapshot_cookies()
+        snapshot = adapter.snapshot_cookies()
     finally:
         await adapter.close()
 
-    output = str(exc_info.value)
-    for sentinel in (sentinel_name, *first_cookie.values(), *second_cookie.values()):
-        assert sentinel not in output
+    assert [(c.name, c.value, c.domain, c.path) for c in snapshot] == [
+        (sentinel_name, sentinel_value, sentinel_domain, sentinel_path),
+        (sentinel_name, second_cookie["value"], sentinel_domain, "/other-scope"),
+    ]
 
 
 @pytest.mark.parametrize("changed_field", ["domain", "path"])
@@ -223,7 +202,7 @@ async def test_snapshot_accepts_same_value_across_httpx_cookie_scopes(changed_fi
     adapter.cookies.jar = _DuplicateCookieJar([first_record, second_record])
 
     try:
-        assert adapter.snapshot_cookies() == {"PHPSESSID": "same-session"}
+        assert len(adapter.snapshot_cookies()) == 2
     finally:
         await adapter.close()
 
@@ -245,7 +224,9 @@ async def test_mint_passes_separated_proxy_credentials_to_playwright():
         "username": "user123",
         "password": "pw_country-cl_session-abc_lifetime-1h",
     }
-    assert result.cookies == {"TSPD_101": "abc"}
+    assert result.cookies == (
+        CookieRecord("TSPD_101", "abc", "oficinajudicialvirtual.pjud.cl", "/"),
+    )
     assert result.user_agent == "Mozilla/5.0 Test UA"
 
 
@@ -260,7 +241,9 @@ async def test_mint_without_proxy_does_not_pass_proxy_kwarg():
     launch_mock.assert_awaited_once()
     _, kwargs = launch_mock.call_args
     assert "proxy" not in kwargs
-    assert result.cookies == {"TSPD_101": "abc"}
+    assert result.cookies == (
+        CookieRecord("TSPD_101", "abc", "oficinajudicialvirtual.pjud.cl", "/"),
+    )
 
 
 async def test_mint_attributes_chromium_transfer_sizes_to_active_operation():

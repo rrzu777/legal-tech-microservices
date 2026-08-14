@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections.abc import Mapping, Sequence
 
 import httpx
 
@@ -10,7 +11,13 @@ from app.bandwidth import (
     record_proxy_response,
     record_proxy_retry,
 )
-from app.cookie_scope import flatten_cookie_name_values
+from app.cookie_scope import (
+    CookieRecord,
+    cookie_jar_from_records,
+    cookie_records_from_jar,
+    legacy_cookie_records,
+    legacy_cookie_scope,
+)
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -28,17 +35,23 @@ class OJVHttpAdapter:
         settings: Settings,
         proxy: str | None = None,
         user_agent: str | None = None,
-        cookies: dict[str, str] | None = None,
+        cookies: Sequence[CookieRecord] | Mapping[str, str] | None = None,
     ):
         self._settings = settings
         self._base = settings.OJV_BASE_URL.rstrip("/")
         self._rate_limit_s = settings.RATE_LIMIT_MS / 1000.0
         self._last_request_time: float = 0.0
+        cookie_records = cookies or ()
+        if isinstance(cookie_records, Mapping):
+            domain, secure = legacy_cookie_scope(self._base)
+            cookie_records = legacy_cookie_records(
+                cookie_records, domain=domain, secure=secure,
+            )
         self._client = httpx.AsyncClient(
             proxy=proxy,
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
-            cookies=cookies or {},
+            cookies=cookie_jar_from_records(cookie_records),
             headers={
                 "User-Agent": user_agent or _USER_AGENT,
                 "Accept-Language": "es-CL,es;q=0.9",
@@ -95,10 +108,8 @@ class OJVHttpAdapter:
     def cookies(self) -> httpx.Cookies:
         return self._client.cookies
 
-    def snapshot_cookies(self) -> dict[str, str]:
-        return flatten_cookie_name_values(
-            (cookie.name, cookie.value) for cookie in self._client.cookies.jar
-        )
+    def snapshot_cookies(self) -> tuple[CookieRecord, ...]:
+        return cookie_records_from_jar(self._client.cookies.jar)
 
     async def close(self):
         await self._client.aclose()

@@ -5,11 +5,20 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 
 import fcntl
 
+from app.cookie_scope import (
+    CookieRecord,
+    cookie_record_from_json,
+    legacy_cookie_records,
+    normalize_cookie_records,
+)
+
 DEFAULT_COOKIE_STORE_PATH = "/var/lib/estrado-pjud/cookies.json"
 PRODUCTION_CHECKOUT = Path("/opt/legal-tech-microservices")
+DEFAULT_LEGACY_COOKIE_DOMAIN = "oficinajudicialvirtual.pjud.cl"
 
 
 class CookieStoreLockTimeoutError(TimeoutError):
@@ -35,11 +44,21 @@ def validate_cookie_store_path(value: str) -> str:
 
 @dataclass
 class CookieBundle:
-    cookies: dict[str, str]
+    cookies: tuple[CookieRecord, ...]
     user_agent: str
     saved_at: float
     proxy_url: str | None = None
     proxy_token: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.cookies, Mapping):
+            self.cookies = legacy_cookie_records(
+                self.cookies,
+                domain=DEFAULT_LEGACY_COOKIE_DOMAIN,
+                secure=True,
+            )
+        else:
+            self.cookies = normalize_cookie_records(self.cookies)
 
     @property
     def age_seconds(self) -> float:
@@ -55,9 +74,58 @@ class CookieStore:
     perdidas entre worker y API.
     """
 
-    def __init__(self, path: str, *, lock_timeout_s: float = 2.0):
+    def __init__(
+        self,
+        path: str,
+        *,
+        lock_timeout_s: float = 2.0,
+        legacy_cookie_domain: str = DEFAULT_LEGACY_COOKIE_DOMAIN,
+        legacy_cookie_secure: bool = True,
+    ):
         self._path = path
         self._lock_timeout_s = min(max(lock_timeout_s, 0.0), 2.0)
+        self._legacy_cookie_domain = legacy_cookie_domain
+        self._legacy_cookie_secure = legacy_cookie_secure
+
+    def _normalize_cookies(
+        self, cookies: Sequence[CookieRecord] | Mapping[str, str],
+    ) -> tuple[CookieRecord, ...]:
+        if isinstance(cookies, Mapping):
+            return legacy_cookie_records(
+                cookies,
+                domain=self._legacy_cookie_domain,
+                secure=self._legacy_cookie_secure,
+            )
+        return normalize_cookie_records(cookies)
+
+    def _serialize_cookies(self, cookies) -> list[dict]:
+        return [record.to_json() for record in self._normalize_cookies(cookies)]
+
+    def _parse_cookies(self, cookies) -> tuple[CookieRecord, ...]:
+        if isinstance(cookies, Mapping):
+            return self._normalize_cookies(cookies)
+        if not isinstance(cookies, list):
+            raise ValueError("invalid_cookie_record")
+        return normalize_cookie_records(cookie_record_from_json(item) for item in cookies)
+
+    def _bundle_from_raw(self, data) -> CookieBundle:
+        if not isinstance(data, dict):
+            raise ValueError("invalid_cookie_bundle")
+        return CookieBundle(
+            cookies=self._parse_cookies(data["cookies"]),
+            user_agent=data["user_agent"],
+            saved_at=data["saved_at"],
+            proxy_url=None,
+            proxy_token=data.get("proxy_token"),
+        )
+
+    def _serialize_bundle(self, bundle: CookieBundle) -> dict:
+        return {
+            "cookies": self._serialize_cookies(bundle.cookies),
+            "user_agent": bundle.user_agent,
+            "proxy_token": bundle.proxy_token,
+            "saved_at": bundle.saved_at,
+        }
 
     @contextmanager
     def _exclusive_write_lock(self):
@@ -99,8 +167,13 @@ class CookieStore:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def save(self, cookies: dict[str, str], user_agent: str) -> None:
-        payload = {"cookies": cookies, "user_agent": user_agent, "saved_at": time.time()}
+    def save(self, cookies, user_agent: str) -> None:
+        payload = {
+            "version": 2,
+            "cookies": self._serialize_cookies(cookies),
+            "user_agent": user_agent,
+            "saved_at": time.time(),
+        }
         with self._exclusive_write_lock():
             d = os.path.dirname(self._path) or "."
             fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
@@ -122,12 +195,8 @@ class CookieStore:
         try:
             with open(self._path) as f:
                 data = json.load(f)
-            return CookieBundle(
-                cookies=data["cookies"],
-                user_agent=data["user_agent"],
-                saved_at=data["saved_at"],
-            )
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            return self._bundle_from_raw(data)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
 
     # -- Multi-bundle API (N slots, uno por IP del pool) ---------------------
@@ -140,7 +209,7 @@ class CookieStore:
     # por una escritura concurrente de un slot distinto.
 
     def _write_all(self, slots: dict[str, dict]) -> None:
-        payload = {"slots": slots}
+        payload = {"version": 2, "slots": slots}
         d = os.path.dirname(self._path) or "."
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
@@ -155,11 +224,15 @@ class CookieStore:
             raise
 
     def _read_all_raw(self) -> dict[str, dict]:
-        # Tolera archivo ausente, JSON corrupto, o esquema viejo/incorrecto
-        # (incl. el formato single-bundle previo) → vacío, nunca crashea.
+        # Tolera archivo ausente, JSON corrupto o esquema incorrecto. El formato
+        # single-bundle previo se expone como slot 0 para migrarlo al primer write.
         try:
             with open(self._path) as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            if "slots" not in data and {"cookies", "user_agent", "saved_at"} <= set(data):
+                return {"0": data}
             slots = data["slots"]
             if not isinstance(slots, dict):
                 return {}
@@ -170,15 +243,19 @@ class CookieStore:
     def save_slot(
         self,
         slot_id,
-        cookies: dict[str, str],
+        cookies: Sequence[CookieRecord] | Mapping[str, str],
         user_agent: str,
         proxy_token: str | None,
     ) -> None:
         slot_key = str(slot_id)
         with self._exclusive_write_lock():
-            slots = self._read_all_raw()
+            existing = self.load_all()
+            slots = {
+                key: self._serialize_bundle(bundle)
+                for key, bundle in existing.items()
+            }
             slots[slot_key] = {
-                "cookies": cookies,
+                "cookies": self._serialize_cookies(cookies),
                 "user_agent": user_agent,
                 # Persistir el URL completo filtraba usuario/password del proveedor.
                 # El API reconstruye el URL sticky desde su OJV_PROXY_URL secreto y
@@ -196,15 +273,7 @@ class CookieStore:
         result: dict[str, CookieBundle] = {}
         for slot_key, data in slots.items():
             try:
-                result[slot_key] = CookieBundle(
-                    cookies=data["cookies"],
-                    user_agent=data["user_agent"],
-                    saved_at=data["saved_at"],
-                    # Deliberadamente ignoramos proxy_url del esquema legacy:
-                    # nunca volver a cargar credenciales persistidas en disco.
-                    proxy_url=None,
-                    proxy_token=data.get("proxy_token"),
-                )
-            except (KeyError, TypeError):
+                result[slot_key] = self._bundle_from_raw(data)
+            except (KeyError, TypeError, ValueError):
                 continue
         return result

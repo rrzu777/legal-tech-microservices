@@ -19,7 +19,7 @@ from app.failure_kind import (
 )
 from app.metrics import api_metrics
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
-from tests.helpers import FakeOJVSession
+from tests.helpers import FakeOJVSession, cookie_values
 from worker.proxy_control import ProxyControlSnapshot
 
 
@@ -45,7 +45,7 @@ class SnapshotAdapter:
     """Adapter fake that keeps the cookie jar contract used by the pools."""
 
     def __init__(self, _settings, *, cookies=None, **_kwargs):
-        self.cookies = dict(cookies or {})
+        self.cookies = cookie_values(cookies)
 
     def snapshot_cookies(self):
         return dict(self.cookies)
@@ -148,7 +148,7 @@ async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, 
 
     class JarAdapter:
         def __init__(self, _settings, *, cookies=None, **_kwargs):
-            self.jar = dict(cookies or {})
+            self.jar = cookie_values(cookies)
 
         def snapshot_cookies(self):
             return dict(self.jar)
@@ -166,8 +166,8 @@ async def test_on_demand_mint_persists_cookie_jar_after_initialize(monkeypatch, 
 
     await pool._mint_new_bundle()
 
-    assert store.slots["0"].cookies == {"PHPSESSID": "old", "TS-old": "old-f5"}
-    assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {
+    assert cookie_values(store.slots["0"].cookies) == {"PHPSESSID": "old", "TS-old": "old-f5"}
+    assert cookie_values(store.slots[_API_COOKIE_STORE_SLOT].cookies) == {
         "PHPSESSID": "renewed", "TS-current": "renewed-f5",
     }
 
@@ -212,9 +212,11 @@ async def test_on_demand_mint_persists_equivalent_cookie_scopes(monkeypatch, tmp
 
     session = await pool._mint_new_bundle()
     try:
-        assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {
-            "TS-current": "f5",
-            "PHPSESSID": "renewed",
+        assert {(cookie.name, cookie.domain, cookie.path) for cookie in
+                store.slots[_API_COOKIE_STORE_SLOT].cookies} == {
+            ("TS-current", "oficinajudicialvirtual.pjud.cl", "/"),
+            ("PHPSESSID", "oficinajudicialvirtual.pjud.cl", "/"),
+            ("PHPSESSID", ".pjud.cl", "/consultaUnificada.php"),
         }
     finally:
         await session.close()
@@ -430,7 +432,7 @@ async def test_on_demand_failed_initialize_keeps_existing_bundle(monkeypatch, tm
         await pool._mint_new_bundle()
 
     assert store.save_calls == []
-    assert store.slots["0"].cookies == old_cookies
+    assert cookie_values(store.slots["0"].cookies) == old_cookies
 
 
 @pytest.mark.asyncio
@@ -479,7 +481,7 @@ async def test_on_demand_ambiguous_cookie_snapshot_keeps_existing_bundle(monkeyp
         await pool._mint_new_bundle()
 
     assert store.save_calls == []
-    assert store.slots["0"].cookies == old_cookies
+    assert cookie_values(store.slots["0"].cookies) == old_cookies
 
 
 class RecordingUsageTracker:
@@ -544,7 +546,7 @@ async def test_familia_stale_bundle_mints_and_returns_fresh_bundle_on_demand(
 
     bundle = await familia_bundle_or_alert(pool, request)
 
-    assert bundle.cookies == {"TSPD_101": "fresh"}
+    assert cookie_values(bundle.cookies) == {"TSPD_101": "fresh"}
     assert bundle.proxy_url == minted_proxies[0]
     assert len(minted_proxies) == 1
     assert minted_proxies[0] is not None
@@ -608,11 +610,9 @@ async def test_empty_proxy_pool_mints_and_persists_one_bundle_on_demand(monkeypa
     assert "geo.iproyal.com:12321" in minted_proxies[0]
     assert len(store.slots) == 1
     assert usage.operations == ["mint"]
-    assert adapter_calls == [{
-        "proxy": minted_proxies[0],
-        "user_agent": "fresh-UA",
-        "cookies": {"TSPD_101": "fresh"},
-    }]
+    assert adapter_calls[0]["proxy"] == minted_proxies[0]
+    assert adapter_calls[0]["user_agent"] == "fresh-UA"
+    assert cookie_values(adapter_calls[0]["cookies"]) == {"TSPD_101": "fresh"}
 
 
 @pytest.mark.asyncio
@@ -728,8 +728,8 @@ async def test_challenged_stored_bundle_falls_back_to_fresh_on_demand_mint(
         {"TSPD_101": "fresh"},
     ]
     assert len(minted_proxies) == 1
-    assert store.slots["0"].cookies == {"TSPD_101": "stale"}
-    assert store.slots[_API_COOKIE_STORE_SLOT].cookies == {"TSPD_101": "fresh"}
+    assert cookie_values(store.slots["0"].cookies) == {"TSPD_101": "stale"}
+    assert cookie_values(store.slots[_API_COOKIE_STORE_SLOT].cookies) == {"TSPD_101": "fresh"}
     assert api_metrics.snapshot()["total_bundle_retries"] == 1
 
 
