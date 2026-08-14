@@ -179,11 +179,25 @@ ante éxito o error; la unidad transitoria replica las propiedades necesarias y 
 tiene `Restart`:
 
 ```bash
+set -Eeuo pipefail
+validation_unit=estrado-pjud-validation-once.service
 restore_worker() {
-  systemctl enable --now estrado-pjud-worker.service
+  rc=$?
+  trap - EXIT INT TERM
+  systemctl stop "$validation_unit" 2>/dev/null || true
+  if ! systemctl enable --now estrado-pjud-worker.service; then
+    rc=1
+  fi
+  exit "$rc"
 }
-trap restore_worker EXIT INT TERM
+trap restore_worker EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 systemctl disable --now estrado-pjud-worker.service
+if systemctl is-active --quiet estrado-pjud-worker.service; then
+  echo "El worker permanente no se detuvo; se aborta el one-shot" >&2
+  exit 1
+fi
 systemd-run --unit=estrado-pjud-validation-once --wait --collect --service-type=exec \
   --property=User=estrado --property=Group=estrado \
   --property=WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service \
@@ -200,7 +214,6 @@ if systemctl is-active --quiet estrado-pjud-validation-once.service; then
   echo "La unidad transitoria no terminó" >&2
   exit 1
 fi
-trap - EXIT INT TERM
 restore_worker
 ```
 
