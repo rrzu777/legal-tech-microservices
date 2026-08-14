@@ -1,4 +1,5 @@
 from http.cookiejar import CookieJar
+from urllib.request import Request
 
 import pytest
 
@@ -85,3 +86,35 @@ def test_playwright_infinite_expiry_fails_with_stable_error():
             "name": "a", "value": "1", "domain": "pjud.cl", "path": "/",
             "secure": True, "expires": float("inf"),
         }])
+
+
+def test_host_only_cookie_is_not_sent_to_subdomain():
+    jar = cookie_jar_from_records((
+        CookieRecord("host", "only", "example.com", "/", True),
+    ))
+    host_request = Request("https://example.com/path")
+    child_request = Request("https://sub.example.com/path")
+
+    jar.add_cookie_header(host_request)
+    jar.add_cookie_header(child_request)
+
+    assert host_request.get_header("Cookie") == "host=only"
+    assert child_request.get_header("Cookie") is None
+
+
+def test_leading_dot_domain_cookie_is_sent_to_subdomain():
+    jar = cookie_jar_from_records((
+        CookieRecord("shared", "yes", ".example.com", "/", True),
+    ))
+    child_request = Request("https://sub.example.com/path")
+
+    jar.add_cookie_header(child_request)
+
+    assert child_request.get_header("Cookie") == "shared=yes"
+
+
+def test_non_positive_expiry_normalizes_to_session_cookie():
+    record = CookieRecord("a", "1", "example.com", expires=-1)
+
+    assert record.expires is None
+    assert tuple(cookie_jar_from_records((record,)))[0].expires is None

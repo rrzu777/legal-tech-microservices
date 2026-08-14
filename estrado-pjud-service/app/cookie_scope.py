@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from http.cookiejar import Cookie, CookieJar
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 import math
 from typing import Any
 from urllib.parse import urlparse
@@ -34,6 +34,8 @@ class CookieRecord:
             or (self.same_site is not None and not isinstance(self.same_site, str))
         ):
             raise ValueError("invalid_cookie_record")
+        if self.expires is not None and self.expires <= 0:
+            object.__setattr__(self, "expires", None)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,7 +94,9 @@ def playwright_cookie_records(records: Sequence[Mapping[str, Any]]) -> tuple[Coo
 
 
 def cookie_jar_from_records(records: Iterable[CookieRecord]) -> CookieJar:
-    jar = CookieJar()
+    jar = CookieJar(policy=DefaultCookiePolicy(
+        strict_ns_domain=DefaultCookiePolicy.DomainStrictNonDomain,
+    ))
     for record in normalize_cookie_records(records):
         rest: dict[str, str | None] = {}
         if record.http_only:
@@ -102,7 +106,8 @@ def cookie_jar_from_records(records: Iterable[CookieRecord]) -> CookieJar:
         jar.set_cookie(Cookie(
             version=0, name=record.name, value=record.value,
             port=None, port_specified=False,
-            domain=record.domain, domain_specified=True,
+            domain=record.domain,
+            domain_specified=record.domain.startswith("."),
             domain_initial_dot=record.domain.startswith("."),
             path=record.path, path_specified=True,
             secure=record.secure, expires=record.expires,

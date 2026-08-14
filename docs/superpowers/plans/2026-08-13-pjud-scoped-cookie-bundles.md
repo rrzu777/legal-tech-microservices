@@ -174,7 +174,40 @@ Refrescar exact head/base/mergeability, mergear sólo SHA revisado y ejecutar de
 
 - [ ] **Step 4: Prueba transitoria**
 
-Detener worker normal; ejecutar el mismo binario mediante `systemd-run --wait --collect` con `PJUD_OFF_HOURS_VALIDATION_ONCE=true`, sin Restart. Inspeccionar sólo agregados seguros. Restaurar worker normal en todos los caminos.
+Ejecutar desde una sola sesión root del VPS. El trap restaura el worker permanente
+ante éxito o error; la unidad transitoria replica las propiedades necesarias y no
+tiene `Restart`:
+
+```bash
+restore_worker() {
+  systemctl enable --now estrado-pjud-worker.service
+}
+trap restore_worker EXIT INT TERM
+systemctl disable --now estrado-pjud-worker.service
+systemd-run --unit=estrado-pjud-validation-once --wait --collect --service-type=exec \
+  --property=User=estrado --property=Group=estrado \
+  --property=WorkingDirectory=/opt/legal-tech-microservices/estrado-pjud-service \
+  --property=EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env \
+  --property=StateDirectory=estrado-pjud --property=StateDirectoryMode=0770 \
+  --property=NoNewPrivileges=true --property=ProtectSystem=strict \
+  --property=ProtectHome=true --property=PrivateTmp=true \
+  --property=ReadWritePaths=/opt/legal-tech-microservices/estrado-pjud-service/logs \
+  --setenv=PYTHONUNBUFFERED=1 --setenv=PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+  --setenv=HOME=/tmp --setenv=PJUD_OFF_HOURS_VALIDATION_ONCE=true \
+  /usr/bin/xvfb-run -a \
+  /opt/legal-tech-microservices/estrado-pjud-service/.venv/bin/python -m worker
+if systemctl is-active --quiet estrado-pjud-validation-once.service; then
+  echo "La unidad transitoria no terminó" >&2
+  exit 1
+fi
+trap - EXIT INT TERM
+restore_worker
+```
+
+Antes de ejecutarlo, confirmar que el checkout está en el SHA mergeado y que el
+control proxy está `enabled`. Inspeccionar sólo agregados seguros. Si el minteo o
+la corrida falla, no repetir: conservar la única ventana redactada y restaurar el
+worker normal.
 
 - [ ] **Step 5: Auditoría final**
 

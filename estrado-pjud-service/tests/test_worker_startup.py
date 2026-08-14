@@ -83,15 +83,15 @@ async def test_one_shot_main_exits_after_permanent_pool_init_failure(monkeypatch
     monkeypatch.setattr(worker_main, "notify_stopping", lambda: None)
     monkeypatch.setattr(worker_main, "refresh_proxy_gate", AsyncMock(return_value=allowed))
     monkeypatch.setattr(worker_main, "scheduler_contract_ready", AsyncMock(return_value=True))
-    initialize = AsyncMock(return_value=False)
-    monkeypatch.setattr(worker_main, "safe_initialize_pool", initialize)
+    pool.initialize = AsyncMock(side_effect=RuntimeError("mint failed"))
     monkeypatch.setattr(worker_main, "send_ops_alert", AsyncMock())
 
     await asyncio.wait_for(worker_main.main(), timeout=0.2)
 
-    initialize.assert_awaited_once()
+    pool.initialize.assert_awaited_once()
     assert config.OJV_PROXY_POOL_SIZE == 1
     assert config.POOL_SIZE == 1
+    assert config.MINT_MAX_RETRIES == 1
     pool.close_all.assert_awaited_once()
 
 

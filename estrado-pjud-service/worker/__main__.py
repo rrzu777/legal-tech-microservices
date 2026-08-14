@@ -230,9 +230,11 @@ async def main():
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
     if validation_once:
         # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
-        # en el proceso transitorio y acota el tráfico de adquisición a un slot.
+        # en el proceso transitorio y acota el tráfico de adquisición a un slot
+        # y una IP. Si falla, el operador diagnostica sin rotar en loop.
         config.OJV_PROXY_POOL_SIZE = 1
         config.POOL_SIZE = 1
+        config.MINT_MAX_RETRIES = 1
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
@@ -317,7 +319,7 @@ async def main():
             notify_status("initializing proxy pool")
             initialized = await safe_initialize_pool(
                 pool,
-                max_retries=config.MINT_MAX_RETRIES,
+                max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
                 proxy_control=proxy_control,
                 backoff=backoff,
             )
