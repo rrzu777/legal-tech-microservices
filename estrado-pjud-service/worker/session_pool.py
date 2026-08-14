@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # para otra cosa (un slot re-minteando en loop) y no debe confundirse con esto.
 _MINT_RETRY_BASE_S = 2.0
 _MINT_RETRY_JITTER_S = 1.0
-_MINT_TRAFFIC_BUDGET_S = 20.0
+_DEFAULT_MINT_TRAFFIC_BUDGET_S = 35.0
 _MAX_NEW_STICKY_IPS_PER_MINT = 3
 _CANDIDATE_CLOSE_TIMEOUT_S = 1.0
 
@@ -159,7 +159,19 @@ class SessionPool:
             _MAX_NEW_STICKY_IPS_PER_MINT,
             max(1, self._config.MINT_MAX_RETRIES),
         )
-        deadline = time.monotonic() + _MINT_TRAFFIC_BUDGET_S
+        traffic_budget = getattr(
+            self._config,
+            "MINT_TRAFFIC_BUDGET_S",
+            _DEFAULT_MINT_TRAFFIC_BUDGET_S,
+        )
+        # Algunos tests/adaptadores construyen una config parcial. Produccion
+        # siempre pasa por WorkerConfig y su rango 10..60.
+        if (
+            isinstance(traffic_budget, bool)
+            or not isinstance(traffic_budget, (int, float))
+        ):
+            traffic_budget = _DEFAULT_MINT_TRAFFIC_BUDGET_S
+        deadline = time.monotonic() + float(traffic_budget)
         for attempt in range(1, attempts + 1):
             if time.monotonic() >= deadline:
                 raise MintUnavailableError("deadline_exceeded")

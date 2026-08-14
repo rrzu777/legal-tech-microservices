@@ -605,8 +605,8 @@ async def test_worker_mint_deadline_cancels_traffic_and_finalizes_tracking(monke
 
     config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
     config.MINT_MAX_RETRIES = 3
+    config.MINT_TRAFFIC_BUDGET_S = 0.02
     monkeypatch.setattr(sp, "CookieMinter", BlockingMinter)
-    monkeypatch.setattr(sp, "_MINT_TRAFFIC_BUDGET_S", 0.02, raising=False)
     pool = sp.SessionPool(config, proxy_usage=Tracker())
 
     with pytest.raises(MintUnavailableError) as exc_info:
@@ -617,6 +617,50 @@ async def test_worker_mint_deadline_cancels_traffic_and_finalizes_tracking(monke
     assert cleanup_finished.is_set()
     assert len(captured) == 1
     assert pool._proxy_usage.exited is True
+
+
+@pytest.mark.asyncio
+async def test_worker_mint_deadline_also_cancels_session_initialize(monkeypatch):
+    """The same bounded budget covers browser mint and OJV initialization."""
+    from worker import session_pool as sp
+
+    initialize_cancelled = asyncio.Event()
+    created_sessions = []
+
+    class FreshMinter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def mint(self):
+            return MintResult(cookies={"PHPSESSID": "fresh"}, user_agent="fresh-UA")
+
+    class BlockingSession(_FakeSession):
+        def __init__(self, adapter):
+            super().__init__(adapter)
+            created_sessions.append(self)
+
+        async def initialize(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                initialize_cancelled.set()
+                raise
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.MINT_TRAFFIC_BUDGET_S = 0.02
+    monkeypatch.setattr(sp, "CookieMinter", FreshMinter)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", _SnapshotAdapter)
+    monkeypatch.setattr(sp, "OJVSession", BlockingSession)
+    pool = sp.SessionPool(config)
+
+    with pytest.raises(MintUnavailableError) as exc_info:
+        await pool.initialize()
+
+    assert exc_info.value.code == "deadline_exceeded"
+    assert initialize_cancelled.is_set()
+    assert len(created_sessions) == 1
+    assert created_sessions[0].closed is True
 
 
 @pytest.mark.asyncio

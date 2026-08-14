@@ -109,6 +109,7 @@ class CookieMinter:
                     )
                 except PlaywrightError:
                     raise MintUnavailableError("navigation_failed") from None
+                logger.info("PJUD navigation ready")
                 try:
                     await page.wait_for_selector(
                         _FORM_READY_SELECTOR,
