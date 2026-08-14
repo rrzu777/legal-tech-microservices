@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from app.bandwidth import record_proxy_request, record_proxy_response
-from app.cookie_scope import flatten_cookie_name_values
+from app.cookie_scope import CookieRecord, legacy_cookie_records, playwright_cookie_records
 from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
 
@@ -35,14 +35,16 @@ _ANTIBOT_ARGS = [
 
 @dataclass
 class MintResult:
-    cookies: dict[str, str]
+    cookies: tuple[CookieRecord, ...]
     user_agent: str
 
-
-def cookies_to_dict(pw_cookies: list[dict]) -> dict[str, str]:
-    return flatten_cookie_name_values(
-        (cookie["name"], cookie["value"]) for cookie in pw_cookies
-    )
+    def __post_init__(self) -> None:
+        if isinstance(self.cookies, dict):
+            self.cookies = legacy_cookie_records(
+                self.cookies,
+                domain="oficinajudicialvirtual.pjud.cl",
+                secure=True,
+            )
 
 
 class CookieMinter:
@@ -116,7 +118,7 @@ class CookieMinter:
                     raise MintUnavailableError("form_timeout") from None
                 ua = await page.evaluate("() => navigator.userAgent")
                 pw_cookies = await context.cookies()
-                cookies = cookies_to_dict(pw_cookies)
+                cookies = playwright_cookie_records(pw_cookies)
                 try:
                     transfers = await page.evaluate(
                         """() => [
@@ -137,8 +139,8 @@ class CookieMinter:
                     logger.warning("pjud_mint_transfer_telemetry_unavailable")
                 logger.info(
                     "PJUD form ready; cookie_count=%d has_php_session=%s has_ts_family=%s",
-                    len(cookies), "PHPSESSID" in cookies,
-                    any(name.startswith("TS") for name in cookies),
+                    len(cookies), any(cookie.name == "PHPSESSID" for cookie in cookies),
+                    any(cookie.name.startswith("TS") for cookie in cookies),
                 )
                 return MintResult(cookies=cookies, user_agent=ua)
             finally:

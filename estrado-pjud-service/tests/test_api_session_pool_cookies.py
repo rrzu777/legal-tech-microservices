@@ -97,7 +97,9 @@ def test_acquire_injects_cookies_from_store(monkeypatch):
     monkeypatch.setattr(sp, "OJVSession", _FakeSession)
 
     asyncio.run(pool.acquire())
-    assert captured["cookies"] == {"TSPD_101": "z"}
+    assert [(cookie.name, cookie.value) for cookie in captured["cookies"]] == [
+        ("TSPD_101", "z"),
+    ]
     assert captured["ua"] == "UAx"
 
 

@@ -158,9 +158,25 @@ async def safe_initialize_pool(
     return False
 
 
-def can_initialize_paid_pool(now=None) -> bool:
+def can_initialize_paid_pool(now=None, *, validation_once: bool = False) -> bool:
     """El pool residencial solo puede mintear cuando el scheduler puede trabajar."""
-    return is_scheduled_processing_window(now)
+    return validation_once or is_scheduled_processing_window(now)
+
+
+async def wait_before_retry(
+    shutdown_event: asyncio.Event,
+    timeout: float,
+    *,
+    validation_once: bool,
+) -> bool:
+    """Return False instead of leaving a transient validation unit waiting."""
+    if validation_once:
+        return False
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    return True
 
 
 async def safe_get_next_batch(scheduler, metrics, backoff):
@@ -211,6 +227,14 @@ async def refresh_proxy_gate(
 
 async def main():
     config = WorkerConfig()
+    validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
+    if validation_once:
+        # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
+        # en el proceso transitorio y acota el tráfico de adquisición a un slot
+        # y una IP. Si falla, el operador diagnostica sin rotar en loop.
+        config.OJV_PROXY_POOL_SIZE = 1
+        config.POOL_SIZE = 1
+        config.MINT_MAX_RETRIES = 1
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
@@ -267,35 +291,35 @@ async def main():
                     "Proxy control denies startup traffic (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
-            if not can_initialize_paid_pool():
+            if not can_initialize_paid_pool(validation_once=validation_once):
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             if not await scheduler_contract_ready(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
                 notify_status("scheduler migration unavailable; mint blocked")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             metrics.set_status("starting")
             notify_status("initializing proxy pool")
             initialized = await safe_initialize_pool(
                 pool,
-                max_retries=config.MINT_MAX_RETRIES,
+                max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
                 proxy_control=proxy_control,
                 backoff=backoff,
             )
@@ -310,6 +334,9 @@ async def main():
                 config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
                 "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
             )
+            if validation_once:
+                logger.error("One-shot validation stopped after mint failure")
+                return
             if not backoff.is_permanently_open:
                 await shutdown_event.wait()
                 return
@@ -340,13 +367,13 @@ async def main():
                     "Proxy traffic paused (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
-            if not is_scheduled_processing_window():
+            if not validation_once and not is_scheduled_processing_window():
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 try:
@@ -360,10 +387,10 @@ async def main():
                 notify_status("temporary backoff")
                 wait = backoff.seconds_until_close
                 logger.warning("Circuit breaker open, waiting %.0fs", wait)
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=min(wait, 30))
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, min(wait, 30), validation_once=validation_once,
+                ):
+                    return
                 continue
 
             metrics.set_status("running")
@@ -374,6 +401,9 @@ async def main():
             if batch is None:
                 metrics.set_status("backoff")
                 notify_status("scheduler unavailable; pool kept alive")
+                if validation_once:
+                    logger.error("One-shot validation stopped after scheduler failure")
+                    return
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -383,6 +413,9 @@ async def main():
             if not batch:
                 logger.debug("No cases to sync, sleeping 30s")
                 await maybe_alert_bandwidth(config, bandwidth_alert_state)
+                if validation_once:
+                    logger.info("One-shot validation found no eligible case")
+                    return
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
@@ -399,10 +432,17 @@ async def main():
                 shutdown_event,
                 backoff,
                 proxy_control=proxy_control,
+                processing_window=(
+                    (lambda: True) if validation_once
+                    else is_scheduled_processing_window
+                ),
             )
 
             await scheduler.release_batch(case_ids)
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
+            if validation_once:
+                logger.info("One-shot validation completed one batch")
+                return
 
     finally:
         notify_stopping()

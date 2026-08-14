@@ -1,5 +1,6 @@
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
+from app.cookie_scope import CookieRecord
 
 
 def _settings():
@@ -12,8 +13,14 @@ def test_adapter_uses_injected_user_agent():
 
 
 def test_adapter_seeds_cookies():
-    a = OJVHttpAdapter(_settings(), cookies={"TSPD_101": "abc"})
-    assert a._client.cookies.get("TSPD_101") == "abc"
+    a = OJVHttpAdapter(_settings(), cookies=(
+        CookieRecord("PHPSESSID", "root", "x", "/"),
+        CookieRecord("PHPSESSID", "detail", "x", "/detail"),
+    ))
+    assert [(c.name, c.value, c.path) for c in a._client.cookies.jar] == [
+        ("PHPSESSID", "root", "/"),
+        ("PHPSESSID", "detail", "/detail"),
+    ]
 
 
 def test_adapter_defaults_ua_when_none():

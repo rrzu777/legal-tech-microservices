@@ -33,6 +33,7 @@ class WorkerConfig(BaseSettings):
     # recupera por re-mint; esta pausa solo rate-limita el re-minteo (evita
     # mint-storms). Configurable por env para tunear throughput sin redeploy.
     BLOCK_PAUSE_S: int = 30
+    PJUD_OFF_HOURS_VALIDATION_ONCE: bool = False
 
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""

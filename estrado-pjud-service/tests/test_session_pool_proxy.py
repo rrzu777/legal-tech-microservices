@@ -19,6 +19,7 @@ from app.minter import MintResult
 from app.cookie_store import CookieStoreLockTimeoutError
 from app.failure_kind import MintUnavailableError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from tests.helpers import cookie_values
 
 
 def _make_config(pool_size=1, proxy_url=None, proxy_pool_size=3, block_pause_s=30):
@@ -61,7 +62,7 @@ class _SnapshotAdapter:
     """Minimal adapter fake that preserves the pool's cookie snapshot contract."""
 
     def __init__(self, _settings, *, cookies=None, **_kwargs):
-        self.cookies = dict(cookies or {})
+        self.cookies = cookie_values(cookies)
 
     def snapshot_cookies(self):
         return dict(self.cookies)
@@ -130,7 +131,7 @@ async def test_slot_mint_persists_cookie_jar_after_initialize(monkeypatch):
 
     class JarAdapter:
         def __init__(self, _settings, *, cookies=None, **_kwargs):
-            self.jar = dict(cookies or {})
+            self.jar = cookie_values(cookies)
 
         def snapshot_cookies(self):
             return dict(self.jar)
@@ -188,9 +189,11 @@ async def test_worker_mint_persists_equivalent_cookie_scopes(monkeypatch):
     pool = sp.SessionPool(config)
     try:
         await pool.initialize()
-        assert fake_store.save_slot.call_args.args[1] == {
-            "TS-current": "f5",
-            "PHPSESSID": "renewed",
+        saved = fake_store.save_slot.call_args.args[1]
+        assert {(cookie.name, cookie.domain, cookie.path) for cookie in saved} == {
+            ("TS-current", "oficinajudicialvirtual.pjud.cl", "/"),
+            ("PHPSESSID", "oficinajudicialvirtual.pjud.cl", "/"),
+            ("PHPSESSID", ".pjud.cl", "/consultaUnificada.php"),
         }
     finally:
         await pool.close_all()
@@ -220,7 +223,9 @@ async def test_worker_familia_slot_never_reads_api_on_demand_namespace(tmp_path)
 
     bundle, slot = await pool.acquire_familia_bundle()
     try:
-        assert bundle.cookies == {"PHPSESSID": "worker-cookie"}
+        assert [(cookie.name, cookie.value) for cookie in bundle.cookies] == [
+            ("PHPSESSID", "worker-cookie"),
+        ]
         assert bundle.proxy_url == worker_proxy
     finally:
         await pool.release_familia_bundle(slot)

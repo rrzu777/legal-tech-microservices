@@ -25,6 +25,7 @@ class TestWorkerConfig:
         assert config.WORKER_ID == "worker-1"
         assert config.POOL_SIZE == 1
         assert config.BATCH_SIZE == 10
+        assert config.PJUD_OFF_HOURS_VALIDATION_ONCE is False
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
         assert config.OJV_TIMEOUT_S == 25

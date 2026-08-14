@@ -43,7 +43,8 @@ class Scheduler:
 
     async def get_next_batch(self, now: datetime | None = None) -> list[dict]:
         now = now or datetime.now(TZ_SANTIAGO)
-        if not is_scheduled_processing_window(now):
+        validation_once = self._config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
+        if not validation_once and not is_scheduled_processing_window(now):
             return []
         if now.tzinfo is None:
             now = now.replace(tzinfo=TZ_SANTIAGO)
@@ -54,7 +55,7 @@ class Scheduler:
         # procesos pagaran la misma causa al abrir la ventana de las 08:00.
         resp = await run_query(self._sb.rpc("claim_pjud_sync_cases", {
             "p_worker_id": self._config.WORKER_ID,
-            "p_limit": self._config.BATCH_SIZE,
+            "p_limit": 1 if validation_once else self._config.BATCH_SIZE,
             "p_now": now_iso,
         }))
         cases = resp.data or []

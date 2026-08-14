@@ -12,6 +12,7 @@ def _mock_config(worker_id="test-worker", batch_size=10):
     config = MagicMock()
     config.WORKER_ID = worker_id
     config.BATCH_SIZE = batch_size
+    config.PJUD_OFF_HOURS_VALIDATION_ONCE = False
     return config
 
 
@@ -71,6 +72,26 @@ class TestScheduler:
 
         assert await scheduler.get_next_batch(now=NIGHT_NOW) == []
         mock_sb.rpc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_shot_validation_claims_at_most_one_case_outside_office(self):
+        from worker.scheduler import Scheduler
+
+        config = _mock_config(batch_size=10)
+        config.PJUD_OFF_HOURS_VALIDATION_ONCE = True
+        mock_sb = MagicMock()
+        chain = MagicMock()
+        mock_sb.rpc.return_value = chain
+        chain.execute.return_value = MagicMock(data=[{"id": "case-1"}])
+
+        assert await Scheduler(config, mock_sb).get_next_batch(now=NIGHT_NOW) == [
+            {"id": "case-1"},
+        ]
+        mock_sb.rpc.assert_called_once_with("claim_pjud_sync_cases", {
+            "p_worker_id": "test-worker",
+            "p_limit": 1,
+            "p_now": NIGHT_NOW.isoformat(),
+        })
 
     @pytest.mark.asyncio
     async def test_marks_batch_with_worker_id(self):

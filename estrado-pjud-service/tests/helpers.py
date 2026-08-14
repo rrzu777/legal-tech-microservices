@@ -3,6 +3,12 @@
 from unittest.mock import MagicMock
 
 
+def cookie_values(cookies) -> dict[str, str]:
+    if isinstance(cookies, dict):
+        return dict(cookies)
+    return {cookie.name: cookie.value for cookie in (cookies or ())}
+
+
 class FakeOJVSession:
     """Sesión que no habla con nadie. Estaba copiada en cinco archivos.
 
