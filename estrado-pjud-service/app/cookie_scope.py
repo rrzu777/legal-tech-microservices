@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from http.cookiejar import Cookie, CookieJar
+import math
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,7 +26,10 @@ class CookieRecord:
             or not isinstance(self.domain, str) or not self.domain
             or not isinstance(self.path, str) or not self.path.startswith("/")
             or not isinstance(self.secure, bool)
-            or (self.expires is not None and not isinstance(self.expires, int))
+            or (
+                self.expires is not None
+                and (not isinstance(self.expires, int) or isinstance(self.expires, bool))
+            )
             or not isinstance(self.http_only, bool)
             or (self.same_site is not None and not isinstance(self.same_site, str))
         ):
@@ -65,17 +69,24 @@ def playwright_cookie_records(records: Sequence[Mapping[str, Any]]) -> tuple[Coo
     for value in records:
         try:
             expires = value.get("expires")
+            if isinstance(expires, bool):
+                raise ValueError("invalid_cookie_record")
+            normalized_expires = None
+            if isinstance(expires, (int, float)) and expires > 0:
+                if not math.isfinite(expires):
+                    raise ValueError("invalid_cookie_record")
+                normalized_expires = int(expires)
             converted.append(CookieRecord(
                 name=value["name"],
                 value=value["value"],
                 domain=value["domain"],
                 path=value.get("path") or "/",
                 secure=value.get("secure", False),
-                expires=int(expires) if isinstance(expires, (int, float)) and expires > 0 else None,
+                expires=normalized_expires,
                 http_only=value.get("httpOnly", False),
                 same_site=value.get("sameSite"),
             ))
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, OverflowError, TypeError, ValueError):
             raise ValueError("invalid_cookie_record") from None
     return normalize_cookie_records(converted)
 

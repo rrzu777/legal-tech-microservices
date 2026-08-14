@@ -248,3 +248,43 @@ def test_malformed_slot_entry_skipped_good_slots_survive(tmp_path):
     assert all_bundles["0"].cookies == (_legacy_record("a", "1"),)
     assert store.load_slot("1") is None
     assert store.load_slot("2") is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("user_agent", None),
+    ("user_agent", ""),
+    ("saved_at", "123"),
+    ("saved_at", float("nan")),
+    ("proxy_token", 123),
+])
+def test_invalid_bundle_metadata_is_rejected(tmp_path, field, value):
+    p = tmp_path / "cookies.json"
+    payload = {
+        "version": 2,
+        "slots": {"0": {
+            "cookies": [{
+                "name": "a", "value": "1", "domain": "ojv.test", "path": "/",
+                "secure": True, "expires": None, "http_only": False, "same_site": None,
+            }],
+            "user_agent": "UA",
+            "proxy_token": None,
+            "saved_at": 123.0,
+        }},
+    }
+    payload["slots"]["0"][field] = value
+    p.write_text(json.dumps(payload))
+
+    assert CookieStore(path=str(p)).load_all() == {}
+
+
+def test_configured_legacy_scope_is_used_for_dict_bundle(tmp_path):
+    p = tmp_path / "cookies.json"
+    p.write_text('{"slots":{"0":{"cookies":{"a":"1"},"user_agent":"UA",'
+                 '"proxy_token":null,"saved_at":123}}}')
+    store = CookieStore(path=str(p))
+
+    store.configure_legacy_scope("http://ojv.local.test:8080")
+
+    assert store.load_slot("0").cookies == (
+        CookieRecord("a", "1", "ojv.local.test", "/", False),
+    )

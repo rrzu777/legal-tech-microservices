@@ -93,6 +93,7 @@ class APISessionPool:
             settings.OJV_PROXY_STICKY_LIFETIME,
         )
         self._store = CookieStore(settings.COOKIE_STORE_PATH)
+        self._store.configure_legacy_scope(settings.OJV_BASE_URL)
         self._rr_index = 0
         self._proxy_control = proxy_control
         self._proxy_usage = proxy_usage

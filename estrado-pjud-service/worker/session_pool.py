@@ -86,6 +86,11 @@ class SessionPool:
         self._last_global_request: float = 0.0
         self._global_min_delay: float = 1.2
         self._store = CookieStore(config.COOKIE_STORE_PATH)
+        configure_legacy_scope = getattr(self._store, "configure_legacy_scope", None)
+        if callable(configure_legacy_scope):
+            base_url = config.PJUD_BASE_URL
+            if isinstance(base_url, str):
+                configure_legacy_scope(base_url)
         self._proxy_usage = proxy_usage
         self._proxy_control = proxy_control
 

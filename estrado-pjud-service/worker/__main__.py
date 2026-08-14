@@ -163,6 +163,22 @@ def can_initialize_paid_pool(now=None, *, validation_once: bool = False) -> bool
     return validation_once or is_scheduled_processing_window(now)
 
 
+async def wait_before_retry(
+    shutdown_event: asyncio.Event,
+    timeout: float,
+    *,
+    validation_once: bool,
+) -> bool:
+    """Return False instead of leaving a transient validation unit waiting."""
+    if validation_once:
+        return False
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    return True
+
+
 async def safe_get_next_batch(scheduler, metrics, backoff):
     """Un fallo del claim no debe cerrar el proceso y provocar otro minteo.
 
@@ -273,28 +289,28 @@ async def main():
                     "Proxy control denies startup traffic (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             if not can_initialize_paid_pool(validation_once=validation_once):
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             if not await scheduler_contract_ready(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
                 notify_status("scheduler migration unavailable; mint blocked")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             metrics.set_status("starting")
@@ -316,10 +332,10 @@ async def main():
                 config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID,
                 "mint_failed", f"Worker {config.WORKER_ID}: no se pudo inicializar el pool (minteo).",
             )
+            if validation_once:
+                logger.error("One-shot validation stopped after mint failure")
+                return
             if not backoff.is_permanently_open:
-                if validation_once:
-                    logger.error("One-shot validation stopped after mint failure")
-                    return
                 await shutdown_event.wait()
                 return
 
@@ -349,10 +365,10 @@ async def main():
                     "Proxy traffic paused (status=%s reason=%s revision=%s)",
                     snapshot.status, snapshot.reason_code, snapshot.revision,
                 )
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             if not validation_once and not is_scheduled_processing_window():
@@ -369,10 +385,10 @@ async def main():
                 notify_status("temporary backoff")
                 wait = backoff.seconds_until_close
                 logger.warning("Circuit breaker open, waiting %.0fs", wait)
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=min(wait, 30))
-                except asyncio.TimeoutError:
-                    pass
+                if not await wait_before_retry(
+                    shutdown_event, min(wait, 30), validation_once=validation_once,
+                ):
+                    return
                 continue
 
             metrics.set_status("running")

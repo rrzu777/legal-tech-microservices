@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 import time
@@ -14,6 +15,7 @@ from app.cookie_scope import (
     cookie_record_from_json,
     legacy_cookie_records,
     normalize_cookie_records,
+    legacy_cookie_scope,
 )
 
 DEFAULT_COOKIE_STORE_PATH = "/var/lib/estrado-pjud/cookies.json"
@@ -111,13 +113,29 @@ class CookieStore:
     def _bundle_from_raw(self, data) -> CookieBundle:
         if not isinstance(data, dict):
             raise ValueError("invalid_cookie_bundle")
+        user_agent = data["user_agent"]
+        saved_at = data["saved_at"]
+        proxy_token = data.get("proxy_token")
+        if (
+            not isinstance(user_agent, str) or not user_agent
+            or isinstance(saved_at, bool)
+            or not isinstance(saved_at, (int, float))
+            or not math.isfinite(saved_at)
+            or (proxy_token is not None and not isinstance(proxy_token, str))
+        ):
+            raise ValueError("invalid_cookie_bundle")
         return CookieBundle(
             cookies=self._parse_cookies(data["cookies"]),
-            user_agent=data["user_agent"],
-            saved_at=data["saved_at"],
+            user_agent=user_agent,
+            saved_at=saved_at,
             proxy_url=None,
-            proxy_token=data.get("proxy_token"),
+            proxy_token=proxy_token,
         )
+
+    def configure_legacy_scope(self, base_url: str) -> None:
+        domain, secure = legacy_cookie_scope(base_url)
+        self._legacy_cookie_domain = domain
+        self._legacy_cookie_secure = secure
 
     def _serialize_bundle(self, bundle: CookieBundle) -> dict:
         return {

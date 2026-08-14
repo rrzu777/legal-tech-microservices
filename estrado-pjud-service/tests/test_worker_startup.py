@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
@@ -7,6 +8,7 @@ from worker.__main__ import (
     can_initialize_paid_pool,
     safe_get_next_batch,
     scheduler_contract_ready,
+    wait_before_retry,
 )
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,6 +28,71 @@ def test_one_shot_validation_can_initialize_outside_office_window():
     assert can_initialize_paid_pool(
         datetime(2026, 3, 2, 22, 0, tzinfo=tz), validation_once=True,
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_one_shot_validation_never_waits_for_retry():
+    shutdown = asyncio.Event()
+
+    assert await wait_before_retry(shutdown, 30, validation_once=True) is False
+
+
+@pytest.mark.asyncio
+async def test_one_shot_main_exits_after_permanent_pool_init_failure(monkeypatch):
+    from worker import __main__ as worker_main
+    from worker.proxy_control import ProxyControlSnapshot
+
+    config = MagicMock()
+    config.PJUD_OFF_HOURS_VALIDATION_ONCE = True
+    config.OJV_PROXY_URL = "http://proxy.invalid"
+    config.OJV_PROXY_POOL_SIZE = 3
+    config.POOL_SIZE = 3
+    config.MINT_MAX_RETRIES = 3
+    config.LOG_LEVEL = "INFO"
+    config.TELEGRAM_BOT_TOKEN = ""
+    config.TELEGRAM_CHAT_ID = ""
+    config.SUPABASE_SERVICE_KEY = "secret-placeholder"
+    config.OJV_PROXY_PRICE_PER_GB_USD = 1.0
+    config.BLOCK_PAUSE_S = 0
+    config.WORKER_ID = "test-worker"
+
+    pool = MagicMock()
+    pool.close_all = AsyncMock()
+    metrics = MagicMock()
+    metrics.stop = AsyncMock()
+    backoff = MagicMock()
+    backoff.is_permanently_open = True
+    allowed = ProxyControlSnapshot(
+        allowed=True, status="enabled", reason_code=None,
+        revision=1, source="database",
+    )
+
+    monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
+    monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: MagicMock())
+    monkeypatch.setattr(worker_main, "ProxyUsageTracker", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(worker_main, "ProxyControl", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(worker_main, "SessionPool", lambda *_a, **_k: pool)
+    monkeypatch.setattr(worker_main, "Scheduler", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(worker_main, "Notifier", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(worker_main, "Metrics", lambda *_a, **_k: metrics)
+    monkeypatch.setattr(worker_main, "CircuitBreaker", lambda **_k: backoff)
+    monkeypatch.setattr(worker_main.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(worker_main, "notify_ready", lambda: None)
+    monkeypatch.setattr(worker_main, "notify_status", lambda *_a: None)
+    monkeypatch.setattr(worker_main, "notify_stopping", lambda: None)
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", AsyncMock(return_value=allowed))
+    monkeypatch.setattr(worker_main, "scheduler_contract_ready", AsyncMock(return_value=True))
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(worker_main, "safe_initialize_pool", initialize)
+    monkeypatch.setattr(worker_main, "send_ops_alert", AsyncMock())
+
+    await asyncio.wait_for(worker_main.main(), timeout=0.2)
+
+    initialize.assert_awaited_once()
+    assert config.OJV_PROXY_POOL_SIZE == 1
+    assert config.POOL_SIZE == 1
+    pool.close_all.assert_awaited_once()
 
 
 @pytest.mark.asyncio

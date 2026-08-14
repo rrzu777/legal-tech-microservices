@@ -72,3 +72,16 @@ def test_exact_duplicate_is_deduplicated_in_first_seen_order():
 def test_invalid_record_fails_closed(kwargs):
     with pytest.raises(ValueError, match="^invalid_cookie_record$"):
         CookieRecord(**kwargs)
+
+
+def test_boolean_expiry_fails_closed():
+    with pytest.raises(ValueError, match="^invalid_cookie_record$"):
+        CookieRecord("a", "1", "pjud.cl", expires=True)
+
+
+def test_playwright_infinite_expiry_fails_with_stable_error():
+    with pytest.raises(ValueError, match="^invalid_cookie_record$"):
+        playwright_cookie_records([{
+            "name": "a", "value": "1", "domain": "pjud.cl", "path": "/",
+            "secure": True, "expires": float("inf"),
+        }])
