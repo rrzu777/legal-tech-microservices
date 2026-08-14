@@ -29,6 +29,10 @@ class WorkerConfig(BaseSettings):
     LOG_LEVEL: str = "INFO"
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
     MINT_MAX_RETRIES: int = 3
+    # Presupuesto total del minteo del worker, incluyendo navegador e
+    # inicializacion OJV. El flujo interactivo de la API conserva su propio
+    # limite; este valor evita cortar el worker justo despues de que F5 carga.
+    MINT_TRAFFIC_BUDGET_S: float = 35.0
     # Pausa del circuit breaker tras un bloqueo. Con el minter, un bloqueo se
     # recupera por re-mint; esta pausa solo rate-limita el re-minteo (evita
     # mint-storms). Configurable por env para tunear throughput sin redeploy.
@@ -66,6 +70,13 @@ class WorkerConfig(BaseSettings):
     @classmethod
     def _valid_sticky_lifetime(cls, value: str) -> str:
         sticky_lifetime_seconds(value)
+        return value
+
+    @field_validator("MINT_TRAFFIC_BUDGET_S")
+    @classmethod
+    def _valid_mint_traffic_budget(cls, value: float) -> float:
+        if not 10.0 <= value <= 60.0:
+            raise ValueError("MINT_TRAFFIC_BUDGET_S must be between 10 and 60 seconds")
         return value
 
     model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}

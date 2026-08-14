@@ -30,6 +30,22 @@ class TestWorkerConfig:
         assert config.SESSION_MAX_AGE_S == 1500
         assert config.OJV_TIMEOUT_S == 25
         assert config.RATE_LIMIT_MS == 2500
+        assert config.MINT_TRAFFIC_BUDGET_S == 35.0
+
+    def test_mint_traffic_budget_is_configurable_and_bounded(self, monkeypatch):
+        import pytest
+
+        monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
+        monkeypatch.setenv("MINT_TRAFFIC_BUDGET_S", "42")
+
+        from worker.config import WorkerConfig
+
+        assert WorkerConfig(_env_file=None).MINT_TRAFFIC_BUDGET_S == 42.0
+
+        monkeypatch.setenv("MINT_TRAFFIC_BUDGET_S", "61")
+        with pytest.raises(ValueError):
+            WorkerConfig(_env_file=None)
 
     def test_rejects_cookie_store_inside_production_checkout(self, monkeypatch):
         import pytest
