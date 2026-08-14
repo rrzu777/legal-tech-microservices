@@ -116,11 +116,15 @@ class CookieStore:
         user_agent = data["user_agent"]
         saved_at = data["saved_at"]
         proxy_token = data.get("proxy_token")
+        try:
+            saved_at_is_finite = math.isfinite(saved_at)
+        except (OverflowError, TypeError):
+            saved_at_is_finite = False
         if (
             not isinstance(user_agent, str) or not user_agent
             or isinstance(saved_at, bool)
             or not isinstance(saved_at, (int, float))
-            or not math.isfinite(saved_at)
+            or not saved_at_is_finite
             or (proxy_token is not None and not isinstance(proxy_token, str))
         ):
             raise ValueError("invalid_cookie_bundle")

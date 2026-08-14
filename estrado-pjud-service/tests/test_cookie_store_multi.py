@@ -255,6 +255,7 @@ def test_malformed_slot_entry_skipped_good_slots_survive(tmp_path):
     ("user_agent", ""),
     ("saved_at", "123"),
     ("saved_at", float("nan")),
+    ("saved_at", 10**1000),
     ("proxy_token", 123),
 ])
 def test_invalid_bundle_metadata_is_rejected(tmp_path, field, value):
@@ -288,3 +289,19 @@ def test_configured_legacy_scope_is_used_for_dict_bundle(tmp_path):
     assert store.load_slot("0").cookies == (
         CookieRecord("a", "1", "ojv.local.test", "/", False),
     )
+
+
+def test_oversized_timestamp_does_not_poison_healthy_slot(tmp_path):
+    p = tmp_path / "cookies.json"
+    cookie = [{
+        "name": "a", "value": "1", "domain": "ojv.test", "path": "/",
+        "secure": True, "expires": None, "http_only": False, "same_site": None,
+    }]
+    p.write_text(json.dumps({"version": 2, "slots": {
+        "bad": {"cookies": cookie, "user_agent": "UA", "saved_at": 10**1000},
+        "good": {"cookies": cookie, "user_agent": "UA", "saved_at": 123.0},
+    }}))
+
+    bundles = CookieStore(path=str(p)).load_all()
+
+    assert set(bundles) == {"good"}
