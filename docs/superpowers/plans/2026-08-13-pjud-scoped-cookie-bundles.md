@@ -185,7 +185,13 @@ restore_worker() {
   rc=$?
   trap - EXIT INT TERM
   systemctl stop "$validation_unit" 2>/dev/null || true
-  if ! systemctl enable --now estrado-pjud-worker.service; then
+  validation_state=$(systemctl is-active "$validation_unit" 2>/dev/null || true)
+  if [ "$validation_state" != "inactive" ] && [ "$validation_state" != "failed" ]; then
+    echo "No se pudo confirmar detenida la unidad transitoria; worker normal queda apagado" >&2
+    exit 1
+  fi
+  if ! systemctl enable --now estrado-pjud-worker.service \
+    || ! systemctl is-active --quiet estrado-pjud-worker.service; then
     rc=1
   fi
   exit "$rc"
