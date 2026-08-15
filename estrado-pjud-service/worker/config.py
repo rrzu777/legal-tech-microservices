@@ -72,6 +72,13 @@ class WorkerConfig(BaseSettings):
         validate_cookie_store_path
     )
 
+    @field_validator("SESSION_REUSE_ROLLOUT_STARTED_AT", mode="before")
+    @classmethod
+    def _blank_rollout_cutoff_is_unset(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("OJV_PROXY_STICKY_LIFETIME")
     @classmethod
     def _valid_sticky_lifetime(cls, value: str) -> str:

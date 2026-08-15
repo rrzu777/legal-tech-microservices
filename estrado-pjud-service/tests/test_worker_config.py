@@ -72,6 +72,16 @@ class TestWorkerConfig:
             "2026-08-18T12:00:00+00:00"
         )
 
+    def test_empty_rollout_cutoff_is_unset_while_canary_is_off(self, monkeypatch):
+        monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
+        monkeypatch.setenv("WORKER_SESSION_REUSE_VALIDATION_ENABLED", "false")
+        monkeypatch.setenv("SESSION_REUSE_ROLLOUT_STARTED_AT", "")
+
+        from worker.config import WorkerConfig
+
+        assert WorkerConfig(_env_file=None).SESSION_REUSE_ROLLOUT_STARTED_AT is None
+
     def test_hard_age_is_capped_before_one_hour_sticky_expires(self):
         from worker.config import WorkerConfig
 
