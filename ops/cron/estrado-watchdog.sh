@@ -145,6 +145,70 @@ sig_keyed() { # <slug de estado>
   true
 }
 
+# The watchdog can be invoked by overlapping cron/systemd runs. Keep the keyed
+# read/modify/write and the global cooldown state under one process lock so two
+# observers cannot both decide that the same transition is new.
+STATE_LOCK_METHOD=""
+acquire_state_lock() {
+  mkdir -p "$WD_STATE_DIR" 2>/dev/null || return 1
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$WD_STATE_DIR/estrado-wd-state.lock"
+    flock -x 9
+    STATE_LOCK_METHOD="flock"
+    return 0
+  fi
+  local lock_dir="$WD_STATE_DIR/estrado-wd-state.lockdir"
+  local attempt
+  for attempt in $(seq 1 100); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      STATE_LOCK_METHOD="mkdir"
+      return 0
+    fi
+    sleep 0.02
+  done
+  return 1
+}
+
+release_state_lock() {
+  case "$STATE_LOCK_METHOD" in
+    flock) flock -u 9 2>/dev/null || true; exec 9>&- ;;
+    mkdir) rmdir "$WD_STATE_DIR/estrado-wd-state.lockdir" 2>/dev/null || true ;;
+  esac
+  STATE_LOCK_METHOD=""
+}
+
+# Update cron failure state while retaining endpoints absent from this 24h log
+# window. Only an observed 2xx removes an endpoint; a missing endpoint is not
+# evidence of recovery. A status transition replaces the old code for that
+# endpoint and returns the new endpoint|status key as a fresh alert.
+update_cron_failure_state() {
+  local observed="$1" bad="$2" good="$3"
+  local state="$WD_STATE_DIR/estrado-wd-cron-fail"
+  local before merged filtered new tmp endpoint key
+  before=$(cat "$state" 2>/dev/null || true)
+  if ! acquire_state_lock; then
+    CRON_NEW=""
+    return 1
+  fi
+  before=$(cat "$state" 2>/dev/null || true)
+  filtered=""
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    endpoint=${key%%|*}
+    if ! printf '%s\n' "$observed" | grep -Fqx "$endpoint"; then
+      filtered+="$key"$'\n'
+    fi
+  done <<< "$before"
+  merged=$(printf '%s\n%s\n' "$filtered" "$bad" | sed '/^$/d' | sort -u)
+  new=$(comm -23 <(printf '%s\n' "$merged" | sed '/^$/d') <(printf '%s\n' "$before" | sed '/^$/d') || true)
+  tmp="$state.tmp.$$"
+  printf '%s\n' "$merged" | sed '/^$/d' > "$tmp"
+  mv "$tmp" "$state"
+  CRON_NEW="$new"
+  release_state_lock
+  return 0
+}
+
 stuck_window_open() {
   local dow hour
   dow=$(TZ=America/Santiago date -d "@$WATCHDOG_NOW_EPOCH" +%u)
@@ -420,9 +484,14 @@ else
     # sigue dentro de la ventana de 24h. Un endpoint roto de verdad falla también en
     # su última corrida, y los que corren una vez al día tienen esa única corrida
     # como la última, así que igual se atrapan.
-    CRON_BAD=$(printf '%s\n' "$CRON_RECENT_HTTP" \
-                | awk '{ultimo[$3] = $NF} END {for (e in ultimo) if (ultimo[e] != 200) print e, ultimo[e]}' \
+    CRON_LATEST=$(printf '%s\n' "$CRON_RECENT_HTTP" \
+                | awk '{ultimo[$3] = $NF} END {for (e in ultimo) print e, ultimo[e]}' \
                 | sort || true)
+    CRON_BAD=$(printf '%s\n' "$CRON_LATEST" \
+                | awk '$2 !~ /^2[0-9][0-9]$/ {print}' || true)
+    CRON_GOOD=$(printf '%s\n' "$CRON_LATEST" \
+                | awk '$2 ~ /^2[0-9][0-9]$/ {print $1}' || true)
+    CRON_OBSERVED=$(printf '%s\n' "$CRON_LATEST" | awk '{print $1}' || true)
     if [ -n "${CRON_BAD// }" ]; then
       CRON_DETAIL=$(printf '%s\n' "$CRON_BAD" | awk '{printf "    %s -> HTTP %s\n", $1, $2}' || true)
       # La firma lleva los códigos: 404 en todo (APP_URL roto) y 401 (CRON_SECRET
@@ -430,17 +499,17 @@ else
       # mientras el primero está en cooldown NO puede quedar tapado.
       CRON_CODES=$(printf '%s\n' "$CRON_BAD" | awk '{print $2}' | sort -u | paste -sd, - || true)
       CRON_KEYS=$(printf '%s\n' "$CRON_BAD" | awk '{print $1 "|" $2}' | sort || true)
-      CRON_NEW=$(nuevas_claves cron-fail "$CRON_KEYS")
+      update_cron_failure_state "$CRON_OBSERVED" "$CRON_KEYS" "$CRON_GOOD"
       sig_keyed cron-fail
       # El estado keyed es por endpoint y código. Así un 500 persistente no
       # vuelve a despertar al canal cada 3h, pero 500->401 o una recuperación y
       # recaída sí constituyen una transición nueva.
       if [ -n "${CRON_NEW// }" ]; then
         # Ojo: $(...) come el \n final de CRON_DETAIL, así que la pista va con su propio salto.
-        add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." "cron-fail:$CRON_CODES"
+        add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." ""
       fi
     else
-      nuevas_claves cron-fail "" >/dev/null
+      update_cron_failure_state "$CRON_OBSERVED" "" "$CRON_GOOD"
       sig_keyed cron-fail
     fi
   fi
@@ -682,15 +751,21 @@ fi
 # Sano → salir en silencio (0 tokens)
 [ -z "${ANOMALIES// }" ] && { rm -f "$STATE"; exit 0; }
 
-# Anti-spam: si la MISMA firma se alertó hace < COOLDOWN, salir en silencio
+# Anti-spam: si la MISMA firma se alertó hace < COOLDOWN, salir en silencio.
+# Serializar la lectura/escritura evita dos Telegram para la misma firma.
+if ! acquire_state_lock; then
+  exit 0
+fi
 HASH=$(printf '%s' "$SIG" | md5sum | awk '{print $1}')
 if [ -f "$STATE" ]; then
   read -r LAST_HASH LAST_TS < "$STATE" 2>/dev/null || true
   if [ "${LAST_HASH:-}" = "$HASH" ] && [ $(( $(date -u +%s) - ${LAST_TS:-0} )) -lt "$COOLDOWN" ]; then
+    release_state_lock
     exit 0
   fi
 fi
 echo "$HASH $(date -u +%s)" > "$STATE"
+release_state_lock
 
 # Modo prueba: imprime lo que habría alertado y sale. No llama a Luna ni a Telegram.
 if [ "${DRY_RUN:-0}" = "1" ]; then
