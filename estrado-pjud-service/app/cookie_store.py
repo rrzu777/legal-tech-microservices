@@ -30,6 +30,13 @@ class CookieStoreLockTimeoutError(TimeoutError):
         super().__init__("cookie_store_lock_timeout")
 
 
+class CookieStoreConcurrentUpdateError(CookieStoreLockTimeoutError):
+    """A revalidated candidate lost the compare-and-set for its bundle."""
+
+    def __init__(self):
+        TimeoutError.__init__(self, "cookie_store_compare_and_set_failed")
+
+
 def validate_cookie_store_path(value: str) -> str:
     """Fail closed if production would persist runtime state inside Git."""
     path = Path(value)
@@ -286,6 +293,39 @@ class CookieStore:
                 "saved_at": time.time(),
             }
             self._write_all(slots)
+
+    def replace_slot_cookies_if_current(
+        self,
+        slot_id,
+        *,
+        expected_saved_at: float,
+        expected_proxy_token: str | None,
+        cookies: Sequence[CookieRecord] | Mapping[str, str],
+    ) -> bool:
+        """Replace only a still-current bundle's cookies under one RMW lock.
+
+        Revalidation may race another process replacing the same slot.  The
+        durable mint identity (``saved_at`` + sticky token) is therefore the
+        compare key and is never renewed by this write.
+        """
+        slot_key = str(slot_id)
+        with self._exclusive_write_lock():
+            slots = self._read_all_raw()
+            try:
+                current = self._bundle_from_raw(slots.get(slot_key))
+            except (KeyError, TypeError, ValueError):
+                return False
+            if (
+                current.saved_at != expected_saved_at
+                or current.proxy_token != expected_proxy_token
+            ):
+                return False
+            slots[slot_key] = {
+                **self._serialize_bundle(current),
+                "cookies": self._serialize_cookies(cookies),
+            }
+            self._write_all(slots)
+            return True
 
     def load_slot(self, slot_id) -> CookieBundle | None:
         return self.load_all().get(str(slot_id))

@@ -36,6 +36,9 @@ def _make_config(pool_size=1, proxy_url=None, proxy_pool_size=3, block_pause_s=3
     # Estos tests miden el comportamiento POR INTENTO de minteo; con reintentos
     # internos un mint fallido no propagaria y las aserciones perderian sentido.
     config.MINT_MAX_RETRIES = 1
+    config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = False
+    config.SESSION_SOFT_VERIFY_AGE_S = 1200
+    config.session_hard_effective_age_s = 3000
     return config
 
 

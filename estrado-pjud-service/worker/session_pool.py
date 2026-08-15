@@ -6,9 +6,16 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+import httpx
+
 from app.adapters.http_adapter import OJVHttpAdapter
 from app.config import Settings
-from app.cookie_store import CookieBundle, CookieStore
+from app.cookie_store import (
+    CookieBundle,
+    CookieStore,
+    CookieStoreConcurrentUpdateError,
+    CookieStoreLockTimeoutError,
+)
 from app.failure_kind import MintUnavailableError, new_egress_may_help
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
@@ -40,6 +47,13 @@ class _Slot:
     session: OJVSession | None = None
     busy: bool = False
     last_mint_ts: float = 0.0
+    # Durable wall-clock origin of the installed bundle.  OJVSession's age is
+    # process-local and resets whenever a candidate is reconstructed.
+    bundle_saved_at: float | None = None
+    # A healthy verification is process-local and must never extend saved_at.
+    last_verified_at: float | None = None
+    cookie_expires_at: int | None = None
+    minted_during_acquire: bool = False
 
 
 class SessionPool:
@@ -126,9 +140,17 @@ class SessionPool:
         config.POOL_SIZE — el heartbeat reportaba 1 mientras andaban 3."""
         return self._pool_size
 
+    @property
+    def _reuse_validation_enabled(self) -> bool:
+        # WorkerConfig guarantees bool in production.  The identity check also
+        # keeps partial config doubles and legacy callers on the flag-off path.
+        return self._config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is True
+
     # -- Minteo por-slot ------------------------------------------------
 
-    async def _mint_slot(self, slot: _Slot) -> None:
+    async def _mint_slot(
+        self, slot: _Slot, *, max_attempts: int | None = None,
+    ) -> None:
         """Mintea (o re-mintea) UN slot: nueva IP sticky (si hay proxy) + nueva
         sesión OJV. Swap-then-close: la sesión nueva se construye ANTES de
         cerrar la vieja, así que si el minteo falla, el slot conserva su
@@ -159,6 +181,8 @@ class SessionPool:
             _MAX_NEW_STICKY_IPS_PER_MINT,
             max(1, self._config.MINT_MAX_RETRIES),
         )
+        if max_attempts is not None:
+            attempts = min(attempts, max(1, max_attempts))
         traffic_budget = getattr(
             self._config,
             "MINT_TRAFFIC_BUDGET_S",
@@ -271,10 +295,33 @@ class SessionPool:
             raise
 
         old_session = slot.session
+        old_token = slot.token
+        old_proxy_url = slot.proxy_url
         slot.token = token
         slot.proxy_url = proxy_url
         slot.session = new_session
         slot.last_mint_ts = time.monotonic()
+        if self._reuse_validation_enabled:
+            persisted = self._store.load_slot(slot.index)
+            if persisted is None:
+                # The write succeeded but no durable identity can be proven;
+                # do not install an in-memory session that cannot later CAS.
+                slot.token = old_token
+                slot.proxy_url = old_proxy_url
+                slot.session = old_session
+                try:
+                    await asyncio.wait_for(
+                        new_session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+                    )
+                except Exception:
+                    logger.debug(
+                        "No se pudo cerrar la sesion sin identidad durable del slot %d",
+                        slot.index,
+                    )
+                raise RuntimeError("cookie_store_missing_after_mint")
+            slot.bundle_saved_at = persisted.saved_at
+            slot.cookie_expires_at = self._cookie_expiry(persisted)
+            slot.last_verified_at = time.monotonic()
 
         if old_session is not None:
             await old_session.close()
@@ -287,12 +334,200 @@ class SessionPool:
         """Wrapper de re-mint sobre un slot ya existente."""
         await self._mint_slot(slot)
 
+    @staticmethod
+    def _cookie_expiry(bundle: CookieBundle) -> int | None:
+        expiries = [
+            cookie.expires for cookie in bundle.cookies
+            if cookie.expires is not None
+        ]
+        return min(expiries) if expiries else None
+
+    def _bundle_proxy_url(self, bundle: CookieBundle) -> str | None:
+        if not self._proxy_base:
+            return None
+        if not bundle.proxy_token:
+            raise ValueError("worker_bundle_missing_proxy_token")
+        return build_sticky_proxy_url(
+            self._proxy_base,
+            bundle.proxy_token,
+            self._sticky_lifetime,
+        )
+
+    async def _close_candidate(self, candidate: OJVSession) -> None:
+        try:
+            await asyncio.wait_for(
+                candidate.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.debug("No se pudo cerrar candidato de revalidacion")
+
+    async def _revalidate_bundle(self, slot: _Slot, bundle: CookieBundle) -> None:
+        proxy_url = self._bundle_proxy_url(bundle)
+        settings = Settings(
+            API_KEY="unused-by-worker",
+            OJV_BASE_URL=self._config.PJUD_BASE_URL,
+            RATE_LIMIT_MS=self._config.RATE_LIMIT_MS,
+        )
+        adapter = OJVHttpAdapter(
+            settings,
+            proxy=proxy_url,
+            user_agent=bundle.user_agent,
+            cookies=bundle.cookies,
+        )
+        candidate = OJVSession(adapter)
+        try:
+            await candidate.revalidate_once()
+            final_cookies = adapter.snapshot_cookies()
+            replaced = self._store.replace_slot_cookies_if_current(
+                slot.index,
+                expected_saved_at=bundle.saved_at,
+                expected_proxy_token=bundle.proxy_token,
+                cookies=final_cookies,
+            )
+            if not replaced:
+                raise CookieStoreConcurrentUpdateError()
+        except BaseException:
+            await self._close_candidate(candidate)
+            raise
+
+        validated_bundle = CookieBundle(
+            cookies=final_cookies,
+            user_agent=bundle.user_agent,
+            saved_at=bundle.saved_at,
+            proxy_token=bundle.proxy_token,
+        )
+        old_session = slot.session
+        slot.token = bundle.proxy_token
+        slot.proxy_url = proxy_url
+        slot.session = candidate
+        slot.bundle_saved_at = bundle.saved_at
+        slot.cookie_expires_at = self._cookie_expiry(validated_bundle)
+        slot.last_verified_at = time.monotonic()
+        if old_session is not None:
+            try:
+                await old_session.close()
+            except Exception:
+                # CAS + swap already committed.  Cleanup of the retired adapter
+                # is not a failed validation and must never purchase a new IP.
+                logger.debug("No se pudo cerrar la sesion reemplazada del slot %d", slot.index)
+
+    @staticmethod
+    def _validation_failure_allows_mint(exc: BaseException) -> bool:
+        if (
+            is_proxy_billing_error(exc)
+            or isinstance(
+                exc,
+                (
+                    CookieStoreConcurrentUpdateError,
+                    CookieStoreLockTimeoutError,
+                    ProxyBudgetExceededError,
+                    ProxyUsagePersistenceError,
+                ),
+            )
+        ):
+            return False
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in {401, 403}
+        return new_egress_may_help(exc)
+
+    async def _mint_once_for_acquisition(self, slot: _Slot) -> None:
+        await self._mint_slot(slot, max_attempts=1)
+        slot.minted_during_acquire = True
+
+    def _reuse_traffic_budget_s(self) -> float:
+        budget = getattr(
+            self._config,
+            "MINT_TRAFFIC_BUDGET_S",
+            _DEFAULT_MINT_TRAFFIC_BUDGET_S,
+        )
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            return _DEFAULT_MINT_TRAFFIC_BUDGET_S
+        return float(budget)
+
+    async def _within_reuse_acquisition_deadline(self, operation):
+        deadline = time.monotonic() + self._reuse_traffic_budget_s()
+        timer = asyncio.timeout_at(deadline)
+        try:
+            async with timer:
+                return await operation
+        except TimeoutError:
+            if timer.expired():
+                raise MintUnavailableError("deadline_exceeded") from None
+            raise
+
+    async def _revalidate_or_mint_once(
+        self, slot: _Slot, bundle: CookieBundle,
+    ) -> bool:
+        try:
+            await self._revalidate_bundle(slot, bundle)
+        except BaseException as exc:
+            if not self._validation_failure_allows_mint(exc):
+                raise
+            await self._mint_once_for_acquisition(slot)
+            return True
+        return False
+
+    async def _initialize_reuse_slot(self, slot: _Slot) -> bool:
+        bundle = self._store.load_slot(slot.index)
+        if bundle is None:
+            await self._mint_slot(slot, max_attempts=1)
+            return True
+        try:
+            self._bundle_proxy_url(bundle)
+        except ValueError:
+            await self._mint_slot(slot, max_attempts=1)
+            return True
+        now = time.time()
+        cookie_expiry = self._cookie_expiry(bundle)
+        expired = cookie_expiry is not None and cookie_expiry <= now
+        age = max(0.0, now - bundle.saved_at)
+        if expired or age >= self._config.session_hard_effective_age_s:
+            await self._mint_slot(slot, max_attempts=1)
+            return True
+        return await self._revalidate_or_mint_once(slot, bundle)
+
+    async def _prepare_reuse_slot(self, slot: _Slot) -> None:
+        if slot.session is None or slot.bundle_saved_at is None:
+            slot.minted_during_acquire = await self._initialize_reuse_slot(slot)
+            return
+
+        now = time.time()
+        age = max(0.0, now - slot.bundle_saved_at)
+        if (
+            slot.cookie_expires_at is not None
+            and slot.cookie_expires_at <= now
+        ) or age >= self._config.session_hard_effective_age_s:
+            await self._mint_once_for_acquisition(slot)
+            return
+
+        verified_recently = (
+            slot.last_verified_at is not None
+            and time.monotonic() - slot.last_verified_at
+            < self._config.SESSION_SOFT_VERIFY_AGE_S
+        )
+        if age < self._config.SESSION_SOFT_VERIFY_AGE_S or verified_recently:
+            return
+
+        bundle = self._store.load_slot(slot.index)
+        if (
+            bundle is None
+            or bundle.saved_at != slot.bundle_saved_at
+            or bundle.proxy_token != slot.token
+        ):
+            raise CookieStoreConcurrentUpdateError()
+        slot.minted_during_acquire = await self._revalidate_or_mint_once(slot, bundle)
+
     # -- Ciclo de vida ----------------------------------------------------
 
     async def initialize(self):
         self._slots = [_Slot(index=i) for i in range(self._pool_size)]
         for i, slot in enumerate(self._slots):
-            await self._mint_slot(slot)
+            if self._reuse_validation_enabled:
+                await self._within_reuse_acquisition_deadline(
+                    self._initialize_reuse_slot(slot),
+                )
+            else:
+                await self._mint_slot(slot)
             logger.info("Slot %d initialized", i)
             if i < self._pool_size - 1:
                 await asyncio.sleep(1.5)  # stagger: evita N Chromium headed a la vez (G8)
@@ -313,27 +548,49 @@ class SessionPool:
                 self._sem.release()
                 raise RuntimeError("borrow: semáforo dio permiso pero no hay slot libre")
             slot.busy = True
+            slot.minted_during_acquire = False
 
-        needs_refresh = (
-            slot.session is None or slot.session.age_seconds > self._config.SESSION_MAX_AGE_S
-        )
-        if needs_refresh:
+        if self._reuse_validation_enabled:
             try:
-                await self._refresh_slot(slot)
-            except Exception as exc:
-                if is_proxy_billing_error(exc) or isinstance(
-                    exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
-                ):
-                    await self._persist_cost_failure(exc)
+                await self._within_reuse_acquisition_deadline(
+                    self._prepare_reuse_slot(slot),
+                )
+            except BaseException as exc:
+                try:
+                    if isinstance(exc, Exception) and (
+                        is_proxy_billing_error(exc)
+                        or isinstance(
+                            exc,
+                            (ProxyBudgetExceededError, ProxyUsagePersistenceError),
+                        )
+                    ):
+                        await self._persist_cost_failure(exc)
+                finally:
                     slot.busy = False
                     self._sem.release()
-                    raise
-                # No penalizar la causa por un fallo de minteo/refresh: usar la
-                # sesión/bundle existente (posiblemente vencido). El challenge F5
-                # que devuelva se detecta downstream y va por el path de bloqueo
-                # (sin incrementar consecutive_sync_failures), disparando el re-mint reactivo
-                # vía la release correspondiente (healthy=False).
-                logger.exception("Refresh de slot %d falló; usando la sesión existente", slot.index)
+                raise
+        else:
+            needs_refresh = (
+                slot.session is None
+                or slot.session.age_seconds > self._config.SESSION_MAX_AGE_S
+            )
+            if needs_refresh:
+                try:
+                    await self._refresh_slot(slot)
+                except Exception as exc:
+                    if is_proxy_billing_error(exc) or isinstance(
+                        exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
+                    ):
+                        await self._persist_cost_failure(exc)
+                        slot.busy = False
+                        self._sem.release()
+                        raise
+                    # Legacy flag-off behavior intentionally returns the stale
+                    # session after a refresh failure.
+                    logger.exception(
+                        "Refresh de slot %d falló; usando la sesión existente",
+                        slot.index,
+                    )
         return slot
 
     async def _return_slot(self, slot: _Slot, healthy: bool, remint: bool = True) -> None:
@@ -342,7 +599,14 @@ class SessionPool:
         en uso por otras corrutinas. Base compartida por `release` y
         `release_familia_bundle`."""
         try:
-            if not healthy and remint:
+            if (
+                not healthy
+                and remint
+                and not (
+                    self._reuse_validation_enabled
+                    and slot.minted_during_acquire
+                )
+            ):
                 try:
                     await self._refresh_slot(slot)
                 except Exception as exc:
@@ -353,6 +617,7 @@ class SessionPool:
                         raise
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
         finally:
+            slot.minted_during_acquire = False
             slot.busy = False
             self._sem.release()
 
