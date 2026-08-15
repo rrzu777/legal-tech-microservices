@@ -182,10 +182,9 @@ release_state_lock() {
 # evidence of recovery. A status transition replaces the old code for that
 # endpoint and returns the new endpoint|status key as a fresh alert.
 update_cron_failure_state() {
-  local observed="$1" bad="$2" good="$3"
+  local observed="$1" bad="$2"
   local state="$WD_STATE_DIR/estrado-wd-cron-fail"
   local before merged filtered new tmp endpoint key
-  before=$(cat "$state" 2>/dev/null || true)
   if ! acquire_state_lock; then
     CRON_NEW=""
     return 1
@@ -489,17 +488,14 @@ else
                 | sort || true)
     CRON_BAD=$(printf '%s\n' "$CRON_LATEST" \
                 | awk '$2 !~ /^2[0-9][0-9]$/ {print}' || true)
-    CRON_GOOD=$(printf '%s\n' "$CRON_LATEST" \
-                | awk '$2 ~ /^2[0-9][0-9]$/ {print $1}' || true)
     CRON_OBSERVED=$(printf '%s\n' "$CRON_LATEST" | awk '{print $1}' || true)
     if [ -n "${CRON_BAD// }" ]; then
       CRON_DETAIL=$(printf '%s\n' "$CRON_BAD" | awk '{printf "    %s -> HTTP %s\n", $1, $2}' || true)
       # La firma lleva los códigos: 404 en todo (APP_URL roto) y 401 (CRON_SECRET
       # desincronizado con Vercel) son incidentes distintos, y si el segundo aparece
       # mientras el primero está en cooldown NO puede quedar tapado.
-      CRON_CODES=$(printf '%s\n' "$CRON_BAD" | awk '{print $2}' | sort -u | paste -sd, - || true)
       CRON_KEYS=$(printf '%s\n' "$CRON_BAD" | awk '{print $1 "|" $2}' | sort || true)
-      update_cron_failure_state "$CRON_OBSERVED" "$CRON_KEYS" "$CRON_GOOD"
+      update_cron_failure_state "$CRON_OBSERVED" "$CRON_KEYS"
       sig_keyed cron-fail
       # El estado keyed es por endpoint y código. Así un 500 persistente no
       # vuelve a despertar al canal cada 3h, pero 500->401 o una recuperación y
@@ -509,7 +505,7 @@ else
         add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." ""
       fi
     else
-      update_cron_failure_state "$CRON_OBSERVED" "" "$CRON_GOOD"
+      update_cron_failure_state "$CRON_OBSERVED" ""
       sig_keyed cron-fail
     fi
   fi
