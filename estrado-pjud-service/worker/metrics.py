@@ -1,7 +1,7 @@
 # worker/metrics.py
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 from worker.sd_notify import notify_watchdog
@@ -68,6 +68,20 @@ class Metrics:
         attempts = getattr(self._pool, "mint_attempts", 0) if self._pool else 0
         failures = getattr(self._pool, "mint_failures", 0) if self._pool else 0
         control = self._proxy_control.snapshot if self._proxy_control else None
+        reuse_enabled = (
+            getattr(self._config, "WORKER_SESSION_REUSE_VALIDATION_ENABLED", False)
+            is True
+        )
+        rollout_started_at = getattr(
+            self._config, "SESSION_REUSE_ROLLOUT_STARTED_AT", None
+        )
+        rollout_started_at_iso = (
+            rollout_started_at.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+            if reuse_enabled and isinstance(rollout_started_at, datetime)
+            else None
+        )
         return {
             "worker_id": self._config.WORKER_ID,
             "status": status or self.current_status,
@@ -91,6 +105,11 @@ class Metrics:
                 "proxy_control_revision": control.revision if control else None,
                 "proxy_control_source": control.source if control else "local",
                 "document_inline_enabled": False,
+                "session_reuse_validation_enabled": reuse_enabled,
+                "session_reuse_canary_stage": (
+                    "worker_canary" if reuse_enabled else "off"
+                ),
+                "session_reuse_rollout_started_at": rollout_started_at_iso,
             },
         }
 

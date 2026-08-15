@@ -97,6 +97,59 @@ async def test_pagina_real_inicializa_normal():
     assert [p for p, _ in adapter.posts] == ["/includes/sesion-invitado.php"]
 
 
+class _OneShotAdapter:
+    def __init__(self, html_get=_PAGINA_REAL):
+        self.html_get = html_get
+        self.calls = []
+
+    async def get_once(self, path, **kwargs):
+        self.calls.append(("GET", path))
+        return httpx.Response(
+            200,
+            content=self.html_get.encode(),
+            request=httpx.Request("GET", f"https://x{path}"),
+        )
+
+    async def post_once(self, path, **kwargs):
+        self.calls.append(("POST", path))
+        return httpx.Response(
+            200,
+            content=b"ok",
+            request=httpx.Request("POST", f"https://x{path}"),
+        )
+
+    async def get(self, *_args, **_kwargs):
+        raise AssertionError("revalidate_once must not use retrying GET")
+
+    async def post(self, *_args, **_kwargs):
+        raise AssertionError("revalidate_once must not use retrying POST")
+
+
+@pytest.mark.asyncio
+async def test_revalidate_once_calls_exactly_one_get_and_one_post():
+    adapter = _OneShotAdapter()
+    session = OJVSession(adapter)
+
+    await session.revalidate_once()
+
+    assert adapter.calls == [
+        ("GET", "/consultaUnificada.php"),
+        ("POST", "/includes/sesion-invitado.php"),
+    ]
+    assert session.csrf_token == "a" * 32
+
+
+@pytest.mark.asyncio
+async def test_revalidate_once_stops_after_blocked_initial_page():
+    adapter = _OneShotAdapter(html_get=_CHALLENGE)
+    session = OJVSession(adapter)
+
+    with pytest.raises(BlockedPageError):
+        await session.revalidate_once()
+
+    assert adapter.calls == [("GET", "/consultaUnificada.php")]
+
+
 @pytest.mark.parametrize("exc", infra_exceptions() + [BlockedPageError("challenge")])
 def test_otro_egreso_ayuda_ante_infra(exc):
     """Si la culpa es nuestra y el re-mint ayuda, otro bundle es otra IP."""

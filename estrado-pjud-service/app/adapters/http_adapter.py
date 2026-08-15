@@ -67,6 +67,11 @@ class OJVHttpAdapter:
     async def get(self, path: str, **kwargs) -> httpx.Response:
         return await self._request("get", path, **kwargs)
 
+    async def get_once(self, path: str, **kwargs) -> httpx.Response:
+        """GET exactly once without following redirects or retrying transport."""
+        kwargs["follow_redirects"] = False
+        return await self._request("get", path, max_attempts=1, **kwargs)
+
     async def post(self, path: str, **kwargs) -> httpx.Response:
         return await self._request("post", path, **kwargs)
 

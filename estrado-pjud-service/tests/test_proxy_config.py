@@ -55,6 +55,7 @@ def test_worker_config_proxy_env_override(monkeypatch):
     monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
     monkeypatch.setenv("OJV_PROXY_URL", "http://dummy:dummy_country-cl@geo.example.com:12321")
     monkeypatch.setenv("OJV_PROXY_STICKY_LIFETIME", "30m")
+    monkeypatch.setenv("SESSION_SOFT_VERIFY_AGE_S", "600")
     monkeypatch.setenv("OJV_PROXY_POOL_SIZE", "5")
     monkeypatch.setenv("OJV_PROXY_GB_BUDGET", "10.5")
     monkeypatch.setenv("OJV_PROXY_GB_ALERT_PCT", "90")

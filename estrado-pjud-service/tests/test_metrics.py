@@ -173,6 +173,30 @@ class TestWorkerMetrics:
 
         assert metadata["document_inline_enabled"] is False
 
+    def test_heartbeat_publica_estado_y_corte_autoritativos_del_canary(self):
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock
+
+        from worker.metrics import Metrics
+
+        config = MagicMock(WORKER_ID="worker-1", POOL_SIZE=1)
+        config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = True
+        config.SESSION_REUSE_ROLLOUT_STARTED_AT = datetime(
+            2026, 8, 18, 12, 0, tzinfo=timezone.utc
+        )
+
+        metadata = Metrics(config, MagicMock()).heartbeat_payload("running")["metadata"]
+
+        assert metadata["session_reuse_validation_enabled"] is True
+        assert metadata["session_reuse_canary_stage"] == "worker_canary"
+        assert metadata["session_reuse_rollout_started_at"] == "2026-08-18T12:00:00Z"
+
+        config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = False
+        metadata = Metrics(config, MagicMock()).heartbeat_payload("running")["metadata"]
+        assert metadata["session_reuse_validation_enabled"] is False
+        assert metadata["session_reuse_canary_stage"] == "off"
+        assert metadata["session_reuse_rollout_started_at"] is None
+
     def test_tasa_de_minteo_sin_intentos_no_divide_por_cero(self):
         m = self._make(pool=self._fake_pool(attempts=0, failures=0))
         assert m.heartbeat_payload("running")["metadata"]["mint_failure_rate"] == 0.0
