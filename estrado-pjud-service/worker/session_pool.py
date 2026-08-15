@@ -16,13 +16,14 @@ from app.cookie_store import (
     CookieStoreConcurrentUpdateError,
     CookieStoreLockTimeoutError,
 )
-from app.failure_kind import MintUnavailableError, new_egress_may_help
+from app.failure_kind import BlockedPageError, MintUnavailableError, new_egress_may_help
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 from worker.config import WorkerConfig
+from worker.proxy_usage import SessionReason
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ _MINT_RETRY_JITTER_S = 1.0
 _DEFAULT_MINT_TRAFFIC_BUDGET_S = 35.0
 _MAX_NEW_STICKY_IPS_PER_MINT = 3
 _CANDIDATE_CLOSE_TIMEOUT_S = 1.0
+_MAX_SESSION_TELEMETRY_AGE_S = 86_400
 
 
 @dataclass
@@ -54,6 +56,9 @@ class _Slot:
     last_verified_at: float | None = None
     cookie_expires_at: int | None = None
     minted_during_acquire: bool = False
+    session_cycle_id: uuid.UUID | None = None
+    session_cycle_reason: SessionReason | None = None
+    session_cycle_age_seconds: int | None = None
 
 
 class SessionPool:
@@ -123,16 +128,47 @@ class SessionPool:
             await self._proxy_control.refresh()
 
     @asynccontextmanager
-    async def _mint_usage_scope(self, slot: _Slot, attempt: int):
+    async def _mint_usage_scope(
+        self, slot: _Slot, attempt: int,
+    ):
+        if self._proxy_usage is None or not self._proxy_base:
+            yield None
+            return
+        telemetry = {}
+        if slot.session_cycle_id is not None:
+            telemetry = {
+                "session_cycle_id": slot.session_cycle_id,
+                "session_reason": slot.session_cycle_reason,
+                "session_age_seconds": slot.session_cycle_age_seconds,
+            }
+        async with self._proxy_usage.track(
+            operation="mint",
+            transaction_key=f"slot:{slot.index}:attempt:{attempt}:{uuid.uuid4()}",
+            **telemetry,
+        ) as usage:
+            if attempt > 1:
+                usage.retry_count += 1
+            yield usage
+
+    @asynccontextmanager
+    async def _health_usage_scope(
+        self,
+        slot: _Slot,
+        *,
+        session_cycle_id: uuid.UUID,
+        session_reason: SessionReason,
+        session_age_seconds: int,
+    ):
         if self._proxy_usage is None or not self._proxy_base:
             yield None
             return
         async with self._proxy_usage.track(
-            operation="mint",
-            transaction_key=f"slot:{slot.index}:attempt:{attempt}:{uuid.uuid4()}",
+            operation="health",
+            transaction_key=f"slot:{slot.index}:health:{uuid.uuid4()}",
+            session_cycle_id=session_cycle_id,
+            session_reason=session_reason,
+            session_age_seconds=session_age_seconds,
         ) as usage:
-            if attempt > 1:
-                usage.retry_count += 1
             yield usage
 
     @property
@@ -343,6 +379,25 @@ class SessionPool:
         ]
         return min(expiries) if expiries else None
 
+    @staticmethod
+    def _bounded_session_age_seconds(age: float) -> int:
+        return min(max(0, int(age)), _MAX_SESSION_TELEMETRY_AGE_S)
+
+    def _begin_session_cycle(
+        self,
+        slot: _Slot,
+        age: float | None,
+        reason: SessionReason,
+    ) -> tuple[uuid.UUID, int | None]:
+        cycle_id = uuid.uuid4()
+        age_seconds = (
+            None if age is None else self._bounded_session_age_seconds(age)
+        )
+        slot.session_cycle_id = cycle_id
+        slot.session_cycle_reason = reason
+        slot.session_cycle_age_seconds = age_seconds
+        return cycle_id, age_seconds
+
     def _bundle_proxy_url(self, bundle: CookieBundle) -> str | None:
         if not self._proxy_base:
             return None
@@ -386,7 +441,15 @@ class SessionPool:
         self._retired_cleanup_tasks.add(task)
         task.add_done_callback(self._retired_cleanup_tasks.discard)
 
-    async def _revalidate_bundle(self, slot: _Slot, bundle: CookieBundle) -> None:
+    async def _revalidate_bundle(
+        self,
+        slot: _Slot,
+        bundle: CookieBundle,
+        *,
+        session_cycle_id: uuid.UUID,
+        session_reason: SessionReason,
+        session_age_seconds: int,
+    ) -> None:
         proxy_url = self._bundle_proxy_url(bundle)
         settings = Settings(
             API_KEY="unused-by-worker",
@@ -401,7 +464,13 @@ class SessionPool:
         )
         candidate = OJVSession(adapter)
         try:
-            await candidate.revalidate_once()
+            async with self._health_usage_scope(
+                slot,
+                session_cycle_id=session_cycle_id,
+                session_reason=session_reason,
+                session_age_seconds=session_age_seconds,
+            ):
+                await candidate.revalidate_once()
             final_cookies = adapter.snapshot_cookies()
             replaced = self._store.replace_slot_cookies_if_current(
                 slot.index,
@@ -452,7 +521,34 @@ class SessionPool:
             return exc.response.status_code in {401, 403}
         return new_egress_may_help(exc)
 
-    async def _mint_once_for_acquisition(self, slot: _Slot) -> None:
+    @staticmethod
+    def _replacement_mint_reason(exc: BaseException) -> SessionReason:
+        if isinstance(exc, BlockedPageError) or (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code in {401, 403}
+        ):
+            return "session_rejected"
+        return "transport_rotation"
+
+    async def _mint_once_for_acquisition(
+        self,
+        slot: _Slot,
+        *,
+        session_cycle_id: uuid.UUID | None = None,
+        session_reason: SessionReason = "session_rejected",
+        session_age_seconds: int | None = None,
+    ) -> None:
+        cycle_id = session_cycle_id or slot.session_cycle_id or uuid.uuid4()
+        age_seconds = session_age_seconds
+        if age_seconds is None:
+            age_seconds = slot.session_cycle_age_seconds
+        if age_seconds is None and slot.bundle_saved_at is not None:
+            age_seconds = self._bounded_session_age_seconds(
+                max(0.0, time.time() - slot.bundle_saved_at),
+            )
+        slot.session_cycle_id = cycle_id
+        slot.session_cycle_reason = session_reason
+        slot.session_cycle_age_seconds = age_seconds
         await self._mint_slot(slot, max_attempts=1)
         slot.minted_during_acquire = True
 
@@ -478,25 +574,51 @@ class SessionPool:
             raise
 
     async def _revalidate_or_mint_once(
-        self, slot: _Slot, bundle: CookieBundle,
+        self,
+        slot: _Slot,
+        bundle: CookieBundle,
+        *,
+        session_reason: SessionReason = "soft_age",
     ) -> bool:
+        age_seconds = self._bounded_session_age_seconds(
+            max(0.0, time.time() - bundle.saved_at),
+        )
+        cycle_id, _ = self._begin_session_cycle(
+            slot, age_seconds, session_reason,
+        )
         try:
-            await self._revalidate_bundle(slot, bundle)
+            await self._revalidate_bundle(
+                slot,
+                bundle,
+                session_cycle_id=cycle_id,
+                session_reason=session_reason,
+                session_age_seconds=age_seconds,
+            )
         except BaseException as exc:
             if not self._validation_failure_allows_mint(exc):
                 raise
-            await self._mint_once_for_acquisition(slot)
+            await self._mint_once_for_acquisition(
+                slot,
+                session_cycle_id=cycle_id,
+                session_reason=self._replacement_mint_reason(exc),
+                session_age_seconds=age_seconds,
+            )
             return True
         return False
 
     async def _initialize_reuse_slot(self, slot: _Slot) -> bool:
         bundle = self._store.load_slot(slot.index)
         if bundle is None:
+            self._begin_session_cycle(slot, None, "missing_bundle")
             await self._mint_slot(slot, max_attempts=1)
             return True
         try:
             self._bundle_proxy_url(bundle)
         except ValueError:
+            age_seconds = self._bounded_session_age_seconds(
+                max(0.0, time.time() - bundle.saved_at),
+            )
+            self._begin_session_cycle(slot, age_seconds, "missing_bundle")
             await self._mint_slot(slot, max_attempts=1)
             return True
         now = time.time()
@@ -504,9 +626,17 @@ class SessionPool:
         expired = cookie_expiry is not None and cookie_expiry <= now
         age = max(0.0, now - bundle.saved_at)
         if expired or age >= self._config.session_hard_effective_age_s:
+            age_seconds = self._bounded_session_age_seconds(age)
+            self._begin_session_cycle(
+                slot,
+                age_seconds,
+                "cookie_expired" if expired else "hard_age",
+            )
             await self._mint_slot(slot, max_attempts=1)
             return True
-        return await self._revalidate_or_mint_once(slot, bundle)
+        return await self._revalidate_or_mint_once(
+            slot, bundle, session_reason="startup",
+        )
 
     async def _prepare_reuse_slot(self, slot: _Slot) -> None:
         if slot.session is None or slot.bundle_saved_at is None:
@@ -519,7 +649,23 @@ class SessionPool:
             slot.cookie_expires_at is not None
             and slot.cookie_expires_at <= now
         ) or age >= self._config.session_hard_effective_age_s:
-            await self._mint_once_for_acquisition(slot)
+            age_seconds = self._bounded_session_age_seconds(age)
+            cycle_id, _ = self._begin_session_cycle(
+                slot,
+                age_seconds,
+                (
+                    "cookie_expired"
+                    if slot.cookie_expires_at is not None
+                    and slot.cookie_expires_at <= now
+                    else "hard_age"
+                ),
+            )
+            await self._mint_once_for_acquisition(
+                slot,
+                session_cycle_id=cycle_id,
+                session_reason=slot.session_cycle_reason or "hard_age",
+                session_age_seconds=age_seconds,
+            )
             return
 
         verified_recently = (
@@ -571,6 +717,9 @@ class SessionPool:
                 raise RuntimeError("borrow: semáforo dio permiso pero no hay slot libre")
             slot.busy = True
             slot.minted_during_acquire = False
+            slot.session_cycle_id = None
+            slot.session_cycle_reason = None
+            slot.session_cycle_age_seconds = None
 
         if self._reuse_validation_enabled:
             try:
@@ -631,7 +780,10 @@ class SessionPool:
             ):
                 try:
                     if self._reuse_validation_enabled:
-                        await self._mint_once_for_acquisition(slot)
+                        await self._mint_once_for_acquisition(
+                            slot,
+                            session_reason="session_rejected",
+                        )
                     else:
                         await self._refresh_slot(slot)
                 except Exception as exc:
@@ -643,6 +795,9 @@ class SessionPool:
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
         finally:
             slot.minted_during_acquire = False
+            slot.session_cycle_id = None
+            slot.session_cycle_reason = None
+            slot.session_cycle_age_seconds = None
             slot.busy = False
             self._sem.release()
 

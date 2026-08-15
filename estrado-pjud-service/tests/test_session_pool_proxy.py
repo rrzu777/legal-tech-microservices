@@ -11,6 +11,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import httpx
 import pytest
@@ -782,6 +783,118 @@ async def test_proxy_mint_runs_inside_durable_usage_operation(monkeypatch):
 
     assert len(tracked) == 1
     assert tracked[0]["operation"] == "mint"
+
+
+@pytest.mark.asyncio
+async def test_failed_soft_age_health_and_replacement_mint_share_cycle(monkeypatch):
+    """Generating a second UUID for replacement mint would hide per-cycle limits."""
+    from app.cookie_scope import CookieRecord
+    from app.cookie_store import CookieBundle
+    from app.failure_kind import BlockedPageError
+    from worker import session_pool as sp
+
+    tracked = []
+
+    class Tracker:
+        @asynccontextmanager
+        async def track(self, **kwargs):
+            tracked.append(kwargs)
+            yield SimpleNamespace(retry_count=0)
+
+    bundle = CookieBundle(
+        cookies=(CookieRecord(
+            "PHPSESSID", "persisted", "oficinajudicialvirtual.pjud.cl",
+        ),),
+        user_agent="persisted-UA",
+        saved_at=8_700.0,
+        proxy_token="sticky",
+    )
+
+    class Candidate(_FakeSession):
+        async def revalidate_once(self):
+            raise BlockedPageError("challenge")
+
+    class Store:
+        def replace_slot_cookies_if_current(self, *_args, **_kwargs):
+            return True
+
+        def save_slot(self, *_args, **_kwargs):
+            pass
+
+        def load_slot(self, _slot_id):
+            return CookieBundle(
+                cookies=bundle.cookies,
+                user_agent="fresh-UA",
+                saved_at=10_000.0,
+                proxy_token="replacement",
+            )
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = True
+    monkeypatch.setattr(sp.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(sp, "Settings", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sp, "OJVHttpAdapter", _SnapshotAdapter)
+    monkeypatch.setattr(sp, "OJVSession", Candidate)
+    monkeypatch.setattr(sp, "CookieMinter", lambda *_args, **_kwargs: MagicMock(
+        mint=AsyncMock(return_value=MintResult(
+            cookies={"PHPSESSID": "fresh"}, user_agent="fresh-UA",
+        )),
+    ))
+    pool = sp.SessionPool(config, proxy_usage=Tracker())
+    pool._store = Store()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=_FakeSession(MagicMock()),
+        bundle_saved_at=bundle.saved_at,
+    )
+
+    await pool._revalidate_or_mint_once(slot, bundle)
+
+    assert [event["operation"] for event in tracked] == ["health", "mint"]
+    assert tracked[0]["session_reason"] == "soft_age"
+    assert tracked[1]["session_reason"] == "session_rejected"
+    assert tracked[0]["session_cycle_id"] == tracked[1]["session_cycle_id"]
+    assert isinstance(tracked[0]["session_cycle_id"], UUID)
+    assert tracked[0]["session_age_seconds"] == 1_300
+    assert tracked[1]["session_age_seconds"] == 1_300
+
+
+@pytest.mark.asyncio
+async def test_hard_age_mint_scope_is_clamped_and_has_no_health(monkeypatch):
+    """Hard expiry must mint directly and keep persisted age within the ledger bound."""
+    from worker import session_pool as sp
+
+    _patch_pool_deps(monkeypatch, sp)
+    tracked = []
+
+    class Tracker:
+        @asynccontextmanager
+        async def track(self, **kwargs):
+            tracked.append(kwargs)
+            yield SimpleNamespace(retry_count=0)
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = True
+    pool = sp.SessionPool(config, proxy_usage=Tracker())
+    pool._store.load_slot.return_value = SimpleNamespace(
+        saved_at=1.0,
+        cookies=(),
+        proxy_token="replacement",
+    )
+    slot = sp._Slot(
+        index=0,
+        session=_FakeSession(MagicMock()),
+        bundle_saved_at=-100_000.0,
+    )
+
+    await pool._prepare_reuse_slot(slot)
+
+    assert [event["operation"] for event in tracked] == ["mint"]
+    assert tracked[0]["session_reason"] == "hard_age"
+    assert tracked[0]["session_age_seconds"] == 86_400
+    assert isinstance(tracked[0]["session_cycle_id"], UUID)
 
 
 @pytest.mark.asyncio

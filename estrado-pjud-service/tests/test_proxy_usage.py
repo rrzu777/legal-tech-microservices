@@ -72,6 +72,92 @@ async def test_usage_tracker_reserves_persists_and_finalizes_actual_bytes():
 
 
 @pytest.mark.asyncio
+async def test_session_usage_serializes_closed_safe_metadata_and_clamps_age():
+    """Dropping lifecycle fields or persisting an unbounded age hides session cost."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    cycle = UUID("11111111-1111-4111-8111-111111111111")
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="health",
+            transaction_key="health-1",
+            session_cycle_id=cycle,
+            session_reason="soft_age",
+            session_age_seconds=100_000,
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["session_cycle_id"] == str(cycle)
+    assert payload["session_reason"] == "soft_age"
+    assert payload["session_age_seconds"] == 86_400
+    assert "cookies" not in payload
+    assert "proxy_url" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"session_cycle_id": UUID("11111111-1111-4111-8111-111111111111")},
+        {"session_reason": "soft_age", "session_age_seconds": 1_201},
+        {
+            "session_cycle_id": UUID("11111111-1111-4111-8111-111111111111"),
+            "session_reason": "soft_age",
+        },
+    ],
+)
+async def test_session_usage_rejects_incomplete_metadata_before_reservation(metadata):
+    """A partial lifecycle tuple would make aggregate evidence permanently partial."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with pytest.raises(ValueError, match="session telemetry"):
+        async with tracker.track(operation="health", **metadata):
+            pass
+
+    sb.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "reason", "age"),
+    [
+        ("search", "soft_age", 1_201),
+        ("health", "free_form_reason", 1_201),
+        ("health", "soft_age", -1),
+        ("health", "soft_age", True),
+    ],
+)
+async def test_session_usage_rejects_open_or_non_lifecycle_metadata(
+    operation, reason, age,
+):
+    """Open reasons or metadata on business traffic would violate the SQL contract."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with pytest.raises(ValueError, match="session telemetry"):
+        async with tracker.track(
+            operation=operation,
+            session_cycle_id=UUID("11111111-1111-4111-8111-111111111111"),
+            session_reason=reason,
+            session_age_seconds=age,
+        ):
+            pass
+
+    sb.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_transient_reservation_disconnect_retries_before_provider_work():
     """Removing bounded retry would turn one lost HTTP/2 response into a global pause."""
     sb = _supabase()

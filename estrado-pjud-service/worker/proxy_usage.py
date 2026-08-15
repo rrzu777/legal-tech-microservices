@@ -37,6 +37,27 @@ ESTIMATED_OPERATION_BYTES = {
     "other": 5_000_000,
 }
 _TELEMETRY_RETRY_DELAYS_S = (0.1, 0.25)
+_MAX_SESSION_AGE_SECONDS = 86_400
+SessionReason = Literal[
+    "startup",
+    "missing_bundle",
+    "soft_age",
+    "hard_age",
+    "cookie_expired",
+    "session_rejected",
+    "transport_rotation",
+]
+_SESSION_REASONS: frozenset[str] = frozenset({
+    "startup",
+    "missing_bundle",
+    "soft_age",
+    "hard_age",
+    "cookie_expired",
+    "session_rejected",
+    "transport_rotation",
+})
+_SESSION_REASONS_WITHOUT_AGE = frozenset({"startup", "missing_bundle"})
+_SESSION_OPERATIONS = frozenset({"health", "mint"})
 
 
 class ProxyUsageTracker:
@@ -238,6 +259,45 @@ class ProxyUsageTracker:
                     raise
                 await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
 
+    @staticmethod
+    def _normalize_session_telemetry(
+        *,
+        operation: str,
+        session_cycle_id: uuid.UUID | None,
+        session_reason: SessionReason | None,
+        session_age_seconds: int | None,
+    ) -> tuple[str | None, SessionReason | None, int | None]:
+        has_metadata = any(
+            value is not None
+            for value in (session_cycle_id, session_reason, session_age_seconds)
+        )
+        if not has_metadata:
+            return None, None, None
+        if (
+            operation not in _SESSION_OPERATIONS
+            or not isinstance(session_cycle_id, uuid.UUID)
+            or session_reason not in _SESSION_REASONS
+            or (
+                session_age_seconds is None
+                and session_reason not in _SESSION_REASONS_WITHOUT_AGE
+            )
+            or (
+                session_age_seconds is not None
+                and (
+                    isinstance(session_age_seconds, bool)
+                    or not isinstance(session_age_seconds, int)
+                    or session_age_seconds < 0
+                )
+            )
+        ):
+            raise ValueError("invalid session telemetry tuple")
+        normalized_age = (
+            None
+            if session_age_seconds is None
+            else min(session_age_seconds, _MAX_SESSION_AGE_SECONDS)
+        )
+        return str(session_cycle_id), session_reason, normalized_age
+
     @asynccontextmanager
     async def track(
         self,
@@ -251,7 +311,20 @@ class ProxyUsageTracker:
         estimated_bytes: int | None = None,
         cause_operation: Literal["opportunistic_catalog_refresh"] | None = None,
         cause_session_id: uuid.UUID | None = None,
+        session_cycle_id: uuid.UUID | None = None,
+        session_reason: SessionReason | None = None,
+        session_age_seconds: int | None = None,
     ):
+        (
+            normalized_session_cycle_id,
+            normalized_session_reason,
+            normalized_session_age_seconds,
+        ) = self._normalize_session_telemetry(
+            operation=operation,
+            session_cycle_id=session_cycle_id,
+            session_reason=session_reason,
+            session_age_seconds=session_age_seconds,
+        )
         inherited = current_usage_scope()
         law_firm_id = law_firm_id or inherited["law_firm_id"]
         case_id = case_id or inherited["case_id"]
@@ -323,6 +396,9 @@ class ProxyUsageTracker:
                         movement_id=movement_id,
                         error=caught,
                         estimated_bytes=estimate,
+                        session_cycle_id=normalized_session_cycle_id,
+                        session_reason=normalized_session_reason,
+                        session_age_seconds=normalized_session_age_seconds,
                     )
                 except Exception as exc:
                     if caught is not None:
@@ -347,6 +423,9 @@ class ProxyUsageTracker:
         movement_id: str | None,
         error: BaseException | None,
         estimated_bytes: int,
+        session_cycle_id: str | None,
+        session_reason: SessionReason | None,
+        session_age_seconds: int | None,
     ) -> None:
         has_provider_usage = usage.request_count > 0
         has_savings_event = usage.documents_skipped > 0
@@ -402,6 +481,12 @@ class ProxyUsageTracker:
             "provider": self._provider,
             "price_per_gb_usd": self._price_per_gb_usd,
         }
+        if session_cycle_id is not None:
+            payload.update({
+                "session_cycle_id": session_cycle_id,
+                "session_reason": session_reason,
+                "session_age_seconds": session_age_seconds,
+            })
         await self._persist_usage_event(payload)
 
         # The append-only causal fact already exists once INSERT succeeds. A
