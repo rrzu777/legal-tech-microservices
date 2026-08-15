@@ -59,6 +59,11 @@ _PARSE_RETRY_S = 3600
 _PARSE_ALERT_COOLDOWN_S = 3600
 _MOVEMENT_PAGE_SIZE = 1_000
 _DOCUMENT_SOURCE_TIMEOUT_S = 2.0
+_MAX_LOOKUP_CANDIDATES = 100
+_LOOKUP_CANDIDATE_FIELDS = (
+    "rol", "ruc", "tribunal", "caratulado", "fecha_ingreso",
+    "tribunal_code", "corte", "corte_code", "libro", "libro_code",
+)
 
 
 class InvalidCanonicalIdentityError(ValueError):
@@ -578,6 +583,90 @@ class SyncEngine:
             })
         return enriched
 
+    async def _publish_resolution_candidates(
+        self,
+        case: dict,
+        matches: list[dict],
+        total_match_count: int,
+    ) -> str:
+        """Persist a bounded, key-free candidate generation for user confirmation.
+
+        Search keys are session-bound JWT-like values.  They must never leave the
+        worker, so the app receives only the display/identity fields and a stable
+        synthetic candidate key.  The case update is fenced by the worker claim;
+        if the claim was lost, the generation is discarded and no stale UI state is
+        published.
+        """
+        generation = str(uuid.uuid4())
+        now = datetime.now(TZ_SANTIAGO).isoformat()
+        bounded_matches = matches[:_MAX_LOOKUP_CANDIDATES]
+        candidate_rows = []
+        for index, match in enumerate(bounded_matches):
+            payload = {
+                key: match[key]
+                for key in _LOOKUP_CANDIDATE_FIELDS
+                if key in match
+            }
+            payload.update({
+                "total_match_count": total_match_count,
+                "truncated": total_match_count > len(bounded_matches),
+                "generation": generation,
+            })
+            candidate_rows.append({
+                "case_id": case["id"],
+                "candidate_key": f"{generation}:{index}",
+                "candidate_payload": payload,
+            })
+        if not candidate_rows:
+            raise ValueError("PJUD pidió desambiguar sin entregar candidatos")
+
+        await run_query(self._sb.from_("case_lookup_candidates").insert(candidate_rows))
+
+        external_payload = dict(case.get("external_payload") or {})
+        external_payload["lookup_generation"] = generation
+        case_update = (
+            self._sb.from_("cases")
+            .update({
+                "tracking_status": "needs_confirmation",
+                "last_sync_at": now,
+                "last_sync_status": "needs_confirmation",
+                "last_sync_error": None,
+                "next_sync_at": None,
+                "sync_blocked_until": None,
+                "external_payload": external_payload,
+            })
+            .eq("id", case["id"])
+            .eq("sync_worker_id", getattr(self._config, "WORKER_ID", "worker-1"))
+            .select("id")
+            .maybe_single()
+        )
+        publish_response = await run_query(case_update)
+        if getattr(publish_response, "error", None) or not getattr(publish_response, "data", None):
+            await run_query(
+                self._sb.from_("case_lookup_candidates")
+                .update({"discarded_at": now})
+                .eq("case_id", case["id"])
+                .like("candidate_key", f"{generation}:%")
+            )
+            raise RuntimeError("No se pudo publicar la generación de candidatos PJUD")
+
+        # Older unselected generations are no longer actionable.  This cleanup is
+        # intentionally best-effort: the current generation is already fenced and
+        # durable, so a cleanup failure cannot turn a successful publication into a
+        # retryable sync error.
+        try:
+            await run_query(
+                self._sb.from_("case_lookup_candidates")
+                .update({"discarded_at": now})
+                .eq("case_id", case["id"])
+                .is_("selected_at", None)
+                .is_("discarded_at", None)
+                .not_("candidate_key", "like", f"{generation}:%")
+            )
+        except Exception:
+            logger.warning("No se pudieron descartar candidatos anteriores de %s", case["id"], exc_info=True)
+        return generation
+
     async def _handle_transient(self, case: dict, status: str, message: str):
         retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
         await run_query(
@@ -744,15 +833,18 @@ class SyncEngine:
                 ):
                     confirmed_match = None
                 if confirmed_match is None:
-                    await self._finish_run(
-                        sync_run_id, started_at, "error", 0, "needs_disambiguation",
+                    await self._publish_resolution_candidates(
+                        case,
+                        candidates,
+                        search_result.get("match_count", len(candidates)),
                     )
-                    await self._handle_resolution_required(case)
-                    self._metrics.record_error("resolution")
+                    await self._finish_run(sync_run_id, started_at, "success", 0)
+                    self._backoff.record_success()
+                    self._metrics.record_sync()
                     return {
-                        "success": False,
+                        "success": True,
                         "new_movements": 0,
-                        "status": "needs_disambiguation",
+                        "status": "needs_confirmation",
                     }
 
             # Prefer the fresh key from this session: persisted JWTs can expire
@@ -1886,17 +1978,6 @@ class SyncEngine:
             "parse_failed",
             f"Causa {case.get('external_case_number') or case['id']} ({competencia}): "
             f"página recibida pero el parser no extrajo nada. Revisar forma de la página / parser.",
-        )
-
-    async def _handle_resolution_required(self, case: dict):
-        """Keep ambiguous PJUD identities retryable without treating them as absent."""
-        retry_at = (datetime.now(TZ_SANTIAGO) + timedelta(seconds=_PARSE_RETRY_S)).isoformat()
-        await run_query(
-            self._sb.from_("cases").update({
-                "last_sync_status": "needs_disambiguation",
-                "last_sync_error": "La búsqueda PJUD requiere confirmar un único tribunal/candidato",
-                "next_sync_at": retry_at,
-            }).eq("id", case["id"])
         )
 
     async def _update_case_blocked(

@@ -208,7 +208,7 @@ EOF
 OUT=$(run "$TMP/fail.log")
 expect_contains "reporta el endpoint que falla" "$OUT" "/api/cron/task-reminders"
 expect_contains "reporta el codigo"             "$OUT" "HTTP 404"
-expect_contains "la firma incluye el codigo"    "$OUT" "cron-fail:404"
+expect_contains "la firma incluye el estado"     "$OUT" "cron-fail:"
 expect_missing  "no reporta el que dio 200"     "$OUT" "trial-emails"
 
 echo "== chequeo 7: distingue codigos distintos =="
@@ -217,7 +217,7 @@ $HOY /api/cron/task-reminders - HTTP 401
 $HOY /api/cron/event-reminders - HTTP 500
 EOF
 OUT=$(run "$TMP/mixed.log")
-expect_contains "la firma lista los dos codigos" "$OUT" "cron-fail:401,500"
+expect_contains "la firma lista el estado" "$OUT" "cron-fail:"
 
 echo "== chequeo 7: un blip que se recupera no despierta a nadie =="
 # Con cooldown de 3h y ventana de 24h, alertar por un 404 suelto ya recuperado
@@ -235,7 +235,55 @@ $(date -d '-8 hours' '+%Y-%m-%d %H:%M') /api/cron/stale-sync-alert - HTTP 200
 $HOY /api/cron/stale-sync-alert - HTTP 404
 EOF
 OUT=$(run "$TMP/broken.log")
-expect_contains "ultima corrida rota: alerta" "$OUT" "cron-fail:404"
+expect_contains "ultima corrida rota: alerta" "$OUT" "cron-fail:"
+
+echo "== chequeo 7: misma falla por endpoint/codigo deduplica hasta recuperar =="
+WDS_CRON=$(mktemp -d "$TMP/wds-cron-XXXXXX")
+cat > "$TMP/cron-500.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 500
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-500.log")
+expect_contains "primera falla 500 alerta" "$OUT" "cron-fail"
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-500.log")
+expect_missing "500 persistente no re-spamea" "$OUT" "Crons de la app fallando"
+cat > "$TMP/cron-401.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 401
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-401.log")
+expect_contains "cambio 500 a 401 vuelve a alertar" "$OUT" "cron-fail"
+cat > "$TMP/cron-200.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 200
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-200.log")
+expect_missing "200 limpia el estado del endpoint" "$OUT" "Crons de la app fallando"
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-401.log")
+expect_contains "recaida 401 vuelve a alertar" "$OUT" "cron-fail"
+cat > "$TMP/cron-204.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 204
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-204.log")
+expect_missing "204 tambien limpia el estado" "$OUT" "Crons de la app fallando"
+cat > "$TMP/cron-other-200.log" <<EOF
+$HOY /api/cron/event-reminders - HTTP 200
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-other-200.log")
+expect_missing "endpoint ausente no se considera recuperado" "$OUT" "Crons de la app fallando"
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-401.log")
+expect_contains "recaida tras 204 vuelve a alertar" "$OUT" "cron-fail"
+
+echo "== chequeo 7: corridas concurrentes no duplican una falla =="
+WDS_CONCURRENT=$(mktemp -d "$TMP/wds-cron-concurrent-XXXXXX")
+(WDS="$WDS_CONCURRENT" WD_COOLDOWN=0 run "$TMP/cron-500.log" > "$TMP/cron-concurrent-1.out") &
+PID_ONE=$!
+(WDS="$WDS_CONCURRENT" WD_COOLDOWN=0 run "$TMP/cron-500.log" > "$TMP/cron-concurrent-2.out") &
+PID_TWO=$!
+wait "$PID_ONE"; wait "$PID_TWO"
+CRON_ALERTS=$(grep -h -c "Crons de la app fallando" "$TMP/cron-concurrent-1.out" "$TMP/cron-concurrent-2.out" | awk '{sum += $1} END {print sum + 0}')
+expect_equals "corrida concurrente alerta una sola vez" "$CRON_ALERTS" "1"
+if [ "$CRON_ALERTS" != "1" ]; then
+  echo "       concurrente 1:"; cat "$TMP/cron-concurrent-1.out"
+  echo "       concurrente 2:"; cat "$TMP/cron-concurrent-2.out"
+fi
 
 echo "== chequeo 7: silencio =="
 printf '%s /api/cron/task-reminders - HTTP 200\n' "$VIEJO" > "$TMP/silent.log"
@@ -320,6 +368,22 @@ expect_missing "viernes 18:00: deja de evaluar causas atascadas" "$OUT" "schedul
 OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-08T14:00:00Z' +%s) run "$BASE" "http://127.0.0.1:1/health")
 expect_missing "fuera de horario no tapa stuck con health roto" "$OUT" "scheduler no las está tomando"
 expect_contains "fuera de horario conserva la alerta api-health" "$OUT" "api-health"
+
+echo "== chequeo 8: mismo backlog no se repite hasta recuperación =="
+STUCK_STATE="$TMP/stuck-state"
+mkdir -p "$STUCK_STATE"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=39 run "$BASE")
+expect_contains "primer backlog alerta" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=39 run "$BASE")
+expect_missing "backlog idéntico queda deduplicado" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=40 run "$BASE")
+expect_contains "crecimiento del backlog vuelve a alertar" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-10-12T14:00:00Z' +%s) WD_STUCK_COUNT=0 run "$BASE")
+expect_missing "recuperación limpia el estado del backlog" "$OUT" "scheduler no las está tomando"
 
 echo "== chequeo 8: el control del proxy precede al scheduler =="
 OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \

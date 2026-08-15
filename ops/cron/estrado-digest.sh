@@ -76,6 +76,18 @@ heartbeat_summary() {
 
 HB=$(heartbeat_summary)
 
+# Una métrica puede ser cero y estar perfectamente disponible. Sólo contamos
+# como disponible un valor que no sea el sentinel explícito "sin datos"; no
+# incluimos cuerpos, URLs, IDs ni errores crudos en el resumen.
+AVAILABLE=0
+TOTAL_READS=14
+for value in "$FIRMS" "$TOTAL_USERS" "$NEW_USERS" "$TOTAL_CASES" "$ACTIVE_TRACK" \
+  "$NEW_CASES" "$NEW_MOV" "$EVENTS_24" "$SYNC_ERROR_CURRENT" "$SYNC_BLOCKED_CURRENT" \
+  "$RUNS_24" "$RUNS_SUCCESS_24" "$RUNS_ERROR_24" "$RUNS_BLOCKED_24"; do
+  [ "$value" != "sin datos" ] && AVAILABLE=$((AVAILABLE + 1))
+done
+AVAILABILITY="$AVAILABLE/$TOTAL_READS"
+
 METRICS="Fecha (UTC): $DIGEST_DATE_UTC
 Estudios (law_firms): $FIRMS
 Usuarios: $TOTAL_USERS total | +$NEW_USERS en 24h
@@ -86,6 +98,7 @@ Corridas últimas 24h: $RUNS_24 total | $RUNS_SUCCESS_24 success | $RUNS_ERROR_2
 Causas con último sync actualmente en error: $SYNC_ERROR_CURRENT
 Causas bloqueadas actualmente: $SYNC_BLOCKED_CURRENT
 Las corridas de 24h y el estado actual de causas son métricas distintas.
+Disponibilidad de métricas agregadas: $AVAILABILITY lecturas disponibles (sin datos no equivale a cero)
 Worker heartbeat (más reciente): $HB"
 
 # Componer con Luna. Prompt+métricas a archivo sin secretos, legible por hermes.

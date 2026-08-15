@@ -106,7 +106,8 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         chain.insert.return_value = chain
         chain.select.return_value = chain
         chain.single.return_value = chain
-        chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
+        chain.maybe_single.return_value = chain
+        chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0, error=None)
         chain.update.return_value = chain
         chain.eq.return_value = chain
         chain.order.return_value = chain
@@ -944,14 +945,104 @@ class TestSyncEngine:
             mock_search.return_value = _mock_search_response(matches=candidates)
             result = await engine.sync_case(case)
 
-        assert result == {"success": False, "new_movements": 0, "status": "needs_disambiguation"}
+        assert result == {"success": True, "new_movements": 0, "status": "needs_confirmation"}
         mock_detail.assert_not_awaited()
         mock_backoff.record_failure.assert_not_called()
         mock_backoff.record_blocked.assert_not_called()
-        mock_metrics.record_error.assert_called_once_with("resolution")
-        resolution_update = find_update_payload(mock_sb, last_sync_status="needs_disambiguation")
+        mock_metrics.record_error.assert_not_called()
+        resolution_update = find_update_payload(mock_sb, last_sync_status="needs_confirmation")
         assert resolution_update is not None
         assert "consecutive_sync_failures" not in resolution_update
+
+    @pytest.mark.asyncio
+    async def test_sync_broad_ambiguous_publishes_sanitized_candidates_and_stops_retry(self):
+        """Ambiguity is a user decision, not a paid retryable worker error."""
+        engine, mock_pool, mock_sb, _notifier, mock_metrics, mock_backoff = _make_engine()
+        case = _make_case(
+            court_code=None,
+            tribunal_code=None,
+            libro="C",
+            pjud_search_mode=None,
+            tribunal_unknown=True,
+        )
+        candidates = [
+            {
+                "key": "JWT-SECRET-A",
+                "rol": "C-1234-2024",
+                "ruc": None,
+                "tribunal": "1° Juzgado Civil de Santiago",
+                "caratulado": "FIRST",
+                "fecha_ingreso": "2025-01-15",
+                "detail_token": "DO-NOT-PERSIST",
+            },
+            {
+                "key": "JWT-SECRET-B",
+                "rol": "C-1234-2024",
+                "ruc": None,
+                "tribunal": "2° Juzgado Civil de Santiago",
+                "caratulado": "SECOND",
+                "fecha_ingreso": "2024-01-15",
+            },
+        ]
+
+        with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
+            mock_search.return_value = _mock_search_response(matches=candidates)
+            result = await engine.sync_case(case)
+
+        assert result == {"success": True, "new_movements": 0, "status": "needs_confirmation"}
+        mock_detail.assert_not_awaited()
+        mock_metrics.record_error.assert_not_called()
+        mock_metrics.record_sync.assert_called_once()
+        mock_backoff.record_success.assert_called_once()
+        candidate_insert = next(
+            call.args[0] for call in mock_sb.from_.return_value.insert.call_args_list
+            if isinstance(call.args[0], list)
+        )
+        assert len(candidate_insert) == 2
+        assert all(row["case_id"] == case["id"] for row in candidate_insert)
+        assert all("key" not in row["candidate_payload"] for row in candidate_insert)
+        assert all("JWT-SECRET" not in repr(row) for row in candidate_insert)
+        assert all("detail_token" not in row["candidate_payload"] for row in candidate_insert)
+        assert all(row["candidate_payload"]["generation"] for row in candidate_insert)
+        assert all(row["candidate_payload"]["total_match_count"] == 2 for row in candidate_insert)
+
+        update_payloads = [call.args[0] for call in mock_sb.from_.return_value.update.call_args_list]
+        case_update = next(payload for payload in update_payloads if payload.get("tracking_status") == "needs_confirmation")
+        assert case_update["last_sync_status"] == "needs_confirmation"
+        assert case_update["next_sync_at"] is None
+        run_finish = next(payload for payload in update_payloads if payload.get("finished_at"))
+        assert run_finish["status"] == "success"
+        assert run_finish["error_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_candidate_publication_claim_loss_discards_generation(self):
+        """A lost worker claim must not leave actionable stale candidates."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        engine._config.WORKER_ID = "worker-1"
+        case = _make_case(external_payload={"existing": "value"})
+        matches = [{
+            "key": "JWT-SECRET",
+            "rol": "C-1234-2024",
+            "tribunal": "Juzgado Civil",
+        }]
+        responses = [
+            MagicMock(error=None, data=None),
+            MagicMock(error=None, data=None),
+            MagicMock(error=None, data=None),
+        ]
+
+        with patch("worker.engine.run_query", new_callable=AsyncMock) as mock_run:
+            mock_run.side_effect = responses
+            with pytest.raises(RuntimeError, match="No se pudo publicar"):
+                await engine._publish_resolution_candidates(case, matches, 1)
+
+        assert mock_run.await_count == 3
+        inserted = mock_sb.from_.return_value.insert.call_args.args[0]
+        assert inserted[0]["candidate_payload"]["rol"] == "C-1234-2024"
+        assert "key" not in inserted[0]["candidate_payload"]
+        discarded = mock_sb.from_.return_value.update.call_args.args[0]
+        assert set(discarded) == {"discarded_at"}
 
     @pytest.mark.asyncio
     async def test_invalid_canonical_identity_never_falls_back_to_first_legacy_match(self):
@@ -1013,7 +1104,7 @@ class TestSyncEngine:
             }])
             result = await engine.sync_case(case)
 
-        assert result["status"] == "needs_disambiguation"
+        assert result["status"] == "needs_confirmation"
         mock_detail.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1039,7 +1130,7 @@ class TestSyncEngine:
             }])
             result = await engine.sync_case(case)
 
-        assert result["status"] == "needs_disambiguation"
+        assert result["status"] == "needs_confirmation"
         mock_detail.assert_not_awaited()
 
     @pytest.mark.asyncio

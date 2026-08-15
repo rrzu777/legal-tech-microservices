@@ -45,7 +45,9 @@ if [[ " $* " == *" -I "* ]]; then
     *'cases?select=id'*) count=0 ;;
     *) count=0 ;;
   esac
-  if [ -n "${DIGEST_FAKE_CONTENT_RANGE:-}" ]; then
+  if [ "${DIGEST_FAKE_PARTIAL:-0}" = 1 ] && [[ "$*" == *'law_firms?'* ]]; then
+    printf 'HTTP/1.1 200 OK\r\n\r\n'
+  elif [ -n "${DIGEST_FAKE_CONTENT_RANGE:-}" ]; then
     printf 'HTTP/1.1 200 OK\r\nContent-Range: %s\r\n\r\n' "$DIGEST_FAKE_CONTENT_RANGE"
   elif [ "${DIGEST_FAKE_MISSING_RANGE:-0}" != 1 ]; then
     printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$count"
@@ -105,14 +107,24 @@ expect_contains 'separa bloqueos actuales de las corridas' "$PROMPT" \
   'Causas bloqueadas actualmente: 3'
 expect_contains 'explica que ventana y estado actual difieren' "$PROMPT" \
   'Las corridas de 24h y el estado actual de causas son métricas distintas.'
+expect_contains 'resume disponibilidad sin confundir cero con desconocido' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
 
 echo '== digest: Content-Range ausente no equivale a cero =='
 DIGEST_FAKE_MISSING_RANGE=1 run
 PROMPT=$(<"$TMP/prompt")
 expect_contains 'muestra datos desconocidos como sin datos' "$PROMPT" 'sin datos'
+expect_contains 'todos los conteos ausentes se expresan como 0/14' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 0/14 lecturas disponibles'
 expect_missing 'no inventa una corrida total cero' "$PROMPT" 'Corridas últimas 24h: 0 total'
 expect_contains 'prohíbe traducir desconocido a cero' "$PROMPT" \
   '"sin datos" significa desconocido, no cero.'
+
+echo '== digest: disponibilidad parcial de conteos =='
+DIGEST_FAKE_PARTIAL=1 run
+PROMPT=$(<"$TMP/prompt")
+expect_contains 'un conteo ausente deja 13/14' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 13/14 lecturas disponibles'
 
 echo '== digest: Content-Range inválido no se extrae parcialmente =='
 DIGEST_FAKE_MISSING_RANGE=0 DIGEST_FAKE_CONTENT_RANGE='*/12' run
