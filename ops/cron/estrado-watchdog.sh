@@ -429,8 +429,19 @@ else
       # desincronizado con Vercel) son incidentes distintos, y si el segundo aparece
       # mientras el primero está en cooldown NO puede quedar tapado.
       CRON_CODES=$(printf '%s\n' "$CRON_BAD" | awk '{print $2}' | sort -u | paste -sd, - || true)
-      # Ojo: $(...) come el \n final de CRON_DETAIL, así que la pista va con su propio salto.
-      add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." "cron-fail:$CRON_CODES"
+      CRON_KEYS=$(printf '%s\n' "$CRON_BAD" | awk '{print $1 "|" $2}' | sort || true)
+      CRON_NEW=$(nuevas_claves cron-fail "$CRON_KEYS")
+      sig_keyed cron-fail
+      # El estado keyed es por endpoint y código. Así un 500 persistente no
+      # vuelve a despertar al canal cada 3h, pero 500->401 o una recuperación y
+      # recaída sí constituyen una transición nueva.
+      if [ -n "${CRON_NEW// }" ]; then
+        # Ojo: $(...) come el \n final de CRON_DETAIL, así que la pista va con su propio salto.
+        add "Crons de la app fallando (últimas 24h):"$'\n'"$CRON_DETAIL"$'\n'"    404 en todos = APP_URL roto; 401 = CRON_SECRET desincronizado con Vercel; 000 = no hubo conexión." "cron-fail:$CRON_CODES"
+      fi
+    else
+      nuevas_claves cron-fail "" >/dev/null
+      sig_keyed cron-fail
     fi
   fi
 fi

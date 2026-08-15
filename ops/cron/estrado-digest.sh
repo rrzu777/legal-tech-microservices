@@ -80,14 +80,12 @@ HB=$(heartbeat_summary)
 # como disponible un valor que no sea el sentinel explícito "sin datos"; no
 # incluimos cuerpos, URLs, IDs ni errores crudos en el resumen.
 AVAILABLE=0
-TOTAL_READS=15
+TOTAL_READS=14
 for value in "$FIRMS" "$TOTAL_USERS" "$NEW_USERS" "$TOTAL_CASES" "$ACTIVE_TRACK" \
   "$NEW_CASES" "$NEW_MOV" "$EVENTS_24" "$SYNC_ERROR_CURRENT" "$SYNC_BLOCKED_CURRENT" \
   "$RUNS_24" "$RUNS_SUCCESS_24" "$RUNS_ERROR_24" "$RUNS_BLOCKED_24"; do
   [ "$value" != "sin datos" ] && AVAILABLE=$((AVAILABLE + 1))
 done
-AVAILABILITY="$AVAILABLE/$TOTAL_READS"
-[ "$HB" != "sin datos" ] && AVAILABLE=$((AVAILABLE + 1))
 AVAILABILITY="$AVAILABLE/$TOTAL_READS"
 
 METRICS="Fecha (UTC): $DIGEST_DATE_UTC

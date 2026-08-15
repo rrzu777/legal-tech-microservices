@@ -106,12 +106,14 @@ expect_contains 'separa bloqueos actuales de las corridas' "$PROMPT" \
 expect_contains 'explica que ventana y estado actual difieren' "$PROMPT" \
   'Las corridas de 24h y el estado actual de causas son métricas distintas.'
 expect_contains 'resume disponibilidad sin confundir cero con desconocido' "$PROMPT" \
-  'Disponibilidad de métricas agregadas: 14/15 lecturas disponibles'
+  'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
 
 echo '== digest: Content-Range ausente no equivale a cero =='
 DIGEST_FAKE_MISSING_RANGE=1 run
 PROMPT=$(<"$TMP/prompt")
 expect_contains 'muestra datos desconocidos como sin datos' "$PROMPT" 'sin datos'
+expect_contains 'todos los conteos ausentes se expresan como 0/14' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 0/14 lecturas disponibles'
 expect_missing 'no inventa una corrida total cero' "$PROMPT" 'Corridas últimas 24h: 0 total'
 expect_contains 'prohíbe traducir desconocido a cero' "$PROMPT" \
   '"sin datos" significa desconocido, no cero.'

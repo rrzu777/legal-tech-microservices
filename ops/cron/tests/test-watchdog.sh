@@ -237,6 +237,28 @@ EOF
 OUT=$(run "$TMP/broken.log")
 expect_contains "ultima corrida rota: alerta" "$OUT" "cron-fail:404"
 
+echo "== chequeo 7: misma falla por endpoint/codigo deduplica hasta recuperar =="
+WDS_CRON=$(mktemp -d "$TMP/wds-cron-XXXXXX")
+cat > "$TMP/cron-500.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 500
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-500.log")
+expect_contains "primera falla 500 alerta" "$OUT" "cron-fail"
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-500.log")
+expect_missing "500 persistente no re-spamea" "$OUT" "Crons de la app fallando"
+cat > "$TMP/cron-401.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 401
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-401.log")
+expect_contains "cambio 500 a 401 vuelve a alertar" "$OUT" "cron-fail"
+cat > "$TMP/cron-200.log" <<EOF
+$HOY /api/cron/task-reminders - HTTP 200
+EOF
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-200.log")
+expect_missing "200 limpia el estado del endpoint" "$OUT" "Crons de la app fallando"
+OUT=$(WDS="$WDS_CRON" WD_COOLDOWN=0 run "$TMP/cron-401.log")
+expect_contains "recaida 401 vuelve a alertar" "$OUT" "cron-fail"
+
 echo "== chequeo 7: silencio =="
 printf '%s /api/cron/task-reminders - HTTP 200\n' "$VIEJO" > "$TMP/silent.log"
 OUT=$(run "$TMP/silent.log")
