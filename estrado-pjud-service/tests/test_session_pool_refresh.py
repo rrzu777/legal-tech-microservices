@@ -475,6 +475,47 @@ async def test_hard_age_mints_once_without_revalidation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wall_clock_rollback_cannot_reduce_durable_bundle_age(monkeypatch):
+    from worker import session_pool as sp
+
+    wall_now = 10_000.0
+    monotonic_now = 100.0
+    monkeypatch.setattr(sp.time, "time", lambda: wall_now)
+    pool = _reuse_pool()
+    pool._wall_clock_now = lambda: wall_now
+    pool._monotonic_now = lambda: monotonic_now
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        bundle_saved_at=wall_now - 1_000,
+    )
+    pool._slots = [slot]
+    fresh = _ReusableSession()
+    mint_calls = []
+
+    async def mint_once(target, *, max_attempts=None):
+        mint_calls.append(max_attempts)
+        target.session = fresh
+        target.bundle_saved_at = wall_now
+
+    pool._mint_slot = mint_once
+
+    first = await pool.acquire()
+    await pool.release(first)
+
+    wall_now = 8_000.0
+    monotonic_now = 2_600.0
+    second = await pool.acquire()
+
+    assert second is fresh
+    assert mint_calls == [1]
+    await pool.release(second)
+
+
+@pytest.mark.asyncio
 async def test_expired_cookie_mints_once_without_revalidation(monkeypatch):
     """An explicit cookie expiry wins even while the bundle is below soft age."""
     from worker import session_pool as sp

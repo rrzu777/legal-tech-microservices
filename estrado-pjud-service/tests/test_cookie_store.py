@@ -47,6 +47,28 @@ def test_load_wrong_shape_returns_none(tmp_path):
     assert CookieStore(path=str(p)).load() is None
 
 
+def test_load_rejects_bundle_saved_meaningfully_in_the_future(tmp_path, monkeypatch):
+    from app import cookie_store as cookie_store_module
+
+    now = 10_000.0
+    monkeypatch.setattr(cookie_store_module.time, "time", lambda: now)
+    path = tmp_path / "cookies.json"
+    store = CookieStore(path=str(path))
+    store.save_slot(
+        0,
+        cookies={"TSPD_101": "abc"},
+        user_agent="UA/1.0",
+        proxy_token="sticky",
+    )
+    payload = path.read_text().replace(
+        f'"saved_at": {now}',
+        f'"saved_at": {now + 61}',
+    )
+    path.write_text(payload)
+
+    assert store.load_slot(0) is None
+
+
 def test_age_seconds_reflects_save_time(tmp_path):
     store = CookieStore(path=str(tmp_path / "cookies.json"))
     store.save(cookies={"TSPD_101": "abc"}, user_agent="UA/1.0")

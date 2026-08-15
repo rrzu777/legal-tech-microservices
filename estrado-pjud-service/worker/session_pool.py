@@ -52,6 +52,9 @@ class _Slot:
     # Durable wall-clock origin of the installed bundle.  OJVSession's age is
     # process-local and resets whenever a candidate is reconstructed.
     bundle_saved_at: float | None = None
+    bundle_age_anchor_monotonic: float | None = None
+    bundle_age_at_anchor: float | None = None
+    bundle_age_floor_seconds: float = 0.0
     # A healthy verification is process-local and must never extend saved_at.
     last_verified_at: float | None = None
     cookie_expires_at: int | None = None
@@ -113,6 +116,8 @@ class SessionPool:
         self._proxy_usage = proxy_usage
         self._proxy_control = proxy_control
         self._retired_cleanup_tasks: set[asyncio.Task] = set()
+        self._wall_clock_now = time.time
+        self._monotonic_now = time.monotonic
 
     async def _persist_cost_failure(self, exc: BaseException) -> None:
         if self._proxy_control is None:
@@ -356,7 +361,7 @@ class SessionPool:
                         slot.index,
                     )
                 raise RuntimeError("cookie_store_missing_after_mint")
-            slot.bundle_saved_at = persisted.saved_at
+            self._anchor_slot_bundle_age(slot, persisted.saved_at)
             slot.cookie_expires_at = self._cookie_expiry(persisted)
             slot.last_verified_at = time.monotonic()
 
@@ -382,6 +387,41 @@ class SessionPool:
     @staticmethod
     def _bounded_session_age_seconds(age: float) -> int:
         return min(max(0, int(age)), _MAX_SESSION_TELEMETRY_AGE_S)
+
+    def _wall_bundle_age(self, saved_at: float) -> float:
+        return max(0.0, self._wall_clock_now() - saved_at)
+
+    def _slot_bundle_age(self, slot: _Slot) -> float:
+        if slot.bundle_saved_at is None:
+            return 0.0
+        monotonic_now = self._monotonic_now()
+        wall_age = self._wall_bundle_age(slot.bundle_saved_at)
+        if (
+            slot.bundle_age_anchor_monotonic is None
+            or slot.bundle_age_at_anchor is None
+        ):
+            slot.bundle_age_anchor_monotonic = monotonic_now
+            slot.bundle_age_at_anchor = wall_age
+        monotonic_age = slot.bundle_age_at_anchor + max(
+            0.0,
+            monotonic_now - slot.bundle_age_anchor_monotonic,
+        )
+        age = max(slot.bundle_age_floor_seconds, wall_age, monotonic_age)
+        slot.bundle_age_floor_seconds = age
+        return age
+
+    def _anchor_slot_bundle_age(self, slot: _Slot, saved_at: float) -> None:
+        prior_age = (
+            self._slot_bundle_age(slot)
+            if slot.bundle_saved_at == saved_at
+            else 0.0
+        )
+        wall_age = self._wall_bundle_age(saved_at)
+        anchored_age = max(prior_age, wall_age)
+        slot.bundle_saved_at = saved_at
+        slot.bundle_age_anchor_monotonic = self._monotonic_now()
+        slot.bundle_age_at_anchor = anchored_age
+        slot.bundle_age_floor_seconds = anchored_age
 
     def _begin_session_cycle(
         self,
@@ -494,7 +534,7 @@ class SessionPool:
         slot.token = bundle.proxy_token
         slot.proxy_url = proxy_url
         slot.session = candidate
-        slot.bundle_saved_at = bundle.saved_at
+        self._anchor_slot_bundle_age(slot, bundle.saved_at)
         slot.cookie_expires_at = self._cookie_expiry(validated_bundle)
         slot.last_verified_at = time.monotonic()
         if old_session is not None:
@@ -544,7 +584,7 @@ class SessionPool:
             age_seconds = slot.session_cycle_age_seconds
         if age_seconds is None and slot.bundle_saved_at is not None:
             age_seconds = self._bounded_session_age_seconds(
-                max(0.0, time.time() - slot.bundle_saved_at),
+                self._slot_bundle_age(slot),
             )
         slot.session_cycle_id = cycle_id
         slot.session_cycle_reason = session_reason
@@ -580,9 +620,12 @@ class SessionPool:
         *,
         session_reason: SessionReason = "soft_age",
     ) -> bool:
-        age_seconds = self._bounded_session_age_seconds(
-            max(0.0, time.time() - bundle.saved_at),
+        age = (
+            self._slot_bundle_age(slot)
+            if slot.bundle_saved_at == bundle.saved_at
+            else self._wall_bundle_age(bundle.saved_at)
         )
+        age_seconds = self._bounded_session_age_seconds(age)
         cycle_id, _ = self._begin_session_cycle(
             slot, age_seconds, session_reason,
         )
@@ -616,15 +659,15 @@ class SessionPool:
             self._bundle_proxy_url(bundle)
         except ValueError:
             age_seconds = self._bounded_session_age_seconds(
-                max(0.0, time.time() - bundle.saved_at),
+                self._wall_bundle_age(bundle.saved_at),
             )
             self._begin_session_cycle(slot, age_seconds, "missing_bundle")
             await self._mint_slot(slot, max_attempts=1)
             return True
-        now = time.time()
+        now = self._wall_clock_now()
         cookie_expiry = self._cookie_expiry(bundle)
         expired = cookie_expiry is not None and cookie_expiry <= now
-        age = max(0.0, now - bundle.saved_at)
+        age = self._wall_bundle_age(bundle.saved_at)
         if expired or age >= self._config.session_hard_effective_age_s:
             age_seconds = self._bounded_session_age_seconds(age)
             self._begin_session_cycle(
@@ -643,8 +686,8 @@ class SessionPool:
             slot.minted_during_acquire = await self._initialize_reuse_slot(slot)
             return
 
-        now = time.time()
-        age = max(0.0, now - slot.bundle_saved_at)
+        now = self._wall_clock_now()
+        age = self._slot_bundle_age(slot)
         if (
             slot.cookie_expires_at is not None
             and slot.cookie_expires_at <= now

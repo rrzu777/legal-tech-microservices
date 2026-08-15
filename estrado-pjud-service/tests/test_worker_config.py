@@ -29,6 +29,7 @@ class TestWorkerConfig:
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
         assert config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is False
+        assert config.SESSION_REUSE_ROLLOUT_STARTED_AT is None
         assert config.SESSION_SOFT_VERIFY_AGE_S == 1200
         assert config.SESSION_HARD_MAX_AGE_S == 3000
         assert config.SESSION_STICKY_SAFETY_MARGIN_S == 600
@@ -36,6 +37,40 @@ class TestWorkerConfig:
         assert config.OJV_TIMEOUT_S == 25
         assert config.RATE_LIMIT_MS == 2500
         assert config.MINT_TRAFFIC_BUDGET_S == 35.0
+
+    def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
+        import pytest
+
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match="SESSION_REUSE_ROLLOUT_STARTED_AT"):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                WORKER_SESSION_REUSE_VALIDATION_ENABLED=True,
+                _env_file=None,
+            )
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                WORKER_SESSION_REUSE_VALIDATION_ENABLED=True,
+                SESSION_REUSE_ROLLOUT_STARTED_AT="2026-08-18T08:00:00",
+                _env_file=None,
+            )
+
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            WORKER_SESSION_REUSE_VALIDATION_ENABLED=True,
+            SESSION_REUSE_ROLLOUT_STARTED_AT="2026-08-18T12:00:00Z",
+            _env_file=None,
+        )
+
+        assert config.SESSION_REUSE_ROLLOUT_STARTED_AT.isoformat() == (
+            "2026-08-18T12:00:00+00:00"
+        )
 
     def test_hard_age_is_capped_before_one_hour_sticky_expires(self):
         from worker.config import WorkerConfig

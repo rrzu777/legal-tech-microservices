@@ -21,6 +21,7 @@ from app.cookie_scope import (
 DEFAULT_COOKIE_STORE_PATH = "/var/lib/estrado-pjud/cookies.json"
 PRODUCTION_CHECKOUT = Path("/opt/legal-tech-microservices")
 DEFAULT_LEGACY_COOKIE_DOMAIN = "oficinajudicialvirtual.pjud.cl"
+_MAX_FUTURE_SAVED_AT_S = 60.0
 
 
 class CookieStoreLockTimeoutError(TimeoutError):
@@ -132,6 +133,7 @@ class CookieStore:
             or isinstance(saved_at, bool)
             or not isinstance(saved_at, (int, float))
             or not saved_at_is_finite
+            or saved_at > time.time() + _MAX_FUTURE_SAVED_AT_S
             or (proxy_token is not None and not isinstance(proxy_token, str))
         ):
             raise ValueError("invalid_cookie_bundle")
