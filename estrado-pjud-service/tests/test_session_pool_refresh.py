@@ -724,21 +724,23 @@ async def test_active_reactive_release_mints_exactly_once(monkeypatch):
 
     now = 10_000.0
     monkeypatch.setattr(sp.time, "time", lambda: now)
+    created = _patch_revalidation_candidate(monkeypatch, sp)
     pool = _reuse_pool()
-    session = _ReusableSession()
+    pool._store = _ReuseStore(_bundle(now - 1300))
+    old_session = _ReusableSession()
     slot = sp._Slot(
         index=0,
         token="sticky",
         proxy_url="http://old-proxy",
-        session=session,
-        bundle_saved_at=now - 60,
-        last_verified_at=sp.time.monotonic(),
+        session=old_session,
+        bundle_saved_at=now - 1300,
     )
     pool._slots = [slot]
     pool._mint_slot = AsyncMock()
 
     acquired = await pool.acquire()
-    assert acquired is session
+    assert acquired is created[0]
+    assert created[0].revalidate_count == 1
     assert slot.minted_during_acquire is False
 
     await pool.release(acquired, healthy=False)
