@@ -455,8 +455,23 @@ if stuck_window_open; then
       else
         STUCK=$(cnt "$STUCK_FILTER")
       fi
-      conteo_supera "$STUCK" 1 stuck "las causas atascadas" \
-        && add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." "stuck"
+      if [[ "$STUCK" =~ ^[0-9]+$ ]] && conteo_supera "$STUCK" 1 stuck "las causas atascadas"; then
+        STUCK_NEW=$(nuevas_claves stuck "${STUCK}")
+        if [ -n "${STUCK_NEW// }" ]; then
+          # La deduplicación vive en el estado keyed. No agregar una etiqueta a
+          # SIG evita que un backlog nuevo altere el cooldown de incidentes ajenos
+          # dentro de la misma corrida; la transición de conteo ya es el evento.
+          add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." ""
+        fi
+      else
+        # A cero (o sin datos) también se reescribe el estado sólo cuando el
+        # conteo fue válido; así una recuperación limpia la alerta y una recaída
+        # posterior vuelve a notificar, mientras un fallo de lectura conserva la
+        # evidencia anterior.
+        if [[ "$STUCK" =~ ^[0-9]+$ ]]; then
+          nuevas_claves stuck "" >/dev/null
+        fi
+      fi
       ;;
     2)
       PROXY_CONTROL_NEW=$(nuevas_claves proxy-control-root "$PROXY_CONTROL_TAG")

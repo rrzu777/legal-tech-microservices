@@ -105,6 +105,8 @@ expect_contains 'separa bloqueos actuales de las corridas' "$PROMPT" \
   'Causas bloqueadas actualmente: 3'
 expect_contains 'explica que ventana y estado actual difieren' "$PROMPT" \
   'Las corridas de 24h y el estado actual de causas son métricas distintas.'
+expect_contains 'resume disponibilidad sin confundir cero con desconocido' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 14/15 lecturas disponibles'
 
 echo '== digest: Content-Range ausente no equivale a cero =='
 DIGEST_FAKE_MISSING_RANGE=1 run

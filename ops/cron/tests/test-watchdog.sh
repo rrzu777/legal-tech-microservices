@@ -321,6 +321,22 @@ OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=$(date -u -d '2026-08-08T14:00:00Z
 expect_missing "fuera de horario no tapa stuck con health roto" "$OUT" "scheduler no las está tomando"
 expect_contains "fuera de horario conserva la alerta api-health" "$OUT" "api-health"
 
+echo "== chequeo 8: mismo backlog no se repite hasta recuperación =="
+STUCK_STATE="$TMP/stuck-state"
+mkdir -p "$STUCK_STATE"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=39 run "$BASE")
+expect_contains "primer backlog alerta" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=39 run "$BASE")
+expect_missing "backlog idéntico queda deduplicado" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-08-10T14:00:00Z' +%s) WD_STUCK_COUNT=40 run "$BASE")
+expect_contains "crecimiento del backlog vuelve a alertar" "$OUT" "scheduler no las está tomando"
+OUT=$(WDS="$STUCK_STATE" WD_COOLDOWN=0 WD_ENV="$TMP/watchdog.env" \
+  WD_NOW_EPOCH=$(date -u -d '2026-10-12T14:00:00Z' +%s) WD_STUCK_COUNT=0 run "$BASE")
+expect_missing "recuperación limpia el estado del backlog" "$OUT" "scheduler no las está tomando"
+
 echo "== chequeo 8: el control del proxy precede al scheduler =="
 OUT=$(WD_ENV="$TMP/watchdog.env" WD_NOW_EPOCH=1786370400 \
   WD_PROXY_CONTROL_JSON='[{"status":"enabled","reason_code":null}]' run "$BASE")
