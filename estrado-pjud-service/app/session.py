@@ -70,6 +70,29 @@ class OJVSession:
         # Must use consultaUnificada.php (not indexN.php) because only
         # this page contains the CSRF token needed for detail requests.
         resp = await self._adapter.get("/consultaUnificada.php")
+        self._accept_initial_page(resp)
+
+        # Step 2: Activate guest session
+        resp = await self._adapter.post(
+            "/includes/sesion-invitado.php",
+            headers=_AJAX_HEADERS,
+        )
+        resp.raise_for_status()
+        logger.info("Guest session activated")
+
+    async def revalidate_once(self):
+        """Validate the current OJV session with exactly one GET and one POST."""
+        resp = await self._adapter.get_once("/consultaUnificada.php")
+        self._accept_initial_page(resp)
+        resp = await self._adapter.post_once(
+            "/includes/sesion-invitado.php",
+            headers=_AJAX_HEADERS,
+        )
+        resp.raise_for_status()
+        logger.info("Guest session revalidated")
+
+    def _accept_initial_page(self, resp: httpx.Response) -> None:
+        """Validate an initial OJV page and refresh this session's CSRF token."""
         resp.raise_for_status()
         html = _decode(resp)
 
@@ -101,14 +124,6 @@ class OJVSession:
             logger.info("CSRF token acquired")
         else:
             logger.warning("CSRF token not found in initial page")
-
-        # Step 2: Activate guest session
-        resp = await self._adapter.post(
-            "/includes/sesion-invitado.php",
-            headers=_AJAX_HEADERS,
-        )
-        resp.raise_for_status()
-        logger.info("Guest session activated")
 
     async def search(self, competencia_path: str, form_data: dict) -> str:
         """Step 3: POST search and return decoded HTML."""

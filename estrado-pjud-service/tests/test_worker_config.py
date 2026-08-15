@@ -28,9 +28,45 @@ class TestWorkerConfig:
         assert config.PJUD_OFF_HOURS_VALIDATION_ONCE is False
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
+        assert config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is False
+        assert config.SESSION_SOFT_VERIFY_AGE_S == 1200
+        assert config.SESSION_HARD_MAX_AGE_S == 3000
+        assert config.SESSION_STICKY_SAFETY_MARGIN_S == 600
+        assert config.session_hard_effective_age_s == 3000
         assert config.OJV_TIMEOUT_S == 25
         assert config.RATE_LIMIT_MS == 2500
         assert config.MINT_TRAFFIC_BUDGET_S == 35.0
+
+    def test_hard_age_is_capped_before_one_hour_sticky_expires(self):
+        from worker.config import WorkerConfig
+
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            SESSION_SOFT_VERIFY_AGE_S=1200,
+            SESSION_HARD_MAX_AGE_S=3300,
+            SESSION_STICKY_SAFETY_MARGIN_S=600,
+            OJV_PROXY_STICKY_LIFETIME="1h",
+            _env_file=None,
+        )
+
+        assert config.session_hard_effective_age_s == 3000
+
+    def test_rejects_soft_age_at_or_beyond_effective_hard_age(self):
+        import pytest
+
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match="SESSION_SOFT_VERIFY_AGE_S"):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                SESSION_SOFT_VERIFY_AGE_S=1200,
+                SESSION_HARD_MAX_AGE_S=3000,
+                SESSION_STICKY_SAFETY_MARGIN_S=600,
+                OJV_PROXY_STICKY_LIFETIME="30m",
+                _env_file=None,
+            )
 
     def test_mint_traffic_budget_is_configurable_and_bounded(self, monkeypatch):
         import pytest

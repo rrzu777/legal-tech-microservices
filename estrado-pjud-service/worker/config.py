@@ -1,7 +1,7 @@
 import asyncio
 from zoneinfo import ZoneInfo
 
-from pydantic import field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
@@ -23,6 +23,10 @@ class WorkerConfig(BaseSettings):
     BATCH_SIZE: int = 10
     HEARTBEAT_INTERVAL_S: int = 60
     SESSION_MAX_AGE_S: int = 1500
+    WORKER_SESSION_REUSE_VALIDATION_ENABLED: bool = False
+    SESSION_SOFT_VERIFY_AGE_S: int = Field(default=1200, gt=0)
+    SESSION_HARD_MAX_AGE_S: int = Field(default=3000, gt=0)
+    SESSION_STICKY_SAFETY_MARGIN_S: int = Field(default=600, ge=0)
     OJV_TIMEOUT_S: int = 25
     RATE_LIMIT_MS: int = 2500
     PJUD_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
@@ -71,6 +75,23 @@ class WorkerConfig(BaseSettings):
     def _valid_sticky_lifetime(cls, value: str) -> str:
         sticky_lifetime_seconds(value)
         return value
+
+    @property
+    def session_hard_effective_age_s(self) -> int:
+        sticky_ceiling = (
+            sticky_lifetime_seconds(self.OJV_PROXY_STICKY_LIFETIME)
+            - self.SESSION_STICKY_SAFETY_MARGIN_S
+        )
+        return min(self.SESSION_HARD_MAX_AGE_S, sticky_ceiling)
+
+    @model_validator(mode="after")
+    def _valid_session_reuse_ages(self):
+        if self.SESSION_SOFT_VERIFY_AGE_S >= self.session_hard_effective_age_s:
+            raise ValueError(
+                "SESSION_SOFT_VERIFY_AGE_S must be lower than the effective "
+                "hard session age"
+            )
+        return self
 
     @field_validator("MINT_TRAFFIC_BUDGET_S")
     @classmethod

@@ -113,6 +113,55 @@ async def test_post_once_never_retries_transport_errors():
 
 
 @pytest.mark.asyncio
+async def test_get_once_never_retries_transport_errors():
+    adapter = OJVHttpAdapter(_settings())
+    adapter._client.get = AsyncMock(side_effect=httpx.ConnectError("proxy down"))
+
+    with capture_proxy_usage() as usage:
+        with pytest.raises(httpx.ConnectError, match="proxy down"):
+            await adapter.get_once("/foo")
+
+    assert adapter._client.get.await_count == 1
+    assert usage.request_count == 1
+    assert usage.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_get_once_never_follows_redirects_or_hides_wire_requests():
+    wire_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        wire_requests.append(request)
+        if request.url.path == "/redirected":
+            return httpx.Response(200, content=b"unexpected", request=request)
+        return httpx.Response(
+            302,
+            headers={"location": "/redirected"},
+            content=b"redirect",
+            request=request,
+        )
+
+    adapter = OJVHttpAdapter(_settings())
+    await adapter._client.aclose()
+    adapter._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+
+    try:
+        with capture_proxy_usage() as usage:
+            response = await adapter.get_once("/first")
+    finally:
+        await adapter.close()
+
+    assert response.status_code == 302
+    assert len(wire_requests) == 1
+    assert usage.request_count == 1
+    assert usage.retry_count == 0
+    assert usage.bytes_down == len(b"redirect")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("redirect_status", [307, 308])
 async def test_post_once_never_follows_redirects_or_hides_wire_requests(
     redirect_status,
