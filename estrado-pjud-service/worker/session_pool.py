@@ -107,6 +107,7 @@ class SessionPool:
                 configure_legacy_scope(base_url)
         self._proxy_usage = proxy_usage
         self._proxy_control = proxy_control
+        self._retired_cleanup_tasks: set[asyncio.Task] = set()
 
     async def _persist_cost_failure(self, exc: BaseException) -> None:
         if self._proxy_control is None:
@@ -324,7 +325,7 @@ class SessionPool:
             slot.last_verified_at = time.monotonic()
 
         if old_session is not None:
-            await old_session.close()
+            self._retire_session(old_session, slot.index)
 
         logger.info(
             "Slot %d minteado (proxy=%s)", slot.index, redact_proxy_url(proxy_url)
@@ -360,6 +361,30 @@ class SessionPool:
             )
         except Exception:
             logger.debug("No se pudo cerrar candidato de revalidacion")
+
+    async def _close_retired_session(
+        self, session: OJVSession, slot_index: int,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.debug(
+                "Timeout cerrando la sesion retirada del slot %d", slot_index,
+            )
+        except Exception:
+            logger.debug(
+                "No se pudo cerrar la sesion retirada del slot %d", slot_index,
+            )
+
+    def _retire_session(self, session: OJVSession, slot_index: int) -> None:
+        """Close an already-replaced session without delaying its committed swap."""
+        task = asyncio.create_task(
+            self._close_retired_session(session, slot_index),
+        )
+        self._retired_cleanup_tasks.add(task)
+        task.add_done_callback(self._retired_cleanup_tasks.discard)
 
     async def _revalidate_bundle(self, slot: _Slot, bundle: CookieBundle) -> None:
         proxy_url = self._bundle_proxy_url(bundle)
@@ -404,12 +429,9 @@ class SessionPool:
         slot.cookie_expires_at = self._cookie_expiry(validated_bundle)
         slot.last_verified_at = time.monotonic()
         if old_session is not None:
-            try:
-                await old_session.close()
-            except Exception:
-                # CAS + swap already committed.  Cleanup of the retired adapter
-                # is not a failed validation and must never purchase a new IP.
-                logger.debug("No se pudo cerrar la sesion reemplazada del slot %d", slot.index)
+            # CAS + swap already committed.  Cleanup of the retired adapter is
+            # bounded background work, never a failed validation or new-IP cue.
+            self._retire_session(old_session, slot.index)
 
     @staticmethod
     def _validation_failure_allows_mint(exc: BaseException) -> bool:
@@ -608,7 +630,10 @@ class SessionPool:
                 )
             ):
                 try:
-                    await self._refresh_slot(slot)
+                    if self._reuse_validation_enabled:
+                        await self._mint_once_for_acquisition(slot)
+                    else:
+                        await self._refresh_slot(slot)
                 except Exception as exc:
                     if is_proxy_billing_error(exc) or isinstance(
                         exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
@@ -695,6 +720,11 @@ class SessionPool:
         for slot in self._slots:
             if slot.session is not None:
                 await slot.session.close()
+        if self._retired_cleanup_tasks:
+            await asyncio.gather(
+                *tuple(self._retired_cleanup_tasks),
+                return_exceptions=True,
+            )
         self._slots.clear()
         # Limpia el registro de checkout: en el shutdown normal el pool se drena
         # antes, pero si quedara algo apuntaría a sesiones ya cerradas.

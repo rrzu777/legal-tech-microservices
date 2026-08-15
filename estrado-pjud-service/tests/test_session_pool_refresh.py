@@ -351,6 +351,7 @@ async def test_soft_age_revalidates_and_reuses_without_mint(monkeypatch):
 
     assert acquired is created[0]
     assert created[0].revalidate_count == 1
+    await asyncio.gather(*tuple(pool._retired_cleanup_tasks))
     assert old.close_count == 1
     assert store.cas_calls[0][1]["expected_saved_at"] == now - 1300
     assert store.cas_calls[0][1]["expected_proxy_token"] == "sticky"
@@ -714,3 +715,80 @@ async def test_validation_and_mint_share_one_acquisition_deadline(monkeypatch):
     assert created[0].close_count == 1
     assert slot.busy is False
     assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_active_reactive_release_mints_exactly_once(monkeypatch):
+    """A healthy validation followed by unhealthy work still has a one-IP ceiling."""
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    pool = _reuse_pool()
+    session = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=session,
+        bundle_saved_at=now - 60,
+        last_verified_at=sp.time.monotonic(),
+    )
+    pool._slots = [slot]
+    pool._mint_slot = AsyncMock()
+
+    acquired = await pool.acquire()
+    assert acquired is session
+    assert slot.minted_during_acquire is False
+
+    await pool.release(acquired, healthy=False)
+
+    pool._mint_slot.assert_awaited_once_with(slot, max_attempts=1)
+    assert slot.minted_during_acquire is False
+    assert slot.busy is False
+    assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_revalidation_swap_does_not_wait_for_retired_session_close(monkeypatch):
+    """Once CAS+swap commits, a stuck retired adapter cannot fail acquisition."""
+    from worker import session_pool as sp
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingOldSession(_ReusableSession):
+        async def close(self):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(sp, "_CANDIDATE_CLOSE_TIMEOUT_S", 0.01)
+    now = 10_000.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    created = _patch_revalidation_candidate(monkeypatch, sp)
+    pool = _reuse_pool()
+    pool._config.MINT_TRAFFIC_BUDGET_S = 0.05
+    pool._store = _ReuseStore(_bundle(now - 1300))
+    old = BlockingOldSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        bundle_saved_at=now - 1300,
+    )
+    pool._slots = [slot]
+    pool._mint_slot = AsyncMock()
+
+    acquired = await asyncio.wait_for(pool.acquire(), timeout=0.03)
+
+    assert acquired is created[0]
+    assert slot.session is created[0]
+    pool._mint_slot.assert_not_awaited()
+    await asyncio.wait_for(started.wait(), timeout=0.03)
+    await asyncio.wait_for(cancelled.wait(), timeout=0.05)
+    await pool.release(acquired)

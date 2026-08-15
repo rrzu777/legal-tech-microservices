@@ -424,6 +424,67 @@ async def test_slot_mint_save_failure_closes_candidate_and_keeps_previous_slot(m
 
 
 @pytest.mark.asyncio
+async def test_mint_swap_ignores_retired_session_close_error(monkeypatch):
+    """A durable mint remains installed when cleanup of the old adapter fails."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    captured, _ = _patch_pool_deps(monkeypatch, sp)
+    pool = sp.SessionPool(config)
+
+    class BrokenOldSession(_FakeSession):
+        async def close(self):
+            self.closed = True
+            raise RuntimeError("old adapter close failed")
+
+    old = BrokenOldSession(MagicMock())
+    slot = sp._Slot(index=0, session=old, last_mint_ts=-10_000)
+
+    await pool._mint_slot(slot, max_attempts=1)
+    await pool.close_all()
+
+    assert len(captured) == 1
+    assert slot.session is not old
+    assert old.closed is True
+
+
+@pytest.mark.asyncio
+async def test_mint_swap_does_not_wait_for_retired_session_close(monkeypatch):
+    """A stuck old adapter cannot hold a new durable session past its caller deadline."""
+    from worker import session_pool as sp
+
+    config = _make_config(proxy_url="http://proxy", proxy_pool_size=1)
+    captured, _ = _patch_pool_deps(monkeypatch, sp)
+    monkeypatch.setattr(sp, "_CANDIDATE_CLOSE_TIMEOUT_S", 0.01)
+    pool = sp.SessionPool(config)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingOldSession(_FakeSession):
+        async def close(self):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    old = BlockingOldSession(MagicMock())
+    slot = sp._Slot(index=0, session=old, last_mint_ts=-10_000)
+
+    await asyncio.wait_for(
+        pool._mint_slot(slot, max_attempts=1),
+        timeout=0.03,
+    )
+
+    assert len(captured) == 1
+    assert slot.session is not old
+    await asyncio.wait_for(started.wait(), timeout=0.03)
+    await asyncio.wait_for(cancelled.wait(), timeout=0.05)
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
 async def test_external_cancel_during_initialize_closes_worker_candidate_once(monkeypatch):
     """Worker cancellation must close its candidate before propagating it."""
     from worker import session_pool as sp
