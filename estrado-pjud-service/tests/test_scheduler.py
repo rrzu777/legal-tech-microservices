@@ -13,6 +13,7 @@ def _mock_config(worker_id="test-worker", batch_size=10):
     config.WORKER_ID = worker_id
     config.BATCH_SIZE = batch_size
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = False
+    config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = False
     return config
 
 
@@ -90,6 +91,26 @@ class TestScheduler:
         mock_sb.rpc.assert_called_once_with("claim_pjud_sync_cases", {
             "p_worker_id": "test-worker",
             "p_limit": 1,
+            "p_now": NIGHT_NOW.isoformat(),
+        })
+
+    @pytest.mark.asyncio
+    async def test_temporary_override_claims_normal_batch_outside_office(self):
+        from worker.scheduler import Scheduler
+
+        config = _mock_config(batch_size=10)
+        config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = True
+        mock_sb = MagicMock()
+        chain = MagicMock()
+        mock_sb.rpc.return_value = chain
+        chain.execute.return_value = MagicMock(data=[{"id": "case-1"}])
+
+        assert await Scheduler(config, mock_sb).get_next_batch(now=NIGHT_NOW) == [
+            {"id": "case-1"},
+        ]
+        mock_sb.rpc.assert_called_once_with("claim_pjud_sync_cases", {
+            "p_worker_id": "test-worker",
+            "p_limit": 10,
             "p_now": NIGHT_NOW.isoformat(),
         })
 

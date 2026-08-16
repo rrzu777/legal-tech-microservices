@@ -110,6 +110,9 @@ class Metrics:
                     "worker_canary" if reuse_enabled else "off"
                 ),
                 "session_reuse_rollout_started_at": rollout_started_at_iso,
+                "process_outside_office_hours_enabled": (
+                    self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+                ),
             },
         }
 

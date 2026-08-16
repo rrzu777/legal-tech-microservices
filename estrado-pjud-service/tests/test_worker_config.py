@@ -26,6 +26,7 @@ class TestWorkerConfig:
         assert config.POOL_SIZE == 1
         assert config.BATCH_SIZE == 10
         assert config.PJUD_OFF_HOURS_VALIDATION_ONCE is False
+        assert config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is False
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
         assert config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is False
@@ -37,6 +38,15 @@ class TestWorkerConfig:
         assert config.OJV_TIMEOUT_S == 25
         assert config.RATE_LIMIT_MS == 2500
         assert config.MINT_TRAFFIC_BUDGET_S == 35.0
+
+    def test_temporary_outside_office_hours_override_loads_from_env(self, monkeypatch):
+        monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "eyJtest")
+        monkeypatch.setenv("PJUD_PROCESS_OUTSIDE_OFFICE_HOURS", "true")
+
+        from worker.config import WorkerConfig
+
+        assert WorkerConfig(_env_file=None).PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
 
     def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
         import pytest

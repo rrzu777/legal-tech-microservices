@@ -30,6 +30,15 @@ def test_one_shot_validation_can_initialize_outside_office_window():
     ) is True
 
 
+def test_temporary_override_can_initialize_outside_office_window():
+    tz = ZoneInfo("America/Santiago")
+
+    assert can_initialize_paid_pool(
+        datetime(2026, 3, 1, 22, 0, tzinfo=tz),
+        process_outside_office_hours=True,
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_one_shot_validation_never_waits_for_retry():
     shutdown = asyncio.Event()
