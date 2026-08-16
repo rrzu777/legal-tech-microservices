@@ -14,7 +14,11 @@ from app.logging_redaction import install_secret_redaction
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
-from worker.scheduler import Scheduler, is_scheduled_processing_window
+from worker.scheduler import (
+    Scheduler,
+    is_processing_allowed,
+    is_scheduled_processing_window,
+)
 from worker.engine import SyncEngine
 from worker.notifier import Notifier
 from worker.metrics import Metrics
@@ -158,9 +162,18 @@ async def safe_initialize_pool(
     return False
 
 
-def can_initialize_paid_pool(now=None, *, validation_once: bool = False) -> bool:
+def can_initialize_paid_pool(
+    now=None,
+    *,
+    validation_once: bool = False,
+    process_outside_office_hours: bool = False,
+) -> bool:
     """El pool residencial solo puede mintear cuando el scheduler puede trabajar."""
-    return validation_once or is_scheduled_processing_window(now)
+    return is_processing_allowed(
+        now,
+        validation_once=validation_once,
+        process_outside_office_hours=process_outside_office_hours,
+    )
 
 
 async def wait_before_retry(
@@ -228,6 +241,9 @@ async def refresh_proxy_gate(
 async def main():
     config = WorkerConfig()
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
+    process_outside_office_hours = (
+        config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+    )
     if validation_once:
         # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
         # en el proceso transitorio y acota el tráfico de adquisición a un slot
@@ -297,7 +313,10 @@ async def main():
                     return
                 continue
 
-            if not can_initialize_paid_pool(validation_once=validation_once):
+            if not can_initialize_paid_pool(
+                validation_once=validation_once,
+                process_outside_office_hours=process_outside_office_hours,
+            ):
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 if not await wait_before_retry(
@@ -373,7 +392,10 @@ async def main():
                     return
                 continue
 
-            if not validation_once and not is_scheduled_processing_window():
+            if not is_processing_allowed(
+                validation_once=validation_once,
+                process_outside_office_hours=process_outside_office_hours,
+            ):
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 try:
@@ -433,8 +455,10 @@ async def main():
                 backoff,
                 proxy_control=proxy_control,
                 processing_window=(
-                    (lambda: True) if validation_once
-                    else is_scheduled_processing_window
+                    lambda: is_processing_allowed(
+                        validation_once=validation_once,
+                        process_outside_office_hours=process_outside_office_hours,
+                    )
                 ),
             )
 

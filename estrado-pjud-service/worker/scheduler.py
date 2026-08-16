@@ -27,6 +27,21 @@ def is_scheduled_processing_window(dt: datetime | None = None) -> bool:
         now = now.astimezone(TZ_SANTIAGO)
     return now.weekday() < 5 and 8 <= now.hour < 18
 
+
+def is_processing_allowed(
+    dt: datetime | None = None,
+    *,
+    validation_once: bool = False,
+    process_outside_office_hours: bool = False,
+) -> bool:
+    """Centraliza el bypass explícito sin alterar los límites del scheduler."""
+    return (
+        validation_once
+        or process_outside_office_hours
+        or is_scheduled_processing_window(dt)
+    )
+
+
 class Scheduler:
     def __init__(self, config: WorkerConfig, supabase):
         self._config = config
@@ -44,7 +59,14 @@ class Scheduler:
     async def get_next_batch(self, now: datetime | None = None) -> list[dict]:
         now = now or datetime.now(TZ_SANTIAGO)
         validation_once = self._config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
-        if not validation_once and not is_scheduled_processing_window(now):
+        process_outside_office_hours = (
+            self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+        )
+        if not is_processing_allowed(
+            now,
+            validation_once=validation_once,
+            process_outside_office_hours=process_outside_office_hours,
+        ):
             return []
         if now.tzinfo is None:
             now = now.replace(tzinfo=TZ_SANTIAGO)

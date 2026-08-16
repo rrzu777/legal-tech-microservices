@@ -197,6 +197,20 @@ class TestWorkerMetrics:
         assert metadata["session_reuse_canary_stage"] == "off"
         assert metadata["session_reuse_rollout_started_at"] is None
 
+    def test_heartbeat_publica_override_temporal_de_horario(self):
+        from unittest.mock import MagicMock
+
+        from worker.metrics import Metrics
+
+        config = MagicMock(WORKER_ID="worker-1", POOL_SIZE=1)
+        config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = False
+        config.SESSION_REUSE_ROLLOUT_STARTED_AT = None
+        config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = True
+
+        metadata = Metrics(config, MagicMock()).heartbeat_payload("running")["metadata"]
+
+        assert metadata["process_outside_office_hours_enabled"] is True
+
     def test_tasa_de_minteo_sin_intentos_no_divide_por_cero(self):
         m = self._make(pool=self._fake_pool(attempts=0, failures=0))
         assert m.heartbeat_payload("running")["metadata"]["mint_failure_rate"] == 0.0

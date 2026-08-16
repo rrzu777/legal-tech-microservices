@@ -44,6 +44,9 @@ class WorkerConfig(BaseSettings):
     # mint-storms). Configurable por env para tunear throughput sin redeploy.
     BLOCK_PAUSE_S: int = 30
     PJUD_OFF_HOURS_VALIDATION_ONCE: bool = False
+    # Override operacional temporal para una marcha blanca continua. El valor
+    # por defecto conserva estrictamente la ventana hábil.
+    PJUD_PROCESS_OUTSIDE_OFFICE_HOURS: bool = False
 
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""
