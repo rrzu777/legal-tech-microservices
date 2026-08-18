@@ -188,6 +188,179 @@ async def test_transient_reservation_disconnect_retries_before_provider_work():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["40001", "40P01", "55P03"])
+async def test_transient_reservation_database_contention_retries_before_provider_work(code):
+    """A bounded PostgreSQL concurrency race during startup is not a ledger outage."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    entered = False
+    serialization_failure = APIError({
+        "message": "transient database contention",
+        "code": code,
+        "hint": None,
+        "details": None,
+    })
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        serialization_failure,
+        _response([]),
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        _response([{ "id": "event-1" }]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="mint",
+            transaction_key="slot:0:attempt:1:test",
+        ):
+            entered = True
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    assert entered is True
+    reserve_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]
+    assert len(reserve_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_transient_reservation_contention_during_reconciliation_retries_same_claim():
+    """A contention-only reconciliation read cannot turn into a permanent pause."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    contention = APIError({
+        "message": "could not serialize access due to concurrent update",
+        "code": "40001",
+        "hint": None,
+        "details": None,
+    })
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        contention,
+        contention,
+        _response([{
+            "allowed": True,
+            "reservation_id": "reservation-1",
+            "claim_status": "claimed",
+            "blocking_scope": None,
+        }]),
+        _response([{ "id": "event-1" }]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="mint",
+            transaction_key="slot:0:attempt:1:reconcile-contention",
+        ):
+            record_proxy_request(10)
+            record_proxy_response(90)
+
+    reserve_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]
+    assert len(reserve_calls) == 2
+    assert reserve_calls[0].args[1] == reserve_calls[1].args[1]
+
+
+@pytest.mark.asyncio
+async def test_transient_reservation_contention_exhausts_without_provider_work():
+    """Persistent DB contention remains fail-closed after the bounded retries."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    contention = APIError({
+        "message": "could not serialize access due to concurrent update",
+        "code": "40001",
+        "hint": None,
+        "details": None,
+    })
+
+    with patch("worker.proxy_usage.run_query", side_effect=[contention] * 6):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="mint",
+                transaction_key="slot:0:attempt:1:persistent-contention",
+            ):
+                pytest.fail("provider work must not start")
+
+    reserve_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]
+    assert len(reserve_calls) == 3
+    assert len({str(call.args[1]) for call in reserve_calls}) == 1
+
+
+@pytest.mark.asyncio
+async def test_reservation_reconciliation_constraint_is_not_retried_and_logs_safe_code(caplog):
+    """A deterministic reconciliation failure stays fail-closed but diagnosable."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    contention = APIError({
+        "message": "could not serialize access due to concurrent update",
+        "code": "40001",
+        "hint": None,
+        "details": None,
+    })
+    constraint = APIError({
+        "message": "reservation ownership rejected",
+        "code": "23514",
+        "hint": None,
+        "details": None,
+    })
+
+    with patch("worker.proxy_usage.run_query", side_effect=[contention, constraint]):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="mint",
+                transaction_key="slot:0:attempt:1:reconcile-constraint",
+            ):
+                pytest.fail("provider work must not start")
+
+    reserve_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]
+    assert len(reserve_calls) == 1
+    assert "reconciliation rejected operation=mint code=23514; not retrying" in caplog.text
+    assert "reservation ownership rejected" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reservation_constraint_error_is_not_retried(caplog):
+    """Only transient database concurrency errors may retry before proxy traffic."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+    constraint = APIError({
+        "message": "invalid budget reservation",
+        "code": "23514",
+        "hint": None,
+        "details": None,
+    })
+
+    with patch("worker.proxy_usage.run_query", side_effect=constraint):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="mint",
+                transaction_key="slot:0:attempt:1:test",
+            ):
+                pytest.fail("provider work must not start")
+
+    reserve_calls = [
+        call for call in sb.rpc.call_args_list
+        if call.args[0] == "pjud_proxy_reserve_budget"
+    ]
+    assert len(reserve_calls) == 1
+    assert "code=23514; not retrying" in caplog.text
+    assert "invalid budget reservation" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_reservation_response_recovers_same_claim_without_second_reserve():
     """A committed reserve with a lost response must be recovered, not charged twice."""
     sb = _supabase()
