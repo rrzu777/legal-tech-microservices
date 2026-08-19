@@ -236,6 +236,7 @@ def advance_state(
         entry["resolution_enabled"] = result.resolution_enabled
 
         if result.active:
+            new_episode = not was_active
             severity_changed = was_active and previous_severity != result.severity
             if not was_active or severity_changed:
                 entry["active_since"] = timestamp
@@ -259,7 +260,14 @@ def advance_state(
                 or (now - last_sent).total_seconds() >= result.cooldown_seconds
             )
             should_send = persisted and (
-                (not entry.get("notified") and (cooldown_due or severity_changed))
+                (
+                    not entry.get("notified")
+                    and (
+                        (new_episode and result.resolution_enabled)
+                        or cooldown_due
+                        or severity_changed
+                    )
+                )
                 or (entry.get("notified") and cooldown_due)
             )
             if should_send:

@@ -190,6 +190,36 @@ def test_recovery_emits_one_resolved_event_after_a_firing_was_delivered():
     assert all(event.kind != "resolved" for event in repeated)
 
 
+def test_new_critical_episode_fires_immediately_after_recent_resolution():
+    now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    firing, state = evaluate(snapshot(api_active="inactive"), {}, now)
+    first = next(
+        event
+        for event in firing
+        if event.key == "unit.inactive:estrado-pjud.service"
+    )
+    state = record_delivery_success(state, first, now)
+
+    recovery, state = evaluate(snapshot(), state, now + timedelta(minutes=5))
+    resolved = next(
+        event
+        for event in recovery
+        if event.key == "unit.inactive:estrado-pjud.service"
+        and event.kind == "resolved"
+    )
+    state = record_delivery_success(state, resolved, now + timedelta(minutes=5))
+
+    relapse, _ = evaluate(
+        snapshot(api_active="inactive"), state, now + timedelta(minutes=10)
+    )
+
+    assert [
+        (event.key, event.severity, event.kind)
+        for event in relapse
+        if event.key == "unit.inactive:estrado-pjud.service"
+    ] == [("unit.inactive:estrado-pjud.service", "critical", "firing")]
+
+
 def test_restart_counter_establishes_baseline_then_warns_once_per_cooldown():
     now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
     baseline_events, state = evaluate(snapshot(api_restarts=4), {}, now)

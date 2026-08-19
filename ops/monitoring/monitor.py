@@ -85,14 +85,9 @@ class TelegramTransport:
             if callable(close):
                 close_attempted = True
                 close()
-        except Exception:
-            if response is not None and not close_attempted:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
+        except Exception as error:
+            if not close_attempted:
+                _safe_close(response if response is not None else error)
             raise TelegramDeliveryError("Telegram delivery failed") from None
 
 
@@ -238,6 +233,15 @@ def main(
 
 def _format_event(event: AlertEvent) -> str:
     return f"JurisTrack [{event.severity.upper()}] {event.message} ({event.kind})"
+
+
+def _safe_close(value: Any) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def _write_json(output: TextIO, value: dict[str, Any]) -> None:

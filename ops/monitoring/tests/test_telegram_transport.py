@@ -99,6 +99,36 @@ def test_transport_sanitizes_network_exceptions(error):
     assert caught.value.__cause__ is None
 
 
+def test_transport_closes_http_error_and_its_response_body():
+    body = io.BytesIO(b'{"ok": false}')
+
+    class TrackingHTTPError(urllib.error.HTTPError):
+        close_called = False
+
+        def close(self):
+            self.close_called = True
+            super().close()
+
+    error = TrackingHTTPError(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        429,
+        f"denied {CHAT_ID} {MESSAGE}",
+        {},
+        body,
+    )
+
+    def opener(request, timeout):
+        raise error
+
+    with pytest.raises(TelegramDeliveryError) as caught:
+        TelegramTransport(TOKEN, CHAT_ID, opener).send(MESSAGE)
+
+    assert error.close_called is True
+    assert body.closed is True
+    assert str(caught.value) == "Telegram delivery failed"
+    assert caught.value.__cause__ is None
+
+
 def test_transport_sanitizes_request_construction_errors(monkeypatch):
     def fail_request(url, **kwargs):
         raise ValueError(f"bad request {url} {MESSAGE}")
