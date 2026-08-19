@@ -51,6 +51,11 @@ expect_count() {
   count=$(grep -c -F "$2" "$EVENTS" 2>/dev/null || true)
   expect_eq "$1" "$count" "$3"
 }
+expect_exact_count() {
+  local count
+  count=$(grep -c -x -F "$2" "$EVENTS" 2>/dev/null || true)
+  expect_eq "$1" "$count" "$3"
+}
 
 write_stub() { # name, body on stdin
   local name="$1"
@@ -112,6 +117,10 @@ setup() {
     printf '%s\n' enabled > "$STATE/unit-$unit-enabled"
     printf '%s\n' active > "$STATE/unit-$unit-active"
   done
+  for unit in hermes-gateway.service hermes-dashboard.service; do
+    printf '%s\n' enabled > "$STATE/user-unit-$unit-enabled"
+    printf '%s\n' active > "$STATE/user-unit-$unit-active"
+  done
 
   if [ -d "$TMP/stub-bin" ]; then
     cp -R "$TMP/stub-bin/." "$BIN/"
@@ -161,11 +170,49 @@ if [ "${1:-}" = list-unit-files ]; then
   esac
   exit 0
 fi
-if [ "${1:-}" = --user ] && [ "${3:-}" = list-unit-files ]; then
-  printf '%s\n' 'hermes-gateway.service enabled enabled' 'hermes-dashboard.service enabled disabled'
+state_file() { printf '%s/unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
+user_state_file() { printf '%s/user-unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
+if [ "${1:-}" = --user ]; then
+  command=${3:-}; unit=${4:-}
+  if [ "$command" = list-unit-files ]; then
+    for candidate in hermes-gateway.service hermes-dashboard.service; do
+      value=$(cat "$(user_state_file "$candidate" enabled)") || exit 1
+      [ "$value" != enabled ] || printf '%s enabled enabled\n' "$candidate"
+    done
+    exit 0
+  fi
+  case "$command" in
+    is-enabled|is-active)
+      kind=${command#is-}; value=$(cat "$(user_state_file "$unit" "$kind")") || exit 1
+      printf '%s\n' "$value"
+      if [ "$kind" = enabled ]; then
+        case "$value" in
+          enabled) exit 0 ;;
+          static) [ ! -e "$RG_TEST_STATE/static-status-fail" ] ;;
+          disabled) exit 1 ;;
+          *) exit 4 ;;
+        esac
+      else
+        case "$value" in active) exit 0 ;; inactive) exit 3 ;; *) exit 4 ;; esac
+      fi
+      ;;
+    enable|disable)
+      case "$command" in enable) value=enabled ;; disable) value=disabled ;; esac
+      shift 3
+      for candidate in "$@"; do
+        current=$(cat "$(user_state_file "$candidate" enabled)") || exit 1
+        [ "$current" = static ] || printf '%s\n' "$value" > "$(user_state_file "$candidate" enabled)"
+      done
+      ;;
+    start|stop|restart)
+      case "$command" in stop) value=inactive ;; *) value=active ;; esac
+      shift 3
+      for candidate in "$@"; do printf '%s\n' "$value" > "$(user_state_file "$candidate" active)"; done
+      ;;
+    *) exit 1 ;;
+  esac
   exit 0
 fi
-if [ "${1:-}" = --user ] && [ "${3:-}" = restart ]; then exit 0; fi
 if [ "${1:-}" = show ]; then
   unit=${2:-}
   property='' value_mode=0
@@ -185,7 +232,14 @@ if [ "${1:-}" = show ]; then
   if [ -e "$RG_TEST_STATE/property-bad" ]; then
     bad_key=$(cat "$RG_TEST_STATE/property-bad")
     [ -n "$bad_key" ] || bad_key=legaltech.slice:MemoryMax
-    if [ "$unit:$1" = "$bad_key" ]; then echo drifted; return; fi
+    if [ "$unit:$1" = "$bad_key" ]; then
+      if [ -e "$RG_TEST_STATE/property-bad-value" ]; then
+        cat "$RG_TEST_STATE/property-bad-value"
+      else
+        echo drifted
+      fi
+      return
+    fi
   fi
   case "$unit:$1" in
     legaltech.slice:CPUWeight) echo 1000 ;;
@@ -226,9 +280,12 @@ if [ "${1:-}" = show ]; then
     legaltech-monitor.service:LogsDirectoryMode) echo 0750 ;;
     legaltech-monitor.service:ReadWritePaths) echo '/var/lib/legaltech-monitor /var/log/legaltech' ;;
     legaltech-monitor.service:RestrictAddressFamilies) echo '' ;;
+    legaltech-monitor.service:PartOf) echo '' ;;
+    legaltech-monitor.service:EnvironmentFiles) echo '/etc/legaltech-monitoring.env (ignore_errors=yes)' ;;
     legaltech-resource-tracker.service:StateDirectory|legaltech-resource-tracker.service:LogsDirectory) echo '' ;;
     legaltech-resource-tracker.service:ReadWritePaths) echo /var/log/legaltech/resources.csv ;;
     legaltech-resource-tracker.service:RestrictAddressFamilies) echo AF_UNIX ;;
+    legaltech-resource-tracker.service:PartOf|legaltech-resource-tracker.service:EnvironmentFiles) echo '' ;;
     legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
     legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
     legaltech-monitor.timer:OnBootUSec|legaltech-resource-tracker.timer:OnBootUSec) echo 5min ;;
@@ -242,17 +299,29 @@ if [ "${1:-}" = show ]; then
   fi
   exit 0
 fi
-state_file() { printf '%s/unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
 case "${1:-}" in
   is-enabled|is-active)
     kind=${1#is-}; unit=${2:-}; value=$(cat "$(state_file "$unit" "$kind")") || exit 1
     printf '%s\n' "$value"
-    if [ "$kind" = enabled ]; then [ "$value" = enabled ]; else [ "$value" = active ]; fi
+    if [ "$kind" = enabled ]; then
+      case "$value" in
+        enabled) exit 0 ;;
+        static) [ ! -e "$RG_TEST_STATE/static-status-fail" ] ;;
+        disabled) exit 1 ;;
+        *) exit 4 ;;
+      esac
+    else
+      case "$value" in active) exit 0 ;; inactive) exit 3 ;; *) exit 4 ;; esac
+    fi
     ;;
   enable|disable)
     action=$1; shift
     case "$action" in enable) value=enabled ;; disable) value=disabled ;; esac
-    for unit in "$@"; do [ "$unit" = -- ] || printf '%s\n' "$value" > "$(state_file "$unit" enabled)"; done
+    for unit in "$@"; do
+      [ "$unit" = -- ] && continue
+      current=$(cat "$(state_file "$unit" enabled)") || exit 1
+      [ "$current" = static ] || printf '%s\n' "$value" > "$(state_file "$unit" enabled)"
+    done
     ;;
   start|stop|restart)
     action=$1; shift
@@ -358,11 +427,18 @@ EOF
   write_stub provision <<'EOF'
 printf '%s\n' provision >> "$RG_TEST_STATE/events"
 [ "${PROV_SKIP_CADDY:-0}" = 1 ] || { printf '%s\n' caddy-not-skipped >> "$RG_TEST_STATE/events"; exit 98; }
-printf '%s\n' disabled > "$RG_TEST_STATE/unit-legaltech-monitor.service-enabled"
-printf '%s\n' disabled > "$RG_TEST_STATE/unit-legaltech-resource-tracker.service-enabled"
+for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+  [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = static ] || printf '%s\n' disabled > "$RG_TEST_STATE/unit-$unit-enabled"
+done
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-estrado-pjud.service-enabled"
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-monitor.timer-enabled"
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-resource-tracker.timer-enabled"
+if [ -f "$RG_TEST_STATE/hermes-enabled-after-provision" ]; then
+  while read -r unit value extra; do
+    [ -n "${unit:-}" ] && [ -z "${extra:-}" ] || exit 1
+    printf '%s\n' "$value" > "$RG_TEST_STATE/user-unit-$unit-enabled"
+  done < "$RG_TEST_STATE/hermes-enabled-after-provision"
+fi
 case "${RG_TEST_MUTATE:-none}" in
   all)
     printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service"
@@ -663,7 +739,7 @@ if [ -f "$BACKUP_DIR/unit-states.tsv" ]; then
 else
   live_state_lines=missing
 fi
-expect_eq 'backup records exactly six live unit states' "$live_state_lines" 6
+expect_eq 'backup records six system and two Hermes live unit states' "$live_state_lines" 8
 expect_missing 'live unit metadata contains no credential content' "$(cat "$BACKUP_DIR/unit-states.tsv" 2>/dev/null || true)" "$SECRET_SENTINEL"
 printf '%s\n' "$FAKE/outside"$'\t0\t-\t-\t-\t-' >> "$BACKUP_DIR/manifest.tsv"
 before_tampered_rollback=$(cat "$FAKE/systemd/estrado-pjud.service")
@@ -858,6 +934,35 @@ for key in "${postflight_drifts[@]}"; do
   expect_eq "$key drift refuses postflight" "$RC" 1
 done
 
+echo '== postflight rejects inherited ownership and credential responsibility drift'
+run_postflight_override() {
+  local scenario=$1 key=$2 value=$3
+  trap - EXIT
+  setup
+  : > "$STATE/swap-applied"
+  printf '%s\n' "$key" > "$STATE/property-bad"
+  printf '%s' "$value" > "$STATE/property-bad-value"
+  run_guard postflight
+  printf '%s|%s\n' "$scenario" "$RC"
+}
+postflight_override_scenarios=(
+  monitor-partof
+  tracker-partof
+  tracker-credential-env
+  monitor-missing-env
+  monitor-extra-env
+)
+run_postflight_override monitor-partof legaltech-monitor.service:PartOf legaltech.slice > "$TMP/postflight-monitor-partof" &
+run_postflight_override tracker-partof legaltech-resource-tracker.service:PartOf legaltech.slice > "$TMP/postflight-tracker-partof" &
+run_postflight_override tracker-credential-env legaltech-resource-tracker.service:EnvironmentFiles '/etc/legaltech-monitoring.env (ignore_errors=yes)' > "$TMP/postflight-tracker-credential-env" &
+run_postflight_override monitor-missing-env legaltech-monitor.service:EnvironmentFiles '' > "$TMP/postflight-monitor-missing-env" &
+run_postflight_override monitor-extra-env legaltech-monitor.service:EnvironmentFiles '/etc/legaltech-monitoring.env (ignore_errors=yes) /etc/extra.env (ignore_errors=no)' > "$TMP/postflight-monitor-extra-env" &
+wait
+for scenario in "${postflight_override_scenarios[@]}"; do
+  IFS='|' read -r _scenario RC < "$TMP/postflight-$scenario"
+  expect_eq "$scenario refuses postflight" "$RC" 1
+done
+
 setup
 : > "$STATE/swap-applied"
 run_guard postflight
@@ -942,6 +1047,73 @@ for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
   expect_eq "rollback restores $unit inactive" "$(cat "$STATE/unit-$unit-active")" inactive
 done
 expect_contains 'complete live-state restore reports rollback OK' "$OUT" 'ROLLBACK OK'
+
+echo '== static one-shots are captured and preserved without enable actions'
+setup
+for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+  printf '%s\n' static > "$STATE/unit-$unit-enabled"
+done
+: > "$STATE/postflight-fail"
+TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'static one-shot rollout reaches postflight and rolls back' "$RC" 1
+for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+  expect_eq "rollback preserves static $unit" "$(cat "$STATE/unit-$unit-enabled")" static
+  expect_count "rollback never enables static $unit" "systemctl enable $unit" 0
+  expect_count "rollback never disables static $unit" "systemctl disable $unit" 0
+done
+expect_contains 'static one-shot rollback completes' "$OUT" 'ROLLBACK OK'
+
+for invalid_static in status-mismatch unknown-output; do
+  setup
+  if [ "$invalid_static" = status-mismatch ]; then
+    printf '%s\n' static > "$STATE/unit-legaltech-monitor.service-enabled"
+    : > "$STATE/static-status-fail"
+  else
+    printf '%s\n' indirect > "$STATE/unit-legaltech-monitor.service-enabled"
+  fi
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq "$invalid_static enablement state refuses apply" "$RC" 1
+  expect_count "$invalid_static enablement state causes no provision" provision 0
+done
+
+echo '== Hermes rollback restores exact mixed enabled and active states'
+setup
+printf '%s\n' enabled > "$STATE/user-unit-hermes-gateway.service-enabled"
+printf '%s\n' active > "$STATE/user-unit-hermes-gateway.service-active"
+printf '%s\n' static > "$STATE/user-unit-hermes-dashboard.service-enabled"
+printf '%s\n' inactive > "$STATE/user-unit-hermes-dashboard.service-active"
+printf '%s\n' 'hermes-gateway.service disabled' > "$STATE/hermes-enabled-after-provision"
+: > "$STATE/postflight-fail"
+TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'mixed Hermes rollout fails on postflight' "$RC" 1
+expect_eq 'rollback re-enables gateway' "$(cat "$STATE/user-unit-hermes-gateway.service-enabled")" enabled
+expect_eq 'rollback restarts previously active gateway' "$(cat "$STATE/user-unit-hermes-gateway.service-active")" active
+expect_eq 'rollback preserves static dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-enabled")" static
+expect_eq 'rollback keeps previously inactive dashboard inactive' "$(cat "$STATE/user-unit-hermes-dashboard.service-active")" inactive
+expect_count 'rollback enables gateway exactly once' 'systemctl --user --machine=hermes@.host enable hermes-gateway.service' 1
+expect_exact_count 'rollback restarts gateway individually' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 1
+expect_exact_count 'rollback stops dashboard individually' 'systemctl --user --machine=hermes@.host stop hermes-dashboard.service' 1
+expect_count 'rollback never enables static dashboard' 'systemctl --user --machine=hermes@.host enable hermes-dashboard.service' 0
+expect_contains 'mixed Hermes rollback completes' "$OUT" 'ROLLBACK OK'
+
+setup
+printf '%s\n' disabled > "$STATE/user-unit-hermes-gateway.service-enabled"
+printf '%s\n' inactive > "$STATE/user-unit-hermes-gateway.service-active"
+printf '%s\n' enabled > "$STATE/user-unit-hermes-dashboard.service-enabled"
+printf '%s\n' active > "$STATE/user-unit-hermes-dashboard.service-active"
+printf '%s\n' 'hermes-gateway.service enabled' 'hermes-dashboard.service disabled' > "$STATE/hermes-enabled-after-provision"
+: > "$STATE/postflight-fail"
+TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'inverse Hermes rollout fails on postflight' "$RC" 1
+expect_eq 'rollback disables gateway' "$(cat "$STATE/user-unit-hermes-gateway.service-enabled")" disabled
+expect_eq 'rollback keeps gateway inactive' "$(cat "$STATE/user-unit-hermes-gateway.service-active")" inactive
+expect_eq 'rollback re-enables dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-enabled")" enabled
+expect_eq 'rollback restarts active dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-active")" active
+expect_count 'rollback disables gateway exactly once' 'systemctl --user --machine=hermes@.host disable hermes-gateway.service' 1
+expect_exact_count 'rollback stops gateway individually' 'systemctl --user --machine=hermes@.host stop hermes-gateway.service' 1
+expect_count 'rollback enables dashboard exactly once' 'systemctl --user --machine=hermes@.host enable hermes-dashboard.service' 1
+expect_exact_count 'rollback restarts dashboard individually' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
+expect_contains 'inverse Hermes rollback completes' "$OUT" 'ROLLBACK OK'
 
 echo '== partial live-state restore is loud and never reports success'
 setup

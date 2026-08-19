@@ -508,31 +508,48 @@ tracked_units=(
   legaltech-resource-tracker.service
   legaltech-monitor.timer
   legaltech-resource-tracker.timer
+  hermes-gateway.service
+  hermes-dashboard.service
 )
+tracked_unit_scopes=(system system system system system system user user)
+readonly system_unit_count=6
 desired_enabled_states=()
 desired_active_states=()
 
-read_unit_state() { # is-enabled|is-active unit
-  local query=$1 unit=$2 output rc=0
-  if output=$("$systemctl_bin" "$query" "$unit" 2>"$null_file"); then
+scoped_systemctl() { # system|user, arguments...
+  local scope=$1
+  shift
+  case "$scope" in
+    system) "$systemctl_bin" "$@" ;;
+    user) "$systemctl_bin" --user --machine=hermes@.host "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+read_unit_state() { # system|user is-enabled|is-active unit
+  local scope=$1 query=$2 unit=$3 output rc=0
+  if output=$(scoped_systemctl "$scope" "$query" "$unit" 2>"$null_file"); then
     rc=0
   else
     rc=$?
   fi
   case "$query:$output:$rc" in
     is-enabled:enabled:0) printf '%s\n' enabled ;;
-    is-enabled:disabled:[1-9]|is-enabled:disabled:[1-9][0-9]*) printf '%s\n' disabled ;;
+    is-enabled:disabled:1) printf '%s\n' disabled ;;
+    is-enabled:static:0) printf '%s\n' static ;;
     is-active:active:0) printf '%s\n' active ;;
-    is-active:inactive:[1-9]|is-active:inactive:[1-9][0-9]*) printf '%s\n' inactive ;;
+    is-active:inactive:3) printf '%s\n' inactive ;;
     *) return 1 ;;
   esac
 }
 
 capture_unit_states() {
-  local unit enabled active
-  for unit in "${tracked_units[@]}"; do
-    enabled=$(read_unit_state is-enabled "$unit") || return 1
-    active=$(read_unit_state is-active "$unit") || return 1
+  local index unit scope enabled active
+  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    scope=${tracked_unit_scopes[$index]}
+    enabled=$(read_unit_state "$scope" is-enabled "$unit") || return 1
+    active=$(read_unit_state "$scope" is-active "$unit") || return 1
     printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active"
   done
 }
@@ -543,7 +560,7 @@ load_and_validate_unit_states() {
   desired_active_states=()
   while IFS=$'\t' read -r unit enabled active extra; do
     [ "$count" -lt "${#tracked_units[@]}" ] && [ "$unit" = "${tracked_units[$count]}" ] || return 1
-    case "$enabled" in enabled|disabled) ;; *) return 1 ;; esac
+    case "$enabled" in enabled|disabled|static) ;; *) return 1 ;; esac
     case "$active" in active|inactive) ;; *) return 1 ;; esac
     [ -z "${extra:-}" ] || return 1
     desired_enabled_states+=("$enabled")
@@ -673,7 +690,9 @@ run_postflight() {
   show_contract estrado-pjud-worker.service PartOf legaltech.slice Slice legaltech.slice MemoryHigh 2147483648 MemoryMax 3221225472 CPUQuotaPerSecUSec 2s CPUWeight 800 TasksMax 512 || return 1
   show_contract "user-$uid.slice" MemoryHigh 2147483648 MemoryMax 2621440000 TasksMax 1024 CPUWeight 200 || return 1
   show_contract legaltech-monitor.service \
-    Type oneshot User root WorkingDirectory /opt/legaltech-monitoring \
+    Type oneshot User root PartOf '' \
+    EnvironmentFiles '/etc/legaltech-monitoring.env (ignore_errors=yes)' \
+    WorkingDirectory /opt/legaltech-monitoring \
     NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
     StateDirectory legaltech-monitor StateDirectoryMode 0750 \
     LogsDirectory legaltech LogsDirectoryMode 0750 \
@@ -681,7 +700,8 @@ run_postflight() {
     RestrictAddressFamilies '' Slice system.slice MemoryMax 134217728 \
     CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
   show_contract legaltech-resource-tracker.service \
-    Type oneshot User root WorkingDirectory /opt/legaltech-monitoring \
+    Type oneshot User root PartOf '' EnvironmentFiles '' \
+    WorkingDirectory /opt/legaltech-monitoring \
     NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
     StateDirectory '' LogsDirectory '' ReadWritePaths /var/log/legaltech/resources.csv \
     RestrictAddressFamilies AF_UNIX Slice system.slice MemoryMax 134217728 \
@@ -692,8 +712,8 @@ run_postflight() {
       legaltech-resource-tracker.timer) target=legaltech-resource-tracker.service ;;
     esac
     show_contract "$timer" Unit "$target" OnBootUSec 5min OnUnitActiveUSec 5min Persistent yes RandomizedDelayUSec 1min || return 1
-    enabled=$(read_unit_state is-enabled "$timer") || return 1
-    active=$(read_unit_state is-active "$timer") || return 1
+    enabled=$(read_unit_state system is-enabled "$timer") || return 1
+    active=$(read_unit_state system is-active "$timer") || return 1
     [ "$enabled" = enabled ] && [ "$active" = active ] || return 1
   done
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
@@ -820,24 +840,37 @@ restore_manifest() { # skip swap-owned fstab/sysctl when swap rollback was unsaf
   return "$rc"
 }
 
+restore_enabled_state() { # system|user unit enabled|disabled|static
+  local scope=$1 unit=$2 desired=$3 current action
+  current=$(read_unit_state "$scope" is-enabled "$unit") || return 1
+  case "$desired" in
+    static)
+      [ "$current" = static ] || return 1
+      ;;
+    enabled|disabled)
+      if [ "$current" != "$desired" ]; then
+        case "$desired" in enabled) action=enable ;; disabled) action=disable ;; esac
+        scoped_systemctl "$scope" "$action" "$unit" >"$null_file" 2>&1 || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  current=$(read_unit_state "$scope" is-enabled "$unit") || return 1
+  [ "$current" = "$desired" ]
+}
+
 restore_unit_states() {
   local index unit desired current rc=0 action
-  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+  for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_enabled_states[$index]}
-    current=$(read_unit_state is-enabled "$unit") || { rc=1; continue; }
-    if [ "$current" != "$desired" ]; then
-      case "$desired" in enabled) action=enable ;; disabled) action=disable ;; esac
-      "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || { rc=1; continue; }
-    fi
-    current=$(read_unit_state is-enabled "$unit") || { rc=1; continue; }
-    [ "$current" = "$desired" ] || rc=1
+    restore_enabled_state system "$unit" "$desired" || rc=1
   done
 
-  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+  for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_active_states[$index]}
-    current=$(read_unit_state is-active "$unit") || { rc=1; continue; }
+    current=$(read_unit_state system is-active "$unit") || { rc=1; continue; }
     if [ "$unit" = estrado-pjud.service ] && [ "$changed_api" -eq 1 ]; then
       if [ "$desired" = active ]; then
         "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
@@ -866,7 +899,30 @@ restore_unit_states() {
         "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || rc=1
       fi
     fi
-    current=$(read_unit_state is-active "$unit") || { rc=1; continue; }
+    current=$(read_unit_state system is-active "$unit") || { rc=1; continue; }
+    [ "$current" = "$desired" ] || rc=1
+  done
+  return "$rc"
+}
+
+restore_hermes_unit_states() {
+  local index unit desired current rc=0
+  [ "$changed_hermes" -eq 1 ] || return 0
+  for ((index = system_unit_count; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    desired=${desired_enabled_states[$index]}
+    restore_enabled_state user "$unit" "$desired" || rc=1
+  done
+  for ((index = system_unit_count; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    desired=${desired_active_states[$index]}
+    current=$(read_unit_state user is-active "$unit") || { rc=1; continue; }
+    if [ "$desired" = active ]; then
+      scoped_systemctl user restart "$unit" >"$null_file" 2>&1 || rc=1
+    elif [ "$current" = active ]; then
+      scoped_systemctl user stop "$unit" >"$null_file" 2>&1 || rc=1
+    fi
+    current=$(read_unit_state user is-active "$unit") || { rc=1; continue; }
     [ "$current" = "$desired" ] || rc=1
   done
   return "$rc"
@@ -892,10 +948,7 @@ do_rollback() {
   restore_manifest "$swap_rc" || rollback_rc=1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1
   restore_unit_states || rollback_rc=1
-  if [ "$changed_hermes" -eq 1 ]; then
-    "$systemctl_bin" --user --machine=hermes@.host restart \
-      hermes-gateway.service hermes-dashboard.service >"$null_file" 2>&1 || rollback_rc=1
-  fi
+  restore_hermes_unit_states || rollback_rc=1
   if [ "$rollback_rc" -ne 0 ]; then
     printf '%s\n' 'ROLLBACK INCOMPLETO: intervención manual requerida; no se hizo borrado amplio.' >&2
     return 1
