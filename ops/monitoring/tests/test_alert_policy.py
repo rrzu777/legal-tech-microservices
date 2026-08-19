@@ -24,6 +24,9 @@ def unit(
     memory_current: int = 10,
     memory_high: int = 100,
     restarts: int = 0,
+    load_state: str = "loaded",
+    unit_file_state: str = "enabled",
+    result: str = "success",
 ) -> UnitSnapshot:
     return UnitSnapshot(
         name=name,
@@ -37,6 +40,9 @@ def unit(
         tasks_max=10,
         cpu_usage_ns=1,
         n_restarts=restarts,
+        load_state=load_state,
+        unit_file_state=unit_file_state,
+        result=result,
     )
 
 
@@ -85,8 +91,18 @@ def snapshot(
                 restarts=worker_restarts,
             ),
             "legaltech-monitor.service": unit(
-                "legaltech-monitor.service", restarts=monitor_restarts
+                "legaltech-monitor.service",
+                active_state="inactive",
+                restarts=monitor_restarts,
             ),
+            "legaltech-resource-tracker.service": unit(
+                "legaltech-resource-tracker.service", active_state="inactive"
+            ),
+            "legaltech-monitor.timer": unit("legaltech-monitor.timer"),
+            "legaltech-resource-tracker.timer": unit(
+                "legaltech-resource-tracker.timer"
+            ),
+            "user-4242.slice": unit("user-4242.slice"),
         },
     )
 
@@ -289,3 +305,77 @@ def test_atomic_state_survives_a_new_policy_process(tmp_path):
         )
     ]
     assert list(tmp_path.glob(".state.json.*")) == []
+
+
+@pytest.mark.parametrize(
+    ("unit_name", "mutation"),
+    [
+        ("legaltech.slice", "missing"),
+        ("legaltech.slice", "failed"),
+        ("user-4242.slice", "not-found"),
+        ("legaltech-monitor.timer", "not-found"),
+        ("legaltech-resource-tracker.timer", "not-found"),
+        ("legaltech-monitor.service", "failed-result"),
+        ("legaltech-resource-tracker.service", "failed-result"),
+    ],
+)
+def test_required_observer_failure_is_immediate_and_suppresses_healthy_heartbeat(
+    unit_name, mutation
+):
+    sample = snapshot()
+    if mutation == "missing":
+        sample.units.pop(unit_name)
+    elif mutation == "failed":
+        sample.units[unit_name] = unit(unit_name, active_state="failed")
+    elif mutation == "not-found":
+        sample.units[unit_name] = unit(
+            unit_name,
+            active_state="inactive",
+            load_state="not-found",
+            unit_file_state="not-found",
+            result="success",
+        )
+    else:
+        sample.units[unit_name] = unit(
+            unit_name,
+            active_state="inactive",
+            result="failed",
+        )
+
+    rule = rules_by_key(sample)[f"unit.operational:{unit_name}"]
+    events, _ = evaluate(sample, {}, datetime(2026, 8, 19, 12, 0, tzinfo=UTC))
+
+    assert rule.active is True
+    assert rule.persist_for_seconds == 0
+    assert rule.message == f"Required operational unit {unit_name} is unavailable"
+    assert any(event.key == rule.key for event in events)
+    assert all(event.key != "healthy-heartbeat" for event in events)
+
+
+def test_disabled_inactive_worker_is_optional_but_enabled_inactive_worker_is_not():
+    disabled = snapshot(worker_active="inactive")
+    disabled.units["estrado-pjud-worker.service"] = unit(
+        "estrado-pjud-worker.service",
+        active_state="inactive",
+        unit_file_state="disabled",
+    )
+    enabled = snapshot(worker_active="inactive")
+
+    disabled_rules = rules_by_key(disabled)
+    enabled_rules = rules_by_key(enabled)
+
+    assert disabled_rules["unit.inactive:estrado-pjud-worker.service"].active is False
+    assert enabled_rules["unit.inactive:estrado-pjud-worker.service"].active is True
+
+
+def test_complete_snapshot_has_no_required_observer_alert_and_can_emit_heartbeat():
+    now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    results = evaluate_rules(snapshot(), {})
+    events, _ = advance_state(results, {}, now)
+
+    assert all(
+        not result.active
+        for result in results
+        if result.key.startswith("unit.operational:")
+    )
+    assert [event.key for event in events] == ["healthy-heartbeat"]

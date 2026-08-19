@@ -9,7 +9,12 @@ import pytest
 
 from ops.monitoring.alert_policy import new_state
 from ops.monitoring.monitor import main
-from ops.monitoring.resource_metrics import HostSnapshot, ResourceSnapshot, UnitSnapshot
+from ops.monitoring.resource_metrics import (
+    CollectionUnavailable,
+    HostSnapshot,
+    ResourceSnapshot,
+    UnitSnapshot,
+)
 
 
 MONITOR_PATH = Path(__file__).parents[1] / "monitor.py"
@@ -41,7 +46,17 @@ def sample(api_active="active"):
             "legaltech.slice": unit("legaltech.slice"),
             "estrado-pjud.service": unit("estrado-pjud.service", api_active),
             "estrado-pjud-worker.service": unit("estrado-pjud-worker.service"),
-            "legaltech-monitor.service": unit("legaltech-monitor.service"),
+            "legaltech-monitor.service": unit(
+                "legaltech-monitor.service", "inactive"
+            ),
+            "legaltech-resource-tracker.service": unit(
+                "legaltech-resource-tracker.service", "inactive"
+            ),
+            "legaltech-monitor.timer": unit("legaltech-monitor.timer"),
+            "legaltech-resource-tracker.timer": unit(
+                "legaltech-resource-tracker.timer"
+            ),
+            "user-4242.slice": unit("user-4242.slice"),
         },
     )
 
@@ -148,6 +163,40 @@ def test_dry_run_returns_candidates_without_network_or_state_mutation(tmp_path):
     assert result == 0
     assert rendered["dry_run"] is True
     assert rendered["events"][0]["key"] == "unit.inactive:estrado-pjud.service"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_collection_unavailable_becomes_stable_immediate_alert_without_heartbeat(
+    tmp_path,
+):
+    output = io.StringIO()
+
+    def unavailable(**kwargs):
+        raise CollectionUnavailable("Required host resource metrics are unavailable")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("collection failure dry-run mutated state or used network")
+
+    result = main(
+        ["--dry-run", "--state-dir", str(tmp_path)],
+        environ={},
+        collect=unavailable,
+        clock=fixed_clock,
+        state_loader=lambda path: new_state(),
+        state_writer=forbidden,
+        transport_factory=forbidden,
+        slice_resolver=lambda: "user-4242.slice",
+        stdout=output,
+        stderr=io.StringIO(),
+    )
+
+    rendered = json.loads(output.getvalue())
+    assert result == 0
+    assert [event["key"] for event in rendered["events"]] == [
+        "monitor.collection.unavailable"
+    ]
+    assert rendered["events"][0]["severity"] == "critical"
+    assert all(event["key"] != "healthy-heartbeat" for event in rendered["events"])
     assert list(tmp_path.iterdir()) == []
 
 

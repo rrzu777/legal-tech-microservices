@@ -40,6 +40,7 @@ test_mode=${SWAP_TEST_MODE:-0}
 override_present=0
 for variable_name in \
   SWAP_FILE SWAP_FSTAB_FILE SWAP_SYSCTL_FILE SWAP_PROC_SWAPS_FILE \
+  SWAP_SWAPPINESS_METADATA_FILE SWAP_TEST_ROOT_UID SWAP_TEST_ROOT_GID \
   SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
   SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
   SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN
@@ -57,6 +58,7 @@ fi
 if [ "$test_mode" = 1 ]; then
   for variable_name in \
     SWAP_FILE SWAP_FSTAB_FILE SWAP_SYSCTL_FILE SWAP_PROC_SWAPS_FILE \
+    SWAP_SWAPPINESS_METADATA_FILE SWAP_TEST_ROOT_UID SWAP_TEST_ROOT_GID \
     SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
     SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
     SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN
@@ -68,7 +70,10 @@ fi
 swap_file=${SWAP_FILE:-/swapfile}
 fstab_file=${SWAP_FSTAB_FILE:-/etc/fstab}
 sysctl_file=${SWAP_SYSCTL_FILE:-/etc/sysctl.d/60-legaltech-swap.conf}
+swappiness_metadata_file=${SWAP_SWAPPINESS_METADATA_FILE:-/etc/sysctl.d/60-legaltech-swap.previous}
 proc_swaps_file=${SWAP_PROC_SWAPS_FILE:-/proc/swaps}
+root_uid=${SWAP_TEST_ROOT_UID:-0}
+root_gid=${SWAP_TEST_ROOT_GID:-0}
 
 df_bin=${SWAP_DF_BIN:-/usr/bin/df}
 fallocate_bin=${SWAP_FALLOCATE_BIN:-/usr/bin/fallocate}
@@ -85,7 +90,7 @@ stat_bin=${SWAP_STAT_BIN:-/usr/bin/stat}
 rm_bin=${SWAP_RM_BIN:-/usr/bin/rm}
 
 for absolute_value in \
-  "$swap_file" "$fstab_file" "$sysctl_file" "$proc_swaps_file" \
+  "$swap_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" "$proc_swaps_file" \
   "$df_bin" "$fallocate_bin" "$dd_bin" "$chmod_bin" "$mkswap_bin" \
   "$swapon_bin" "$swapoff_bin" "$sysctl_bin" "$free_bin" "$cp_bin" \
   "$mv_bin" "$stat_bin" "$rm_bin"
@@ -95,12 +100,16 @@ do
     *) usage ;;
   esac
 done
+is_uint "$root_uid" && is_uint "$root_gid" || usage
 
 fstab_state=invalid
 backup_state=invalid
 active_target_count=0
+active_target_used_bytes=0
 swap_file_exists=0
 sysctl_state=absent
+swappiness_metadata_state=absent
+previous_swappiness=''
 current_temp=''
 apply_created_swap_file=0
 apply_activated_swap=0
@@ -108,6 +117,8 @@ apply_activation_unknown=0
 apply_created_backup=0
 apply_promoted_fstab=0
 apply_created_sysctl=0
+apply_created_swappiness_metadata=0
+apply_swappiness_may_have_changed=0
 
 cleanup_temp() {
   if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
@@ -164,6 +175,7 @@ inspect_active_swaps() {
 
   local line device type size used priority extra line_number=0
   active_target_count=0
+  active_target_used_bytes=0
   while IFS= read -r line || [ -n "$line" ]; do
     line_number=$((line_number + 1))
     if [ "$line_number" -eq 1 ]; then
@@ -181,7 +193,9 @@ inspect_active_swaps() {
       is_uint "$used" && [ -n "$priority" ] && [ -z "$extra" ] || return 1
     [ "$device" = "$swap_file" ] || return 1
     [ "$type" = file ] || return 1
+    [ "$used" -le 9007199254740991 ] || return 1
     active_target_count=$((active_target_count + 1))
+    active_target_used_bytes=$((used * 1024))
   done < "$proc_swaps_file" || return 1
   [ "$line_number" -ge 1 ] || return 1
   [ "$active_target_count" -le 1 ] || return 1
@@ -219,6 +233,72 @@ inspect_sysctl_file() {
   fi
   [ "$content" = $'vm.swappiness=10\n' ] || return 1
   sysctl_state=managed
+}
+
+valid_swappiness() {
+  is_uint "$1" && [ "$1" -le 200 ]
+}
+
+validate_swappiness_metadata_file() {
+  local path=$1 metadata kind mode size links uid gid extra content raw
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$path") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && [ "$mode" = 600 ] && is_uint "$size" \
+    && [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] \
+    && [ -z "$extra" ] || return 1
+  read_text_file "$path" content || return 1
+  case "$content" in *$'\n') raw=${content%$'\n'} ;; *) return 1 ;; esac
+  [ "$content" = "$raw"$'\n' ] && valid_swappiness "$raw" || return 1
+  previous_swappiness=$raw
+}
+
+inspect_swappiness_metadata() {
+  swappiness_metadata_state=absent
+  previous_swappiness=''
+  if [ ! -e "$swappiness_metadata_file" ] && [ ! -L "$swappiness_metadata_file" ]; then
+    return 0
+  fi
+  [ -f "$swappiness_metadata_file" ] && [ ! -L "$swappiness_metadata_file" ] || return 1
+  validate_swappiness_metadata_file "$swappiness_metadata_file" || return 1
+  swappiness_metadata_state=managed
+}
+
+read_live_swappiness() {
+  local output rc
+  if output=$("$sysctl_bin" -n vm.swappiness); then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return 1
+  case "$output" in *$'\n'*) return 1 ;; esac
+  valid_swappiness "$output" || return 1
+  printf '%s\n' "$output"
+}
+
+create_swappiness_metadata() {
+  local value=$1
+  valid_swappiness "$value" || return 1
+  [ ! -e "$swappiness_metadata_file" ] && [ ! -L "$swappiness_metadata_file" ] || return 1
+  current_temp="${swappiness_metadata_file}.tmp.$$"
+  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
+  umask 077
+  printf '%s\n' "$value" > "$current_temp" || return 1
+  "$chmod_bin" 0600 "$current_temp" || return 1
+  validate_swappiness_metadata_file "$current_temp" || return 1
+  "$mv_bin" -n "$current_temp" "$swappiness_metadata_file" || return 1
+  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
+  current_temp=''
+  apply_created_swappiness_metadata=1
+  inspect_swappiness_metadata || return 1
+  [ "$swappiness_metadata_state" = managed ] && [ "$previous_swappiness" = "$value" ]
+}
+
+restore_live_swappiness() {
+  local output rc restored
+  inspect_swappiness_metadata || return 1
+  [ "$swappiness_metadata_state" = managed ] || return 1
+  if output=$("$sysctl_bin" -w "vm.swappiness=$previous_swappiness"); then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return 1
+  restored=$(read_live_swappiness) || return 1
+  [ "$restored" = "$previous_swappiness" ]
 }
 
 read_text_file() {
@@ -288,16 +368,19 @@ inspect_managed_state() {
   inspect_active_swaps || return 1
   inspect_swap_file || return 1
   inspect_sysctl_file || return 1
+  inspect_swappiness_metadata || return 1
 
   if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ] && \
      [ "$swap_file_exists" -eq 0 ] && \
-     [ "$active_target_count" -eq 0 ] && [ "$sysctl_state" = absent ]; then
+     [ "$active_target_count" -eq 0 ] && [ "$sysctl_state" = absent ] \
+     && [ "$swappiness_metadata_state" = absent ]; then
     printf '%s\n' clean
     return 0
   fi
   if [ "$fstab_state" = managed ] && [ "$backup_state" = managed ] && \
      [ "$swap_file_exists" -eq 1 ] && \
-     [ "$active_target_count" -eq 1 ] && [ "$sysctl_state" = managed ]; then
+     [ "$active_target_count" -eq 1 ] && [ "$sysctl_state" = managed ] \
+     && [ "$swappiness_metadata_state" = managed ]; then
     printf '%s\n' managed
     return 0
   fi
@@ -388,16 +471,29 @@ replace_fstab_without_managed_block() {
 
 cleanup_current_apply() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
-  local cleanup_failed=0 configuration_safe=1
+  local cleanup_failed=0 configuration_safe=1 swapoff_required=0
 
   if [ "$apply_activation_unknown" -eq 1 ]; then
-    cleanup_failed=1
+    return 1
   elif [ "$apply_activated_swap" -eq 1 ]; then
+    read_memory_safety || return 1
+    swapoff_required=1
+  fi
+
+  if [ "$apply_swappiness_may_have_changed" -eq 1 ]; then
+    if restore_live_swappiness; then
+      apply_swappiness_may_have_changed=0
+    else
+      return 1
+    fi
+  fi
+
+  if [ "$swapoff_required" -eq 1 ]; then
     if "$swapoff_bin" "$swap_file" && inspect_active_swaps && \
        [ "$active_target_count" -eq 0 ]; then
       apply_activated_swap=0
     else
-      cleanup_failed=1
+      return 1
     fi
   fi
 
@@ -450,6 +546,17 @@ cleanup_current_apply() {
     fi
   fi
 
+
+  if [ "$apply_created_swappiness_metadata" -eq 1 ] && [ "$cleanup_failed" -eq 0 ] \
+    && [ "$configuration_safe" -eq 1 ]; then
+    if validate_swappiness_metadata_file "$swappiness_metadata_file" \
+      && "$rm_bin" "$swappiness_metadata_file"; then
+      apply_created_swappiness_metadata=0
+    else
+      cleanup_failed=1
+    fi
+  fi
+
   [ "$cleanup_failed" -eq 0 ]
 }
 
@@ -462,18 +569,20 @@ verify_managed() {
   local state swappiness
   state=$(inspect_managed_state) || return 1
   [ "$state" = managed ] || return 1
-  swappiness=$("$sysctl_bin" -n vm.swappiness) || return 1
+  swappiness=$(read_live_swappiness) || return 1
   [ "$swappiness" = 10 ]
 }
 
 apply_swap() {
-  local state
+  local state original_swappiness
   apply_created_swap_file=0
   apply_activated_swap=0
   apply_activation_unknown=0
   apply_created_backup=0
   apply_promoted_fstab=0
   apply_created_sysctl=0
+  apply_created_swappiness_metadata=0
+  apply_swappiness_may_have_changed=0
   check_free_disk || return 1
   state=$(inspect_managed_state) || return 1
   if [ "$state" = managed ]; then
@@ -481,6 +590,9 @@ apply_swap() {
     return
   fi
   [ "$state" = clean ] || return 1
+
+  original_swappiness=$(read_live_swappiness) || return 1
+  create_swappiness_metadata "$original_swappiness" || { abort_current_apply; return 1; }
 
   apply_created_swap_file=1
   if ! "$fallocate_bin" -l "$SWAP_BYTES" "$swap_file"; then
@@ -494,6 +606,11 @@ apply_swap() {
   "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
   inspect_swap_file || { abort_current_apply; return 1; }
   "$mkswap_bin" "$swap_file" || { abort_current_apply; return 1; }
+  replace_fstab_with_managed_block || { abort_current_apply; return 1; }
+  apply_created_sysctl=1
+  printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
+  apply_swappiness_may_have_changed=1
+  "$sysctl_bin" -p "$sysctl_file" >/dev/null || { abort_current_apply; return 1; }
   if "$swapon_bin" "$swap_file"; then
     apply_activated_swap=1
   else
@@ -507,32 +624,28 @@ apply_swap() {
     abort_current_apply
     return 1
   fi
-  replace_fstab_with_managed_block || { abort_current_apply; return 1; }
-  apply_created_sysctl=1
-  printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
-  "$sysctl_bin" -p "$sysctl_file" >/dev/null || { abort_current_apply; return 1; }
   verify_managed || { abort_current_apply; return 1; }
 }
 
 read_memory_safety() {
-  local output line label _a b _c _d _e f extra available='' used=''
-  output=$("$free_bin" -b) || return 1
+  local output rc line label _a _b _c _d _e f extra available=''
+  if output=$("$free_bin" -b); then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
-    label=''; _a=''; b=''; _c=''; _d=''; _e=''; f=''; extra=''
-    read -r label _a b _c _d _e f extra <<< "$line" || true
+    label=''; _a=''; _b=''; _c=''; _d=''; _e=''; f=''; extra=''
+    read -r label _a _b _c _d _e f extra <<< "$line" || true
     case "$label" in
       Mem:)
         [ -z "$available" ] && is_uint "$f" && [ -z "$extra" ] || return 1
         available=$f
         ;;
-      Swap:)
-        [ -z "$used" ] && is_uint "$b" && [ -z "$extra" ] || return 1
-        used=$b
-        ;;
     esac
   done <<< "$output"
-  is_uint "$available" && is_uint "$used" || return 1
-  [ "$available" -gt $((used + RAM_MARGIN_BYTES)) ]
+  is_uint "$available" || return 1
+  inspect_active_swaps || return 1
+  [ "$active_target_count" -eq 1 ] || return 1
+  [ "$active_target_used_bytes" -le $((9223372036854775807 - RAM_MARGIN_BYTES)) ] || return 1
+  [ "$available" -gt $((active_target_used_bytes + RAM_MARGIN_BYTES)) ]
 }
 
 rollback_swap() {
@@ -544,10 +657,16 @@ rollback_swap() {
   [ "$state" = managed ] || return 1
   read_memory_safety || return 1
 
+  restore_live_swappiness || return 1
+
   "$swapoff_bin" "$swap_file" || return 1
+  inspect_active_swaps || return 1
+  [ "$active_target_count" -eq 0 ] || return 1
   replace_fstab_without_managed_block || return 1
   "$rm_bin" "$sysctl_file" || return 1
   "$rm_bin" "$swap_file" || return 1
+  validate_swappiness_metadata_file "$swappiness_metadata_file" || return 1
+  "$rm_bin" "$swappiness_metadata_file" || return 1
 }
 
 case "$command_name" in

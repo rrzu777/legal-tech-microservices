@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -21,8 +22,11 @@ from typing import Callable, Protocol, Sequence
 SCHEMA_VERSION = 1
 SYSTEMD_TIMEOUT_SECONDS = 5.0
 SYSTEMD_PROPERTIES = (
+    "LoadState",
+    "UnitFileState",
     "ActiveState",
     "SubState",
+    "Result",
     "MemoryCurrent",
     "MemoryPeak",
     "MemoryHigh",
@@ -39,7 +43,17 @@ BASE_UNITS = (
     "estrado-pjud-worker.service",
     "legaltech-monitor.service",
     "legaltech-resource-tracker.service",
+    "legaltech-monitor.timer",
+    "legaltech-resource-tracker.timer",
 )
+COLLECTION_UNAVAILABLE_MESSAGE = "Required host resource metrics are unavailable"
+
+
+class CollectionUnavailable(RuntimeError):
+    """A deliberately sanitized required-host-metric collection failure."""
+
+    def __init__(self, *_details: object) -> None:
+        super().__init__(COLLECTION_UNAVAILABLE_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,10 @@ class UnitSnapshot:
     cpu_usage_ns: int | None
     n_restarts: int | None
     diagnostic: str | None = None
+    load_state: str = "loaded"
+    unit_file_state: str = "enabled"
+    result: str = "success"
+    control_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +95,7 @@ class ResourceSnapshot:
     timestamp_utc: str
     host: HostSnapshot
     units: dict[str, UnitSnapshot]
+    hermes_user_slice: str | None = None
 
 
 class StatvfsResult(Protocol):
@@ -165,8 +184,12 @@ CSV_COLUMNS = (
     "root_inodes_total",
     "root_inodes_used",
     "unit_name",
+    "load_state",
+    "unit_file_state",
     "active_state",
     "sub_state",
+    "result",
+    "control_group",
     "memory_current_bytes",
     "memory_peak_bytes",
     "memory_high_bytes",
@@ -206,8 +229,12 @@ def append_csv(path: Path, snapshot: ResourceSnapshot) -> None:
                 common
                 | {
                     "unit_name": unit.name,
+                    "load_state": unit.load_state,
+                    "unit_file_state": unit.unit_file_state,
                     "active_state": unit.active_state,
                     "sub_state": unit.sub_state,
+                    "result": unit.result,
+                    "control_group": unit.control_group,
                     "memory_current_bytes": unit.memory_current_bytes,
                     "memory_peak_bytes": unit.memory_peak_bytes,
                     "memory_high_bytes": unit.memory_high_bytes,
@@ -254,18 +281,46 @@ def collect_resource_snapshot(
     now: Now = _utc_timestamp,
 ) -> ResourceSnapshot:
     """Collect host and unit aggregates without letting one unit hide the host."""
-    meminfo = parse_meminfo(read_text("/proc/meminfo"))
-    filesystem = statvfs("/")
-    memory_total = meminfo.get("MemTotal", 0)
-    memory_available = meminfo.get("MemAvailable", 0)
-    swap_total = meminfo.get("SwapTotal", 0)
-    swap_used = max(0, swap_total - meminfo.get("SwapFree", 0))
+    try:
+        meminfo = parse_meminfo(read_text("/proc/meminfo"))
+        required_meminfo = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")
+        if any(key not in meminfo for key in required_meminfo):
+            raise ValueError("required meminfo value missing")
+        memory_total = meminfo["MemTotal"]
+        memory_available = meminfo["MemAvailable"]
+        swap_total = meminfo["SwapTotal"]
+        swap_free = meminfo["SwapFree"]
+        if (
+            memory_total <= 0
+            or not 0 <= memory_available <= memory_total
+            or swap_total < 0
+            or not 0 <= swap_free <= swap_total
+        ):
+            raise ValueError("required meminfo value invalid")
+
+        filesystem = statvfs("/")
+        if (
+            filesystem.f_blocks <= 0
+            or filesystem.f_frsize <= 0
+            or not 0 <= filesystem.f_bfree <= filesystem.f_blocks
+            or filesystem.f_files <= 0
+            or not 0 <= filesystem.f_ffree <= filesystem.f_files
+        ):
+            raise ValueError("required filesystem value invalid")
+
+        load_1m = loadavg()[0]
+        if not isinstance(load_1m, (int, float)) or not math.isfinite(load_1m) or load_1m < 0:
+            raise ValueError("required load value invalid")
+    except Exception:
+        raise CollectionUnavailable() from None
+
+    swap_used = swap_total - swap_free
     host = HostSnapshot(
         memory_total_bytes=memory_total,
         memory_available_bytes=memory_available,
         swap_total_bytes=swap_total,
         swap_used_bytes=swap_used,
-        load_1m=loadavg()[0],
+        load_1m=load_1m,
         root_bytes_total=filesystem.f_blocks * filesystem.f_frsize,
         root_bytes_used=max(0, (filesystem.f_blocks - filesystem.f_bfree) * filesystem.f_frsize),
         root_inodes_total=filesystem.f_files,
@@ -280,6 +335,7 @@ def collect_resource_snapshot(
         timestamp_utc=now(),
         host=host,
         units=units,
+        hermes_user_slice=hermes_user_slice,
     )
 
 
@@ -292,7 +348,7 @@ def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
     except Exception:
         return UnitSnapshot(
             name=unit_name,
-            active_state="inactive",
+            active_state="unknown",
             sub_state="unknown",
             memory_current_bytes=None,
             memory_peak_bytes=None,
@@ -303,6 +359,10 @@ def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
             cpu_usage_ns=None,
             n_restarts=None,
             diagnostic="systemctl show failed",
+            load_state="unknown",
+            unit_file_state="unknown",
+            result="unknown",
+            control_group=None,
         )
     return UnitSnapshot(
         name=unit_name,
@@ -316,6 +376,10 @@ def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
         tasks_max=_optional_int(values.get("TasksMax")),
         cpu_usage_ns=_optional_int(values.get("CPUUsageNSec")),
         n_restarts=_optional_int(values.get("NRestarts")),
+        load_state=values.get("LoadState", "unknown") or "unknown",
+        unit_file_state=values.get("UnitFileState", "unknown") or "unknown",
+        result=values.get("Result", "unknown") or "unknown",
+        control_group=values.get("ControlGroup") or None,
     )
 
 

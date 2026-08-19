@@ -59,6 +59,7 @@ setup() {
   SWAP_FILE="$ROOT/swapfile"
   FSTAB_FILE="$ROOT/etc/fstab"
   SYSCTL_FILE="$ROOT/etc/sysctl.d/60-legaltech-swap.conf"
+  SWAPPINESS_METADATA_FILE="$ROOT/etc/sysctl.d/60-legaltech-swap.previous"
   PROC_SWAPS_FILE="$ROOT/proc/swaps"
   SWAPPINESS_STATE="$base/swappiness"
   MV_COUNT_FILE="$base/mv-count"
@@ -71,6 +72,11 @@ setup() {
   FREE_BYTES=$((9 * 1024 * 1024 * 1024))
   AVAILABLE_RAM=$((4 * 1024 * 1024 * 1024))
   SWAP_USED=0
+  TARGET_USED_KIB=0
+  unset DF_FAIL FALLOCATE_FAIL CHMOD_FAIL MKSWAP_FAIL SWAPON_FAIL SWAPOFF_FAIL
+  unset SWAPON_FAIL_STATE SWAPOFF_KEEP_ACTIVE SYSCTL_FAIL FREE_FAIL
+  unset SYSCTL_RESTORE_FAIL SYSCTL_VERIFY_FAIL FREE_MALFORMED FREE_FAIL_AFTER_OUTPUT
+  unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL
 
   write_stub df '
 printf "df %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -105,7 +111,7 @@ exit 0'
 printf "swapon %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 case "${SWAP_TEST_SWAPON_FAIL_STATE:-none}" in
   absent) exit 8 ;;
-  active) printf "%s file 4194300 0 -2\n" "$1" >> "$SWAP_TEST_PROC_SWAPS"; exit 8 ;;
+  active) printf "%s file 4194300 %s -2\n" "$1" "$SWAP_TEST_TARGET_USED_KIB" >> "$SWAP_TEST_PROC_SWAPS"; exit 8 ;;
   malformed) printf "malformed swaps state\n" > "$SWAP_TEST_PROC_SWAPS"; exit 8 ;;
   none) ;;
   *) exit 9 ;;
@@ -133,8 +139,22 @@ done < "$SWAP_TEST_PROC_SWAPS"
 printf "sysctl %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_SYSCTL_FAIL:-0}" != 1 ] || exit 8
 case "${1:-}" in
-  -n) [ "${2:-}" = vm.swappiness ] || exit 9; cat "$SWAP_TEST_SWAPPINESS_STATE" ;;
+  -n)
+    [ "${2:-}" = vm.swappiness ] || exit 9
+    current=$(cat "$SWAP_TEST_SWAPPINESS_STATE") || exit 8
+    if [ "${SWAP_TEST_SYSCTL_VERIFY_FAIL:-0}" = 1 ] && [ "$current" != 10 ]; then
+      printf "999\n"
+    else
+      printf "%s\n" "$current"
+    fi
+    ;;
   -p) [ -f "${2:-}" ] || exit 9; printf "10\n" > "$SWAP_TEST_SWAPPINESS_STATE" ;;
+  -w)
+    case "${2:-}" in vm.swappiness=*) value=${2#vm.swappiness=} ;; *) exit 9 ;; esac
+    [ "${SWAP_TEST_SYSCTL_RESTORE_FAIL:-0}" != 1 ] || exit 8
+    printf "%s\n" "$value" > "$SWAP_TEST_SWAPPINESS_STATE"
+    printf "vm.swappiness = %s\n" "$value"
+    ;;
   *) exit 9 ;;
 esac'
 
@@ -144,7 +164,8 @@ printf "free %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 if [ "${SWAP_TEST_FREE_MALFORMED:-0}" = 1 ]; then printf "not parseable\n"; exit 0; fi
 printf "              total used free shared buff/cache available\n"
 printf "Mem: 10000000000 1 1 0 0 %s\n" "$SWAP_TEST_AVAILABLE_RAM"
-printf "Swap: 4294967296 %s 1\n" "$SWAP_TEST_SWAP_USED"'
+printf "Swap: 4294967296 %s 1\n" "$SWAP_TEST_SWAP_USED"
+[ "${SWAP_TEST_FREE_FAIL_AFTER_OUTPUT:-0}" != 1 ] || exit 8'
 
   write_stub cp '
 printf "cp %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -169,8 +190,12 @@ path=${!#}
 metadata=$("$SWAP_TEST_PYTHON" -c '\''import os,stat,sys
 s=os.lstat(sys.argv[1])
 kind="regular file" if stat.S_ISREG(s.st_mode) else ("symbolic link" if stat.S_ISLNK(s.st_mode) else "other")
-print(f"{kind}|{stat.S_IMODE(s.st_mode):o}|{s.st_size}|{s.st_nlink}")'\'' "$path") || exit 8
-case "$*" in *%h*) printf "%s\n" "$metadata" ;; *) printf "%s\n" "${metadata%|*}" ;; esac'
+print(f"{kind}|{stat.S_IMODE(s.st_mode):o}|{s.st_size}|{s.st_nlink}|{s.st_uid}|{s.st_gid}")'\'' "$path") || exit 8
+case "$*" in
+  *%u*) printf "%s\n" "$metadata" ;;
+  *%h*) printf "%s\n" "${metadata%|*|*}" ;;
+  *) short=${metadata%|*|*}; printf "%s\n" "${short%|*}" ;;
+esac'
 
   write_stub rm '
 printf "rm %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -181,7 +206,8 @@ exec /bin/rm "$@"'
 run_swap() {
   OUT=$(SWAP_TEST_MODE=1 \
     SWAP_FILE="$SWAP_FILE" SWAP_FSTAB_FILE="$FSTAB_FILE" \
-    SWAP_SYSCTL_FILE="$SYSCTL_FILE" SWAP_PROC_SWAPS_FILE="$PROC_SWAPS_FILE" \
+    SWAP_SYSCTL_FILE="$SYSCTL_FILE" SWAP_SWAPPINESS_METADATA_FILE="$SWAPPINESS_METADATA_FILE" \
+    SWAP_PROC_SWAPS_FILE="$PROC_SWAPS_FILE" \
     SWAP_DF_BIN="$BIN_DIR/df" SWAP_FALLOCATE_BIN="$BIN_DIR/fallocate" \
     SWAP_DD_BIN="$BIN_DIR/dd" SWAP_CHMOD_BIN="$BIN_DIR/chmod" \
     SWAP_MKSWAP_BIN="$BIN_DIR/mkswap" SWAP_SWAPON_BIN="$BIN_DIR/swapon" \
@@ -192,15 +218,20 @@ run_swap() {
     SWAP_TEST_PROC_SWAPS="$PROC_SWAPS_FILE" \
     SWAP_TEST_MV_COUNT_FILE="$MV_COUNT_FILE" \
     SWAP_TEST_SWAPPINESS_STATE="$SWAPPINESS_STATE" \
+    SWAP_TEST_ROOT_UID="$(/usr/bin/id -u)" SWAP_TEST_ROOT_GID="$(/usr/bin/id -g)" \
     SWAP_TEST_FREE_BYTES="$FREE_BYTES" SWAP_TEST_AVAILABLE_RAM="$AVAILABLE_RAM" \
-    SWAP_TEST_SWAP_USED="$SWAP_USED" SWAP_TEST_PYTHON="$(command -v python3)" \
+    SWAP_TEST_SWAP_USED="$SWAP_USED" SWAP_TEST_TARGET_USED_KIB="$TARGET_USED_KIB" \
+    SWAP_TEST_PYTHON="$(command -v python3)" \
     SWAP_TEST_DF_FAIL="${DF_FAIL:-0}" SWAP_TEST_FALLOCATE_FAIL="${FALLOCATE_FAIL:-0}" \
     SWAP_TEST_CHMOD_FAIL="${CHMOD_FAIL:-0}" SWAP_TEST_MKSWAP_FAIL="${MKSWAP_FAIL:-0}" \
     SWAP_TEST_SWAPON_FAIL="${SWAPON_FAIL:-0}" SWAP_TEST_SWAPOFF_FAIL="${SWAPOFF_FAIL:-0}" \
     SWAP_TEST_SWAPON_FAIL_STATE="${SWAPON_FAIL_STATE:-none}" \
     SWAP_TEST_SWAPOFF_KEEP_ACTIVE="${SWAPOFF_KEEP_ACTIVE:-0}" \
     SWAP_TEST_SYSCTL_FAIL="${SYSCTL_FAIL:-0}" SWAP_TEST_FREE_FAIL="${FREE_FAIL:-0}" \
-    SWAP_TEST_FREE_MALFORMED="${FREE_MALFORMED:-0}" SWAP_TEST_CP_FAIL="${CP_FAIL:-0}" \
+    SWAP_TEST_SYSCTL_RESTORE_FAIL="${SYSCTL_RESTORE_FAIL:-0}" \
+    SWAP_TEST_SYSCTL_VERIFY_FAIL="${SYSCTL_VERIFY_FAIL:-0}" \
+    SWAP_TEST_FREE_MALFORMED="${FREE_MALFORMED:-0}" \
+    SWAP_TEST_FREE_FAIL_AFTER_OUTPUT="${FREE_FAIL_AFTER_OUTPUT:-0}" SWAP_TEST_CP_FAIL="${CP_FAIL:-0}" \
     SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" \
     SWAP_TEST_MV_FAIL_ON_CALL="${MV_FAIL_ON_CALL:-0}" \
     SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
@@ -224,12 +255,223 @@ append_managed_block() {
 managed_fstab() {
   save_fstab_backup
   append_managed_block
+  printf '%s\n' 10 > "$SWAPPINESS_METADATA_FILE"
+  /bin/chmod 600 "$SWAPPINESS_METADATA_FILE"
 }
 
 make_valid_file() {
   "$(command -v python3)" -c 'import sys; f=open(sys.argv[1], "wb"); f.truncate(4294967296); f.close()' "$SWAP_FILE"
   /bin/chmod 600 "$SWAP_FILE"
 }
+
+expect_recoverable_active_apply_state() {
+  local label=$1
+  expect_eq "$label keeps target active" \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
+  if [ -f "$SWAP_FILE" ]; then ok "$label keeps active swapfile"; else bad "$label keeps active swapfile"; fi
+  expect_eq "$label keeps one managed fstab block" \
+    "$(grep -cFx '# BEGIN LEGALTECH MANAGED SWAP' "$FSTAB_FILE" 2>/dev/null || true)" 1
+  if [ -f "$SYSCTL_FILE" ]; then ok "$label keeps managed sysctl"; else bad "$label keeps managed sysctl"; fi
+}
+
+run_apply_compensation_gate_regressions() {
+  echo '== every apply compensation swapoff uses exact-target RAM gate'
+  setup compensation-equality
+  SWAPON_FAIL_STATE=active
+  TARGET_USED_KIB=1048576
+  AVAILABLE_RAM=$((2 * 1024 * 1024 * 1024))
+  SWAP_USED=$((1 * 1024 * 1024 * 1024))
+  run_swap apply
+  expect_eq 'equality boundary keeps apply failed' "$RC" 1
+  expect_eq 'equality boundary never calls swapoff' "$(count_log "swapoff $SWAP_FILE")" 0
+  expect_recoverable_active_apply_state 'equality boundary'
+
+  setup compensation-below
+  SWAPON_FAIL_STATE=active
+  TARGET_USED_KIB=1048576
+  AVAILABLE_RAM=$((2 * 1024 * 1024 * 1024 - 1))
+  SWAP_USED=$((1 * 1024 * 1024 * 1024))
+  run_swap apply
+  expect_eq 'below boundary keeps apply failed' "$RC" 1
+  expect_eq 'below boundary never calls swapoff' "$(count_log "swapoff $SWAP_FILE")" 0
+  expect_recoverable_active_apply_state 'below boundary'
+
+  setup compensation-malformed-free
+  SWAPON_FAIL_STATE=active
+  FREE_MALFORMED=1
+  run_swap apply
+  expect_eq 'malformed free keeps apply failed' "$RC" 1
+  expect_eq 'malformed free never calls swapoff' "$(count_log "swapoff $SWAP_FILE")" 0
+  expect_recoverable_active_apply_state 'malformed free'
+  unset FREE_MALFORMED
+
+  setup compensation-free-status
+  SWAPON_FAIL_STATE=active
+  FREE_FAIL_AFTER_OUTPUT=1
+  run_swap apply
+  expect_eq 'valid-looking free with nonzero status keeps apply failed' "$RC" 1
+  expect_eq 'valid-looking failed free never calls swapoff' "$(count_log "swapoff $SWAP_FILE")" 0
+  expect_recoverable_active_apply_state 'valid-looking failed free'
+  unset FREE_FAIL_AFTER_OUTPUT
+
+  setup compensation-malformed-swaps
+  SWAPON_FAIL_STATE=malformed
+  run_swap apply
+  expect_eq 'malformed swaps keeps apply failed' "$RC" 1
+  expect_eq 'malformed swaps never calls swapoff' "$(count_log "swapoff $SWAP_FILE")" 0
+  if [ -f "$SWAP_FILE" ]; then ok 'malformed swaps keeps possibly active swapfile'; else bad 'malformed swaps keeps possibly active swapfile'; fi
+  expect_eq 'malformed swaps keeps one managed fstab block' \
+    "$(grep -cFx '# BEGIN LEGALTECH MANAGED SWAP' "$FSTAB_FILE" 2>/dev/null || true)" 1
+
+  setup compensation-success
+  SWAPON_FAIL_STATE=active
+  TARGET_USED_KIB=0
+  SWAP_USED=$((3 * 1024 * 1024 * 1024))
+  AVAILABLE_RAM=$((1024 * 1024 * 1024 + 1))
+  run_swap apply
+  expect_eq 'gated compensation still reports original apply failure' "$RC" 1
+  expect_eq 'gated compensation calls swapoff once using exact target usage' \
+    "$(count_log "swapoff $SWAP_FILE")" 1
+  expect_eq 'gated compensation confirms target inactive' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+  if [ ! -e "$SWAP_FILE" ]; then ok 'gated compensation removes inactive swapfile'; else bad 'gated compensation removes inactive swapfile'; fi
+  expect_missing 'gated compensation removes managed fstab block' "$(cat "$FSTAB_FILE")" \
+    'LEGALTECH MANAGED SWAP'
+}
+
+if [ "${SWAP_FOCUS:-}" = apply-compensation ]; then
+  run_apply_compensation_gate_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_apply_compensation_gate_regressions
+fi
+
+run_swappiness_metadata_regressions() {
+  local mutations_before metadata_uid metadata_gid
+  echo '== live swappiness is captured once and restored through retryable metadata'
+  setup swappiness-60
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  run_swap apply
+  expect_eq 'apply from swappiness 60 succeeds' "$RC" 0
+  if [ -f "$SWAPPINESS_METADATA_FILE" ]; then ok 'apply creates swappiness metadata'; else bad 'apply creates swappiness metadata'; fi
+  expect_eq 'metadata stores exact previous value 60' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+  expect_eq 'metadata mode is 0600' "$(file_mode "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 600
+  metadata_uid=$(/usr/bin/stat -f '%u' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
+  metadata_gid=$(/usr/bin/stat -f '%g' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
+  expect_eq 'metadata owner is exact injected root uid' "$metadata_uid" "$(/usr/bin/id -u)"
+  expect_eq 'metadata group is exact injected root gid' "$metadata_gid" "$(/usr/bin/id -g)"
+  run_swap apply
+  expect_eq 'idempotent managed apply succeeds' "$RC" 0
+  expect_eq 'idempotent apply never replaces original swappiness' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+  run_swap rollback
+  expect_eq 'rollback to swappiness 60 succeeds' "$RC" 0
+  expect_eq 'rollback restores live swappiness 60' "$(cat "$SWAPPINESS_STATE")" 60
+  if [ ! -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'rollback removes metadata last'; else bad 'rollback removes metadata last'; fi
+
+  setup swappiness-zero
+  printf '%s\n' 0 > "$SWAPPINESS_STATE"
+  run_swap apply
+  expect_eq 'apply captures swappiness zero' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 0
+  run_swap rollback
+  expect_eq 'rollback to swappiness zero succeeds' "$RC" 0
+  expect_eq 'rollback restores live swappiness zero' "$(cat "$SWAPPINESS_STATE")" 0
+
+  setup swappiness-malformed-live
+  printf '%s\n' malformed > "$SWAPPINESS_STATE"
+  run_swap apply
+  expect_eq 'malformed live swappiness refuses clean apply' "$RC" 1
+  expect_eq 'malformed live swappiness causes no swap mutation' "$(mutation_count)" 0
+  if [ ! -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'malformed live value creates no metadata'; else bad 'malformed live value creates no metadata'; fi
+
+  setup swappiness-metadata-only
+  printf '%s\n' 60 > "$SWAPPINESS_METADATA_FILE"
+  /bin/chmod 600 "$SWAPPINESS_METADATA_FILE"
+  run_swap preflight
+  expect_eq 'metadata-only state is unknown' "$RC" 1
+  expect_eq 'metadata-only state is never mutated' "$(mutation_count)" 0
+
+  setup swappiness-unsafe-metadata
+  printf '%s\n' 60 > "$SWAPPINESS_METADATA_FILE"
+  /bin/chmod 0644 "$SWAPPINESS_METADATA_FILE"
+  run_swap apply
+  expect_eq 'world-readable metadata is unsafe' "$RC" 1
+  expect_eq 'unsafe metadata blocks before swap creation' "$(count_log 'fallocate ')" 0
+
+  setup swappiness-missing-managed-metadata
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  run_swap apply
+  /bin/rm -f "$SWAPPINESS_METADATA_FILE"
+  mutations_before=$(mutation_count)
+  run_swap verify
+  expect_eq 'managed swap without metadata is unknown' "$RC" 1
+  expect_eq 'missing metadata verification does not mutate' "$(mutation_count)" "$mutations_before"
+
+  setup swappiness-restore-retry
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  run_swap apply
+  SYSCTL_RESTORE_FAIL=1
+  run_swap rollback
+  expect_eq 'failed live restoration keeps rollback failed' "$RC" 1
+  expect_eq 'failed live restoration happens before swapoff' "$(count_log 'swapoff ')" 0
+  expect_eq 'failed live restoration retains original metadata' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+  expect_eq 'failed live restoration keeps active target retryable' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
+  unset SYSCTL_RESTORE_FAIL
+  run_swap rollback
+  expect_eq 'retry after restoration failure succeeds' "$RC" 0
+  expect_eq 'retry restores exact original live value' "$(cat "$SWAPPINESS_STATE")" 60
+  if [ ! -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'successful retry removes metadata'; else bad 'successful retry removes metadata'; fi
+
+  setup swappiness-verify-retry
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  run_swap apply
+  SYSCTL_VERIFY_FAIL=1
+  run_swap rollback
+  expect_eq 'failed restoration verification keeps rollback failed' "$RC" 1
+  expect_eq 'failed restoration verification retains metadata' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+  unset SYSCTL_VERIFY_FAIL
+  run_swap rollback
+  expect_eq 'retry after verification failure succeeds' "$RC" 0
+
+  setup swappiness-apply-compensation-restore
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  SWAPON_FAIL_STATE=active
+  SYSCTL_RESTORE_FAIL=1
+  run_swap apply
+  expect_eq 'apply compensation restoration failure stays failed' "$RC" 1
+  expect_eq 'apply compensation restores before any swapoff' \
+    "$(count_log "swapoff $SWAP_FILE")" 0
+  expect_eq 'failed apply restoration retains active target for retry' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
+  expect_eq 'failed apply restoration retains original metadata' \
+    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+  unset SWAPON_FAIL_STATE SYSCTL_RESTORE_FAIL
+  run_swap rollback
+  expect_eq 'rollback retries apply compensation restoration safely' "$RC" 0
+  expect_eq 'retry restores apply-time original swappiness' "$(cat "$SWAPPINESS_STATE")" 60
+}
+
+if [ "${SWAP_FOCUS:-}" = swappiness ]; then
+  run_swappiness_metadata_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_swappiness_metadata_regressions
+fi
 
 echo "== interfaz cerrada y overrides sólo bajo guard de test"
 setup interface
@@ -278,7 +520,8 @@ expect_eq "marker END una vez" "$(grep -cFx '# END LEGALTECH MANAGED SWAP' "$FST
 expect_eq "sysctl administrado exacto" "$(cat "$SYSCTL_FILE")" "vm.swappiness=10"
 expect_file_eq "backup conserva fstab original" "$TMP/fstab.before" "$FSTAB_FILE.legaltech-swap.bak"
 MUTATIONS=$(grep -E '^(fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p)' "$CALL_LOG" | cut -d' ' -f1 | tr '\n' ' ')
-expect_eq "orden de mutaciones" "$MUTATIONS" "fallocate chmod mkswap swapon cp mv cp mv sysctl "
+expect_eq "metadata y estructura durable preceden activación" "$MUTATIONS" \
+  "chmod mv fallocate chmod mkswap cp mv cp mv sysctl swapon "
 
 echo "== apply repetido es idempotente"
 cp "$FSTAB_FILE" "$TMP/fstab.applied"
@@ -582,11 +825,11 @@ else
 fi
 expect_eq "estado desconocido no ejecuta cleanup destructivo" \
   "$(grep -Ec '^(swapoff|rm) ' "$CALL_LOG" || true)" "0"
-if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "estado desconocido no deja backup"; else bad "estado desconocido no deja backup"; fi
-if [ ! -e "$SYSCTL_FILE" ]; then ok "estado desconocido no deja sysctl"; else bad "estado desconocido no deja sysctl"; fi
+if [ -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "estado desconocido conserva backup recuperable"; else bad "estado desconocido conserva backup recuperable"; fi
+if [ -e "$SYSCTL_FILE" ]; then ok "estado desconocido conserva sysctl administrado"; else bad "estado desconocido conserva sysctl administrado"; fi
 unset SWAPON_FAIL_STATE
 
-echo "== apply revierte sólo su transacción si falla el segundo rename"
+echo "== apply falla antes de activar si falla el segundo rename"
 setup second-rename-failure
 /bin/cp "$FSTAB_FILE" "$TMP/second-rename.fstab"
 MV_FAIL_ON_CALL=2
@@ -601,38 +844,37 @@ else
 fi
 expect_eq "fallo no deja temporales fstab" "$(fstab_temp_count)" "0"
 if [ ! -e "$SYSCTL_FILE" ]; then ok "fallo no deja sysctl"; else bad "fallo no deja sysctl"; fi
-expect_eq "fallo desactiva swap recién activado" \
+expect_eq "fallo previo a swapon deja target inactivo" \
   "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "0"
 if [ ! -e "$SWAP_FILE" ]; then
-  ok "fallo elimina swapfile creado tras desactivarlo"
+  ok "fallo elimina swapfile creado antes de activarlo"
 else
-  bad "fallo elimina swapfile creado tras desactivarlo"
+  bad "fallo elimina swapfile creado antes de activarlo"
 fi
-expect_eq "cleanup usa swapoff exacto una vez" "$(count_log "swapoff $SWAP_FILE")" "1"
+expect_eq "fallo previo a activación no usa swapoff" "$(count_log "swapoff $SWAP_FILE")" "0"
 unset MV_FAIL_ON_CALL
 run_swap apply
 expect_eq "retry apply luego de cleanup sale 0" "$RC" "0"
 run_swap rollback
 expect_eq "rollback luego del retry sale 0" "$RC" "0"
 
-echo "== cleanup falla cerrado si no puede desactivar swap recién creado"
+echo "== compensación falla cerrado si no puede desactivar target ambiguamente activo"
 setup second-rename-swapoff-failure
-/bin/cp "$FSTAB_FILE" "$TMP/swapoff-failure.fstab"
-MV_FAIL_ON_CALL=2
+SWAPON_FAIL_STATE=active
 SWAPOFF_FAIL=1
 run_swap apply
-expect_eq "fallo de swapoff durante cleanup mantiene error" "$RC" "1"
-expect_contains "cleanup fallido emite error genérico" "$OUT" \
+expect_eq "fallo de swapoff durante compensación mantiene error" "$RC" "1"
+expect_contains "compensación fallida emite error genérico" "$OUT" \
   "ERROR: swap state is unsafe or invalid"
-expect_file_eq "cleanup fallido conserva fstab original" \
-  "$TMP/swapoff-failure.fstab" "$FSTAB_FILE"
-if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then
-  ok "cleanup fallido elimina backup propio"
+expect_contains "compensación fallida conserva marker recuperable" \
+  "$(cat "$FSTAB_FILE")" "# BEGIN LEGALTECH MANAGED SWAP"
+if [ -e "$FSTAB_FILE.legaltech-swap.bak" ]; then
+  ok "compensación fallida conserva backup propio"
 else
-  bad "cleanup fallido elimina backup propio"
+  bad "compensación fallida conserva backup propio"
 fi
-expect_eq "cleanup fallido no deja temporales fstab" "$(fstab_temp_count)" "0"
-if [ ! -e "$SYSCTL_FILE" ]; then ok "cleanup fallido no deja sysctl"; else bad "cleanup fallido no deja sysctl"; fi
+expect_eq "compensación fallida no deja temporales fstab" "$(fstab_temp_count)" "0"
+if [ -e "$SYSCTL_FILE" ]; then ok "compensación fallida conserva sysctl"; else bad "compensación fallida conserva sysctl"; fi
 expect_eq "swap permanece activo al fallar swapoff" \
   "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "1"
 if [ -f "$SWAP_FILE" ]; then
@@ -643,14 +885,16 @@ fi
 expect_eq "cleanup intenta sólo swapoff del target exacto" \
   "$(count_log "swapoff $SWAP_FILE")" "1"
 expect_eq "cleanup no llama rm sobre archivo activo" "$(count_log "rm $SWAP_FILE")" "0"
-unset MV_FAIL_ON_CALL SWAPOFF_FAIL
+if [ -e "$SWAPPINESS_METADATA_FILE" ]; then ok "compensación fallida conserva metadata de retry"; else bad "compensación fallida conserva metadata de retry"; fi
+unset SWAPON_FAIL_STATE SWAPOFF_FAIL
 
 echo "== rollback inseguro no toca configuración"
 setup rollback-refuse
 make_valid_file
 managed_fstab
 printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
-printf '%s file 4194300 1073741824 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+# Linux /proc/swaps reports Size and Used in KiB; 1048576 KiB is 1 GiB.
+printf '%s file 4194300 1048576 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 cp "$FSTAB_FILE" "$TMP/refuse.fstab"
 cp "$SYSCTL_FILE" "$TMP/refuse.sysctl"
 AVAILABLE_RAM=$((2 * 1024 * 1024 * 1024))

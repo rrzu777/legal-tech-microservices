@@ -39,6 +39,7 @@ def main(
     append: Append = append_csv,
     slice_resolver: Callable[[], str] = resolve_hermes_user_slice,
     stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="collect one sample and exit")
@@ -54,8 +55,12 @@ def main(
     )
     arguments = parser.parse_args(argv)
 
-    hermes_user_slice = arguments.hermes_user_slice or slice_resolver()
-    sample = collect(hermes_user_slice=hermes_user_slice)
+    try:
+        hermes_user_slice = arguments.hermes_user_slice or slice_resolver()
+        sample = collect(hermes_user_slice=hermes_user_slice)
+    except Exception:
+        stderr.write("Resource collection unavailable\n")
+        return 1
     append(arguments.csv, sample)
     json.dump({"status": "recorded"}, stdout, sort_keys=True)
     stdout.write("\n")

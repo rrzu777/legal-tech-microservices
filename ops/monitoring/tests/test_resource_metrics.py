@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from ops.monitoring.resource_metrics import (
+    CollectionUnavailable,
     HostSnapshot,
     ResourceSnapshot,
     UnitSnapshot,
@@ -32,8 +33,11 @@ def test_parse_systemctl_show_preserves_explicit_property_values():
     values = parse_systemctl_show((FIXTURES / "systemctl-show.txt").read_text())
 
     assert values == {
+        "LoadState": "loaded",
+        "UnitFileState": "enabled",
         "ActiveState": "active",
         "SubState": "running",
+        "Result": "success",
         "MemoryCurrent": "1048576",
         "MemoryPeak": "2097152",
         "MemoryHigh": "max",
@@ -99,11 +103,17 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
         "estrado-pjud-worker.service",
         "legaltech-monitor.service",
         "legaltech-resource-tracker.service",
+        "legaltech-monitor.timer",
+        "legaltech-resource-tracker.timer",
         "user-4242.slice",
     }
-    assert len(calls) == 6
+    assert len(calls) == 8
     assert all(timeout == 5.0 for _, timeout in calls)
     assert all("--property=ControlGroup" in command for command, _ in calls)
+    assert all("--property=LoadState" in command for command, _ in calls)
+    assert all("--property=UnitFileState" in command for command, _ in calls)
+    assert all("--property=Result" in command for command, _ in calls)
+    assert snapshot.units["legaltech-monitor.service"].result == "success"
 
 
 def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_error():
@@ -132,10 +142,76 @@ def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_
 
     failed_unit = snapshot.units["user-999.slice"]
     assert snapshot.host.memory_total_bytes == 16_777_216_000
-    assert failed_unit.active_state == "inactive"
+    assert failed_unit.active_state == "unknown"
     assert failed_unit.sub_state == "unknown"
+    assert failed_unit.load_state == "unknown"
     assert failed_unit.diagnostic == "systemctl show failed"
     assert secret_value not in failed_unit.diagnostic
+
+
+@pytest.mark.parametrize("missing_key", ["MemTotal", "MemAvailable", "SwapTotal", "SwapFree"])
+def test_collect_rejects_missing_required_meminfo_key_with_sanitized_typed_error(
+    missing_key,
+):
+    secret = "must-not-leak-host-reader-detail"
+    meminfo = "\n".join(
+        line
+        for line in (FIXTURES / "meminfo.txt").read_text().splitlines()
+        if not line.startswith(f"{missing_key}:")
+    )
+
+    with pytest.raises(CollectionUnavailable) as raised:
+        collect_resource_snapshot(
+            hermes_user_slice="user-4242.slice",
+            read_text=lambda path: meminfo,
+            statvfs=lambda path: (_ for _ in ()).throw(
+                AssertionError("statvfs must not run after invalid meminfo")
+            ),
+            run_command=lambda command, timeout: (_ for _ in ()).throw(
+                AssertionError("systemd must not run after invalid meminfo")
+            ),
+            loadavg=lambda: (0.0, 0.0, 0.0),
+        )
+
+    assert str(raised.value) == "Required host resource metrics are unavailable"
+    assert secret not in str(raised.value)
+
+
+@pytest.mark.parametrize("failed_boundary", ["statvfs", "loadavg"])
+def test_collect_wraps_statvfs_and_load_failures_as_sanitized_unavailable(
+    failed_boundary,
+):
+    secret = "host-boundary-secret"
+
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 4096
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    statvfs = (
+        (lambda path: (_ for _ in ()).throw(OSError(secret)))
+        if failed_boundary == "statvfs"
+        else (lambda path: FakeStatvfs())
+    )
+    loadavg = (
+        (lambda: (_ for _ in ()).throw(OSError(secret)))
+        if failed_boundary == "loadavg"
+        else (lambda: (0.1, 0.0, 0.0))
+    )
+
+    with pytest.raises(CollectionUnavailable) as raised:
+        collect_resource_snapshot(
+            hermes_user_slice="user-4242.slice",
+            read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+            statvfs=statvfs,
+            run_command=lambda command, timeout: (FIXTURES / "systemctl-show.txt").read_text(),
+            loadavg=loadavg,
+        )
+
+    assert str(raised.value) == "Required host resource metrics are unavailable"
+    assert secret not in str(raised.value)
 
 
 def test_atomic_write_json_replaces_value_without_leaving_a_temporary_file(tmp_path):
@@ -210,8 +286,12 @@ def test_append_csv_writes_versioned_stable_rows(tmp_path):
         "root_inodes_total",
         "root_inodes_used",
         "unit_name",
+        "load_state",
+        "unit_file_state",
         "active_state",
         "sub_state",
+        "result",
+        "control_group",
         "memory_current_bytes",
         "memory_peak_bytes",
         "memory_high_bytes",
@@ -221,7 +301,7 @@ def test_append_csv_writes_versioned_stable_rows(tmp_path):
         "cpu_usage_ns",
         "n_restarts",
     ]
-    assert rows[1][0:14] == [
+    assert rows[1][0:18] == [
         "1",
         "2026-08-19T12:00:00Z",
         "1000",
@@ -234,8 +314,12 @@ def test_append_csv_writes_versioned_stable_rows(tmp_path):
         "300",
         "60",
         "a.service",
+        "loaded",
+        "enabled",
         "inactive",
         "dead",
+        "success",
+        "",
     ]
     assert rows[2][11] == "z.service"
-    assert rows[1][14:] == ["", "", "", "", "", "", "", ""]
+    assert rows[1][18:] == ["", "", "", "", "", "", "", ""]

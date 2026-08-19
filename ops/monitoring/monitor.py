@@ -18,24 +18,34 @@ try:
     from .alert_policy import (
         AlertEvent,
         advance_state,
+        collection_unavailable_rule,
         evaluate_rules,
         load_state,
         record_delivery_failure,
         record_delivery_success,
         save_state,
     )
-    from .resource_metrics import ResourceSnapshot, collect_resource_snapshot
+    from .resource_metrics import (
+        CollectionUnavailable,
+        ResourceSnapshot,
+        collect_resource_snapshot,
+    )
 except ImportError:  # Flat installation in /opt/legaltech-monitoring.
     from alert_policy import (
         AlertEvent,
         advance_state,
+        collection_unavailable_rule,
         evaluate_rules,
         load_state,
         record_delivery_failure,
         record_delivery_success,
         save_state,
     )
-    from resource_metrics import ResourceSnapshot, collect_resource_snapshot
+    from resource_metrics import (
+        CollectionUnavailable,
+        ResourceSnapshot,
+        collect_resource_snapshot,
+    )
 
 
 class TelegramDeliveryError(RuntimeError):
@@ -176,9 +186,20 @@ def main(
     state_path = arguments.state_dir / "state.json"
     try:
         state = state_loader(state_path)
+    except Exception:
+        stderr.write("Resource monitoring evaluation failed\n")
+        return 1
+    try:
         hermes_user_slice = arguments.hermes_user_slice or slice_resolver()
         sample = collect(hermes_user_slice=hermes_user_slice)
-        events, candidate = advance_state(evaluate_rules(sample, state), state, now)
+        results = evaluate_rules(sample, state)
+    except CollectionUnavailable:
+        results = [collection_unavailable_rule()]
+    except Exception:
+        stderr.write("Resource monitoring evaluation failed\n")
+        return 1
+    try:
+        events, candidate = advance_state(results, state, now)
     except Exception:
         stderr.write("Resource monitoring evaluation failed\n")
         return 1

@@ -1,10 +1,13 @@
 import http.client
+import io
 import importlib.util
 import socket
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+from ops.monitoring.resource_metrics import CollectionUnavailable
 
 
 TRACKER_PATH = Path(__file__).parents[1] / "resource-tracker.py"
@@ -55,6 +58,30 @@ def test_once_collects_and_appends_csv_without_any_network_path(monkeypatch, tmp
         ("collect", "user-4242.slice"),
         ("append", target, sample),
     ]
+
+
+def test_collection_unavailable_does_not_append_partial_row_or_leak_details(tmp_path):
+    tracker = load_tracker()
+    stderr = io.StringIO()
+    target = tmp_path / "resources.csv"
+
+    def unavailable(**kwargs):
+        raise CollectionUnavailable("Required host resource metrics are unavailable")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("tracker appended an incomplete resource snapshot")
+
+    result = tracker.main(
+        ["--once", "--csv", str(target), "--hermes-user-slice", "user-4242.slice"],
+        collect=unavailable,
+        append=forbidden,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert stderr.getvalue() == "Resource collection unavailable\n"
+    assert not target.exists()
 
 
 def test_tracker_runs_as_a_flat_installed_script_without_repo_pythonpath():

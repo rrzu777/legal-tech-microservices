@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,11 +55,12 @@ def evaluate_rules(
 ) -> list[RuleResult]:
     """Evaluate one highest-severity result for each stable alert family."""
     previous_rules = (state or {}).get("rules", {})
-    results: list[RuleResult] = []
+    results: list[RuleResult] = [collection_unavailable_rule(active=False)]
 
     for unit_name in CRITICAL_UNITS:
         unit = snapshot.units.get(unit_name)
-        inactive = unit is None or unit.active_state != "active"
+        expected = unit_name == "estrado-pjud.service" or _worker_is_expected(unit)
+        inactive = expected and not _continuous_unit_is_available(unit)
         results.append(
             RuleResult(
                 key=f"unit.inactive:{unit_name}",
@@ -70,6 +72,43 @@ def evaluate_rules(
                 value=unit.active_state if unit else "missing",
             )
         )
+
+    required_continuous_units = (
+        ("legaltech.slice", False),
+        ("legaltech-monitor.timer", True),
+        ("legaltech-resource-tracker.timer", True),
+    )
+    hermes_user_slice = snapshot.hermes_user_slice or next(
+        (
+            name
+            for name in sorted(snapshot.units)
+            if re.fullmatch(r"user-[0-9]+\.slice", name)
+        ),
+        "hermes-user.slice",
+    )
+    required_continuous_units += ((hermes_user_slice, False),)
+    for unit_name, enabled_required in required_continuous_units:
+        unit = snapshot.units.get(unit_name)
+        unavailable = not _continuous_unit_is_available(unit) or (
+            enabled_required
+            and unit is not None
+            and unit.unit_file_state not in {"enabled", "enabled-runtime"}
+        )
+        results.append(_operational_unit_rule(unit_name, unavailable))
+
+    for unit_name in (
+        "legaltech-monitor.service",
+        "legaltech-resource-tracker.service",
+    ):
+        unit = snapshot.units.get(unit_name)
+        unavailable = (
+            unit is None
+            or unit.diagnostic is not None
+            or unit.load_state != "loaded"
+            or unit.active_state in {"failed", "unknown"}
+            or unit.result != "success"
+        )
+        results.append(_operational_unit_rule(unit_name, unavailable))
 
     host = snapshot.host
     available_percent = _percent(host.memory_available_bytes, host.memory_total_bytes)
@@ -212,6 +251,55 @@ def evaluate_rules(
         )
 
     return results
+
+
+def collection_unavailable_rule(*, active: bool = True) -> RuleResult:
+    """Return the stable sanitized rule used when required collection fails."""
+    return RuleResult(
+        key="monitor.collection.unavailable",
+        severity="critical",
+        active=active,
+        persist_for_seconds=0,
+        cooldown_seconds=DEFAULT_COOLDOWN_SECONDS,
+        message=(
+            "Required resource collection is unavailable"
+            if active
+            else "Required resource collection recovered"
+        ),
+        value="unavailable" if active else "available",
+    )
+
+
+def _worker_is_expected(unit: Any) -> bool:
+    return unit is not None and (
+        unit.active_state == "active"
+        or unit.unit_file_state not in {"disabled", "not-found"}
+    )
+
+
+def _continuous_unit_is_available(unit: Any) -> bool:
+    return (
+        unit is not None
+        and unit.diagnostic is None
+        and unit.load_state == "loaded"
+        and unit.active_state == "active"
+    )
+
+
+def _operational_unit_rule(unit_name: str, unavailable: bool) -> RuleResult:
+    return RuleResult(
+        key=f"unit.operational:{unit_name}",
+        severity="critical",
+        active=unavailable,
+        persist_for_seconds=0,
+        cooldown_seconds=DEFAULT_COOLDOWN_SECONDS,
+        message=(
+            f"Required operational unit {unit_name} is unavailable"
+            if unavailable
+            else f"Required operational unit {unit_name} recovered"
+        ),
+        value="unavailable" if unavailable else "available",
+    )
 
 
 def advance_state(

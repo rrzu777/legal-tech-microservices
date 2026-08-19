@@ -29,7 +29,7 @@ is_uint() {
 
 readonly -a OVERRIDE_NAMES=(
   RG_REPO_DIR RG_SYSTEMD_DIR RG_CREDENTIAL_FILE RG_BACKUP_ROOT RG_TMP_ROOT RG_DISK_PATH RG_NULL_FILE
-  RG_MONITORING_DIR RG_MONITOR_ENV_FILE RG_FSTAB_FILE RG_SYSCTL_FILE
+  RG_MONITORING_DIR RG_MONITOR_ENV_FILE RG_FSTAB_FILE RG_SYSCTL_FILE RG_SWAPPINESS_METADATA_FILE
   RG_CADDYFILE RG_LOGROTATE_FILE RG_JURISTRACK_HEALTH_URL
   RG_ESTRADO_HEALTH_URL RG_GIT_BIN RG_DF_BIN RG_FREE_BIN RG_ID_BIN RG_PS_BIN
   RG_SYSTEMCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_STAT_BIN RG_SHA256_BIN
@@ -66,6 +66,7 @@ monitoring_dir=${RG_MONITORING_DIR:-/opt/legaltech-monitoring}
 monitor_env_file=${RG_MONITOR_ENV_FILE:-/etc/legaltech-monitoring.env}
 fstab_file=${RG_FSTAB_FILE:-/etc/fstab}
 sysctl_file=${RG_SYSCTL_FILE:-/etc/sysctl.d/60-legaltech-swap.conf}
+swappiness_metadata_file=${RG_SWAPPINESS_METADATA_FILE:-/etc/sysctl.d/60-legaltech-swap.previous}
 caddyfile=${RG_CADDYFILE:-/etc/caddy/Caddyfile}
 logrotate_file=${RG_LOGROTATE_FILE:-/etc/logrotate.d/legaltech-resources}
 juristrack_health_url=${RG_JURISTRACK_HEALTH_URL:-https://juristrack.cl/}
@@ -97,7 +98,7 @@ root_gid=${RG_TEST_ROOT_GID:-0}
 
 for absolute_value in \
   "$repo_dir" "$systemd_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
-  "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" \
+  "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" \
   "$caddyfile" "$logrotate_file" "$git_bin" "$df_bin" "$free_bin" \
   "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" \
   "$stat_bin" "$sha256_bin" "$find_bin" "$cp_bin" "$rm_bin" \
@@ -227,7 +228,7 @@ validate_managed_source() {
     expected_gid=$("$id_bin" -g estrado 2>"$null_file") || return 1
     is_uint "$expected_gid" || return 1
     [ "$mode" = 640 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$expected_gid" ]
-  elif [ "$path" = "$monitor_env_file" ]; then
+  elif [ "$path" = "$monitor_env_file" ] || [ "$path" = "$swappiness_metadata_file" ]; then
     [ "$mode" = 600 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ]
   else
     [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && safe_read_mode "$mode"
@@ -449,7 +450,7 @@ check_public_health() {
 }
 
 run_preflight() {
-  local uid swap_state
+  local uid swap_state worker_activity
   check_git || { fail 'Git tree or deployed SHA is not exact'; return 1; }
   safe_existing_path "$provision_bin" && [ -x "$provision_bin" ] \
     && safe_existing_path "$swap_bin" && [ -x "$swap_bin" ] \
@@ -459,8 +460,13 @@ run_preflight() {
   uid=$(validate_hermes_inventory) || { fail 'Hermes UID or persistent inventory is unknown'; return 1; }
   [ -n "$uid" ] || { fail 'Hermes UID is unknown'; return 1; }
   check_public_health || { fail 'a public health endpoint is not exactly HTTP 200'; return 1; }
-  prepare_temp_credentials || { fail 'protected Supabase configuration is invalid'; return 1; }
-  check_exact_zero_and_fresh_heartbeat || { fail 'worker heartbeat or exact active-claim count is unsafe'; return 1; }
+  worker_activity=$(read_unit_state system is-active estrado-pjud-worker.service) \
+    || { fail 'worker activity is unknown'; return 1; }
+  if [ "$worker_activity" = active ]; then
+    prepare_temp_credentials || { fail 'protected Supabase configuration is invalid'; return 1; }
+    check_exact_zero_and_fresh_heartbeat \
+      || { fail 'worker heartbeat or exact active-claim count is unsafe'; return 1; }
+  fi
   swap_state=$("$swap_bin" preflight 2>"$null_file") || { fail 'swap preflight is unsafe'; return 1; }
   case "$swap_state" in
     clean) swap_initial_state=clean ;;
@@ -490,6 +496,7 @@ build_managed_paths() {
     "$monitor_env_file"
     "$fstab_file"
     "$sysctl_file"
+    "$swappiness_metadata_file"
     "$logrotate_file"
     "$monitoring_dir"
   )
@@ -515,6 +522,10 @@ tracked_unit_scopes=(system system system system system system user user)
 readonly system_unit_count=6
 desired_enabled_states=()
 desired_active_states=()
+monitor_runtime_units=(legaltech-monitor.service legaltech-resource-tracker.service)
+previous_monitor_pids=()
+previous_monitor_control_groups=()
+previous_monitor_slices=()
 
 scoped_systemctl() { # system|user, arguments...
   local scope=$1
@@ -537,6 +548,7 @@ read_unit_state() { # system|user is-enabled|is-active unit
     is-enabled:enabled:0) printf '%s\n' enabled ;;
     is-enabled:disabled:1) printf '%s\n' disabled ;;
     is-enabled:static:0) printf '%s\n' static ;;
+    is-enabled:not-found:1|is-enabled:not-found:4) printf '%s\n' absent ;;
     is-active:active:0) printf '%s\n' active ;;
     is-active:inactive:3) printf '%s\n' inactive ;;
     *) return 1 ;;
@@ -554,13 +566,64 @@ capture_unit_states() {
   done
 }
 
+read_effective_runtime() { # scope unit -> active|pid|control-group-or--|slice|result
+  local scope=$1 unit=$2 output line key value
+  local active='' pid='' control_group='' effective_slice='' result=''
+  local active_count=0 pid_count=0 control_count=0 slice_count=0 result_count=0
+  output=$(scoped_systemctl "$scope" show "$unit" \
+    --property=ActiveState --property=MainPID --property=ControlGroup \
+    --property=Slice --property=Result 2>"$null_file") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      ActiveState) active_count=$((active_count + 1)); active=$value ;;
+      MainPID) pid_count=$((pid_count + 1)); pid=$value ;;
+      ControlGroup) control_count=$((control_count + 1)); control_group=$value ;;
+      Slice) slice_count=$((slice_count + 1)); effective_slice=$value ;;
+      Result) result_count=$((result_count + 1)); result=$value ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [ "$active_count" -eq 1 ] && [ "$pid_count" -eq 1 ] \
+    && [ "$control_count" -eq 1 ] && [ "$slice_count" -eq 1 ] \
+    && [ "$result_count" -eq 1 ] || return 1
+  case "$active" in active|inactive) ;; *) return 1 ;; esac
+  is_uint "$pid" || return 1
+  case "$control_group" in ''|/*) ;; *) return 1 ;; esac
+  [[ "$effective_slice" =~ ^[A-Za-z0-9_.@:-]+$ ]] || return 1
+  [[ "$result" =~ ^[A-Za-z0-9_.@:-]*$ ]] || return 1
+  [ -n "$control_group" ] || control_group=-
+  printf '%s|%s|%s|%s|%s\n' "$active" "$pid" "$control_group" "$effective_slice" "$result"
+}
+
+capture_monitor_runtime_states() {
+  local unit state runtime active pid control_group effective_slice result
+  for unit in "${monitor_runtime_units[@]}"; do
+    state=$(read_unit_state system is-active "$unit") || return 1
+    runtime=$(read_effective_runtime system "$unit") || return 1
+    IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+    [ "$active" = "$state" ] || return 1
+    if [ "$active" = active ]; then
+      [ "$pid" -gt 0 ] && [ "$control_group" != - ] || return 1
+    else
+      [ "$pid" -eq 0 ] || return 1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$unit" "$active" "$pid" "$control_group" "$effective_slice"
+  done
+}
+
 load_and_validate_unit_states() {
   local unit enabled active extra count=0
   desired_enabled_states=()
   desired_active_states=()
   while IFS=$'\t' read -r unit enabled active extra; do
     [ "$count" -lt "${#tracked_units[@]}" ] && [ "$unit" = "${tracked_units[$count]}" ] || return 1
-    case "$enabled" in enabled|disabled|static) ;; *) return 1 ;; esac
+    case "$enabled" in enabled|disabled|static) ;; absent)
+      case "$unit" in legaltech-monitor.timer|legaltech-resource-tracker.timer) ;; *) return 1 ;; esac
+      [ "$active" = inactive ] || return 1
+      ;; *) return 1 ;; esac
     case "$active" in active|inactive) ;; *) return 1 ;; esac
     [ -z "${extra:-}" ] || return 1
     desired_enabled_states+=("$enabled")
@@ -568,6 +631,33 @@ load_and_validate_unit_states() {
     count=$((count + 1))
   done < "$backup_dir/unit-states.tsv"
   [ "$count" -eq "${#tracked_units[@]}" ]
+}
+
+load_and_validate_monitor_runtime() {
+  local unit active pid control_group effective_slice extra count=0 unit_index
+  previous_monitor_pids=()
+  previous_monitor_control_groups=()
+  previous_monitor_slices=()
+  while IFS=$'\t' read -r unit active pid control_group effective_slice extra; do
+    [ "$count" -lt "${#monitor_runtime_units[@]}" ] \
+      && [ "$unit" = "${monitor_runtime_units[$count]}" ] || return 1
+    unit_index=$((count + 2))
+    [ "$active" = "${desired_active_states[$unit_index]}" ] || return 1
+    is_uint "$pid" || return 1
+    case "$control_group" in -|/*) ;; *) return 1 ;; esac
+    [[ "$effective_slice" =~ ^[A-Za-z0-9_.@:-]+$ ]] || return 1
+    [ -z "${extra:-}" ] || return 1
+    if [ "$active" = active ]; then
+      [ "$pid" -gt 0 ] && [ "$control_group" != - ] || return 1
+    else
+      [ "$pid" -eq 0 ] || return 1
+    fi
+    previous_monitor_pids+=("$pid")
+    previous_monitor_control_groups+=("$control_group")
+    previous_monitor_slices+=("$effective_slice")
+    count=$((count + 1))
+  done < "$backup_dir/monitor-runtime.tsv"
+  [ "$count" -eq "${#monitor_runtime_units[@]}" ]
 }
 
 validate_root_path() { # path mode
@@ -625,13 +715,16 @@ create_backup() {
   printf '%s\n' "$expected_sha" > "$backup_dir/expected-sha" || return 1
   : > "$backup_dir/changes" || return 1
   capture_unit_states > "$backup_dir/unit-states.tsv" || return 1
+  capture_monitor_runtime_states > "$backup_dir/monitor-runtime.tsv" || return 1
   if [ "${swap_initial_state:-unknown}" = managed ]; then
     printf '%s\n' preexisting > "$backup_dir/swap-state" || return 1
   else
     printf '%s\n' 'not-attempted' > "$backup_dir/swap-state" || return 1
   fi
-  "$chmod_bin" 0600 "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" "$backup_dir/unit-states.tsv" || return 1
-  "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" "$backup_dir/unit-states.tsv" || return 1
+  "$chmod_bin" 0600 "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" \
+    "$backup_dir/unit-states.tsv" "$backup_dir/monitor-runtime.tsv" || return 1
+  "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" \
+    "$backup_dir/unit-states.tsv" "$backup_dir/monitor-runtime.tsv" || return 1
   printf '%s\n' "$backup_dir"
 }
 
@@ -742,6 +835,8 @@ validate_backup_dir() {
   [ -z "$expected_sha" ] || [ "$stored_sha" = "$expected_sha" ] || return 1
   [ -f "$1/unit-states.tsv" ] && [ ! -L "$1/unit-states.tsv" ] || return 1
   validate_root_path "$1/unit-states.tsv" 600 || return 1
+  [ -f "$1/monitor-runtime.tsv" ] && [ ! -L "$1/monitor-runtime.tsv" ] || return 1
+  validate_root_path "$1/monitor-runtime.tsv" 600 || return 1
 }
 
 validate_manifest() {
@@ -785,12 +880,14 @@ validate_manifest() {
 
 load_and_validate_changes() {
   local change
-  changed_api=0 changed_worker=0 changed_hermes=0
+  changed_api=0 changed_worker=0 changed_hermes=0 changed_monitor=0 changed_tracker=0
   while IFS= read -r change || [ -n "$change" ]; do
     case "$change" in
       api) [ "$changed_api" -eq 0 ] || return 1; changed_api=1 ;;
       worker) [ "$changed_worker" -eq 0 ] || return 1; changed_worker=1 ;;
       hermes) [ "$changed_hermes" -eq 0 ] || return 1; changed_hermes=1 ;;
+      monitor) [ "$changed_monitor" -eq 0 ] || return 1; changed_monitor=1 ;;
+      tracker) [ "$changed_tracker" -eq 0 ] || return 1; changed_tracker=1 ;;
       '') ;;
       *) return 1 ;;
     esac
@@ -802,7 +899,8 @@ restore_manifest() { # skip swap-owned fstab/sysctl when swap rollback was unsaf
   local rc=0
   while IFS=$'\t' read -r path existed rel mode owner group extra; do
     [ -n "$path" ] && [ -z "${extra:-}" ] && is_managed_path "$path" || { rc=1; continue; }
-    if [ "$skip_swap" -eq 1 ] && { [ "$path" = "$fstab_file" ] || [ "$path" = "$sysctl_file" ]; }; then continue; fi
+    if [ "$skip_swap" -eq 1 ] && { [ "$path" = "$fstab_file" ] \
+      || [ "$path" = "$sysctl_file" ] || [ "$path" = "$swappiness_metadata_file" ]; }; then continue; fi
     case "$existed" in
       1)
         case "$rel" in entries/[0-9][0-9][0-9][0-9]) ;; *) rc=1; continue ;; esac
@@ -844,6 +942,9 @@ restore_enabled_state() { # system|user unit enabled|disabled|static
   local scope=$1 unit=$2 desired=$3 current action
   current=$(read_unit_state "$scope" is-enabled "$unit") || return 1
   case "$desired" in
+    absent)
+      [ "$current" = absent ] || return 1
+      ;;
     static)
       [ "$current" = static ] || return 1
       ;;
@@ -884,6 +985,13 @@ restore_unit_states() {
         else
           rc=1
         fi
+      elif [ "$current" = active ]; then
+        "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
+      fi
+    elif { [ "$unit" = legaltech-monitor.service ] && [ "$changed_monitor" -eq 1 ]; } \
+      || { [ "$unit" = legaltech-resource-tracker.service ] && [ "$changed_tracker" -eq 1 ]; }; then
+      if [ "$desired" = active ]; then
+        "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
       elif [ "$current" = active ]; then
         "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
       fi
@@ -937,6 +1045,7 @@ do_rollback() {
   validate_manifest || { fail 'rollback manifest is unsafe or invalid'; return 1; }
   load_and_validate_changes || { fail 'rollback affected-unit metadata is invalid'; return 1; }
   load_and_validate_unit_states || { fail 'rollback live-unit metadata is invalid'; return 1; }
+  load_and_validate_monitor_runtime || { fail 'rollback monitor runtime metadata is invalid'; return 1; }
   swap_state=$(<"$backup_dir/swap-state")
   case "$swap_state" in
     attempted)
@@ -963,29 +1072,84 @@ automatic_rollback() {
   do_rollback "$backup_dir"
 }
 
+stop_legacy_monitor_if_changed() { # change-flag monitor-array-index system-unit-index
+  local changed=$1 monitor_index=$2 system_index=$3 unit current
+  [ "$changed" -eq 1 ] || return 0
+  unit=${monitor_runtime_units[$monitor_index]}
+  [ "${desired_active_states[$system_index]}" = active ] || return 0
+  "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || return 1
+  current=$(read_unit_state system is-active "$unit") || return 1
+  [ "$current" = inactive ]
+}
+
+old_pid_is_gone() {
+  local pid=$1 output rc
+  [ "$pid" -gt 0 ] || return 0
+  if output=$("$ps_bin" -p "$pid" -o unit= 2>"$null_file"); then
+    return 1
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] && [ -z "$output" ]
+}
+
+verify_monitor_migration() { # change-flag monitor-array-index
+  local changed=$1 monitor_index=$2 unit runtime active pid control_group effective_slice result old_pid
+  [ "$changed" -eq 1 ] || return 0
+  unit=${monitor_runtime_units[$monitor_index]}
+  runtime=$(read_effective_runtime system "$unit") || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  [ "$active" = inactive ] && [ "$pid" -eq 0 ] \
+    && [ "$control_group" = - ] && [ "$effective_slice" = system.slice ] \
+    && [ "$result" = success ] || return 1
+  old_pid=${previous_monitor_pids[$monitor_index]}
+  old_pid_is_gone "$old_pid"
+}
+
 run_apply_steps() {
-  local uid=$1 api_path worker_path worker_dropin_path hermes_path before_api before_worker before_worker_dropin before_hermes
-  local after_api after_worker after_worker_dropin after_hermes provision_rc=0
+  local uid=$1 api_path worker_path worker_dropin_path hermes_path monitor_path tracker_path
+  local monitor_source tracker_source before_api before_worker before_worker_dropin before_hermes before_monitor before_tracker
+  local desired_monitor desired_tracker after_api after_worker after_worker_dropin after_hermes after_monitor after_tracker
+  local monitor_will_change=0 tracker_will_change=0 provision_rc=0
   api_path="$systemd_dir/estrado-pjud.service"
   worker_path="$systemd_dir/estrado-pjud-worker.service"
   worker_dropin_path="$systemd_dir/estrado-pjud-worker.service.d/xvfb.conf"
   hermes_path="$systemd_dir/user-$uid.slice.d/50-legaltech-resource-limits.conf"
+  monitor_path="$systemd_dir/legaltech-monitor.service"
+  tracker_path="$systemd_dir/legaltech-resource-tracker.service"
+  monitor_source="$repo_dir/ops/systemd/legaltech-monitor.service"
+  tracker_source="$repo_dir/ops/systemd/legaltech-resource-tracker.service"
   before_api=$(digest_path "$api_path") || return 1
   before_worker=$(digest_path "$worker_path") || return 1
   before_worker_dropin=$(digest_path "$worker_dropin_path") || return 1
   before_hermes=$(digest_path "$hermes_path") || return 1
+  before_monitor=$(digest_path "$monitor_path") || return 1
+  before_tracker=$(digest_path "$tracker_path") || return 1
+  desired_monitor=$(digest_path "$monitor_source") || return 1
+  desired_tracker=$(digest_path "$tracker_source") || return 1
+  [ "$before_monitor" = "$desired_monitor" ] || monitor_will_change=1
+  [ "$before_tracker" = "$desired_tracker" ] || tracker_will_change=1
   create_backup "$uid" >"$null_file" || return 1
-  validate_backup_dir "$backup_dir" && validate_manifest && load_and_validate_unit_states || return 1
+  validate_backup_dir "$backup_dir" && validate_manifest \
+    && load_and_validate_unit_states && load_and_validate_monitor_runtime || return 1
   check_git || return 1
+  if [ "$monitor_will_change" -eq 1 ]; then record_change monitor || return 1; fi
+  if [ "$tracker_will_change" -eq 1 ]; then record_change tracker || return 1; fi
   mutation_started=1
+  stop_legacy_monitor_if_changed "$monitor_will_change" 0 2 || return 1
+  stop_legacy_monitor_if_changed "$tracker_will_change" 1 3 || return 1
   PROV_ENABLE_PJUD_WORKER=0 PROV_SKIP_CADDY=1 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
   after_api=$(digest_path "$api_path") || return 1
   after_worker=$(digest_path "$worker_path") || return 1
   after_worker_dropin=$(digest_path "$worker_dropin_path") || return 1
   after_hermes=$(digest_path "$hermes_path") || return 1
+  after_monitor=$(digest_path "$monitor_path") || return 1
+  after_tracker=$(digest_path "$tracker_path") || return 1
   if [ "$before_api" != "$after_api" ]; then record_change api || return 1; fi
   if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then record_change worker || return 1; fi
   if [ "$before_hermes" != "$after_hermes" ]; then record_change hermes || return 1; fi
+  [ "$after_monitor" = "$desired_monitor" ] || return 1
+  [ "$after_tracker" = "$desired_tracker" ] || return 1
   [ "$provision_rc" -eq 0 ] || return 1
   if [ "${swap_initial_state:-unknown}" = clean ]; then
     printf '%s\n' attempted > "$backup_dir/swap-state" || return 1
@@ -993,14 +1157,37 @@ run_apply_steps() {
   "$swap_bin" apply >"$null_file" 2>&1 || return 1
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || return 1
-  if [ "$before_api" != "$after_api" ]; then "$systemctl_bin" restart estrado-pjud.service >"$null_file" 2>&1 || return 1; fi
+  verify_monitor_migration "$monitor_will_change" 0 || return 1
+  verify_monitor_migration "$tracker_will_change" 1 || return 1
+  if [ "$before_api" != "$after_api" ]; then
+    if [ "${desired_active_states[0]}" = active ]; then
+      [ "$(read_unit_state system is-active estrado-pjud.service)" = active ] || return 1
+      "$systemctl_bin" restart estrado-pjud.service >"$null_file" 2>&1 || return 1
+    else
+      [ "$(read_unit_state system is-active estrado-pjud.service)" = inactive ] || return 1
+    fi
+  fi
   if [ "$before_hermes" != "$after_hermes" ]; then
-    "$systemctl_bin" --user --machine=hermes@.host restart \
-      hermes-gateway.service hermes-dashboard.service >"$null_file" 2>&1 || return 1
+    local hermes_index hermes_unit hermes_activity
+    for ((hermes_index = system_unit_count; hermes_index < ${#tracked_units[@]}; hermes_index++)); do
+      hermes_unit=${tracked_units[$hermes_index]}
+      hermes_activity=$(read_unit_state user is-active "$hermes_unit") || return 1
+      if [ "${desired_active_states[$hermes_index]}" = active ]; then
+        [ "$hermes_activity" = active ] || return 1
+        scoped_systemctl user restart "$hermes_unit" >"$null_file" 2>&1 || return 1
+      else
+        [ "$hermes_activity" = inactive ] || return 1
+      fi
+    done
   fi
   if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then
-    check_exact_zero_and_fresh_heartbeat || return 1
-    "$systemctl_bin" restart estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+    if [ "${desired_active_states[1]}" = active ]; then
+      [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = active ] || return 1
+      check_exact_zero_and_fresh_heartbeat || return 1
+      "$systemctl_bin" restart estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+    else
+      [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
+    fi
   fi
   "$systemctl_bin" start legaltech-monitor.timer legaltech-resource-tracker.timer >"$null_file" 2>&1 || return 1
   "$python_bin" "$monitoring_dir/resource-tracker.py" --once >"$null_file" 2>&1 || return 1

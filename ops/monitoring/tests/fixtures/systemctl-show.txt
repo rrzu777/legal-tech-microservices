@@ -1,5 +1,8 @@
+LoadState=loaded
+UnitFileState=enabled
 ActiveState=active
 SubState=running
+Result=success
 MemoryCurrent=1048576
 MemoryPeak=2097152
 MemoryHigh=max

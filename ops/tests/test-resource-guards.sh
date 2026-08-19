@@ -69,7 +69,7 @@ setup() {
   STATE="$CASE_DIR/state"
   BIN="$CASE_DIR/bin"
   EVENTS="$STATE/events"
-  mkdir -p "$FAKE/repo/estrado-pjud-service" "$FAKE/systemd" "$CASE_DIR/tmp" \
+  mkdir -p "$FAKE/repo/estrado-pjud-service" "$FAKE/repo/ops/systemd" "$FAKE/systemd" "$CASE_DIR/tmp" \
     "$FAKE/etc/sysctl.d" "$FAKE/etc/caddy" "$FAKE/etc/logrotate.d" \
     "$FAKE/monitoring" "$FAKE/backups" "$STATE" "$BIN"
   chmod 700 "$FAKE/backups"
@@ -91,6 +91,8 @@ setup() {
     legaltech-monitor.timer legaltech-resource-tracker.timer; do
     printf 'original %s\n' "$file" > "$FAKE/systemd/$file"
   done
+  cp "$FAKE/systemd/legaltech-monitor.service" "$FAKE/repo/ops/systemd/legaltech-monitor.service"
+  cp "$FAKE/systemd/legaltech-resource-tracker.service" "$FAKE/repo/ops/systemd/legaltech-resource-tracker.service"
   mkdir -p "$FAKE/systemd/estrado-pjud-worker.service.d" \
     "$FAKE/systemd/user-1002.slice.d"
   printf 'original xvfb\n' > "$FAKE/systemd/estrado-pjud-worker.service.d/xvfb.conf"
@@ -99,6 +101,7 @@ setup() {
   chmod 600 "$FAKE/monitoring.env"
   printf 'UUID=root / ext4 defaults 0 1\n' > "$FAKE/etc/fstab"
   printf 'old sysctl\n' > "$FAKE/etc/sysctl.d/60-legaltech-swap.conf"
+  SWAPPINESS_METADATA_FILE="$FAKE/etc/sysctl.d/60-legaltech-swap.previous"
   printf 'old caddy\n' > "$FAKE/etc/caddy/Caddyfile"
   printf 'old logrotate\n' > "$FAKE/etc/logrotate.d/legaltech-resources"
   printf 'old monitor\n' > "$FAKE/monitoring/monitor.py"
@@ -112,6 +115,10 @@ setup() {
   for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
     printf '%s\n' disabled > "$STATE/unit-$unit-enabled"
     printf '%s\n' inactive > "$STATE/unit-$unit-active"
+    printf '%s\n' 0 > "$STATE/unit-$unit-main-pid"
+    : > "$STATE/unit-$unit-control-group"
+    printf '%s\n' system.slice > "$STATE/unit-$unit-slice"
+    printf '%s\n' success > "$STATE/unit-$unit-result"
   done
   for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
     printf '%s\n' enabled > "$STATE/unit-$unit-enabled"
@@ -156,6 +163,14 @@ esac
 EOF
   write_stub ps <<'EOF'
 [ ! -e "$RG_TEST_STATE/ps-fail" ] || exit 1
+if [ "${1:-}" = -p ]; then
+  pid=${2:-}
+  [ "${3:-}" = -o ] && [ "${4:-}" = unit= ] || exit 1
+  printf 'ps pid=%s\n' "$pid" >> "$RG_TEST_STATE/events"
+  [ -f "$RG_TEST_STATE/pid-$pid-unit" ] || exit 1
+  cat "$RG_TEST_STATE/pid-$pid-unit"
+  exit 0
+fi
 printf '%s\n' 'user@1002.service hermes-gateway.service' 'user@1002.service hermes-dashboard.service'
 EOF
   write_stub systemctl <<'EOF'
@@ -190,6 +205,7 @@ if [ "${1:-}" = --user ]; then
           enabled) exit 0 ;;
           static) [ ! -e "$RG_TEST_STATE/static-status-fail" ] ;;
           disabled) exit 1 ;;
+          not-found) exit 1 ;;
           *) exit 4 ;;
         esac
       else
@@ -227,7 +243,7 @@ if [ "${1:-}" = show ]; then
     case "$unit" in hermes-*) printf '%s\n' hermes ;; *) printf '\n' ;; esac
     exit 0
   fi
-  [ ! -e "$RG_TEST_STATE/postflight-fail" ] || exit 1
+  if [ -e "$RG_TEST_STATE/postflight-fail" ] && [ -e "$RG_TEST_STATE/postflight-armed" ]; then exit 1; fi
   property_value() {
   if [ -e "$RG_TEST_STATE/property-bad" ]; then
     bad_key=$(cat "$RG_TEST_STATE/property-bad")
@@ -263,7 +279,11 @@ if [ "${1:-}" = show ]; then
     user-1002.slice:MemoryMax) echo 2621440000 ;;
     user-1002.slice:TasksMax) echo 1024 ;;
     user-1002.slice:CPUWeight) echo 200 ;;
-    legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) echo system.slice ;;
+    legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) cat "$RG_TEST_STATE/unit-$unit-slice" ;;
+    legaltech-monitor.service:MainPID|legaltech-resource-tracker.service:MainPID) cat "$RG_TEST_STATE/unit-$unit-main-pid" ;;
+    legaltech-monitor.service:ControlGroup|legaltech-resource-tracker.service:ControlGroup) cat "$RG_TEST_STATE/unit-$unit-control-group" ;;
+    legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
+    legaltech-monitor.service:Result|legaltech-resource-tracker.service:Result) cat "$RG_TEST_STATE/unit-$unit-result" ;;
     legaltech-monitor.service:Type|legaltech-resource-tracker.service:Type) echo oneshot ;;
     legaltech-monitor.service:User|legaltech-resource-tracker.service:User) echo root ;;
     legaltech-monitor.service:WorkingDirectory|legaltech-resource-tracker.service:WorkingDirectory) echo /opt/legaltech-monitoring ;;
@@ -308,6 +328,7 @@ case "${1:-}" in
         enabled) exit 0 ;;
         static) [ ! -e "$RG_TEST_STATE/static-status-fail" ] ;;
         disabled) exit 1 ;;
+        not-found) exit 1 ;;
         *) exit 4 ;;
       esac
     else
@@ -326,9 +347,42 @@ case "${1:-}" in
   start|stop|restart)
     action=$1; shift
     case "$action" in stop) value=inactive ;; *) value=active ;; esac
-    for unit in "$@"; do [ "$unit" = -- ] || printf '%s\n' "$value" > "$(state_file "$unit" active)"; done
+    for unit in "$@"; do
+      [ "$unit" = -- ] && continue
+      printf '%s\n' "$value" > "$(state_file "$unit" active)"
+      case "$unit" in
+        legaltech-monitor.service|legaltech-resource-tracker.service)
+          old_pid=$(cat "$RG_TEST_STATE/unit-$unit-main-pid") || exit 1
+          case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
+          if [ "$value" = active ]; then
+            case "$unit" in legaltech-monitor.service) new_pid=5101 ;; *) new_pid=5102 ;; esac
+            printf '%s\n' "$new_pid" > "$RG_TEST_STATE/unit-$unit-main-pid"
+            printf '/%s/%s\n' "$(cat "$RG_TEST_STATE/unit-$unit-slice")" "$unit" > "$RG_TEST_STATE/unit-$unit-control-group"
+            printf '%s\n' "$unit" > "$RG_TEST_STATE/pid-$new_pid-unit"
+          else
+            printf '%s\n' 0 > "$RG_TEST_STATE/unit-$unit-main-pid"
+            : > "$RG_TEST_STATE/unit-$unit-control-group"
+          fi
+          ;;
+      esac
+    done
     ;;
-  daemon-reload) exit 0 ;;
+  daemon-reload)
+    for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+      if grep -q '^changed monitor definition$' "$RG_SYSTEMD_DIR/$unit" 2>/dev/null; then
+        printf '%s\n' system.slice > "$RG_TEST_STATE/unit-$unit-slice"
+      elif grep -q '^legacy monitor definition$' "$RG_SYSTEMD_DIR/$unit" 2>/dev/null; then
+        printf '%s\n' legaltech.slice > "$RG_TEST_STATE/unit-$unit-slice"
+      fi
+    done
+    for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+      if [ ! -e "$RG_SYSTEMD_DIR/$unit" ]; then
+        printf '%s\n' not-found > "$RG_TEST_STATE/unit-$unit-enabled"
+        printf '%s\n' inactive > "$RG_TEST_STATE/unit-$unit-active"
+      fi
+    done
+    exit 0
+    ;;
   *) exit 1 ;;
 esac
 EOF
@@ -431,6 +485,11 @@ for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
   [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = static ] || printf '%s\n' disabled > "$RG_TEST_STATE/unit-$unit-enabled"
 done
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-estrado-pjud.service-enabled"
+for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+  if [ ! -e "$RG_SYSTEMD_DIR/$timer" ]; then
+    printf 'new %s\n' "$timer" > "$RG_SYSTEMD_DIR/$timer"
+  fi
+done
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-monitor.timer-enabled"
 printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-resource-tracker.timer-enabled"
 if [ -f "$RG_TEST_STATE/hermes-enabled-after-provision" ]; then
@@ -444,9 +503,16 @@ case "${RG_TEST_MUTATE:-none}" in
     printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service"
     printf 'changed worker\n' >> "$RG_SYSTEMD_DIR/estrado-pjud-worker.service"
     printf 'changed hermes\n' >> "$RG_SYSTEMD_DIR/user-1002.slice.d/50-legaltech-resource-limits.conf"
+    cp "$RG_REPO_DIR/ops/systemd/legaltech-monitor.service" "$RG_SYSTEMD_DIR/legaltech-monitor.service"
+    cp "$RG_REPO_DIR/ops/systemd/legaltech-resource-tracker.service" "$RG_SYSTEMD_DIR/legaltech-resource-tracker.service"
     ;;
   api) printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service" ;;
   dropin) printf 'changed xvfb\n' >> "$RG_SYSTEMD_DIR/estrado-pjud-worker.service.d/xvfb.conf" ;;
+  hermes) printf 'changed hermes\n' >> "$RG_SYSTEMD_DIR/user-1002.slice.d/50-legaltech-resource-limits.conf" ;;
+  monitors)
+    cp "$RG_REPO_DIR/ops/systemd/legaltech-monitor.service" "$RG_SYSTEMD_DIR/legaltech-monitor.service"
+    cp "$RG_REPO_DIR/ops/systemd/legaltech-resource-tracker.service" "$RG_SYSTEMD_DIR/legaltech-resource-tracker.service"
+    ;;
 esac
 if [ -e "$RG_TEST_STATE/mutate-outside" ]; then printf 'outside changed\n' > "$RG_TEST_OUTSIDE"; fi
 if [ -e "$RG_TEST_STATE/create-sysctl" ]; then printf 'new sysctl\n' > "$RG_SYSCTL_FILE"; fi
@@ -462,6 +528,10 @@ if [ "$1" = preflight ]; then
 fi
 if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-apply-fail" ]; then exit 1; fi
 if [ "$1" = apply ]; then : > "$RG_TEST_STATE/swap-applied"; fi
+if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/create-swap-metadata" ]; then
+  printf '%s\n' 60 > "$RG_SWAPPINESS_METADATA_FILE"
+  chmod 600 "$RG_SWAPPINESS_METADATA_FILE"
+fi
 if [ "$1" = verify ]; then
   [ ! -e "$RG_TEST_STATE/swap-verify-fail" ] || exit 1
   [ ! -e "$RG_TEST_STATE/swap-live-drift" ] || exit 1
@@ -470,6 +540,7 @@ fi
 if [ "$1" = rollback ]; then
   [ ! -e "$RG_TEST_STATE/swap-rollback-fail" ] || exit 1
   rm -f "$RG_TEST_STATE/swap-applied"
+  rm -f "$RG_SWAPPINESS_METADATA_FILE"
 fi
 exit 0
 EOF
@@ -490,15 +561,22 @@ if [ "${target##*/}" = manifest.tsv ] && [ -f "$RG_TEST_STATE/corrupt-backup" ];
     metadata) /bin/chmod 0666 "${target%/*}/entries/0001" ;;
   esac
 fi
-if [ "${target##*/}" = unit-states.tsv ] && [ -e "$RG_TEST_STATE/corrupt-live-state" ]; then
-  /usr/bin/sed '$d' "$target" > "$target.tmp" && /bin/mv "$target.tmp" "$target"
+if [ -e "$RG_TEST_STATE/corrupt-live-state" ]; then
+  for candidate in "$@"; do
+    if [ "${candidate##*/}" = unit-states.tsv ]; then
+      /usr/bin/sed '$d' "$candidate" > "$candidate.tmp" && /bin/mv "$candidate.tmp" "$candidate"
+    fi
+  done
 fi
 EOF
   write_stub python <<'EOF'
 printf 'python %s\n' "$*" >> "$RG_TEST_STATE/events"
 case "$*" in
   *resource-tracker.py*) [ ! -e "$RG_TEST_STATE/tracker-fail" ] || exit 1 ;;
-  *monitor.py*) [ ! -e "$RG_TEST_STATE/monitor-fail" ] || exit 1 ;;
+  *monitor.py*)
+    [ ! -e "$RG_TEST_STATE/monitor-fail" ] || exit 1
+    [ ! -e "$RG_TEST_STATE/postflight-fail" ] || : > "$RG_TEST_STATE/postflight-armed"
+    ;;
 esac
 exit 0
 EOF
@@ -525,7 +603,7 @@ else
     *) /bin/chmod 644 "$destination" ;;
   esac
 fi
-if [ -e "$RG_TEST_STATE/sha-after-backup" ] && [ "${destination##*/}" = 0015 ]; then
+if [ -e "$RG_TEST_STATE/sha-after-backup" ] && [ "${destination##*/}" = 0016 ]; then
   printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$RG_TEST_STATE/git-sha"
 fi
 EOF
@@ -537,6 +615,17 @@ EOF
 }
 
 run_guard() {
+  local monitor_unit
+  for monitor_unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+    cp "$FAKE/systemd/$monitor_unit" "$FAKE/repo/ops/systemd/$monitor_unit"
+  done
+  case "${TEST_MUTATE:-none}" in
+    all|monitors)
+      for monitor_unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+        printf 'changed monitor definition\n' >> "$FAKE/repo/ops/systemd/$monitor_unit"
+      done
+      ;;
+  esac
   set +e
   OUT=$(env \
     RG_TEST_MODE=1 RG_TEST_STATE="$STATE" RG_TEST_OUTSIDE="$FAKE/outside" \
@@ -546,6 +635,7 @@ run_guard() {
     RG_BACKUP_ROOT="$FAKE/backups" RG_MONITORING_DIR="$FAKE/monitoring" \
     RG_MONITOR_ENV_FILE="$FAKE/monitoring.env" RG_FSTAB_FILE="$FAKE/etc/fstab" \
     RG_SYSCTL_FILE="$FAKE/etc/sysctl.d/60-legaltech-swap.conf" \
+    RG_SWAPPINESS_METADATA_FILE="$SWAPPINESS_METADATA_FILE" \
     RG_CADDYFILE="$FAKE/etc/caddy/Caddyfile" \
     RG_LOGROTATE_FILE="$FAKE/etc/logrotate.d/legaltech-resources" \
     RG_JURISTRACK_HEALTH_URL=https://juristrack.cl/ \
@@ -577,6 +667,222 @@ reset_preflight_state() {
   unset TEST_DISK_BYTES TEST_RAM_BYTES
 }
 
+configure_active_worker() {
+  printf '%s\n' enabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
+  printf '%s\n' active > "$STATE/unit-estrado-pjud-worker.service-active"
+}
+
+configure_active_legacy_monitors() {
+  local unit pid
+  for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+    case "$unit" in legaltech-monitor.service) pid=4101 ;; *) pid=4102 ;; esac
+    printf '%s\n' enabled > "$STATE/unit-$unit-enabled"
+    printf '%s\n' active > "$STATE/unit-$unit-active"
+    printf '%s\n' "$pid" > "$STATE/unit-$unit-main-pid"
+    printf '/legaltech.slice/%s\n' "$unit" > "$STATE/unit-$unit-control-group"
+    printf '%s\n' legaltech.slice > "$STATE/unit-$unit-slice"
+    printf '%s\n' "$unit" > "$STATE/pid-$pid-unit"
+    printf 'legacy monitor definition\n' >> "$FAKE/systemd/$unit"
+  done
+}
+
+run_legacy_monitor_migration_regression() {
+  local backup_path unit pid
+  echo '== changed active legacy monitors migrate by exact unit and roll back exactly'
+  setup
+  configure_active_legacy_monitors
+  TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'legacy monitor migration apply succeeds' "$RC" 0
+  for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+    case "$unit" in legaltech-monitor.service) pid=4101 ;; *) pid=4102 ;; esac
+    expect_exact_count "migration stops exact $unit once" "systemctl stop $unit" 1
+    expect_eq "migrated $unit is inactive before timer operation" \
+      "$(cat "$STATE/unit-$unit-active")" inactive
+    if [ ! -e "$STATE/pid-$pid-unit" ]; then
+      ok "legacy PID $pid is absent"
+    else
+      bad "legacy PID $pid is absent"
+    fi
+    expect_before "legacy $unit stops before timers are started" \
+      "systemctl stop $unit" 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer'
+    expect_before "old PID $pid is checked before timers are started" \
+      "ps pid=$pid" 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer'
+  done
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  expect_eq 'backup captures both legacy monitor runtime rows' \
+    "$(wc -l < "$backup_path/monitor-runtime.tsv" 2>/dev/null | tr -d ' ')" 2
+
+  setup
+  configure_active_legacy_monitors
+  : > "$STATE/health-after-first"
+  TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'later failure keeps apply failed after monitor rollback' "$RC" 1
+  for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+    expect_eq "rollback restores $unit enabled" "$(cat "$STATE/unit-$unit-enabled")" enabled
+    expect_eq "rollback restores $unit active" "$(cat "$STATE/unit-$unit-active")" active
+    expect_exact_count "rollback restarts restored legacy $unit once" "systemctl restart $unit" 1
+  done
+  expect_contains 'legacy monitor rollback reports complete' "$OUT" 'ROLLBACK OK'
+}
+
+run_activity_preservation_regressions() {
+  echo '== changed units preserve captured activity independently'
+  setup
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'changed inactive worker apply succeeds' "$RC" 0
+  expect_eq 'changed inactive worker remains inactive' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" inactive
+  expect_count 'changed inactive worker is never restarted' \
+    'systemctl restart estrado-pjud-worker.service' 0
+  expect_count 'changed inactive worker requires no heartbeat query' 'curl heartbeat' 0
+  expect_count 'changed inactive worker requires no claims query' 'curl claims' 0
+
+  setup
+  printf '%s\n' enabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
+  printf '%s\n' active > "$STATE/unit-estrado-pjud-worker.service-active"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'changed active worker apply succeeds' "$RC" 0
+  expect_exact_count 'changed active worker restarts once' \
+    'systemctl restart estrado-pjud-worker.service' 1
+  expect_count 'changed active worker keeps preflight and immediate heartbeat gates' \
+    'curl heartbeat' 2
+  expect_count 'changed active worker keeps preflight and immediate claims gates' \
+    'curl claims' 2
+
+  setup
+  printf '%s\n' inactive > "$STATE/unit-estrado-pjud.service-active"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'changed inactive API apply succeeds' "$RC" 0
+  expect_eq 'changed inactive API remains inactive' \
+    "$(cat "$STATE/unit-estrado-pjud.service-active")" inactive
+  expect_count 'changed inactive API is never restarted' 'systemctl restart estrado-pjud.service' 0
+
+  setup
+  printf '%s\n' active > "$STATE/user-unit-hermes-gateway.service-active"
+  printf '%s\n' inactive > "$STATE/user-unit-hermes-dashboard.service-active"
+  TEST_MUTATE=hermes run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'mixed Hermes activity apply succeeds' "$RC" 0
+  expect_exact_count 'active Hermes gateway restarts individually' \
+    'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 1
+  expect_count 'inactive Hermes dashboard receives no restart' \
+    'restart hermes-dashboard.service' 0
+  expect_count 'inactive Hermes dashboard receives no start' \
+    'systemctl --user --machine=hermes@.host start hermes-dashboard.service' 0
+  expect_eq 'inactive Hermes dashboard remains inactive' \
+    "$(cat "$STATE/user-unit-hermes-dashboard.service-active")" inactive
+}
+
+configure_absent_timer_base() {
+  local timer
+  for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+    rm -f "$FAKE/systemd/$timer"
+    printf '%s\n' not-found > "$STATE/unit-$timer-enabled"
+    printf '%s\n' inactive > "$STATE/unit-$timer-active"
+  done
+}
+
+run_absent_timer_regressions() {
+  local timer
+  echo '== first rollout supports truly absent timer units and restores absence'
+  setup
+  configure_absent_timer_base
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'apply from absent timer base succeeds' "$RC" 0
+  for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+    if [ -f "$FAKE/systemd/$timer" ]; then ok "$timer is created"; else bad "$timer is created"; fi
+    expect_eq "$timer becomes enabled" "$(cat "$STATE/unit-$timer-enabled")" enabled
+    expect_eq "$timer becomes active" "$(cat "$STATE/unit-$timer-active")" active
+  done
+
+  setup
+  configure_absent_timer_base
+  : > "$STATE/health-after-first"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'later failure rolls first rollout back' "$RC" 1
+  for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+    if [ ! -e "$FAKE/systemd/$timer" ]; then ok "$timer file is restored absent"; else bad "$timer file is restored absent"; fi
+    expect_eq "$timer enablement verifies not-found" "$(cat "$STATE/unit-$timer-enabled")" not-found
+    expect_eq "$timer activity verifies inactive" "$(cat "$STATE/unit-$timer-active")" inactive
+    expect_count "rollback never disables absent $timer" "systemctl disable $timer" 0
+    expect_count "rollback never stops absent $timer" "systemctl stop $timer" 0
+  done
+  expect_contains 'absent timer rollback reports complete' "$OUT" 'ROLLBACK OK'
+
+  setup
+  configure_absent_timer_base
+  printf '%s\n' active > "$STATE/unit-legaltech-monitor.timer-active"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'contradictory absent active timer refuses apply' "$RC" 1
+  expect_count 'contradictory absent active timer runs no provision' provision 0
+}
+
+run_swappiness_namespace_regressions() {
+  local backup_path
+  echo '== resource guard manifest owns exact swappiness metadata namespace'
+  setup
+  : > "$STATE/create-swap-metadata"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'apply with managed swappiness metadata succeeds' "$RC" 0
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  expect_eq 'manifest declares exact swappiness metadata path once' \
+    "$(grep -cF "$SWAPPINESS_METADATA_FILE" "$backup_path/manifest.tsv" 2>/dev/null || true)" 1
+  expect_eq 'manifest expands by exactly one managed path' \
+    "$(wc -l < "$backup_path/manifest.tsv" | tr -d ' ')" 16
+
+  setup
+  printf '%s\n' 60 > "$SWAPPINESS_METADATA_FILE"
+  chmod 0644 "$SWAPPINESS_METADATA_FILE"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'unsafe pre-existing swappiness metadata refuses apply' "$RC" 1
+  expect_count 'unsafe swappiness metadata blocks before provision' provision 0
+
+  setup
+  : > "$STATE/create-swap-metadata"
+  : > "$STATE/health-after-first"
+  : > "$STATE/swap-rollback-fail"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'failed swap rollback leaves apply failed' "$RC" 1
+  if [ -f "$SWAPPINESS_METADATA_FILE" ]; then ok 'failed swap rollback retains retry metadata'; else bad 'failed swap rollback retains retry metadata'; fi
+  expect_contains 'failed metadata rollback is loud' "$OUT" 'ROLLBACK INCOMPLETO'
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = legacy-monitors ]; then
+  run_legacy_monitor_migration_regression
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = activity ]; then
+  run_activity_preservation_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = absent-timers ]; then
+  run_absent_timer_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = swappiness-namespace ]; then
+  run_swappiness_namespace_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+run_legacy_monitor_migration_regression
+run_activity_preservation_regressions
+run_absent_timer_regressions
+run_swappiness_namespace_regressions
+
 echo '== explicit test guard rejects a partial override set'
 setup
 set +e
@@ -594,6 +900,7 @@ expect_count 'ambient provision override executes no host command' 'systemctl ' 
 
 echo '== preflight accepts only a fully known safe state'
 setup
+configure_active_worker
 run_guard preflight --expected-sha "$EXPECTED_SHA"
 expect_eq 'safe preflight exits zero' "$RC" 0
 expect_count 'preflight checks one heartbeat' 'curl heartbeat' 1
@@ -649,11 +956,13 @@ expect_count 'find failure causes no provision' provision 0
 
 echo '== protected service configuration is parsed as data and fails closed'
 setup
+configure_active_worker
 printf '%s\n' 'SUPABASE_SERVICE_KEY=second-placeholder' >> "$FAKE/repo/estrado-pjud-service/.env"
 run_guard preflight --expected-sha "$EXPECTED_SHA"
 expect_eq 'duplicate required credential refuses preflight' "$RC" 1
 expect_missing 'duplicate credential values are never diagnosed' "$OUT" 'second-placeholder'
 setup
+configure_active_worker
 chmod 644 "$FAKE/repo/estrado-pjud-service/.env"
 run_guard preflight --expected-sha "$EXPECTED_SHA"
 expect_eq 'world-readable service configuration refuses preflight' "$RC" 1
@@ -661,11 +970,7 @@ expect_eq 'world-readable service configuration refuses preflight' "$RC" 1
 run_negative_preflight() {
   local scenario=$1 provision_count backup_count
   trap - EXIT
-  STATE="$TMP/negative-state-$scenario"
-  EVENTS="$STATE/events"
-  mkdir -p "$STATE"
-  printf '%s\n' 1710000000 > "$STATE/now"
-  reset_preflight_state
+  setup
   case "$scenario" in
     dirty) echo dirty > "$STATE/git-status" ;;
     sha) echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$STATE/git-sha" ;;
@@ -678,6 +983,9 @@ run_negative_preflight() {
     missing|malformed|wildcard|httpfail) echo "$scenario" > "$STATE/claim-count" ;;
     nonzero) echo 1 > "$STATE/claim-count" ;;
   esac
+  case "$scenario" in
+    stale|missing|malformed|wildcard|nonzero|httpfail) configure_active_worker ;;
+  esac
   run_guard apply --expected-sha "$EXPECTED_SHA"
   provision_count=$(grep -c -F provision "$EVENTS" 2>/dev/null || true)
   backup_count=$(grep -c -F backup-copy "$EVENTS" 2>/dev/null || true)
@@ -686,7 +994,6 @@ run_negative_preflight() {
 
 negative_scenarios=(dirty sha disk ram uid juris estrado stale missing malformed wildcard nonzero httpfail)
 negative_pids=()
-setup
 for scenario in "${negative_scenarios[@]}"; do
   run_negative_preflight "$scenario" > "$TMP/negative-$scenario" &
   negative_pids+=("$!")
@@ -712,6 +1019,7 @@ done
 
 echo '== apply backs up before mutation and orders affected restarts safely'
 setup
+configure_active_worker
 TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'apply succeeds' "$RC" 0
 expect_before 'backup precedes provision' backup-copy provision
@@ -723,7 +1031,8 @@ expect_count 'heartbeat gate is repeated for worker restart' 'curl heartbeat' 2
 expect_count 'claim gate is repeated for worker restart' 'curl claims' 2
 expect_count 'API restarted once when changed' 'systemctl restart estrado-pjud.service' 1
 expect_count 'worker restarted once when changed and idle' 'systemctl restart estrado-pjud-worker.service' 1
-expect_count 'Hermes services restarted once when drop-in changed' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service hermes-dashboard.service' 1
+expect_exact_count 'active Hermes gateway restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 1
+expect_exact_count 'active Hermes dashboard restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
 expect_before 'timers start before tracker invocation' 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer' 'python '
 monitor_invocations=$(grep -F "python $FAKE/monitoring/monitor.py" "$EVENTS" 2>/dev/null || true)
 expect_exact_count 'monitor is invoked exactly once in dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run" 1
@@ -735,7 +1044,7 @@ SUCCESS_EVENTS=$(cat "$EVENTS")
 BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
 expect_eq 'service credential backup is root-only 0600' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR/entries/0010")" 600
 expect_missing 'manifest stores metadata but no credential content' "$(cat "$BACKUP_DIR/manifest.tsv")" "$SECRET_SENTINEL"
-expect_eq 'manifest has one record for every exact managed path' "$(wc -l < "$BACKUP_DIR/manifest.tsv" | tr -d ' ')" 15
+expect_eq 'manifest has one record for every exact managed path' "$(wc -l < "$BACKUP_DIR/manifest.tsv" | tr -d ' ')" 16
 expect_eq 'timestamped backup directory is 0700' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR")" 700
 if [ -f "$BACKUP_DIR/unit-states.tsv" ]; then
   live_state_lines=$(wc -l < "$BACKUP_DIR/unit-states.tsv" | tr -d ' ')
@@ -848,6 +1157,7 @@ done
 
 echo '== worker digest includes the managed Xvfb drop-in'
 setup
+configure_active_worker
 TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'drop-in-only apply succeeds' "$RC" 0
 expect_count 'drop-in-only change restarts worker' 'systemctl restart estrado-pjud-worker.service' 1
@@ -883,7 +1193,7 @@ run_mutation_failure() {
     swap-verify) : > "$STATE/swap-verify-fail" ;;
     daemon) : > "$STATE/daemon-fail" ;;
     api-restart) echo 'restart estrado-pjud.service' > "$STATE/fail-command" ;;
-    hermes-restart) echo '--user --machine=hermes@.host restart hermes-gateway.service hermes-dashboard.service' > "$STATE/fail-command" ;;
+    hermes-restart) echo '--user --machine=hermes@.host restart hermes-gateway.service' > "$STATE/fail-command" ;;
     timers) echo 'start legaltech-monitor.timer legaltech-resource-tracker.timer' > "$STATE/fail-command" ;;
     tracker) : > "$STATE/tracker-fail" ;;
     monitor) : > "$STATE/monitor-fail" ;;
@@ -984,6 +1294,7 @@ run_immediate_gate() {
   local state=$1 worker_count
   trap - EXIT
   setup
+  configure_active_worker
   printf '%s\n' 0 > "$STATE/claim-count"
   # Curl flips the count fixture after its first successful claims query.
   printf '%s\n' "$state" > "$STATE/claim-after-first"
@@ -1094,8 +1405,8 @@ expect_eq 'rollback restarts previously active gateway' "$(cat "$STATE/user-unit
 expect_eq 'rollback preserves static dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-enabled")" static
 expect_eq 'rollback keeps previously inactive dashboard inactive' "$(cat "$STATE/user-unit-hermes-dashboard.service-active")" inactive
 expect_count 'rollback enables gateway exactly once' 'systemctl --user --machine=hermes@.host enable hermes-gateway.service' 1
-expect_exact_count 'rollback restarts gateway individually' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 1
-expect_exact_count 'rollback stops dashboard individually' 'systemctl --user --machine=hermes@.host stop hermes-dashboard.service' 1
+expect_exact_count 'active gateway restarts once on apply and once on rollback' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 2
+expect_exact_count 'inactive dashboard is never stopped unnecessarily' 'systemctl --user --machine=hermes@.host stop hermes-dashboard.service' 0
 expect_count 'rollback never enables static dashboard' 'systemctl --user --machine=hermes@.host enable hermes-dashboard.service' 0
 expect_contains 'mixed Hermes rollback completes' "$OUT" 'ROLLBACK OK'
 
@@ -1113,9 +1424,9 @@ expect_eq 'rollback keeps gateway inactive' "$(cat "$STATE/user-unit-hermes-gate
 expect_eq 'rollback re-enables dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-enabled")" enabled
 expect_eq 'rollback restarts active dashboard' "$(cat "$STATE/user-unit-hermes-dashboard.service-active")" active
 expect_count 'rollback disables gateway exactly once' 'systemctl --user --machine=hermes@.host disable hermes-gateway.service' 1
-expect_exact_count 'rollback stops gateway individually' 'systemctl --user --machine=hermes@.host stop hermes-gateway.service' 1
+expect_exact_count 'inactive gateway is never stopped unnecessarily' 'systemctl --user --machine=hermes@.host stop hermes-gateway.service' 0
 expect_count 'rollback enables dashboard exactly once' 'systemctl --user --machine=hermes@.host enable hermes-dashboard.service' 1
-expect_exact_count 'rollback restarts dashboard individually' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
+expect_exact_count 'active dashboard restarts once on apply and once on rollback' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 2
 expect_contains 'inverse Hermes rollback completes' "$OUT" 'ROLLBACK OK'
 
 echo '== partial live-state restore is loud and never reports success'
