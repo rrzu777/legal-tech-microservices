@@ -25,7 +25,17 @@ expect_file_eq() {
   if cmp -s "$2" "$3"; then ok "$1"; else bad "$1 (archivos distintos)"; fi
 }
 count_log() { grep -cF -- "$1" "$CALL_LOG" 2>/dev/null || true; }
-file_mode() { /usr/bin/stat -f '%Lp' "$1"; }
+file_mode() {
+  "$(command -v python3)" -c \
+    'import os,stat,sys; print(f"{stat.S_IMODE(os.lstat(sys.argv[1]).st_mode):o}")' "$1"
+}
+file_size() {
+  "$(command -v python3)" -c 'import os,sys; print(os.lstat(sys.argv[1]).st_size)' "$1"
+}
+mutation_count() {
+  grep -Ec '^(fallocate|dd|chmod|mkswap|swapon|swapoff|cp|mv|sysctl -p|rm) ' \
+    "$CALL_LOG" 2>/dev/null || true
+}
 
 write_stub() {
   local name="$1"
@@ -131,10 +141,11 @@ exec /bin/mv "$@"'
 printf "stat %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_STAT_FAIL:-0}" != 1 ] || exit 8
 path=${!#}
-if [ -L "$path" ]; then kind="symbolic link"; elif [ -f "$path" ]; then kind="regular file"; else kind="other"; fi
-mode=$(/usr/bin/stat -f "%Lp" "$path") || exit 8
-size=$(/usr/bin/stat -f "%z" "$path") || exit 8
-printf "%s|%s|%s\n" "$kind" "$mode" "$size"'
+metadata=$("$SWAP_TEST_PYTHON" -c '\''import os,stat,sys
+s=os.lstat(sys.argv[1])
+kind="regular file" if stat.S_ISREG(s.st_mode) else ("symbolic link" if stat.S_ISLNK(s.st_mode) else "other")
+print(f"{kind}|{stat.S_IMODE(s.st_mode):o}|{s.st_size}|{s.st_nlink}")'\'' "$path") || exit 8
+case "$*" in *%h*) printf "%s\n" "$metadata" ;; *) printf "%s\n" "${metadata%|*}" ;; esac'
 
   write_stub rm '
 printf "rm %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -168,8 +179,21 @@ run_swap() {
   RC=$?
 }
 
+save_fstab_backup() {
+  /bin/cp "$FSTAB_FILE" "$FSTAB_FILE.legaltech-swap.bak"
+}
+
+append_managed_block() {
+  local original=''
+  if IFS= read -r -d '' original < "$FSTAB_FILE"; then :; else [ "$?" -eq 1 ] || return 1; fi
+  if [ -n "$original" ] && [ "${original: -1}" != $'\n' ]; then printf '\n' >> "$FSTAB_FILE"; fi
+  printf '# BEGIN LEGALTECH MANAGED SWAP\n%s none swap sw 0 0\n# END LEGALTECH MANAGED SWAP\n' \
+    "$SWAP_FILE" >> "$FSTAB_FILE"
+}
+
 managed_fstab() {
-  printf 'UUID=root / ext4 defaults 0 1\n# unrelated tail\n# BEGIN LEGALTECH MANAGED SWAP\n%s none swap sw 0 0\n# END LEGALTECH MANAGED SWAP\n' "$SWAP_FILE" > "$FSTAB_FILE"
+  save_fstab_backup
+  append_managed_block
 }
 
 make_valid_file() {
@@ -213,7 +237,7 @@ setup first-apply
 cp "$FSTAB_FILE" "$TMP/fstab.before"
 run_swap apply
 expect_eq "apply sale 0" "$RC" "0"
-expect_eq "crea exactamente 4 GiB" "$(/usr/bin/stat -f '%z' "$SWAP_FILE")" "4294967296"
+expect_eq "crea exactamente 4 GiB" "$(file_size "$SWAP_FILE")" "4294967296"
 expect_eq "deja modo 0600" "$(file_mode "$SWAP_FILE")" "600"
 expect_eq "mkswap una vez" "$(count_log 'mkswap ')" "1"
 expect_eq "swapon una vez" "$(count_log 'swapon ')" "1"
@@ -223,7 +247,7 @@ expect_eq "marker END una vez" "$(grep -cFx '# END LEGALTECH MANAGED SWAP' "$FST
 expect_eq "sysctl administrado exacto" "$(cat "$SYSCTL_FILE")" "vm.swappiness=10"
 expect_file_eq "backup conserva fstab original" "$TMP/fstab.before" "$FSTAB_FILE.legaltech-swap.bak"
 MUTATIONS=$(grep -E '^(fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p)' "$CALL_LOG" | cut -d' ' -f1 | tr '\n' ' ')
-expect_eq "orden de mutaciones" "$MUTATIONS" "fallocate chmod mkswap swapon cp cp mv sysctl "
+expect_eq "orden de mutaciones" "$MUTATIONS" "fallocate chmod mkswap swapon cp mv cp mv sysctl "
 
 echo "== apply repetido es idempotente"
 cp "$FSTAB_FILE" "$TMP/fstab.applied"
@@ -269,6 +293,7 @@ expect_eq "falla con header proc swaps malformado" "$RC" "1"
 
 setup non-exact-marker
 make_valid_file
+save_fstab_backup
 printf 'UUID=root / ext4 defaults 0 1\n# BEGIN LEGALTECH MANAGED SWAP\n\n%s none swap sw 0 0\n# END LEGALTECH MANAGED SWAP\n' "$SWAP_FILE" > "$FSTAB_FILE"
 printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
@@ -330,6 +355,97 @@ expect_eq "rechaza backup fstab que es symlink" "$RC" "1"
 expect_eq "no crea antes de rechazar backup inseguro" "$(count_log 'fallocate ')" "0"
 expect_eq "no sobrescribe destino del symlink" "$(cat "$ROOT/victim")" "do not overwrite"
 
+echo "== backups preexistentes ambiguos nunca se sobrescriben"
+setup arbitrary-clean-backup
+printf 'arbitrary regular backup\n' > "$FSTAB_FILE.legaltech-swap.bak"
+/bin/cp "$FSTAB_FILE" "$TMP/arbitrary-clean.fstab"
+/bin/cp "$FSTAB_FILE.legaltech-swap.bak" "$TMP/arbitrary-clean.backup"
+run_swap apply
+expect_eq "clean rechaza backup regular preexistente" "$RC" "1"
+expect_eq "backup regular clean no causa mutaciones" "$(mutation_count)" "0"
+expect_file_eq "fstab clean queda intacto" "$TMP/arbitrary-clean.fstab" "$FSTAB_FILE"
+expect_file_eq "backup regular queda intacto" "$TMP/arbitrary-clean.backup" "$FSTAB_FILE.legaltech-swap.bak"
+
+setup arbitrary-managed-backup
+printf 'arbitrary regular backup\n' > "$FSTAB_FILE.legaltech-swap.bak"
+append_managed_block
+make_valid_file
+printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+run_swap apply
+expect_eq "managed rechaza backup cuyo contenido no restaura fstab" "$RC" "1"
+expect_eq "backup managed arbitrario no causa mutaciones" "$(mutation_count)" "0"
+
+setup hardlink-clean-backup
+printf 'shared content must survive\n' > "$ROOT/shared-backup"
+ln "$ROOT/shared-backup" "$FSTAB_FILE.legaltech-swap.bak"
+run_swap apply
+expect_eq "clean rechaza backup hardlink" "$RC" "1"
+expect_eq "hardlink clean no causa mutaciones" "$(mutation_count)" "0"
+expect_eq "hardlink no sobrescribe inode compartido" "$(cat "$ROOT/shared-backup")" "shared content must survive"
+
+setup hardlink-managed-backup
+/bin/cp "$FSTAB_FILE" "$ROOT/shared-backup"
+ln "$ROOT/shared-backup" "$FSTAB_FILE.legaltech-swap.bak"
+append_managed_block
+make_valid_file
+printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+run_swap verify
+expect_eq "managed rechaza backup con link count mayor a uno" "$RC" "1"
+
+setup writable-managed-backup
+save_fstab_backup
+/bin/chmod 666 "$FSTAB_FILE.legaltech-swap.bak"
+append_managed_block
+make_valid_file
+printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+run_swap verify
+expect_eq "managed rechaza backup escribible por grupo u otros" "$RC" "1"
+
+setup executable-managed-backup
+save_fstab_backup
+/bin/chmod 755 "$FSTAB_FILE.legaltech-swap.bak"
+append_managed_block
+make_valid_file
+printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+run_swap verify
+expect_eq "managed rechaza backup ejecutable" "$RC" "1"
+
+echo "== el bloque administrado exige tres líneas canónicas contiguas"
+NONCANONICAL_VARIANTS=(indent double-space tab)
+case_number=0
+for variant in "${NONCANONICAL_VARIANTS[@]}"; do
+  case_number=$((case_number + 1))
+  setup "noncanonical-$case_number"
+  case "$variant" in
+    indent) bad_entry="  $SWAP_FILE none swap sw 0 0" ;;
+    double-space) bad_entry="$SWAP_FILE  none swap sw 0 0" ;;
+    tab) bad_entry="$SWAP_FILE"$'\t'"none swap sw 0 0" ;;
+  esac
+  save_fstab_backup
+  printf '# BEGIN LEGALTECH MANAGED SWAP\n%s\n# END LEGALTECH MANAGED SWAP\n' \
+    "$bad_entry" >> "$FSTAB_FILE"
+  make_valid_file
+  printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+  printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+  /bin/cp "$FSTAB_FILE" "$TMP/noncanonical-$case_number.fstab"
+  /bin/cp "$FSTAB_FILE.legaltech-swap.bak" "$TMP/noncanonical-$case_number.backup"
+  run_swap verify
+  expect_eq "verify rechaza variante no canónica $case_number" "$RC" "1"
+  run_swap apply
+  expect_eq "apply rechaza variante no canónica $case_number" "$RC" "1"
+  run_swap rollback
+  expect_eq "rollback rechaza variante no canónica $case_number" "$RC" "1"
+  expect_eq "variante no canónica $case_number no muta" "$(mutation_count)" "0"
+  expect_file_eq "fstab no canónico $case_number queda intacto" \
+    "$TMP/noncanonical-$case_number.fstab" "$FSTAB_FILE"
+  expect_file_eq "backup no canónico $case_number queda intacto" \
+    "$TMP/noncanonical-$case_number.backup" "$FSTAB_FILE.legaltech-swap.bak"
+done
+
 echo "== fallocate usa fallback dd y todo error externo falla cerrado"
 setup fallback
 FALLOCATE_FAIL=1
@@ -361,7 +477,7 @@ expect_eq "RAM igual a uso + 1 GiB rechaza" "$RC" "1"
 expect_eq "no llama swapoff" "$(count_log 'swapoff ')" "0"
 expect_file_eq "fstab queda intacto" "$TMP/refuse.fstab" "$FSTAB_FILE"
 expect_file_eq "sysctl queda intacto" "$TMP/refuse.sysctl" "$SYSCTL_FILE"
-expect_eq "swapfile queda intacto" "$(/usr/bin/stat -f '%z' "$SWAP_FILE")" "4294967296"
+expect_eq "swapfile queda intacto" "$(file_size "$SWAP_FILE")" "4294967296"
 
 echo "== rollback seguro sólo retira artefactos administrados"
 AVAILABLE_RAM=$((2 * 1024 * 1024 * 1024 + 1))
@@ -372,6 +488,7 @@ expect_missing "quita BEGIN" "$(cat "$FSTAB_FILE")" "LEGALTECH MANAGED SWAP"
 expect_eq "preserva bytes no relacionados" "$(cat "$FSTAB_FILE")" $'UUID=root / ext4 defaults 0 1\n# unrelated tail'
 if [ ! -e "$SYSCTL_FILE" ]; then ok "elimina sysctl administrado"; else bad "elimina sysctl administrado"; fi
 if [ ! -e "$SWAP_FILE" ]; then ok "elimina swapfile administrado"; else bad "elimina swapfile administrado"; fi
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "elimina sólo backup validado"; else bad "elimina sólo backup validado"; fi
 run_swap rollback
 expect_eq "rollback repetido es idempotente" "$RC" "0"
 expect_eq "rollback repetido no llama swapoff" "$(count_log 'swapoff ')" "1"
@@ -387,6 +504,20 @@ SWAP_USED=$((1 * 1024 * 1024 * 1024))
 run_swap rollback
 expect_eq "rollback de fstab con líneas finales sale 0" "$RC" "0"
 expect_file_eq "roundtrip conserva fstab byte por byte" "$TMP/preserve.fstab" "$FSTAB_FILE"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "roundtrip elimina backup"; else bad "roundtrip elimina backup"; fi
+
+echo "== rollback restaura fstab sin newline final byte por byte"
+setup preserve-no-newline
+printf 'UUID=root / ext4 defaults 0 1\n# final without newline' > "$FSTAB_FILE"
+/bin/cp "$FSTAB_FILE" "$TMP/no-newline.fstab"
+run_swap apply
+expect_eq "apply sobre fstab sin newline sale 0" "$RC" "0"
+AVAILABLE_RAM=$((2 * 1024 * 1024 * 1024 + 1))
+SWAP_USED=$((1 * 1024 * 1024 * 1024))
+run_swap rollback
+expect_eq "rollback sin newline sale 0" "$RC" "0"
+expect_file_eq "rollback restaura ausencia de newline" "$TMP/no-newline.fstab" "$FSTAB_FILE"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "rollback sin newline elimina backup"; else bad "rollback sin newline elimina backup"; fi
 
 echo "== rollback falla cerrado ante free malformado"
 setup rollback-malformed

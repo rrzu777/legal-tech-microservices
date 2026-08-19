@@ -97,6 +97,7 @@ do
 done
 
 fstab_state=invalid
+backup_state=invalid
 active_target_count=0
 swap_file_exists=0
 sysctl_state=absent
@@ -113,43 +114,39 @@ trap cleanup_temp EXIT
 inspect_fstab() {
   [ -f "$fstab_file" ] && [ ! -L "$fstab_file" ] || return 1
 
-  local line first second third rest
-  local inside=0 begins=0 ends=0 managed_entries=0 unmanaged_entries=0
+  local line first _rest
+  local stage=0 blocks=0
+  local expected_entry="$swap_file none swap sw 0 0"
   while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$stage" -eq 1 ]; then
+      [ "$line" = "$expected_entry" ] || return 1
+      stage=2
+      continue
+    fi
+    if [ "$stage" -eq 2 ]; then
+      [ "$line" = "$END_MARKER" ] || return 1
+      stage=0
+      blocks=$((blocks + 1))
+      continue
+    fi
     if [ "$line" = "$BEGIN_MARKER" ]; then
-      [ "$inside" -eq 0 ] || return 1
-      inside=1
-      begins=$((begins + 1))
+      [ "$blocks" -eq 0 ] || return 1
+      stage=1
       continue
     fi
-    if [ "$line" = "$END_MARKER" ]; then
-      [ "$inside" -eq 1 ] || return 1
-      inside=0
-      ends=$((ends + 1))
-      continue
-    fi
+    [ "$line" != "$END_MARKER" ] || return 1
 
-    first=''; second=''; third=''; rest=''
-    read -r first second third rest <<< "$line" || true
-    if [ "$inside" -eq 1 ]; then
-      if [ "$first" = "$swap_file" ] && [ "$second" = none ] && \
-         [ "$third" = swap ] && [ "$rest" = 'sw 0 0' ]; then
-        managed_entries=$((managed_entries + 1))
-      else
-        return 1
-      fi
-    elif [ "$first" = "$swap_file" ] && [ "${first#\#}" = "$first" ]; then
-      unmanaged_entries=$((unmanaged_entries + 1))
-    fi
+    first=''; _rest=''
+    read -r first _rest <<< "$line" || true
+    [ "$first" != "$swap_file" ] || [ "${first#\#}" != "$first" ] || return 1
   done < "$fstab_file" || return 1
 
-  [ "$inside" -eq 0 ] || return 1
-  [ "$unmanaged_entries" -eq 0 ] || return 1
-  if [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ] && [ "$managed_entries" -eq 0 ]; then
+  [ "$stage" -eq 0 ] || return 1
+  if [ "$blocks" -eq 0 ]; then
     fstab_state=absent
     return 0
   fi
-  if [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ] && [ "$managed_entries" -eq 1 ]; then
+  if [ "$blocks" -eq 1 ]; then
     fstab_state=managed
     return 0
   fi
@@ -218,12 +215,65 @@ inspect_sysctl_file() {
   sysctl_state=managed
 }
 
+read_text_file() {
+  local source_path="$1" destination_name="$2" value=''
+  if IFS= read -r -d '' value < "$source_path"; then
+    :
+  else
+    [ "$?" -eq 1 ] || return 1
+  fi
+  printf -v "$destination_name" '%s' "$value"
+}
+
+validate_backup_metadata() {
+  local path="$1" metadata kind mode size links extra
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h' "$path") || return 1
+  kind=''; mode=''; size=''; links=''; extra=''
+  IFS='|' read -r kind mode size links extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && is_uint "$size" && \
+    [ "$links" = 1 ] && [ -z "$extra" ] || return 1
+  case "$mode" in
+    [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+    *) return 1 ;;
+  esac
+  [ $((8#$mode & 8#0133)) -eq 0 ]
+}
+
+text_files_equal() {
+  local first_path="$1" second_path="$2" first_content='' second_content=''
+  read_text_file "$first_path" first_content || return 1
+  read_text_file "$second_path" second_content || return 1
+  [ "$first_content" = "$second_content" ]
+}
+
+backup_matches_clean_fstab() {
+  text_files_equal "$1" "$fstab_file"
+}
+
+backup_reconstructs_managed_fstab() {
+  local backup_path="$1" backup_content='' current_content='' expected=''
+  read_text_file "$backup_path" backup_content || return 1
+  read_text_file "$fstab_file" current_content || return 1
+  expected=$backup_content
+  if [ -n "$expected" ] && [ "${expected: -1}" != $'\n' ]; then expected+=$'\n'; fi
+  expected+="$BEGIN_MARKER"$'\n'
+  expected+="$swap_file none swap sw 0 0"$'\n'
+  expected+="$END_MARKER"$'\n'
+  [ "$current_content" = "$expected" ]
+}
+
 inspect_fstab_backup() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
+  backup_state=absent
   if [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ]; then
-    return 0
+    [ "$fstab_state" = absent ]
+    return
   fi
-  [ -f "$backup_path" ] && [ ! -L "$backup_path" ]
+  [ "$fstab_state" = managed ] || return 1
+  [ -f "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
+  validate_backup_metadata "$backup_path" || return 1
+  backup_reconstructs_managed_fstab "$backup_path" || return 1
+  backup_state=managed
 }
 
 inspect_managed_state() {
@@ -233,12 +283,14 @@ inspect_managed_state() {
   inspect_swap_file || return 1
   inspect_sysctl_file || return 1
 
-  if [ "$fstab_state" = absent ] && [ "$swap_file_exists" -eq 0 ] && \
+  if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ] && \
+     [ "$swap_file_exists" -eq 0 ] && \
      [ "$active_target_count" -eq 0 ] && [ "$sysctl_state" = absent ]; then
     printf '%s\n' clean
     return 0
   fi
-  if [ "$fstab_state" = managed ] && [ "$swap_file_exists" -eq 1 ] && \
+  if [ "$fstab_state" = managed ] && [ "$backup_state" = managed ] && \
+     [ "$swap_file_exists" -eq 1 ] && \
      [ "$active_target_count" -eq 1 ] && [ "$sysctl_state" = managed ]; then
     printf '%s\n' managed
     return 0
@@ -271,17 +323,28 @@ preflight_state() {
 }
 
 replace_fstab_with_managed_block() {
-  local original=''
-  if IFS= read -r -d '' original < "$fstab_file"; then
-    :
-  else
-    [ "$?" -eq 1 ] || return 1
-  fi
+  local original='' backup_path backup_temp
+  backup_path="${fstab_file}.legaltech-swap.bak"
+  backup_temp="${backup_path}.tmp.$$"
+  read_text_file "$fstab_file" original || return 1
+  [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
+  [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
+
+  current_temp=$backup_temp
+  "$cp_bin" -p -n "$fstab_file" "$backup_temp" || return 1
+  validate_backup_metadata "$backup_temp" || return 1
+  backup_matches_clean_fstab "$backup_temp" || return 1
+  "$mv_bin" -n "$backup_temp" "$backup_path" || return 1
+  [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
+  current_temp=''
+  validate_backup_metadata "$backup_path" || return 1
+  backup_matches_clean_fstab "$backup_path" || return 1
+
   current_temp="${fstab_file}.legaltech-swap.tmp.$$"
   [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
-
-  "$cp_bin" -p "$fstab_file" "${fstab_file}.legaltech-swap.bak" || return 1
-  "$cp_bin" -p "$fstab_file" "$current_temp" || return 1
+  "$cp_bin" -p -n "$fstab_file" "$current_temp" || return 1
+  validate_backup_metadata "$current_temp" || return 1
+  backup_matches_clean_fstab "$current_temp" || return 1
   {
     if [ -n "$original" ] && [ "${original: -1}" != $'\n' ]; then printf '\n'; fi
     printf '%s\n%s none swap sw 0 0\n%s\n' \
@@ -293,31 +356,19 @@ replace_fstab_with_managed_block() {
 }
 
 replace_fstab_without_managed_block() {
-  local line inside=0
+  local backup_path="${fstab_file}.legaltech-swap.bak"
   current_temp="${fstab_file}.legaltech-swap.tmp.$$"
   [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
-  : > "$current_temp" || return 1
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [ "$line" = "$BEGIN_MARKER" ]; then
-      [ "$inside" -eq 0 ] || return 1
-      inside=1
-      continue
-    fi
-    if [ "$line" = "$END_MARKER" ]; then
-      [ "$inside" -eq 1 ] || return 1
-      inside=0
-      continue
-    fi
-    if [ "$inside" -eq 0 ]; then
-      printf '%s\n' "$line" >> "$current_temp" || return 1
-    fi
-  done < "$fstab_file" || return 1
-  [ "$inside" -eq 0 ] || return 1
-
-  "$cp_bin" -p "$fstab_file" "${fstab_file}.legaltech-swap.bak" || return 1
+  validate_backup_metadata "$backup_path" || return 1
+  backup_reconstructs_managed_fstab "$backup_path" || return 1
+  "$cp_bin" -p -n "$backup_path" "$current_temp" || return 1
+  validate_backup_metadata "$current_temp" || return 1
+  backup_reconstructs_managed_fstab "$current_temp" || return 1
   "$mv_bin" "$current_temp" "$fstab_file" || return 1
   current_temp=''
+  validate_backup_metadata "$backup_path" || return 1
+  text_files_equal "$backup_path" "$fstab_file" || return 1
+  "$rm_bin" "$backup_path" || return 1
 }
 
 verify_managed() {
