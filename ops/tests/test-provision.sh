@@ -174,6 +174,7 @@ run_prov() {
         PROV_CHMOD_BIN="$CHMOD_BIN" PROV_CHMOD_LOG="$LOG_CHMOD" \
         PROV_CHMOD_FAIL_FILE="$REPO/../chmod-monitor-env.fail" \
         PROV_ENABLE_PJUD_WORKER="${PROV_ENABLE_PJUD_WORKER:-0}" \
+        PROV_SKIP_CADDY="${PROV_SKIP_CADDY:-0}" \
         PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
 }
@@ -532,6 +533,25 @@ run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "segunda recarga de caddy por el drift" "$(caddy_reloads)" "2"
 expect_same_file "el Caddyfile volvió a ser el del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
+
+echo "== modo resource-guards omite Caddy sin omitir artefactos de recursos"
+setup skipcaddy
+rm "$REPO/ops/caddy/Caddyfile"
+PROV_SKIP_CADDY=1 run_prov
+expect_eq "skip Caddy sale 0 aunque la fuente Caddy no esté" "$RC" "0"
+if [ -f "$SYSD/legaltech.slice" ] && [ -f "$SYSD/legaltech-monitor.timer" ]; then
+  ok "skip Caddy igual instala slice y timers"
+else
+  bad "skip Caddy igual instala slice y timers"
+fi
+if [ ! -e "$CADDYF" ]; then ok "skip Caddy no instala Caddyfile"; else bad "skip Caddy no instala Caddyfile"; fi
+expect_eq "skip Caddy no recarga, inicia ni reinicia Caddy" \
+  "$(grep -cE '^(reload|start|restart) caddy' "$LOG_SYSCTL" || true)" "0"
+
+setup invalidskip
+PROV_SKIP_CADDY=2 run_prov
+expect_eq "skip Caddy inválido falla cerrado" "$RC" "1"
+expect_eq "skip Caddy inválido no instala recursos" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 
 echo "== caddy: binario ausente = receta y exit 1"
 setup nocaddy; rm "$CADDY_BIN"; run_prov

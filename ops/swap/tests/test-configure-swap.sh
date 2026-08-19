@@ -261,6 +261,7 @@ expect_missing "no crea swapfile" "$(cat "$CALL_LOG")" "fallocate "
 FREE_BYTES=$((8 * 1024 * 1024 * 1024))
 run_swap preflight
 expect_eq "acepta exactamente 8 GiB" "$RC" "0"
+expect_eq "preflight clasifica estado exacto limpio" "$OUT" "clean"
 
 echo "== apply crea 4 GiB, 0600, activa y persiste configuración exacta"
 setup first-apply
@@ -290,11 +291,18 @@ expect_eq "no reformatea" "$(count_log 'mkswap ')" "1"
 expect_eq "no reactiva" "$(count_log 'swapon ')" "1"
 expect_eq "no recrea" "$(count_log 'fallocate ')" "1"
 
+run_swap preflight
+expect_eq "preflight clasifica estado administrado verificado" "$RC:$OUT" "0:managed"
+
 /bin/cp "$FSTAB_FILE" "$TMP/idempotent-failure.fstab"
 /bin/cp "$FSTAB_FILE.legaltech-swap.bak" "$TMP/idempotent-failure.backup"
 /bin/cp "$SYSCTL_FILE" "$TMP/idempotent-failure.sysctl"
 IDEMPOTENT_CLEANUP_CALLS=$(grep -Ec '^(swapoff|rm) ' "$CALL_LOG" || true)
 SYSCTL_FAIL=1
+PREFLIGHT_MUTATIONS=$(mutation_count)
+run_swap preflight
+expect_eq "drift live de swappiness hace preflight unknown" "$RC" "1"
+expect_eq "preflight unknown no muta" "$(mutation_count)" "$PREFLIGHT_MUTATIONS"
 run_swap apply
 expect_eq "verify fallido de estado preexistente aborta" "$RC" "1"
 expect_file_eq "verify fallido no restaura fstab preexistente" \

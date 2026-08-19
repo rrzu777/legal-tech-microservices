@@ -169,7 +169,7 @@ path_has_symlink_component() {
 }
 
 safe_existing_path() {
-  local path=$1 fields links
+  local path=$1 fields links output
   [ -e "$path" ] && [ ! -L "$path" ] || return 1
   path_has_symlink_component "$path" && return 1
   if [ -f "$path" ]; then
@@ -177,26 +177,74 @@ safe_existing_path() {
     links=${fields##*|}
     [ "$links" = 1 ] || return 1
   elif [ -d "$path" ]; then
-    [ -z "$("$find_bin" "$path" -type l -print -quit 2>"$null_file")" ] || return 1
-    [ -z "$("$find_bin" "$path" -type f -links +1 -print -quit 2>"$null_file")" ] || return 1
+    output=$("$find_bin" "$path" -type l -print -quit 2>"$null_file") || return 1
+    [ -z "$output" ] || return 1
+    output=$("$find_bin" "$path" -type f -links +1 -print -quit 2>"$null_file") || return 1
+    [ -z "$output" ] || return 1
   else
     return 1
   fi
 }
 
+find_no_match() {
+  local output
+  output=$("$find_bin" "$@" -print -quit 2>"$null_file") || return 1
+  [ -z "$output" ]
+}
+
+safe_read_mode() {
+  local mode=$1 value
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  value=$((8#$mode))
+  [ $((value & 8#0400)) -ne 0 ] && [ $((value & 8#0133)) -eq 0 ]
+}
+
+validate_runtime_tree() {
+  local path=$1 fields mode uid gid _links
+  safe_existing_path "$path" && [ -d "$path" ] || return 1
+  fields=$(stat_fields "$path") || return 1
+  IFS='|' read -r mode uid gid _links <<< "$fields"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] || return 1
+  [ $((8#$mode & 8#0022)) -eq 0 ] || return 1
+  find_no_match "$path" ! -type f ! -type d || return 1
+  find_no_match "$path" ! -user "$root_uid" || return 1
+  find_no_match "$path" ! -group "$root_gid" || return 1
+  find_no_match "$path" -perm -0022 || return 1
+}
+
+validate_managed_source() {
+  local path=$1 fields mode uid gid links expected_gid
+  safe_existing_path "$path" || return 1
+  if [ "$path" = "$monitoring_dir" ]; then
+    validate_runtime_tree "$path"
+    return
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  fields=$(stat_fields "$path") || return 1
+  IFS='|' read -r mode uid gid links <<< "$fields"
+  [ "$links" = 1 ] || return 1
+  if [ "$path" = "$credential_file" ]; then
+    expected_gid=$("$id_bin" -g estrado 2>"$null_file") || return 1
+    is_uint "$expected_gid" || return 1
+    [ "$mode" = 640 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$expected_gid" ]
+  elif [ "$path" = "$monitor_env_file" ]; then
+    [ "$mode" = 600 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ]
+  else
+    [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && safe_read_mode "$mode"
+  fi
+}
+
 prepare_temp_credentials() {
-  local url_count=0 key_count=0 line value credential_fields credential_mode credential_owner _credential_group _credential_links
+  local url_count=0 key_count=0 line value credential_fields credential_mode credential_owner credential_group _credential_links expected_gid
   [ -d "$tmp_root" ] && [ ! -L "$tmp_root" ] || return 1
   path_has_symlink_component "$tmp_root" && return 1
   safe_existing_path "$credential_file" || return 1
   credential_fields=$(stat_fields "$credential_file") || return 1
-  IFS='|' read -r credential_mode credential_owner _credential_group _credential_links <<< "$credential_fields"
+  IFS='|' read -r credential_mode credential_owner credential_group _credential_links <<< "$credential_fields"
+  expected_gid=$("$id_bin" -g estrado 2>"$null_file") || return 1
+  is_uint "$expected_gid" || return 1
   [ "$credential_owner" = "$root_uid" ] || return 1
-  if [ "$test_mode" = 1 ]; then
-    [ "$credential_mode" = 600 ] || [ "$credential_mode" = 640 ] || return 1
-  else
-    [ "$credential_mode" = 640 ] || return 1
-  fi
+  [ "$credential_group" = "$expected_gid" ] && [ "$credential_mode" = 640 ] || return 1
   SUPABASE_URL=''
   SUPABASE_SERVICE_KEY=''
   while IFS= read -r line || [ -n "$line" ]; do
@@ -336,29 +384,31 @@ check_git() {
 }
 
 check_disk() {
-  local _filesystem _blocks _used available _capacity _mount last=''
+  local output _filesystem _blocks _used available _capacity _mount last=''
+  output=$(LC_ALL=C "$df_bin" -Pk "$disk_path" 2>"$null_file") || return 1
   while read -r _filesystem _blocks _used available _capacity _mount; do
     last=$available
-  done < <(LC_ALL=C "$df_bin" -Pk "$disk_path" 2>"$null_file") || return 1
+  done <<< "$output"
   is_uint "$last" || return 1
   [ $((last * 1024)) -ge "$MIN_DISK_BYTES" ]
 }
 
 check_ram() {
-  local label _total _used _free _shared _cache available extra
+  local output label _total _used _free _shared _cache available extra
   available=''
+  output=$(LC_ALL=C "$free_bin" -b 2>"$null_file") || return 1
   while read -r label _total _used _free _shared _cache available extra; do
     [ "$label" = Mem: ] || continue
     [ -z "${extra:-}" ] || return 1
     break
-  done < <(LC_ALL=C "$free_bin" -b 2>"$null_file") || return 1
+  done <<< "$output"
   is_uint "$available" || return 1
   [ "$available" -ge "$MIN_RAM_BYTES" ]
 }
 
 validate_hermes_inventory() {
   local uid reverse ownership system_units user_units system_unit user_unit extra
-  local unit_name _unit_state unit_user
+  local unit_name unit_state preset unit_user
   uid=$("$id_bin" -u hermes 2>"$null_file") || return 1
   is_uint "$uid" || return 1
   reverse=$("$id_bin" -nu "$uid" 2>"$null_file") || return 1
@@ -370,18 +420,20 @@ validate_hermes_inventory() {
     case "$user_unit" in init.scope|hermes-gateway.service|hermes-dashboard.service) ;; *) return 1 ;; esac
   done <<< "$ownership"
   system_units=$("$systemctl_bin" list-unit-files --type=service --state=enabled --no-legend --no-pager 2>"$null_file") || return 1
-  while read -r unit_name _unit_state extra; do
+  while read -r unit_name unit_state preset extra; do
     [ -n "${unit_name:-}" ] || continue
-    [ -z "${extra:-}" ] || return 1
+    [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]] && [ "$unit_state" = enabled ] && [ -z "${extra:-}" ] || return 1
+    case "${preset:-}" in ''|enabled|disabled|ignored|-) ;; *) return 1 ;; esac
     unit_user=$("$systemctl_bin" show "$unit_name" --property User --value 2>"$null_file") || return 1
     if [ "$unit_user" = hermes ] || [ "$unit_user" = "$uid" ]; then
       case "$unit_name" in hermes-gateway.service|hermes-dashboard.service|"user@$uid.service") ;; *) return 1 ;; esac
     fi
   done <<< "$system_units"
   user_units=$("$systemctl_bin" --user --machine=hermes@.host list-unit-files --type=service --state=enabled --no-legend --no-pager 2>"$null_file") || return 1
-  while read -r unit_name _unit_state extra; do
+  while read -r unit_name unit_state preset extra; do
     [ -n "${unit_name:-}" ] || continue
-    [ -z "${extra:-}" ] || return 1
+    [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]] && [ "$unit_state" = enabled ] && [ -z "${extra:-}" ] || return 1
+    case "${preset:-}" in ''|enabled|disabled|ignored|-) ;; *) return 1 ;; esac
     case "$unit_name" in hermes-gateway.service|hermes-dashboard.service) ;; *) return 1 ;; esac
   done <<< "$user_units"
   printf '%s\n' "$uid"
@@ -397,7 +449,7 @@ check_public_health() {
 }
 
 run_preflight() {
-  local uid
+  local uid swap_state
   check_git || { fail 'Git tree or deployed SHA is not exact'; return 1; }
   safe_existing_path "$provision_bin" && [ -x "$provision_bin" ] \
     && safe_existing_path "$swap_bin" && [ -x "$swap_bin" ] \
@@ -409,9 +461,15 @@ run_preflight() {
   check_public_health || { fail 'a public health endpoint is not exactly HTTP 200'; return 1; }
   prepare_temp_credentials || { fail 'protected Supabase configuration is invalid'; return 1; }
   check_exact_zero_and_fresh_heartbeat || { fail 'worker heartbeat or exact active-claim count is unsafe'; return 1; }
-  "$swap_bin" preflight >"$null_file" 2>&1 || { fail 'swap preflight is unsafe'; return 1; }
-  swap_preexisting=0
-  if "$swap_bin" verify >"$null_file" 2>&1; then swap_preexisting=1; fi
+  swap_state=$("$swap_bin" preflight 2>"$null_file") || { fail 'swap preflight is unsafe'; return 1; }
+  case "$swap_state" in
+    clean) swap_initial_state=clean ;;
+    managed)
+      "$swap_bin" verify >"$null_file" 2>&1 || { fail 'managed swap verification is unsafe'; return 1; }
+      swap_initial_state=managed
+      ;;
+    *) fail 'swap initial state is unknown'; return 1 ;;
+  esac
   printf '%s\n' 'PREFLIGHT OK'
 }
 
@@ -432,7 +490,6 @@ build_managed_paths() {
     "$monitor_env_file"
     "$fstab_file"
     "$sysctl_file"
-    "$caddyfile"
     "$logrotate_file"
     "$monitoring_dir"
   )
@@ -442,6 +499,58 @@ is_managed_path() {
   local candidate=$1 path
   for path in "${managed_paths[@]}"; do [ "$candidate" != "$path" ] || return 0; done
   return 1
+}
+
+tracked_units=(
+  estrado-pjud.service
+  estrado-pjud-worker.service
+  legaltech-monitor.service
+  legaltech-resource-tracker.service
+  legaltech-monitor.timer
+  legaltech-resource-tracker.timer
+)
+desired_enabled_states=()
+desired_active_states=()
+
+read_unit_state() { # is-enabled|is-active unit
+  local query=$1 unit=$2 output rc=0
+  if output=$("$systemctl_bin" "$query" "$unit" 2>"$null_file"); then
+    rc=0
+  else
+    rc=$?
+  fi
+  case "$query:$output:$rc" in
+    is-enabled:enabled:0) printf '%s\n' enabled ;;
+    is-enabled:disabled:[1-9]|is-enabled:disabled:[1-9][0-9]*) printf '%s\n' disabled ;;
+    is-active:active:0) printf '%s\n' active ;;
+    is-active:inactive:[1-9]|is-active:inactive:[1-9][0-9]*) printf '%s\n' inactive ;;
+    *) return 1 ;;
+  esac
+}
+
+capture_unit_states() {
+  local unit enabled active
+  for unit in "${tracked_units[@]}"; do
+    enabled=$(read_unit_state is-enabled "$unit") || return 1
+    active=$(read_unit_state is-active "$unit") || return 1
+    printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active"
+  done
+}
+
+load_and_validate_unit_states() {
+  local unit enabled active extra count=0
+  desired_enabled_states=()
+  desired_active_states=()
+  while IFS=$'\t' read -r unit enabled active extra; do
+    [ "$count" -lt "${#tracked_units[@]}" ] && [ "$unit" = "${tracked_units[$count]}" ] || return 1
+    case "$enabled" in enabled|disabled) ;; *) return 1 ;; esac
+    case "$active" in active|inactive) ;; *) return 1 ;; esac
+    [ -z "${extra:-}" ] || return 1
+    desired_enabled_states+=("$enabled")
+    desired_active_states+=("$active")
+    count=$((count + 1))
+  done < "$backup_dir/unit-states.tsv"
+  [ "$count" -eq "${#tracked_units[@]}" ]
 }
 
 validate_root_path() { # path mode
@@ -477,7 +586,7 @@ create_backup() {
     index=$((index + 1))
     rel=$(printf 'entries/%04d' "$index")
     if [ -e "$path" ] || [ -L "$path" ]; then
-      safe_existing_path "$path" || return 1
+      validate_managed_source "$path" || return 1
       fields=$(stat_fields "$path") || return 1
       IFS='|' read -r mode owner group links <<< "$fields"
       [[ "$mode" =~ ^[0-7]{3,4}$ ]] && is_uint "$owner" && is_uint "$group" && is_uint "$links" || return 1
@@ -498,21 +607,26 @@ create_backup() {
   validate_root_path "$manifest" 600 || return 1
   printf '%s\n' "$expected_sha" > "$backup_dir/expected-sha" || return 1
   : > "$backup_dir/changes" || return 1
-  if [ "${swap_preexisting:-0}" -eq 1 ]; then
+  capture_unit_states > "$backup_dir/unit-states.tsv" || return 1
+  if [ "${swap_initial_state:-unknown}" = managed ]; then
     printf '%s\n' preexisting > "$backup_dir/swap-state" || return 1
   else
     printf '%s\n' 'not-attempted' > "$backup_dir/swap-state" || return 1
   fi
-  "$chmod_bin" 0600 "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" || return 1
-  "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" || return 1
+  "$chmod_bin" 0600 "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" "$backup_dir/unit-states.tsv" || return 1
+  "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" "$backup_dir/unit-states.tsv" || return 1
   printf '%s\n' "$backup_dir"
 }
 
 digest_path() {
-  local digest
+  local output digest reported_path
   if [ -f "$1" ] && [ ! -L "$1" ]; then
-    digest=$("$sha256_bin" "$1" 2>"$null_file") || return 1
-    [[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    output=$("$sha256_bin" -- "$1" 2>"$null_file") || return 1
+    case "$output" in *$'\n'*) return 1 ;; esac
+    [[ "$output" =~ ^([0-9a-fA-F]{64})\ \ (.+)$ ]] || return 1
+    digest=${BASH_REMATCH[1]}
+    reported_path=${BASH_REMATCH[2]}
+    [ "$reported_path" = "$1" ] || return 1
     printf '%s\n' "${digest,,}"
   elif [ ! -e "$1" ] && [ ! -L "$1" ]; then
     printf '%s\n' absent
@@ -552,18 +666,35 @@ show_contract() { # unit property expected [property expected ...]
 }
 
 run_postflight() {
-  local uid timer
+  local uid timer target enabled active
   uid=$(validate_hermes_inventory) || { fail 'postflight Hermes inventory is unknown'; return 1; }
   show_contract legaltech.slice CPUWeight 1000 MemoryLow 3221225472 MemoryHigh 6442450944 MemoryMax 8589934592 || return 1
-  show_contract estrado-pjud.service Slice legaltech.slice TasksMax 512 || return 1
-  show_contract estrado-pjud-worker.service Slice legaltech.slice MemoryHigh 2147483648 MemoryMax 3221225472 CPUQuotaPerSecUSec 2s CPUWeight 800 TasksMax 512 || return 1
+  show_contract estrado-pjud.service Slice legaltech.slice MemoryHigh 3221225472 MemoryMax 4294967296 CPUQuotaPerSecUSec 2s CPUWeight 500 TasksMax 512 || return 1
+  show_contract estrado-pjud-worker.service PartOf legaltech.slice Slice legaltech.slice MemoryHigh 2147483648 MemoryMax 3221225472 CPUQuotaPerSecUSec 2s CPUWeight 800 TasksMax 512 || return 1
   show_contract "user-$uid.slice" MemoryHigh 2147483648 MemoryMax 2621440000 TasksMax 1024 CPUWeight 200 || return 1
-  for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
-    show_contract "$unit" Slice system.slice MemoryMax 134217728 CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
-  done
+  show_contract legaltech-monitor.service \
+    Type oneshot User root WorkingDirectory /opt/legaltech-monitoring \
+    NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
+    StateDirectory legaltech-monitor StateDirectoryMode 0750 \
+    LogsDirectory legaltech LogsDirectoryMode 0750 \
+    ReadWritePaths '/var/lib/legaltech-monitor /var/log/legaltech' \
+    RestrictAddressFamilies '' Slice system.slice MemoryMax 134217728 \
+    CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
+  show_contract legaltech-resource-tracker.service \
+    Type oneshot User root WorkingDirectory /opt/legaltech-monitoring \
+    NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
+    StateDirectory '' LogsDirectory '' ReadWritePaths /var/log/legaltech/resources.csv \
+    RestrictAddressFamilies AF_UNIX Slice system.slice MemoryMax 134217728 \
+    CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
   for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
-    [ "$("$systemctl_bin" is-enabled "$timer" 2>"$null_file")" = enabled ] || return 1
-    [ "$("$systemctl_bin" is-active "$timer" 2>"$null_file")" = active ] || return 1
+    case "$timer" in
+      legaltech-monitor.timer) target=legaltech-monitor.service ;;
+      legaltech-resource-tracker.timer) target=legaltech-resource-tracker.service ;;
+    esac
+    show_contract "$timer" Unit "$target" OnBootUSec 5min OnUnitActiveUSec 5min Persistent yes RandomizedDelayUSec 1min || return 1
+    enabled=$(read_unit_state is-enabled "$timer") || return 1
+    active=$(read_unit_state is-active "$timer") || return 1
+    [ "$enabled" = enabled ] && [ "$active" = active ] || return 1
   done
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
   check_public_health || return 1
@@ -571,35 +702,51 @@ run_postflight() {
 }
 
 validate_backup_dir() {
-  local leaf=${1##*/}
+  local leaf=${1##*/} stored_sha
   case "$1" in "$backup_root"/*) ;; *) return 1 ;; esac
   [ "${1%/*}" = "$backup_root" ] || return 1
   [[ "$leaf" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || return 1
   safe_existing_path "$1" && validate_root_path "$1" 700 || return 1
+  [ -d "$1/entries" ] && [ ! -L "$1/entries" ] || return 1
+  validate_root_path "$1/entries" 700 || return 1
   [ -f "$1/manifest.tsv" ] && [ ! -L "$1/manifest.tsv" ] || return 1
   validate_root_path "$1/manifest.tsv" 600 || return 1
   [ -f "$1/changes" ] && [ ! -L "$1/changes" ] || return 1
   validate_root_path "$1/changes" 600 || return 1
   [ -f "$1/swap-state" ] && [ ! -L "$1/swap-state" ] || return 1
   validate_root_path "$1/swap-state" 600 || return 1
+  [ -f "$1/expected-sha" ] && [ ! -L "$1/expected-sha" ] || return 1
+  validate_root_path "$1/expected-sha" 600 || return 1
+  stored_sha=$(<"$1/expected-sha")
+  [[ "$stored_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [ -z "$expected_sha" ] || [ "$stored_sha" = "$expected_sha" ] || return 1
+  [ -f "$1/unit-states.tsv" ] && [ ! -L "$1/unit-states.tsv" ] || return 1
+  validate_root_path "$1/unit-states.tsv" 600 || return 1
 }
 
 validate_manifest() {
   local path existed rel mode owner group extra backup_path fields bmode bowner bgroup _blinks
-  local seen='|' seen_rel='|' count=0 managed
+  local seen='|' seen_rel='|' count=0 managed expected_rel
   while IFS=$'\t' read -r path existed rel mode owner group extra; do
     [ -n "$path" ] && [ -z "${extra:-}" ] && is_managed_path "$path" || return 1
+    [ "$count" -lt "${#managed_paths[@]}" ] && [ "$path" = "${managed_paths[$count]}" ] || return 1
     case "$seen" in *"|$path|"*) return 1 ;; esac
     seen="$seen$path|"
     count=$((count + 1))
     case "$existed" in
       1)
         [[ "$mode" =~ ^[0-7]{3,4}$ ]] && is_uint "$owner" && is_uint "$group" || return 1
-        case "$rel" in entries/[0-9][0-9][0-9][0-9]) ;; *) return 1 ;; esac
+        expected_rel=$(printf 'entries/%04d' "$count")
+        [ "$rel" = "$expected_rel" ] || return 1
         case "$seen_rel" in *"|$rel|"*) return 1 ;; esac
         seen_rel="$seen_rel$rel|"
         backup_path="$backup_dir/$rel"
         safe_existing_path "$backup_path" || return 1
+        if [ "$path" = "$monitoring_dir" ]; then
+          [ -d "$backup_path" ] || return 1
+        else
+          [ -f "$backup_path" ] || return 1
+        fi
         fields=$(stat_fields "$backup_path") || return 1
         IFS='|' read -r bmode bowner bgroup _blinks <<< "$fields"
         if [ "$path" = "$credential_file" ] || [ "$path" = "$monitor_env_file" ]; then
@@ -673,6 +820,58 @@ restore_manifest() { # skip swap-owned fstab/sysctl when swap rollback was unsaf
   return "$rc"
 }
 
+restore_unit_states() {
+  local index unit desired current rc=0 action
+  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    desired=${desired_enabled_states[$index]}
+    current=$(read_unit_state is-enabled "$unit") || { rc=1; continue; }
+    if [ "$current" != "$desired" ]; then
+      case "$desired" in enabled) action=enable ;; disabled) action=disable ;; esac
+      "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || { rc=1; continue; }
+    fi
+    current=$(read_unit_state is-enabled "$unit") || { rc=1; continue; }
+    [ "$current" = "$desired" ] || rc=1
+  done
+
+  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    desired=${desired_active_states[$index]}
+    current=$(read_unit_state is-active "$unit") || { rc=1; continue; }
+    if [ "$unit" = estrado-pjud.service ] && [ "$changed_api" -eq 1 ]; then
+      if [ "$desired" = active ]; then
+        "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
+      elif [ "$current" = active ]; then
+        "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
+      fi
+    elif [ "$unit" = estrado-pjud-worker.service ] && [ "$changed_worker" -eq 1 ]; then
+      if [ "$desired" = active ]; then
+        if prepare_temp_credentials && check_exact_zero_and_fresh_heartbeat; then
+          "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
+        else
+          rc=1
+        fi
+      elif [ "$current" = active ]; then
+        "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
+      fi
+    elif [ "$current" != "$desired" ]; then
+      if [ "$unit" = estrado-pjud-worker.service ] && [ "$desired" = active ]; then
+        if prepare_temp_credentials && check_exact_zero_and_fresh_heartbeat; then
+          "$systemctl_bin" start "$unit" >"$null_file" 2>&1 || rc=1
+        else
+          rc=1
+        fi
+      else
+        case "$desired" in active) action=start ;; inactive) action=stop ;; esac
+        "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || rc=1
+      fi
+    fi
+    current=$(read_unit_state is-active "$unit") || { rc=1; continue; }
+    [ "$current" = "$desired" ] || rc=1
+  done
+  return "$rc"
+}
+
 do_rollback() {
   local uid rollback_rc=0 swap_rc=0 swap_state
   backup_dir=$1
@@ -681,6 +880,7 @@ do_rollback() {
   validate_backup_dir "$backup_dir" || { fail 'rollback backup is unsafe or invalid'; return 1; }
   validate_manifest || { fail 'rollback manifest is unsafe or invalid'; return 1; }
   load_and_validate_changes || { fail 'rollback affected-unit metadata is invalid'; return 1; }
+  load_and_validate_unit_states || { fail 'rollback live-unit metadata is invalid'; return 1; }
   swap_state=$(<"$backup_dir/swap-state")
   case "$swap_state" in
     attempted)
@@ -691,17 +891,10 @@ do_rollback() {
   esac
   restore_manifest "$swap_rc" || rollback_rc=1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1
-  if [ "$changed_api" -eq 1 ]; then "$systemctl_bin" restart estrado-pjud.service >"$null_file" 2>&1 || rollback_rc=1; fi
+  restore_unit_states || rollback_rc=1
   if [ "$changed_hermes" -eq 1 ]; then
     "$systemctl_bin" --user --machine=hermes@.host restart \
       hermes-gateway.service hermes-dashboard.service >"$null_file" 2>&1 || rollback_rc=1
-  fi
-  if [ "$changed_worker" -eq 1 ]; then
-    if prepare_temp_credentials && check_exact_zero_and_fresh_heartbeat; then
-      "$systemctl_bin" restart estrado-pjud-worker.service >"$null_file" 2>&1 || rollback_rc=1
-    else
-      rollback_rc=1
-    fi
   fi
   if [ "$rollback_rc" -ne 0 ]; then
     printf '%s\n' 'ROLLBACK INCOMPLETO: intervención manual requerida; no se hizo borrado amplio.' >&2
@@ -718,26 +911,30 @@ automatic_rollback() {
 }
 
 run_apply_steps() {
-  local uid=$1 api_path worker_path hermes_path before_api before_worker before_hermes
-  local after_api after_worker after_hermes provision_rc=0
+  local uid=$1 api_path worker_path worker_dropin_path hermes_path before_api before_worker before_worker_dropin before_hermes
+  local after_api after_worker after_worker_dropin after_hermes provision_rc=0
   api_path="$systemd_dir/estrado-pjud.service"
   worker_path="$systemd_dir/estrado-pjud-worker.service"
+  worker_dropin_path="$systemd_dir/estrado-pjud-worker.service.d/xvfb.conf"
   hermes_path="$systemd_dir/user-$uid.slice.d/50-legaltech-resource-limits.conf"
   before_api=$(digest_path "$api_path") || return 1
   before_worker=$(digest_path "$worker_path") || return 1
+  before_worker_dropin=$(digest_path "$worker_dropin_path") || return 1
   before_hermes=$(digest_path "$hermes_path") || return 1
   create_backup "$uid" >"$null_file" || return 1
+  validate_backup_dir "$backup_dir" && validate_manifest && load_and_validate_unit_states || return 1
   check_git || return 1
   mutation_started=1
-  PROV_ENABLE_PJUD_WORKER=0 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
+  PROV_ENABLE_PJUD_WORKER=0 PROV_SKIP_CADDY=1 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
   after_api=$(digest_path "$api_path") || return 1
   after_worker=$(digest_path "$worker_path") || return 1
+  after_worker_dropin=$(digest_path "$worker_dropin_path") || return 1
   after_hermes=$(digest_path "$hermes_path") || return 1
   if [ "$before_api" != "$after_api" ]; then record_change api || return 1; fi
-  if [ "$before_worker" != "$after_worker" ]; then record_change worker || return 1; fi
+  if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then record_change worker || return 1; fi
   if [ "$before_hermes" != "$after_hermes" ]; then record_change hermes || return 1; fi
   [ "$provision_rc" -eq 0 ] || return 1
-  if [ "${swap_preexisting:-0}" -eq 0 ]; then
+  if [ "${swap_initial_state:-unknown}" = clean ]; then
     printf '%s\n' attempted > "$backup_dir/swap-state" || return 1
   fi
   "$swap_bin" apply >"$null_file" 2>&1 || return 1
@@ -748,7 +945,7 @@ run_apply_steps() {
     "$systemctl_bin" --user --machine=hermes@.host restart \
       hermes-gateway.service hermes-dashboard.service >"$null_file" 2>&1 || return 1
   fi
-  if [ "$before_worker" != "$after_worker" ]; then
+  if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then
     check_exact_zero_and_fresh_heartbeat || return 1
     "$systemctl_bin" restart estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
   fi

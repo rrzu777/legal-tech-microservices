@@ -9,7 +9,9 @@
 #   - ops/systemd/** → /etc/systemd/system/** (instala solo lo que difiere;
 #     daemon-reload únicamente si algo cambió)
 #   - ops/caddy/Caddyfile → /etc/caddy/Caddyfile (reload de caddy solo si
-#     cambió; si el paquete caddy falta, receta y exit 1 — ops/caddy/README.md)
+#     cambió; si el paquete caddy falta, receta y exit 1 — ops/caddy/README.md;
+#     PROV_SKIP_CADDY=1 omite por completo esta superficie para rollouts que
+#     administran exclusivamente los recursos declarados)
 #   - .env presente, 0640 root:estrado y con TODAS las variables de
 #     ops/env.inventory (compara NOMBRES; los valores nunca se imprimen)
 #   - venv, usuarios de las units y código de ops/monitoring instalado en
@@ -27,7 +29,8 @@
 # en el laptop (ver ops/tests/test-provision.sh): PROV_REPO_DIR,
 # PROV_SYSTEMD_DIR, PROV_SYSTEMCTL, PROV_ENV_FILE, PROV_REQUIRED_USERS,
 # PROV_ENV_OWNER, PROV_ENV_GROUP, PROV_MONITORING_DIR, PROV_CADDY_BIN,
-# PROV_CADDYFILE_DEST y los destinos/binarios PROV_* usados por el harness.
+# PROV_CADDYFILE_DEST, PROV_SKIP_CADDY y los destinos/binarios PROV_* usados
+# por el harness.
 set -euo pipefail
 
 main() {
@@ -54,6 +57,7 @@ main() {
   local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
   local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
   local enable_pjud_worker="${PROV_ENABLE_PJUD_WORKER:-0}"
+  local skip_caddy="${PROV_SKIP_CADDY:-0}"
   local src="$repo_dir/ops/systemd"
   local template_src="$repo_dir/ops/systemd-templates/hermes-user.slice.conf"
   local monitoring_src="$repo_dir/ops/monitoring"
@@ -65,8 +69,10 @@ main() {
   # dice "no falta nada" — o sea que un PROV_REPO_DIR malo o un checkout a
   # medias (el escenario exacto de una reconstrucción) imprimiría "todo OK"
   # sin haber verificado NADA. La ausencia no es señal.
+  case "$skip_caddy" in 0|1) ;; *) echo "ABORTA: PROV_SKIP_CADDY debe ser 0 o 1." >&2; exit 1 ;; esac
+
   if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ] \
-    || [ ! -r "$caddyfile_src" ] || [ ! -r "$template_src" ] \
+    || { [ "$skip_caddy" = 0 ] && [ ! -r "$caddyfile_src" ]; } || [ ! -r "$template_src" ] \
     || [ ! -r "$logrotate_src" ] || [ ! -r "$monitoring_src/monitor.py" ] \
     || [ ! -r "$monitoring_src/resource-tracker.py" ] \
     || [ ! -r "$monitoring_src/alert_policy.py" ] \
@@ -334,10 +340,10 @@ main() {
   fi
 
   # --- caddy: TLS delante de la API (ops/caddy/README.md) ------------------
-  if ! command -v "$caddy_bin" >/dev/null 2>&1; then
+  if [ "$skip_caddy" = 0 ] && ! command -v "$caddy_bin" >/dev/null 2>&1; then
     echo "FALTA caddy (apt-get install caddy) — sin él la API queda sin TLS delante." >&2
     rc=1
-  elif ! cmp -s "$caddyfile_src" "$caddyfile_dest"; then
+  elif [ "$skip_caddy" = 0 ] && ! cmp -s "$caddyfile_src" "$caddyfile_dest"; then
     # Validar ANTES de instalar. Sin esto, un Caddyfile roto llegaba a /etc y
     # un `reload || restart` ciego hacía lo peor posible: el reload gracioso
     # de Caddy rechaza el config inválido y SIGUE sirviendo el viejo (diseño,

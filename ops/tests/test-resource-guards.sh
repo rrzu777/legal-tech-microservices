@@ -97,7 +97,21 @@ setup() {
   printf 'old caddy\n' > "$FAKE/etc/caddy/Caddyfile"
   printf 'old logrotate\n' > "$FAKE/etc/logrotate.d/legaltech-resources"
   printf 'old monitor\n' > "$FAKE/monitoring/monitor.py"
+  printf 'old tracker\n' > "$FAKE/monitoring/resource-tracker.py"
   printf 'outside original\n' > "$FAKE/outside"
+
+  printf '%s\n' enabled > "$STATE/unit-estrado-pjud.service-enabled"
+  printf '%s\n' active > "$STATE/unit-estrado-pjud.service-active"
+  printf '%s\n' disabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
+  printf '%s\n' inactive > "$STATE/unit-estrado-pjud-worker.service-active"
+  for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+    printf '%s\n' disabled > "$STATE/unit-$unit-enabled"
+    printf '%s\n' inactive > "$STATE/unit-$unit-active"
+  done
+  for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+    printf '%s\n' enabled > "$STATE/unit-$unit-enabled"
+    printf '%s\n' active > "$STATE/unit-$unit-active"
+  done
 
   if [ -d "$TMP/stub-bin" ]; then
     cp -R "$TMP/stub-bin/." "$BIN/"
@@ -114,17 +128,20 @@ bytes=${RG_TEST_DISK_BYTES:-9663676416}
 printf 'df %s\n' "$*" >> "$RG_TEST_STATE/events"
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf 'fake 20000000 1 %s 1%% /\n' "$((bytes / 1024))"
+[ ! -e "$RG_TEST_STATE/df-fail-after-output" ]
 EOF
   write_stub free <<'EOF'
 bytes=${RG_TEST_RAM_BYTES:-7516192768}
 printf '               total        used        free      shared  buff/cache   available\n'
 printf 'Mem:     16000000000 1 1 1 1 %s\n' "$bytes"
+[ ! -e "$RG_TEST_STATE/free-fail-after-output" ]
 EOF
   write_stub id <<'EOF'
 if [ -e "$RG_TEST_STATE/id-fail" ]; then exit 1; fi
 case "${1:-}" in
   -u) printf '%s\n' 1002 ;;
   -nu) printf '%s\n' hermes ;;
+  -g) printf '%s\n' "$RG_TEST_ROOT_GID" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -137,11 +154,15 @@ printf 'systemctl %s\n' "$*" >> "$RG_TEST_STATE/events"
 if [ -f "$RG_TEST_STATE/fail-command" ] && [ "$*" = "$(cat "$RG_TEST_STATE/fail-command")" ]; then exit 1; fi
 if [ "${1:-}" = daemon-reload ] && [ -e "$RG_TEST_STATE/daemon-fail" ]; then exit 1; fi
 if [ "${1:-}" = list-unit-files ]; then
-  printf '%s\n' 'estrado-pjud.service enabled' 'hermes-gateway.service enabled' 'hermes-dashboard.service enabled'
+  case "$(cat "$RG_TEST_STATE/list-shape" 2>/dev/null || true)" in
+    unexpected-state) printf '%s\n' 'estrado-pjud.service disabled enabled' ;;
+    extra) printf '%s\n' 'estrado-pjud.service enabled enabled extra' ;;
+    *) printf '%s\n' 'estrado-pjud.service enabled enabled' 'hermes-gateway.service enabled enabled' 'hermes-dashboard.service enabled disabled' ;;
+  esac
   exit 0
 fi
 if [ "${1:-}" = --user ] && [ "${3:-}" = list-unit-files ]; then
-  printf '%s\n' 'hermes-gateway.service enabled' 'hermes-dashboard.service enabled'
+  printf '%s\n' 'hermes-gateway.service enabled enabled' 'hermes-dashboard.service enabled disabled'
   exit 0
 fi
 if [ "${1:-}" = --user ] && [ "${3:-}" = restart ]; then exit 0; fi
@@ -161,14 +182,23 @@ if [ "${1:-}" = show ]; then
   fi
   [ ! -e "$RG_TEST_STATE/postflight-fail" ] || exit 1
   property_value() {
-  if [ -e "$RG_TEST_STATE/property-bad" ] && [ "$unit:$1" = legaltech.slice:MemoryMax ]; then echo 1; return; fi
+  if [ -e "$RG_TEST_STATE/property-bad" ]; then
+    bad_key=$(cat "$RG_TEST_STATE/property-bad")
+    [ -n "$bad_key" ] || bad_key=legaltech.slice:MemoryMax
+    if [ "$unit:$1" = "$bad_key" ]; then echo drifted; return; fi
+  fi
   case "$unit:$1" in
     legaltech.slice:CPUWeight) echo 1000 ;;
     legaltech.slice:MemoryLow) echo 3221225472 ;;
     legaltech.slice:MemoryHigh) echo 6442450944 ;;
     legaltech.slice:MemoryMax) echo 8589934592 ;;
     estrado-pjud.service:Slice) echo legaltech.slice ;;
+    estrado-pjud.service:MemoryHigh) echo 3221225472 ;;
+    estrado-pjud.service:MemoryMax) echo 4294967296 ;;
+    estrado-pjud.service:CPUQuotaPerSecUSec) echo 2s ;;
+    estrado-pjud.service:CPUWeight) echo 500 ;;
     estrado-pjud.service:TasksMax) echo 512 ;;
+    estrado-pjud-worker.service:PartOf) echo legaltech.slice ;;
     estrado-pjud-worker.service:Slice) echo legaltech.slice ;;
     estrado-pjud-worker.service:MemoryHigh) echo 2147483648 ;;
     estrado-pjud-worker.service:MemoryMax) echo 3221225472 ;;
@@ -180,9 +210,31 @@ if [ "${1:-}" = show ]; then
     user-1002.slice:TasksMax) echo 1024 ;;
     user-1002.slice:CPUWeight) echo 200 ;;
     legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) echo system.slice ;;
+    legaltech-monitor.service:Type|legaltech-resource-tracker.service:Type) echo oneshot ;;
+    legaltech-monitor.service:User|legaltech-resource-tracker.service:User) echo root ;;
+    legaltech-monitor.service:WorkingDirectory|legaltech-resource-tracker.service:WorkingDirectory) echo /opt/legaltech-monitoring ;;
+    legaltech-monitor.service:NoNewPrivileges|legaltech-resource-tracker.service:NoNewPrivileges) echo yes ;;
+    legaltech-monitor.service:PrivateTmp|legaltech-resource-tracker.service:PrivateTmp) echo yes ;;
+    legaltech-monitor.service:ProtectSystem|legaltech-resource-tracker.service:ProtectSystem) echo strict ;;
+    legaltech-monitor.service:ProtectHome|legaltech-resource-tracker.service:ProtectHome) echo yes ;;
     legaltech-monitor.service:MemoryMax|legaltech-resource-tracker.service:MemoryMax) echo 134217728 ;;
     legaltech-monitor.service:CPUQuotaPerSecUSec|legaltech-resource-tracker.service:CPUQuotaPerSecUSec) echo 200ms ;;
     legaltech-monitor.service:TasksMax|legaltech-resource-tracker.service:TasksMax) echo 64 ;;
+    legaltech-monitor.service:StateDirectory) echo legaltech-monitor ;;
+    legaltech-monitor.service:StateDirectoryMode) echo 0750 ;;
+    legaltech-monitor.service:LogsDirectory) echo legaltech ;;
+    legaltech-monitor.service:LogsDirectoryMode) echo 0750 ;;
+    legaltech-monitor.service:ReadWritePaths) echo '/var/lib/legaltech-monitor /var/log/legaltech' ;;
+    legaltech-monitor.service:RestrictAddressFamilies) echo '' ;;
+    legaltech-resource-tracker.service:StateDirectory|legaltech-resource-tracker.service:LogsDirectory) echo '' ;;
+    legaltech-resource-tracker.service:ReadWritePaths) echo /var/log/legaltech/resources.csv ;;
+    legaltech-resource-tracker.service:RestrictAddressFamilies) echo AF_UNIX ;;
+    legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
+    legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
+    legaltech-monitor.timer:OnBootUSec|legaltech-resource-tracker.timer:OnBootUSec) echo 5min ;;
+    legaltech-monitor.timer:OnUnitActiveUSec|legaltech-resource-tracker.timer:OnUnitActiveUSec) echo 5min ;;
+    legaltech-monitor.timer:Persistent|legaltech-resource-tracker.timer:Persistent) echo yes ;;
+    legaltech-monitor.timer:RandomizedDelayUSec|legaltech-resource-tracker.timer:RandomizedDelayUSec) echo 1min ;;
     *) exit 1 ;;
   esac; }
   if [ "$value_mode" -eq 1 ]; then property_value "$property"; else
@@ -190,11 +242,26 @@ if [ "${1:-}" = show ]; then
   fi
   exit 0
 fi
+state_file() { printf '%s/unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
 case "${1:-}" in
-  is-enabled|is-active) echo "${1#is-}"; exit 0 ;;
-  daemon-reload|restart|start) exit 0 ;;
+  is-enabled|is-active)
+    kind=${1#is-}; unit=${2:-}; value=$(cat "$(state_file "$unit" "$kind")") || exit 1
+    printf '%s\n' "$value"
+    if [ "$kind" = enabled ]; then [ "$value" = enabled ]; else [ "$value" = active ]; fi
+    ;;
+  enable|disable)
+    action=$1; shift
+    case "$action" in enable) value=enabled ;; disable) value=disabled ;; esac
+    for unit in "$@"; do [ "$unit" = -- ] || printf '%s\n' "$value" > "$(state_file "$unit" enabled)"; done
+    ;;
+  start|stop|restart)
+    action=$1; shift
+    case "$action" in stop) value=inactive ;; *) value=active ;; esac
+    for unit in "$@"; do [ "$unit" = -- ] || printf '%s\n' "$value" > "$(state_file "$unit" active)"; done
+    ;;
+  daemon-reload) exit 0 ;;
+  *) exit 1 ;;
 esac
-exit 1
 EOF
   write_stub curl <<'EOF'
 case "$*" in *fixture-credential-not-a-token*) printf '%s\n' 'credential leaked in argv' >> "$RG_TEST_STATE/events"; exit 97 ;; esac
@@ -273,13 +340,29 @@ if [ -d "$path" ]; then mode=$(/usr/bin/stat -f '%Lp' "$path"); else mode=$(/usr
 uid=$(/usr/bin/stat -f '%u' "$path")
 gid=$(/usr/bin/stat -f '%g' "$path")
 links=$(/usr/bin/stat -f '%l' "$path")
+if [ -e "$RG_TEST_STATE/credential-wrong-gid" ] && [ "$path" = "$RG_CREDENTIAL_FILE" ]; then gid=$((gid + 1)); fi
 printf '%s|%s|%s|%s\n' "$mode" "$uid" "$gid" "$links"
 EOF
   write_stub sha256 <<'EOF'
-if [ -f "$1" ]; then /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; else exit 1; fi
+path=${@: -1}
+[ -f "$path" ] || exit 1
+digest=$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')
+case "$(cat "$RG_TEST_STATE/sha-mode" 2>/dev/null || true)" in
+  malformed) printf 'not-a-digest  %s\n' "$path" ;;
+  wrong-path) printf '%s  %s.other\n' "$digest" "$path" ;;
+  extra) printf '%s  %s\n%s  %s\n' "$digest" "$path" "$digest" "$path" ;;
+  fail-after-output) printf '%s  %s\n' "$digest" "$path"; exit 1 ;;
+  *) printf '%s  %s\n' "$digest" "$path" ;;
+esac
 EOF
   write_stub provision <<'EOF'
 printf '%s\n' provision >> "$RG_TEST_STATE/events"
+[ "${PROV_SKIP_CADDY:-0}" = 1 ] || { printf '%s\n' caddy-not-skipped >> "$RG_TEST_STATE/events"; exit 98; }
+printf '%s\n' disabled > "$RG_TEST_STATE/unit-legaltech-monitor.service-enabled"
+printf '%s\n' disabled > "$RG_TEST_STATE/unit-legaltech-resource-tracker.service-enabled"
+printf '%s\n' enabled > "$RG_TEST_STATE/unit-estrado-pjud.service-enabled"
+printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-monitor.timer-enabled"
+printf '%s\n' enabled > "$RG_TEST_STATE/unit-legaltech-resource-tracker.timer-enabled"
 case "${RG_TEST_MUTATE:-none}" in
   all)
     printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service"
@@ -287,6 +370,7 @@ case "${RG_TEST_MUTATE:-none}" in
     printf 'changed hermes\n' >> "$RG_SYSTEMD_DIR/user-1002.slice.d/50-legaltech-resource-limits.conf"
     ;;
   api) printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service" ;;
+  dropin) printf 'changed xvfb\n' >> "$RG_SYSTEMD_DIR/estrado-pjud-worker.service.d/xvfb.conf" ;;
 esac
 if [ -e "$RG_TEST_STATE/mutate-outside" ]; then printf 'outside changed\n' > "$RG_TEST_OUTSIDE"; fi
 if [ -e "$RG_TEST_STATE/create-sysctl" ]; then printf 'new sysctl\n' > "$RG_SYSCTL_FILE"; fi
@@ -295,10 +379,16 @@ if [ -e "$RG_TEST_STATE/mutate-credential" ]; then printf 'changed protected con
 EOF
   write_stub swap <<'EOF'
 printf 'swap %s\n' "$1" >> "$RG_TEST_STATE/events"
+if [ "$1" = preflight ]; then
+  [ ! -e "$RG_TEST_STATE/swap-preflight-fail" ] || exit 1
+  if [ -e "$RG_TEST_STATE/swap-applied" ]; then printf '%s\n' managed; else printf '%s\n' clean; fi
+  exit 0
+fi
 if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-apply-fail" ]; then exit 1; fi
 if [ "$1" = apply ]; then : > "$RG_TEST_STATE/swap-applied"; fi
 if [ "$1" = verify ]; then
   [ ! -e "$RG_TEST_STATE/swap-verify-fail" ] || exit 1
+  [ ! -e "$RG_TEST_STATE/swap-live-drift" ] || exit 1
   [ -e "$RG_TEST_STATE/swap-applied" ] || exit 1
 fi
 if [ "$1" = rollback ]; then
@@ -306,6 +396,27 @@ if [ "$1" = rollback ]; then
   rm -f "$RG_TEST_STATE/swap-applied"
 fi
 exit 0
+EOF
+  write_stub find <<'EOF'
+/usr/bin/find "$@"
+rc=$?
+[ ! -e "$RG_TEST_STATE/find-fail-after-output" ] || exit 1
+exit "$rc"
+EOF
+  write_stub chmod <<'EOF'
+/bin/chmod "$@" || exit 1
+target=${@: -1}
+if [ "${target##*/}" = manifest.tsv ] && [ -f "$RG_TEST_STATE/corrupt-backup" ]; then
+  case "$(cat "$RG_TEST_STATE/corrupt-backup")" in
+    missing) /usr/bin/sed '$d' "$target" > "$target.tmp" && /bin/mv "$target.tmp" "$target" ;;
+    duplicate) /usr/bin/sed -n '1p' "$target" >> "$target" ;;
+    corrupt) /usr/bin/awk 'NR == 1 { sub(/entries\/[0-9][0-9][0-9][0-9]/, "entries/9999") } { print }' "$target" > "$target.tmp" && /bin/mv "$target.tmp" "$target" ;;
+    metadata) /bin/chmod 0666 "${target%/*}/entries/0001" ;;
+  esac
+fi
+if [ "${target##*/}" = unit-states.tsv ] && [ -e "$RG_TEST_STATE/corrupt-live-state" ]; then
+  /usr/bin/sed '$d' "$target" > "$target.tmp" && /bin/mv "$target.tmp" "$target"
+fi
 EOF
   write_stub python <<'EOF'
 printf 'python %s\n' "$*" >> "$RG_TEST_STATE/events"
@@ -338,7 +449,7 @@ else
     *) /bin/chmod 644 "$destination" ;;
   esac
 fi
-if [ -e "$RG_TEST_STATE/sha-after-backup" ] && [ "${destination##*/}" = 0016 ]; then
+if [ -e "$RG_TEST_STATE/sha-after-backup" ] && [ "${destination##*/}" = 0015 ]; then
   printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$RG_TEST_STATE/git-sha"
 fi
 EOF
@@ -366,8 +477,8 @@ run_guard() {
     RG_GIT_BIN="$BIN/git" RG_DF_BIN="$BIN/df" RG_FREE_BIN="$BIN/free" \
     RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" \
     RG_CURL_BIN="$BIN/curl" RG_DATE_BIN="$BIN/date" RG_STAT_BIN="$BIN/stat" \
-    RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN=/usr/bin/find RG_CP_BIN="$BIN/cp" \
-    RG_RM_BIN=/bin/rm RG_MKDIR_BIN=/bin/mkdir RG_CHMOD_BIN=/bin/chmod \
+    RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN="$BIN/find" RG_CP_BIN="$BIN/cp" \
+    RG_RM_BIN=/bin/rm RG_MKDIR_BIN=/bin/mkdir RG_CHMOD_BIN="$BIN/chmod" \
     RG_CHOWN_BIN=/usr/sbin/chown RG_MKTEMP_BIN=/usr/bin/mktemp RG_JQ_BIN="$BIN/jq" \
     RG_PROVISION_BIN="$BIN/provision" RG_SWAP_BIN="$BIN/swap" RG_PYTHON_BIN="$BIN/python" \
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
@@ -422,6 +533,44 @@ printf '%s\n' zero-star > "$STATE/claim-count"
 run_guard preflight --expected-sha "$EXPECTED_SHA"
 expect_eq 'exact wildcard zero Content-Range form is accepted' "$RC" 0
 
+echo '== systemd inventory accepts real three-column output and rejects ambiguity'
+setup
+run_guard preflight --expected-sha "$EXPECTED_SHA"
+expect_eq 'UNIT STATE PRESET inventory is accepted' "$RC" 0
+for shape in unexpected-state extra; do
+  setup
+  printf '%s\n' "$shape" > "$STATE/list-shape"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq "$shape inventory refuses apply" "$RC" 1
+  expect_count "$shape inventory causes no provision" provision 0
+done
+
+echo '== structurally managed swap with live drift is unknown before backup'
+setup
+: > "$STATE/swap-applied"
+: > "$STATE/swap-live-drift"
+before_fstab=$(cat "$FAKE/etc/fstab")
+run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'managed swap drift refuses apply' "$RC" 1
+expect_count 'managed swap drift never calls swap apply' 'swap apply' 0
+expect_count 'managed swap drift never calls swap rollback' 'swap rollback' 0
+expect_count 'managed swap drift never provisions' provision 0
+expect_eq 'managed swap drift changes no managed file' "$(cat "$FAKE/etc/fstab")" "$before_fstab"
+
+echo '== gate-producing command output followed by nonzero is unknown'
+for dependency in df free; do
+  setup
+  : > "$STATE/$dependency-fail-after-output"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq "$dependency valid-looking output plus failure refuses apply" "$RC" 1
+  expect_count "$dependency failure causes no provision" provision 0
+done
+setup
+: > "$STATE/find-fail-after-output"
+run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'find empty-looking result plus failure refuses apply' "$RC" 1
+expect_count 'find failure causes no provision' provision 0
+
 echo '== protected service configuration is parsed as data and fails closed'
 setup
 printf '%s\n' 'SUPABASE_SERVICE_KEY=second-placeholder' >> "$FAKE/repo/estrado-pjud-service/.env"
@@ -475,6 +624,16 @@ for scenario in "${negative_scenarios[@]}"; do
   expect_eq "$scenario creates no backup content" "$backup_count" 0
 done
 
+echo '== GNU sha256sum output is bound to one exact requested path'
+for sha_mode in malformed wrong-path extra fail-after-output; do
+  setup
+  printf '%s\n' "$sha_mode" > "$STATE/sha-mode"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq "$sha_mode digest refuses apply" "$RC" 1
+  expect_count "$sha_mode digest causes no provision" provision 0
+  expect_count "$sha_mode digest creates no backup" backup-copy 0
+done
+
 echo '== apply backs up before mutation and orders affected restarts safely'
 setup
 TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
@@ -497,8 +656,15 @@ SUCCESS_EVENTS=$(cat "$EVENTS")
 BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
 expect_eq 'service credential backup is root-only 0600' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR/entries/0010")" 600
 expect_missing 'manifest stores metadata but no credential content' "$(cat "$BACKUP_DIR/manifest.tsv")" "$SECRET_SENTINEL"
-expect_eq 'manifest has one record for every exact managed path' "$(wc -l < "$BACKUP_DIR/manifest.tsv" | tr -d ' ')" 16
+expect_eq 'manifest has one record for every exact managed path' "$(wc -l < "$BACKUP_DIR/manifest.tsv" | tr -d ' ')" 15
 expect_eq 'timestamped backup directory is 0700' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR")" 700
+if [ -f "$BACKUP_DIR/unit-states.tsv" ]; then
+  live_state_lines=$(wc -l < "$BACKUP_DIR/unit-states.tsv" | tr -d ' ')
+else
+  live_state_lines=missing
+fi
+expect_eq 'backup records exactly six live unit states' "$live_state_lines" 6
+expect_missing 'live unit metadata contains no credential content' "$(cat "$BACKUP_DIR/unit-states.tsv" 2>/dev/null || true)" "$SECRET_SENTINEL"
 printf '%s\n' "$FAKE/outside"$'\t0\t-\t-\t-\t-' >> "$BACKUP_DIR/manifest.tsv"
 before_tampered_rollback=$(cat "$FAKE/systemd/estrado-pjud.service")
 : > "$EVENTS"
@@ -514,6 +680,14 @@ run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'post-backup SHA drift refuses apply' "$RC" 1
 expect_count 'post-backup SHA drift runs no provision mutation' provision 0
 expect_count 'post-backup SHA drift does not invoke swap rollback before swap apply' 'swap rollback' 0
+
+echo '== corrupt live-state metadata refuses before first mutation'
+setup
+: > "$STATE/corrupt-live-state"
+run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'missing live-state row refuses apply' "$RC" 1
+expect_count 'corrupt live-state metadata causes no provision' provision 0
+expect_count 'corrupt live-state metadata causes no systemd effect' 'systemctl daemon-reload' 0
 
 echo '== apply rejects an existing unsafe backup root rather than taking it over'
 setup
@@ -545,6 +719,61 @@ for kind in symlink hardlink; do
   expect_eq "$kind managed target refuses apply" "$RC" 1
   expect_eq "$kind managed target runs no provision mutation" "$provision_count" 0
 done
+
+echo '== every existing manifest source has safe type, owner, group and mode'
+run_unsafe_source() {
+  local scenario=$1 provision_count swap_count
+  trap - EXIT
+  setup
+  case "$scenario" in
+    credential-gid) : > "$STATE/credential-wrong-gid" ;;
+    unit-writable) chmod 0664 "$FAKE/systemd/estrado-pjud.service" ;;
+    runtime-writable) chmod 0775 "$FAKE/monitoring" ;;
+    monitor-env-writable) chmod 0620 "$FAKE/monitoring.env" ;;
+  esac
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  provision_count=$(grep -c -F provision "$EVENTS" 2>/dev/null || true)
+  swap_count=$(grep -c -F 'swap apply' "$EVENTS" 2>/dev/null || true)
+  printf '%s|%s|%s|%s\n' "$scenario" "$RC" "$provision_count" "$swap_count"
+}
+source_scenarios=(credential-gid unit-writable runtime-writable monitor-env-writable)
+for scenario in "${source_scenarios[@]}"; do run_unsafe_source "$scenario" > "$TMP/source-$scenario" & done
+wait
+for scenario in "${source_scenarios[@]}"; do
+  IFS='|' read -r _scenario RC provision_count swap_count < "$TMP/source-$scenario"
+  expect_eq "$scenario source refuses apply" "$RC" 1
+  expect_eq "$scenario source causes no provision" "$provision_count" 0
+  expect_eq "$scenario source causes no swap mutation" "$swap_count" 0
+done
+
+echo '== generated backup is fully validated before first mutation'
+run_corrupt_backup() {
+  local scenario=$1 provision_count effect_count
+  trap - EXIT
+  setup
+  printf '%s\n' "$scenario" > "$STATE/corrupt-backup"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  provision_count=$(grep -c -F provision "$EVENTS" 2>/dev/null || true)
+  effect_count=$(grep -Ec '^systemctl (daemon-reload|restart|start|stop|enable|disable) ' "$EVENTS" 2>/dev/null || true)
+  printf '%s|%s|%s|%s\n' "$scenario" "$RC" "$provision_count" "$effect_count"
+}
+backup_corruptions=(missing duplicate corrupt metadata)
+for scenario in "${backup_corruptions[@]}"; do run_corrupt_backup "$scenario" > "$TMP/backup-$scenario" & done
+wait
+for scenario in "${backup_corruptions[@]}"; do
+  IFS='|' read -r _scenario RC provision_count effect_count < "$TMP/backup-$scenario"
+  expect_eq "$scenario generated backup refuses apply" "$RC" 1
+  expect_eq "$scenario generated backup causes no provision" "$provision_count" 0
+  expect_eq "$scenario generated backup causes no systemd effect" "$effect_count" 0
+done
+
+echo '== worker digest includes the managed Xvfb drop-in'
+setup
+TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'drop-in-only apply succeeds' "$RC" 0
+expect_count 'drop-in-only change restarts worker' 'systemctl restart estrado-pjud-worker.service' 1
+expect_count 'drop-in-only change repeats heartbeat gate' 'curl heartbeat' 2
+expect_count 'drop-in-only change repeats exact claim gate' 'curl claims' 2
 
 echo '== partial provision failure records affected units for rollback restart'
 setup
@@ -599,6 +828,41 @@ for scenario in "${mutation_scenarios[@]}"; do
   expect_eq "$scenario invokes swap rollback exactly once" "$rollback_count" 1
 done
 
+echo '== postflight rejects drift in every previously omitted live contract class'
+run_postflight_drift() {
+  local key=$1
+  trap - EXIT
+  setup
+  : > "$STATE/swap-applied"
+  printf '%s\n' "$key" > "$STATE/property-bad"
+  run_guard postflight
+  printf '%s|%s\n' "$key" "$RC"
+}
+postflight_drifts=(
+  estrado-pjud.service:MemoryMax
+  estrado-pjud-worker.service:PartOf
+  legaltech-monitor.service:ProtectSystem
+  legaltech-monitor.service:StateDirectoryMode
+  legaltech-resource-tracker.service:RestrictAddressFamilies
+  legaltech-resource-tracker.service:StateDirectory
+  legaltech-monitor.timer:Unit
+  legaltech-resource-tracker.timer:OnBootUSec
+  legaltech-monitor.timer:OnUnitActiveUSec
+  legaltech-resource-tracker.timer:Persistent
+  legaltech-monitor.timer:RandomizedDelayUSec
+)
+for key in "${postflight_drifts[@]}"; do run_postflight_drift "$key" > "$TMP/postflight-${key//[:.]/-}" & done
+wait
+for key in "${postflight_drifts[@]}"; do
+  IFS='|' read -r _key RC < "$TMP/postflight-${key//[:.]/-}"
+  expect_eq "$key drift refuses postflight" "$RC" 1
+done
+
+setup
+: > "$STATE/swap-applied"
+run_guard postflight
+expect_eq 'complete real-shape postflight fixture succeeds' "$RC" 0
+
 echo '== unchanged units are not restarted'
 setup
 run_guard apply --expected-sha "$EXPECTED_SHA"
@@ -651,6 +915,44 @@ expect_eq 'rollback restores protected credential bytes without printing them' "
 expect_eq 'rollback restores protected credential mode from manifest metadata' "$(/usr/bin/stat -f '%Lp' "$FAKE/repo/estrado-pjud-service/.env")" 640
 if [ ! -e "$FAKE/etc/sysctl.d/60-legaltech-swap.conf" ]; then ok 'rollback removes exact newly-created managed path'; else bad 'rollback left newly-created managed path'; fi
 expect_eq 'rollback does not restore an unlisted path' "$(cat "$FAKE/outside")" 'outside changed'
+
+echo '== rollback restores exact legacy enable and timer activity states'
+setup
+printf '%s\n' disabled > "$STATE/unit-estrado-pjud.service-enabled"
+printf '%s\n' inactive > "$STATE/unit-estrado-pjud.service-active"
+for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+  printf '%s\n' enabled > "$STATE/unit-$unit-enabled"
+done
+for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+  printf '%s\n' disabled > "$STATE/unit-$unit-enabled"
+  printf '%s\n' inactive > "$STATE/unit-$unit-active"
+done
+: > "$STATE/postflight-fail"
+TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'legacy-state rollout fails on postflight' "$RC" 1
+expect_eq 'rollback restores API disabled state' "$(cat "$STATE/unit-estrado-pjud.service-enabled")" disabled
+expect_eq 'rollback restores API inactive state' "$(cat "$STATE/unit-estrado-pjud.service-active")" inactive
+expect_eq 'rollback restores worker disabled state' "$(cat "$STATE/unit-estrado-pjud-worker.service-enabled")" disabled
+expect_eq 'rollback restores worker inactive state' "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" inactive
+for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+  expect_eq "rollback restores legacy $unit enable" "$(cat "$STATE/unit-$unit-enabled")" enabled
+done
+for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+  expect_eq "rollback restores $unit disabled" "$(cat "$STATE/unit-$unit-enabled")" disabled
+  expect_eq "rollback restores $unit inactive" "$(cat "$STATE/unit-$unit-active")" inactive
+done
+expect_contains 'complete live-state restore reports rollback OK' "$OUT" 'ROLLBACK OK'
+
+echo '== partial live-state restore is loud and never reports success'
+setup
+printf '%s\n' disabled > "$STATE/unit-legaltech-monitor.timer-enabled"
+printf '%s\n' inactive > "$STATE/unit-legaltech-monitor.timer-active"
+: > "$STATE/postflight-fail"
+printf '%s\n' 'disable legaltech-monitor.timer' > "$STATE/fail-command"
+TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'failed exact timer restore leaves apply failed' "$RC" 1
+expect_contains 'failed exact timer restore is diagnosed incomplete' "$OUT" 'ROLLBACK INCOMPLETO'
+expect_missing 'failed exact timer restore never prints success' "$OUT" 'ROLLBACK OK'
 
 echo '== rollback failure at the swap RAM gate is loud and namespace-limited'
 setup

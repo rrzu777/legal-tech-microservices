@@ -325,7 +325,14 @@ preflight_state() {
   local state
   check_free_disk || return 1
   state=$(inspect_managed_state) || return 1
-  [ "$state" = clean ] || [ "$state" = managed ]
+  case "$state" in
+    clean) printf '%s\n' clean ;;
+    managed)
+      verify_managed || return 1
+      printf '%s\n' managed
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 replace_fstab_with_managed_block() {
@@ -544,7 +551,7 @@ rollback_swap() {
 }
 
 case "$command_name" in
-  preflight) preflight_state || fail ;;
+  preflight) preflight_state || fail; exit 0 ;;
   apply) apply_swap || fail ;;
   verify) verify_managed || fail ;;
   rollback) rollback_swap || fail ;;
