@@ -37,6 +37,7 @@ ESTIMATED_OPERATION_BYTES = {
     "other": 5_000_000,
 }
 _TELEMETRY_RETRY_DELAYS_S = (0.1, 0.25)
+_TRANSIENT_TELEMETRY_API_CODES = frozenset({"40001", "40P01", "55P03"})
 _MAX_SESSION_AGE_SECONDS = 86_400
 SessionReason = Literal[
     "startup",
@@ -58,6 +59,11 @@ _SESSION_REASONS: frozenset[str] = frozenset({
 })
 _SESSION_REASONS_WITHOUT_AGE = frozenset({"startup", "missing_bundle"})
 _SESSION_OPERATIONS = frozenset({"health", "mint"})
+
+
+def _is_transient_telemetry_api_error(exc: APIError) -> bool:
+    """Only database concurrency outcomes may safely reuse the same claim."""
+    return exc.code in _TRANSIENT_TELEMETRY_API_CODES
 
 
 class ProxyUsageTracker:
@@ -193,11 +199,19 @@ class ProxyUsageTracker:
                             "claim_status": "recovered_reserved",
                         }
                 return reservation
-            except httpx.TransportError:
+            except (httpx.TransportError, APIError) as exc:
+                if isinstance(exc, APIError) and not _is_transient_telemetry_api_error(exc):
+                    logger.error(
+                        "Proxy telemetry reservation rejected operation=%s code=%s; not retrying",
+                        operation,
+                        exc.code,
+                    )
+                    raise
                 logger.warning(
                     "Transient proxy telemetry boundary=reservation operation=%s "
-                    "attempt=%d/%d; reconciling",
+                    "code=%s attempt=%d/%d; reconciling",
                     operation,
+                    exc.code if isinstance(exc, APIError) else "transport",
                     attempt + 1,
                     attempts,
                 )
@@ -206,6 +220,16 @@ class ProxyUsageTracker:
                         idempotency_key, claim_token,
                     )
                 except httpx.TransportError:
+                    existing = None
+                except APIError as reconcile_error:
+                    if not _is_transient_telemetry_api_error(reconcile_error):
+                        logger.error(
+                            "Proxy telemetry reservation reconciliation rejected "
+                            "operation=%s code=%s; not retrying",
+                            operation,
+                            reconcile_error.code,
+                        )
+                        raise
                     existing = None
                 if existing is not None:
                     status = existing.get("status")
