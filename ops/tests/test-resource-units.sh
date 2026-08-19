@@ -88,6 +88,16 @@ for monitor in ops/systemd/legaltech-monitor.service ops/systemd/legaltech-resou
   assert_absent_property "$monitor" Service Slice legaltech.slice
 done
 
+assert_property ops/systemd/legaltech-monitor.service Service EnvironmentFile -/etc/legaltech-monitoring.env
+assert_property ops/systemd/legaltech-monitor.service Service StateDirectory legaltech-monitor
+assert_property ops/systemd/legaltech-monitor.service Service ReadWritePaths "/var/lib/legaltech-monitor /var/log/legaltech"
+assert_absent_property ops/systemd/legaltech-monitor.service Service RestrictAddressFamilies
+
+assert_absent_property ops/systemd/legaltech-resource-tracker.service Service EnvironmentFile
+assert_absent_property ops/systemd/legaltech-resource-tracker.service Service StateDirectory
+assert_property ops/systemd/legaltech-resource-tracker.service Service ReadWritePaths /var/log/legaltech
+assert_property ops/systemd/legaltech-resource-tracker.service Service RestrictAddressFamilies AF_UNIX
+
 if command -v systemd-analyze >/dev/null 2>&1; then
   echo "== systemd-analyze verify"
   if systemd-analyze verify \

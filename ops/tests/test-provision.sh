@@ -33,6 +33,8 @@ expect_same_file() { # <nombre> <esperado> <actual>
 setup() { # setup <nombre> — repo falso completo y sano
   local base="$TMP/$1"
   REPO="$base/repo"; SYSD="$base/systemd"; LOG_SYSCTL="$base/systemctl.log"
+  SYSTEM_UNITS="$base/system-units"; SYSTEM_UNIT_USERS="$base/system-unit-users"
+  USER_UNITS="$base/hermes-user-units"
   LOG_INSTALL="$base/install.log"; LOG_CHOWN="$base/chown.log"
   LOG_ID="$base/id.log"; LOG_PS="$base/ps.log"
   ENVF="$base/dotenv"; MON="$base/monitoring"; CRON="$base/estrado-cron"
@@ -60,7 +62,37 @@ setup() { # setup <nombre> — repo falso completo y sano
   chmod 600 "$ENVF"
   touch "$REPO/estrado-pjud-service/.venv/bin/python"
   chmod +x "$REPO/estrado-pjud-service/.venv/bin/python"
-  printf '#!/bin/bash\necho "$@" >> "%s"\nexit 0\n' "$LOG_SYSCTL" > "$base/systemctl"
+  printf 'ssh.service enabled\n' > "$SYSTEM_UNITS"
+  printf 'ssh.service root\n' > "$SYSTEM_UNIT_USERS"
+  printf 'hermes-gateway.service enabled\nhermes-dashboard.service enabled\n' > "$USER_UNITS"
+  cat > "$base/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$LOG_SYSCTL"
+if [ "\$1" = "list-unit-files" ]; then
+  [ ! -e "$base/system-units.fail" ] || exit 1
+  cat "$SYSTEM_UNITS"
+  exit 0
+fi
+if [ "\$1" = "show" ]; then
+  [ ! -e "$base/system-unit-users.fail" ] || exit 1
+  awk -v unit="\$2" '\$1 == unit { print \$2; found=1 } END { exit !found }' "$SYSTEM_UNIT_USERS"
+  exit \$?
+fi
+if [ "\$1" = "--user" ]; then
+  [ ! -e "$base/user-units.fail" ] || exit 1
+  cat "$USER_UNITS"
+  exit 0
+fi
+if [ "\$1" = "disable" ]; then
+  shift
+  for unit in "\$@"; do
+    [ "\$unit" = "--now" ] && continue
+    unlink "$base/multi-user.target.wants/\$unit" 2>/dev/null || true
+  done
+  exit 0
+fi
+exit 0
+EOF
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
@@ -233,7 +265,36 @@ expect_contains "logrotate conserva 14" "$LOGROTATE_RULE" "rotate 14"
 expect_contains "logrotate comprime" "$LOGROTATE_RULE" "compress"
 expect_contains "logrotate evita dependencia de reopen" "$LOGROTATE_RULE" "copytruncate"
 
+echo "== runtime anidado preexistente: converge owner y modo antes del código"
+setup runtimemode
+mkdir -p "$MON/runtime"
+chmod 0777 "$MON/runtime"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_eq "runtime anidado queda 0755" "$(file_mode "$MON/runtime")" "755"
+expect_contains "instala runtime dir como root restrictivo" "$(cat "$LOG_INSTALL")" \
+  "-d -o root -g root -m 0755 $MON/runtime"
+expect_eq "converge ownership exacto del runtime dir" \
+  "$(grep -cFx "root:root $MON/runtime" "$LOG_CHOWN" || true)" "1"
+expect_same_file "recién entonces instala el helper" \
+  "$REPO/ops/monitoring/runtime/helper.py" "$MON/runtime/helper.py"
+
+echo "== runtime anidado symlink: aborta antes de cualquier mutación"
+setup runtimesymlink
+mkdir "$TMP/runtimesymlink/outside"
+ln -s "$TMP/runtimesymlink/outside" "$MON/runtime"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica componente runtime inseguro" "$OUT" "runtime"
+expect_eq "no ejecuta install" "$(wc -l < "$LOG_INSTALL" | tr -d ' ')" "0"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_eq "no escribe código tras el symlink" \
+  "$(find "$TMP/runtimesymlink/outside" -type f | wc -l | tr -d ' ')" "0"
+expect_missing "no hace reload ni enable" "$(cat "$LOG_SYSCTL")" "daemon-reload"
+
 echo "== units y timers instalados: contrato observable completo"
+setup unitcontract; run_prov
+expect_eq "fixture sano para contrato instalado" "$RC" "0"
 for monitor in legaltech-monitor legaltech-resource-tracker; do
   UNIT="$SYSD/$monitor.service"
   expect_eq "$monitor es oneshot" "$(unit_property "$UNIT" Service Type)" "oneshot"
@@ -241,14 +302,23 @@ for monitor in legaltech-monitor legaltech-resource-tracker; do
   expect_eq "$monitor MemoryMax" "$(unit_property "$UNIT" Service MemoryMax)" "128M"
   expect_eq "$monitor CPUQuota" "$(unit_property "$UNIT" Service CPUQuota)" "20%"
   expect_eq "$monitor TasksMax" "$(unit_property "$UNIT" Service TasksMax)" "64"
-  expect_eq "$monitor usa env externo opcional" "$(unit_property "$UNIT" Service EnvironmentFile)" "-/etc/legaltech-monitoring.env"
-  expect_eq "$monitor crea StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" "legaltech-monitor"
-  expect_eq "$monitor restringe StateDirectory" "$(unit_property "$UNIT" Service StateDirectoryMode)" "0750"
   expect_eq "$monitor crea LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectory)" "legaltech"
   expect_eq "$monitor restringe LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectoryMode)" "0750"
-  expect_eq "$monitor permite sólo estado/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/lib/legaltech-monitor /var/log/legaltech"
   expect_contains "$monitor llama --once explícito" "$(unit_property "$UNIT" Service ExecStart)" "--once"
   expect_missing "$monitor no contiene credenciales" "$(cat "$UNIT")" "valor-secreto-falso"
+
+  if [ "$monitor" = "legaltech-monitor" ]; then
+    expect_eq "monitor usa env externo opcional" "$(unit_property "$UNIT" Service EnvironmentFile)" "-/etc/legaltech-monitoring.env"
+    expect_eq "monitor crea StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" "legaltech-monitor"
+    expect_eq "monitor restringe StateDirectory" "$(unit_property "$UNIT" Service StateDirectoryMode)" "0750"
+    expect_eq "monitor permite sólo estado/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/lib/legaltech-monitor /var/log/legaltech"
+    expect_eq "monitor conserva red para Telegram" "$(unit_property "$UNIT" Service RestrictAddressFamilies)" ""
+  else
+    expect_eq "tracker no recibe credenciales" "$(unit_property "$UNIT" Service EnvironmentFile)" ""
+    expect_eq "tracker no recibe StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" ""
+    expect_eq "tracker escribe sólo CSV/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/log/legaltech"
+    expect_eq "tracker sólo puede abrir sockets AF_UNIX" "$(unit_property "$UNIT" Service RestrictAddressFamilies)" "AF_UNIX"
+  fi
 
   TIMER="$SYSD/$monitor.timer"
   expect_eq "$monitor timer arranca tras 5min" "$(unit_property "$TIMER" Timer OnBootSec)" "5min"
@@ -265,6 +335,9 @@ expect_same_file "drop-in usa el template UID-free" "$REPO/ops/systemd-templates
 expect_contains "resuelve id -u hermes" "$(cat "$LOG_ID")" "-u hermes"
 expect_contains "valida reverse mapping del UID" "$(cat "$LOG_ID")" "-nu 4242"
 expect_contains "inspecciona units/procesos del UID" "$(cat "$LOG_PS")" "-U 4242 -o unit=,uunit="
+expect_contains "enumera units de sistema habilitadas" "$(cat "$LOG_SYSCTL")" "list-unit-files --type=service --state=enabled"
+expect_contains "lee el User efectivo de cada unit de sistema" "$(cat "$LOG_SYSCTL")" "show ssh.service --property=User --value"
+expect_contains "enumera units de usuario habilitadas aunque estén inactivas" "$(cat "$LOG_SYSCTL")" "--user --machine=hermes@.host list-unit-files --type=service --state=enabled"
 
 echo "== segunda corrida: idempotente, sin daemon-reload ni recarga de caddy"
 printf 'TOKEN_Y_CHAT_SE_CONFIGURAN_FUERA_DEL_REPO=preservar\n' > "$MON_ENV"
@@ -281,6 +354,34 @@ PROV_ENABLE_PJUD_WORKER=1 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_contains "habilita worker sólo con opt-in" "$(cat "$LOG_SYSCTL")" \
   "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.timer legaltech-resource-tracker.timer"
+
+echo "== migración legacy: deshabilita oneshots antes de timers"
+setup legacyenable
+mkdir -p "$TMP/legacyenable/multi-user.target.wants"
+ln -s "$SYSD/legaltech-monitor.service" \
+  "$TMP/legacyenable/multi-user.target.wants/legaltech-monitor.service"
+ln -s "$SYSD/legaltech-resource-tracker.service" \
+  "$TMP/legacyenable/multi-user.target.wants/legaltech-resource-tracker.service"
+run_prov
+expect_eq "exit 0" "$RC" "0"
+expect_contains "disable explícito" "$(cat "$LOG_SYSCTL")" \
+  "disable legaltech-monitor.service legaltech-resource-tracker.service"
+if [ ! -e "$TMP/legacyenable/multi-user.target.wants/legaltech-monitor.service" ] \
+  && [ ! -L "$TMP/legacyenable/multi-user.target.wants/legaltech-monitor.service" ] \
+  && [ ! -e "$TMP/legacyenable/multi-user.target.wants/legaltech-resource-tracker.service" ] \
+  && [ ! -L "$TMP/legacyenable/multi-user.target.wants/legaltech-resource-tracker.service" ]; then
+  ok "elimina ambos enables legacy"
+else
+  bad "elimina ambos enables legacy"
+fi
+DISABLE_LINE=$(grep -n '^disable legaltech-monitor.service' "$LOG_SYSCTL" | cut -d: -f1)
+ENABLE_LINE=$(grep -n '^enable estrado-pjud.service' "$LOG_SYSCTL" | cut -d: -f1)
+if [ -n "$DISABLE_LINE" ] && [ -n "$ENABLE_LINE" ] \
+  && [ "$DISABLE_LINE" -lt "$ENABLE_LINE" ]; then
+  ok "deshabilita legacy antes de habilitar timers"
+else
+  bad "deshabilita legacy antes de habilitar timers"
+fi
 
 echo "== Hermes ausente: falla antes de instalar o habilitar"
 setup nohermes; rm "$TMP/nohermes/hermes.uid"; run_prov
@@ -307,6 +408,49 @@ expect_eq "exit 1" "$RC" "1"
 expect_contains "nombra sólo la unit inesperada" "$OUT" "rogue-daemon.service"
 expect_eq "no instala drop-in" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 expect_missing "no habilita nada" "$(cat "$LOG_SYSCTL")" "enable"
+
+echo "== unit de usuario habilitada pero inactiva: falla cerrado"
+setup inactiverogue; printf 'rogue-inactive.service enabled\n' >> "$USER_UNITS"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "nombra la unit inactiva inesperada" "$OUT" "rogue-inactive.service"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_missing "no habilita nada" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
+echo "== unit de sistema inactiva con User=hermes: falla cerrado"
+setup systemrogue
+printf 'rogue-system.service enabled\n' >> "$SYSTEM_UNITS"
+printf 'rogue-system.service hermes\n' >> "$SYSTEM_UNIT_USERS"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "nombra la unit de sistema inesperada" "$OUT" "rogue-system.service"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
+echo "== enumeración persistente falla: aborta cerrado"
+setup enumfail; touch "$TMP/enumfail/user-units.fail"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica que no pudo enumerar" "$OUT" "enumerar"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
+echo "== env de monitoreo symlink: aborta antes de cualquier mutación"
+setup monenvlink
+touch "$TMP/monenvlink/credential-target"
+ln -s "$TMP/monenvlink/credential-target" "$MON_ENV"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica path inseguro" "$OUT" "archivo regular"
+expect_eq "no ejecuta install" "$(wc -l < "$LOG_INSTALL" | tr -d ' ')" "0"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_eq "no hace daemon-reload" "$(reloads)" "0"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
+echo "== env de monitoreo directorio: aborta antes de cualquier mutación"
+setup monenvdir; mkdir "$MON_ENV"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica path inseguro" "$OUT" "archivo regular"
+expect_eq "no ejecuta install" "$(wc -l < "$LOG_INSTALL" | tr -d ' ')" "0"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_eq "no hace daemon-reload" "$(reloads)" "0"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"
 setup drift; run_prov

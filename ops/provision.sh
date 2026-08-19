@@ -73,11 +73,49 @@ main() {
     exit 1
   fi
 
+  # Un path existente debe ser regular y nunca symlink. Este gate ocurre
+  # antes de consultar/instalar units para que un fallo no pueda activar los
+  # timers con credenciales apuntando a un destino inseguro.
+  if { [ -e "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; } \
+    && { [ ! -f "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; }; then
+    echo "ABORTA: $monitoring_env_file debe ser un archivo regular root-only, nunca symlink." >&2
+    exit 1
+  fi
+
+  # Preflight completo de los directorios donde terminará Python. Se hace
+  # antes de instalar units: seguir un symlink aquí permitiría reemplazar
+  # código que luego ejecuta root. Directorios reales, aunque hoy tengan un
+  # modo débil, se aceptan para convergerlos en la fase de instalación.
+  local runtime_rel runtime_parent runtime_current runtime_part
+  local -a runtime_parts=()
+  if [ -L "$monitoring_dir" ] \
+    || { [ -e "$monitoring_dir" ] && [ ! -d "$monitoring_dir" ]; }; then
+    echo "ABORTA: el directorio runtime de monitoreo es symlink o no es directorio." >&2
+    exit 1
+  fi
+  while IFS= read -r runtime_rel; do
+    runtime_parent=$(dirname "$runtime_rel")
+    [ "$runtime_parent" != "." ] || continue
+    runtime_current="$monitoring_dir"
+    IFS='/' read -r -a runtime_parts <<< "$runtime_parent"
+    for runtime_part in "${runtime_parts[@]}"; do
+      [ -n "$runtime_part" ] || continue
+      runtime_current="$runtime_current/$runtime_part"
+      if [ -L "$runtime_current" ] \
+        || { [ -e "$runtime_current" ] && [ ! -d "$runtime_current" ]; }; then
+        echo "ABORTA: un componente del runtime de monitoreo es symlink o no es directorio." >&2
+        exit 1
+      fi
+    done
+  done < <(cd "$monitoring_src" && find . -type f -name '*.py' \
+    ! -path './tests/*' ! -path '*/__pycache__/*' | sed 's|^\./||' | sort)
+
   # --- Hermes: validar identidad y ownership ANTES de mutar el host -------
   # `unit` es la unit de sistema y `uunit` la unit del user manager. Mirar
   # sólo nombres de cgroup evita inspeccionar argumentos o payloads del
   # proceso. Cualquier owner persistente fuera de este set explícito aborta.
   local hermes_uid hermes_reverse hermes_ownership system_unit user_unit extra
+  local enabled_system_units enabled_user_units unit_name unit_user
   if ! hermes_uid=$("$id_bin" -u hermes 2>/dev/null); then
     echo "FALTA el usuario hermes; no se instala el límite de su user slice." >&2
     exit 1
@@ -115,6 +153,56 @@ main() {
     esac
   done <<< "$hermes_ownership"
 
+  # `ps` sólo cubre procesos vivos. Una unit habilitada pero hoy inactiva
+  # también puede arrancar mañana dentro del user slice, por lo que el
+  # inventario persistente es un gate separado y obligatorio.
+  if ! enabled_system_units=$("$systemctl_bin" list-unit-files \
+    --type=service --state=enabled --no-legend --no-pager); then
+    echo "No se pudieron enumerar las units de sistema habilitadas; se aborta cerrado." >&2
+    exit 1
+  fi
+  while read -r unit_name _ extra; do
+    [ -z "${unit_name:-}" ] && continue
+    if ! unit_user=$("$systemctl_bin" show "$unit_name" \
+      --property=User --value); then
+      echo "No se pudo leer el User efectivo de una unit habilitada; se aborta cerrado." >&2
+      exit 1
+    fi
+    [ "$unit_user" = "hermes" ] || continue
+    case "$unit_name" in
+      hermes-gateway.service|hermes-dashboard.service|"user@$hermes_uid.service") ;;
+      *)
+        if [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
+          echo "Unit de sistema habilitada inesperada para hermes: $unit_name" >&2
+        else
+          echo "Unit de sistema habilitada inesperada para hermes." >&2
+        fi
+        exit 1
+        ;;
+    esac
+  done <<< "$enabled_system_units"
+
+  if ! enabled_user_units=$("$systemctl_bin" --user \
+    --machine=hermes@.host list-unit-files --type=service --state=enabled \
+    --no-legend --no-pager); then
+    echo "No se pudieron enumerar las units de usuario habilitadas de hermes; se aborta cerrado." >&2
+    exit 1
+  fi
+  while read -r unit_name _ extra; do
+    [ -z "${unit_name:-}" ] && continue
+    case "$unit_name" in
+      hermes-gateway.service|hermes-dashboard.service) ;;
+      *)
+        if [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
+          echo "Unit de usuario habilitada inesperada para hermes: $unit_name" >&2
+        else
+          echo "Unit de usuario habilitada inesperada para hermes." >&2
+        fi
+        exit 1
+        ;;
+    esac
+  done <<< "$enabled_user_units"
+
   # --- units: instalar solo lo que difiere -------------------------------
   while IFS= read -r rel; do
     dest="$systemd_dir/$rel"
@@ -148,10 +236,25 @@ main() {
   # --- runtime de monitoreo -----------------------------------------------
   # Se conserva el layout relativo de Python; así funcionan tanto imports
   # sibling planos como módulos runtime anidados, sin desplegar tests/caches.
-  "$install_bin" -d -o root -g root -m 0755 "$monitoring_dir"
+  ensure_runtime_dir() {
+    local runtime_dir="$1"
+    "$install_bin" -d -o root -g root -m 0755 "$runtime_dir"
+    chmod 0755 "$runtime_dir"
+    "$chown_bin" root:root "$runtime_dir"
+  }
+  ensure_runtime_dir "$monitoring_dir"
   while IFS= read -r rel; do
+    runtime_parent=$(dirname "$rel")
+    runtime_current="$monitoring_dir"
+    if [ "$runtime_parent" != "." ]; then
+      IFS='/' read -r -a runtime_parts <<< "$runtime_parent"
+      for runtime_part in "${runtime_parts[@]}"; do
+        [ -n "$runtime_part" ] || continue
+        runtime_current="$runtime_current/$runtime_part"
+        ensure_runtime_dir "$runtime_current"
+      done
+    fi
     dest="$monitoring_dir/$rel"
-    mkdir -p "$(dirname "$dest")"
     if [ ! -f "$dest" ] || ! cmp -s "$monitoring_src/$rel" "$dest"; then
       "$install_bin" -o root -g root -m 0644 "$monitoring_src/$rel" "$dest"
     fi
@@ -169,7 +272,7 @@ main() {
     "$install_bin" -o root -g root -m 0600 /dev/null "$monitoring_env_file"
   elif [ ! -f "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; then
     echo "NO SE PUDO asegurar $monitoring_env_file como archivo regular root-only." >&2
-    rc=1
+    exit 1
   fi
   if [ -f "$monitoring_env_file" ] && [ ! -L "$monitoring_env_file" ]; then
     chmod 0600 "$monitoring_env_file"
@@ -279,6 +382,11 @@ main() {
   fi
 
   local enable_units=()
+  # Versiones previas habilitaban ambos monitores como servicios permanentes.
+  # Quitar esos symlinks legacy antes de activar los timers evita dos caminos
+  # de scheduling sin interrumpir un oneshot que el timer esté ejecutando.
+  "$systemctl_bin" disable \
+    legaltech-monitor.service legaltech-resource-tracker.service
   if [ "$enable_pjud_worker" = "1" ]; then
     enable_units+=(estrado-pjud-worker.service)
   fi

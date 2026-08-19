@@ -6,18 +6,16 @@ After=network-online.target estrado-pjud.service
 Type=oneshot
 User=root
 WorkingDirectory=/opt/legaltech-monitoring
-EnvironmentFile=-/etc/legaltech-monitoring.env
 ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/resource-tracker.py --once
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-StateDirectory=legaltech-monitor
-StateDirectoryMode=0750
 LogsDirectory=legaltech
 LogsDirectoryMode=0750
-ReadWritePaths=/var/lib/legaltech-monitor /var/log/legaltech
+ReadWritePaths=/var/log/legaltech
+RestrictAddressFamilies=AF_UNIX
 
 MemoryMax=128M
 CPUQuota=20%
