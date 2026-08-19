@@ -36,6 +36,10 @@ mutation_count() {
   grep -Ec '^(fallocate|dd|chmod|mkswap|swapon|swapoff|cp|mv|sysctl -p|rm) ' \
     "$CALL_LOG" 2>/dev/null || true
 }
+fstab_temp_count() {
+  find "${FSTAB_FILE%/*}" -maxdepth 1 -type f \
+    -name 'fstab.legaltech-swap*.tmp.*' | wc -l | tr -d ' '
+}
 
 write_stub() {
   local name="$1"
@@ -57,11 +61,13 @@ setup() {
   SYSCTL_FILE="$ROOT/etc/sysctl.d/60-legaltech-swap.conf"
   PROC_SWAPS_FILE="$ROOT/proc/swaps"
   SWAPPINESS_STATE="$base/swappiness"
+  MV_COUNT_FILE="$base/mv-count"
   mkdir -p "$BIN_DIR" "$ROOT/etc/sysctl.d" "$ROOT/proc"
   printf 'UUID=root / ext4 defaults 0 1\n# unrelated tail\n' > "$FSTAB_FILE"
   printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
   printf '10\n' > "$SWAPPINESS_STATE"
   : > "$CALL_LOG"
+  printf '0\n' > "$MV_COUNT_FILE"
   FREE_BYTES=$((9 * 1024 * 1024 * 1024))
   AVAILABLE_RAM=$((4 * 1024 * 1024 * 1024))
   SWAP_USED=0
@@ -135,6 +141,12 @@ exec /bin/cp "$@"'
   write_stub mv '
 printf "mv %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_MV_FAIL:-0}" != 1 ] || exit 8
+count=$(cat "$SWAP_TEST_MV_COUNT_FILE") || exit 8
+case "$count" in ""|*[!0-9]*) exit 8;; esac
+count=$((count + 1))
+printf "%s\n" "$count" > "$SWAP_TEST_MV_COUNT_FILE" || exit 8
+[ "${SWAP_TEST_MV_FAIL_ON_CALL:-0}" = 0 ] || \
+  [ "$count" != "$SWAP_TEST_MV_FAIL_ON_CALL" ] || exit 8
 exec /bin/mv "$@"'
 
   write_stub stat '
@@ -165,6 +177,7 @@ run_swap() {
     SWAP_MV_BIN="$BIN_DIR/mv" SWAP_STAT_BIN="$BIN_DIR/stat" \
     SWAP_RM_BIN="$BIN_DIR/rm" SWAP_TEST_CALL_LOG="$CALL_LOG" \
     SWAP_TEST_PROC_SWAPS="$PROC_SWAPS_FILE" \
+    SWAP_TEST_MV_COUNT_FILE="$MV_COUNT_FILE" \
     SWAP_TEST_SWAPPINESS_STATE="$SWAPPINESS_STATE" \
     SWAP_TEST_FREE_BYTES="$FREE_BYTES" SWAP_TEST_AVAILABLE_RAM="$AVAILABLE_RAM" \
     SWAP_TEST_SWAP_USED="$SWAP_USED" SWAP_TEST_PYTHON="$(command -v python3)" \
@@ -173,7 +186,9 @@ run_swap() {
     SWAP_TEST_SWAPON_FAIL="${SWAPON_FAIL:-0}" SWAP_TEST_SWAPOFF_FAIL="${SWAPOFF_FAIL:-0}" \
     SWAP_TEST_SYSCTL_FAIL="${SYSCTL_FAIL:-0}" SWAP_TEST_FREE_FAIL="${FREE_FAIL:-0}" \
     SWAP_TEST_FREE_MALFORMED="${FREE_MALFORMED:-0}" SWAP_TEST_CP_FAIL="${CP_FAIL:-0}" \
-    SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
+    SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" \
+    SWAP_TEST_MV_FAIL_ON_CALL="${MV_FAIL_ON_CALL:-0}" \
+    SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
     SWAP_TEST_RM_FAIL="${RM_FAIL:-0}" \
     bash "$SWAP_SCRIPT" "$@" 2>&1)
   RC=$?
@@ -259,6 +274,23 @@ expect_file_eq "sysctl no cambia" "$TMP/sysctl.applied" "$SYSCTL_FILE"
 expect_eq "no reformatea" "$(count_log 'mkswap ')" "1"
 expect_eq "no reactiva" "$(count_log 'swapon ')" "1"
 expect_eq "no recrea" "$(count_log 'fallocate ')" "1"
+
+/bin/cp "$FSTAB_FILE" "$TMP/idempotent-failure.fstab"
+/bin/cp "$FSTAB_FILE.legaltech-swap.bak" "$TMP/idempotent-failure.backup"
+/bin/cp "$SYSCTL_FILE" "$TMP/idempotent-failure.sysctl"
+IDEMPOTENT_CLEANUP_CALLS=$(grep -Ec '^(swapoff|rm) ' "$CALL_LOG" || true)
+SYSCTL_FAIL=1
+run_swap apply
+expect_eq "verify fallido de estado preexistente aborta" "$RC" "1"
+expect_file_eq "verify fallido no restaura fstab preexistente" \
+  "$TMP/idempotent-failure.fstab" "$FSTAB_FILE"
+expect_file_eq "verify fallido conserva backup preexistente" \
+  "$TMP/idempotent-failure.backup" "$FSTAB_FILE.legaltech-swap.bak"
+expect_file_eq "verify fallido conserva sysctl preexistente" \
+  "$TMP/idempotent-failure.sysctl" "$SYSCTL_FILE"
+expect_eq "verify fallido no limpia artefactos preexistentes" \
+  "$(grep -Ec '^(swapoff|rm) ' "$CALL_LOG" || true)" "$IDEMPOTENT_CLEANUP_CALLS"
+unset SYSCTL_FAIL
 
 echo "== verify comprueba proc, tipo, tamaño, modo, swappiness y marker"
 run_swap verify
@@ -461,6 +493,65 @@ run_swap apply
 expect_eq "fallo de df aborta" "$RC" "1"
 expect_eq "df fallido no muta" "$(grep -Ec '^(fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p|rm) ' "$CALL_LOG" || true)" "0"
 unset DF_FAIL
+
+echo "== apply revierte sólo su transacción si falla el segundo rename"
+setup second-rename-failure
+/bin/cp "$FSTAB_FILE" "$TMP/second-rename.fstab"
+MV_FAIL_ON_CALL=2
+run_swap apply
+expect_eq "fallo del segundo rename aborta apply" "$RC" "1"
+expect_file_eq "fallo conserva fstab original byte por byte" \
+  "$TMP/second-rename.fstab" "$FSTAB_FILE"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then
+  ok "fallo elimina backup creado por esta invocación"
+else
+  bad "fallo elimina backup creado por esta invocación"
+fi
+expect_eq "fallo no deja temporales fstab" "$(fstab_temp_count)" "0"
+if [ ! -e "$SYSCTL_FILE" ]; then ok "fallo no deja sysctl"; else bad "fallo no deja sysctl"; fi
+expect_eq "fallo desactiva swap recién activado" \
+  "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "0"
+if [ ! -e "$SWAP_FILE" ]; then
+  ok "fallo elimina swapfile creado tras desactivarlo"
+else
+  bad "fallo elimina swapfile creado tras desactivarlo"
+fi
+expect_eq "cleanup usa swapoff exacto una vez" "$(count_log "swapoff $SWAP_FILE")" "1"
+unset MV_FAIL_ON_CALL
+run_swap apply
+expect_eq "retry apply luego de cleanup sale 0" "$RC" "0"
+run_swap rollback
+expect_eq "rollback luego del retry sale 0" "$RC" "0"
+
+echo "== cleanup falla cerrado si no puede desactivar swap recién creado"
+setup second-rename-swapoff-failure
+/bin/cp "$FSTAB_FILE" "$TMP/swapoff-failure.fstab"
+MV_FAIL_ON_CALL=2
+SWAPOFF_FAIL=1
+run_swap apply
+expect_eq "fallo de swapoff durante cleanup mantiene error" "$RC" "1"
+expect_contains "cleanup fallido emite error genérico" "$OUT" \
+  "ERROR: swap state is unsafe or invalid"
+expect_file_eq "cleanup fallido conserva fstab original" \
+  "$TMP/swapoff-failure.fstab" "$FSTAB_FILE"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then
+  ok "cleanup fallido elimina backup propio"
+else
+  bad "cleanup fallido elimina backup propio"
+fi
+expect_eq "cleanup fallido no deja temporales fstab" "$(fstab_temp_count)" "0"
+if [ ! -e "$SYSCTL_FILE" ]; then ok "cleanup fallido no deja sysctl"; else bad "cleanup fallido no deja sysctl"; fi
+expect_eq "swap permanece activo al fallar swapoff" \
+  "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "1"
+if [ -f "$SWAP_FILE" ]; then
+  ok "cleanup no borra archivo que puede seguir activo"
+else
+  bad "cleanup no borra archivo que puede seguir activo"
+fi
+expect_eq "cleanup intenta sólo swapoff del target exacto" \
+  "$(count_log "swapoff $SWAP_FILE")" "1"
+expect_eq "cleanup no llama rm sobre archivo activo" "$(count_log "rm $SWAP_FILE")" "0"
+unset MV_FAIL_ON_CALL SWAPOFF_FAIL
 
 echo "== rollback inseguro no toca configuración"
 setup rollback-refuse

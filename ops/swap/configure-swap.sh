@@ -102,6 +102,11 @@ active_target_count=0
 swap_file_exists=0
 sysctl_state=absent
 current_temp=''
+apply_created_swap_file=0
+apply_activated_swap=0
+apply_created_backup=0
+apply_promoted_fstab=0
+apply_created_sysctl=0
 
 cleanup_temp() {
   if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
@@ -337,6 +342,7 @@ replace_fstab_with_managed_block() {
   "$mv_bin" -n "$backup_temp" "$backup_path" || return 1
   [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
   current_temp=''
+  apply_created_backup=1
   validate_backup_metadata "$backup_path" || return 1
   backup_matches_clean_fstab "$backup_path" || return 1
 
@@ -353,6 +359,7 @@ replace_fstab_with_managed_block() {
 
   "$mv_bin" "$current_temp" "$fstab_file" || return 1
   current_temp=''
+  apply_promoted_fstab=1
 }
 
 replace_fstab_without_managed_block() {
@@ -371,6 +378,75 @@ replace_fstab_without_managed_block() {
   "$rm_bin" "$backup_path" || return 1
 }
 
+cleanup_current_apply() {
+  local backup_path="${fstab_file}.legaltech-swap.bak"
+  local cleanup_failed=0 configuration_safe=1
+
+  if [ "$apply_activated_swap" -eq 1 ]; then
+    if "$swapoff_bin" "$swap_file" && inspect_active_swaps && \
+       [ "$active_target_count" -eq 0 ]; then
+      apply_activated_swap=0
+    else
+      cleanup_failed=1
+    fi
+  fi
+
+  if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
+    if "$rm_bin" "$current_temp"; then
+      current_temp=''
+    else
+      cleanup_failed=1
+    fi
+  fi
+
+  if [ "$apply_promoted_fstab" -eq 1 ]; then
+    if replace_fstab_without_managed_block; then
+      apply_promoted_fstab=0
+      apply_created_backup=0
+    else
+      cleanup_failed=1
+      configuration_safe=0
+    fi
+  elif [ "$apply_created_backup" -eq 1 ]; then
+    if validate_backup_metadata "$backup_path" && \
+       backup_matches_clean_fstab "$backup_path" && \
+       "$rm_bin" "$backup_path"; then
+      apply_created_backup=0
+    else
+      cleanup_failed=1
+      configuration_safe=0
+    fi
+  fi
+
+  if [ "$apply_created_sysctl" -eq 1 ]; then
+    if "$rm_bin" "$sysctl_file"; then
+      apply_created_sysctl=0
+    else
+      cleanup_failed=1
+    fi
+  fi
+
+  if [ "$apply_created_swap_file" -eq 1 ] && \
+     [ "$apply_activated_swap" -eq 0 ] && [ "$configuration_safe" -eq 1 ]; then
+    if inspect_swap_file 0; then
+      if [ "$swap_file_exists" -eq 0 ] || "$rm_bin" "$swap_file"; then
+        apply_created_swap_file=0
+      else
+        cleanup_failed=1
+      fi
+    else
+      cleanup_failed=1
+    fi
+  fi
+
+  [ "$cleanup_failed" -eq 0 ]
+}
+
+abort_current_apply() {
+  cleanup_current_apply || true
+  return 1
+}
+
 verify_managed() {
   local state swappiness
   state=$(inspect_managed_state) || return 1
@@ -381,6 +457,11 @@ verify_managed() {
 
 apply_swap() {
   local state
+  apply_created_swap_file=0
+  apply_activated_swap=0
+  apply_created_backup=0
+  apply_promoted_fstab=0
+  apply_created_sysctl=0
   check_free_disk || return 1
   state=$(inspect_managed_state) || return 1
   if [ "$state" = managed ]; then
@@ -389,19 +470,25 @@ apply_swap() {
   fi
   [ "$state" = clean ] || return 1
 
+  apply_created_swap_file=1
   if ! "$fallocate_bin" -l "$SWAP_BYTES" "$swap_file"; then
-    "$dd_bin" if=/dev/zero "of=$swap_file" bs=1M count=4096 conv=fsync status=none || return 1
+    if ! "$dd_bin" if=/dev/zero "of=$swap_file" bs=1M count=4096 conv=fsync status=none; then
+      abort_current_apply
+      return 1
+    fi
   fi
-  inspect_swap_file 0 || return 1
-  [ "$swap_file_exists" -eq 1 ] || return 1
-  "$chmod_bin" 0600 "$swap_file" || return 1
-  inspect_swap_file || return 1
-  "$mkswap_bin" "$swap_file" || return 1
-  "$swapon_bin" "$swap_file" || return 1
-  replace_fstab_with_managed_block || return 1
-  printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || return 1
-  "$sysctl_bin" -p "$sysctl_file" >/dev/null || return 1
-  verify_managed
+  inspect_swap_file 0 || { abort_current_apply; return 1; }
+  [ "$swap_file_exists" -eq 1 ] || { abort_current_apply; return 1; }
+  "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
+  inspect_swap_file || { abort_current_apply; return 1; }
+  "$mkswap_bin" "$swap_file" || { abort_current_apply; return 1; }
+  apply_activated_swap=1
+  "$swapon_bin" "$swap_file" || { abort_current_apply; return 1; }
+  replace_fstab_with_managed_block || { abort_current_apply; return 1; }
+  apply_created_sysctl=1
+  printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
+  "$sysctl_bin" -p "$sysctl_file" >/dev/null || { abort_current_apply; return 1; }
+  verify_managed || { abort_current_apply; return 1; }
 }
 
 read_memory_safety() {
