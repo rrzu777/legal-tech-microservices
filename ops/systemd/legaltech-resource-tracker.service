@@ -12,9 +12,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-LogsDirectory=legaltech
-LogsDirectoryMode=0750
-ReadWritePaths=/var/log/legaltech
+ReadWritePaths=/var/log/legaltech/resources.csv
 RestrictAddressFamilies=AF_UNIX
 
 MemoryMax=128M

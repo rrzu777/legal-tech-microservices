@@ -42,6 +42,7 @@ main() {
   local monitoring_env_file="${PROV_MONITORING_ENV_FILE:-/etc/legaltech-monitoring.env}"
   local monitor_state_dir="${PROV_MONITOR_STATE_DIR:-/var/lib/legaltech-monitor}"
   local monitor_log_dir="${PROV_MONITOR_LOG_DIR:-/var/log/legaltech}"
+  local resource_csv="${PROV_RESOURCE_CSV:-$monitor_log_dir/resources.csv}"
   local logrotate_dest="${PROV_LOGROTATE_DEST:-/etc/logrotate.d/legaltech-resources}"
   local cron_dir="${PROV_CRON_DIR:-/opt/estrado-cron}"
   local caddy_bin="${PROV_CADDY_BIN:-caddy}"
@@ -49,6 +50,7 @@ main() {
   local ps_bin="${PROV_PS_BIN:-ps}"
   local install_bin="${PROV_INSTALL_BIN:-install}"
   local chown_bin="${PROV_CHOWN_BIN:-chown}"
+  local chmod_bin="${PROV_CHMOD_BIN:-chmod}"
   local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
   local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
   local enable_pjud_worker="${PROV_ENABLE_PJUD_WORKER:-0}"
@@ -79,6 +81,16 @@ main() {
   if { [ -e "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; } \
     && { [ ! -f "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; }; then
     echo "ABORTA: $monitoring_env_file debe ser un archivo regular root-only, nunca symlink." >&2
+    exit 1
+  fi
+  if [ -L "$monitor_log_dir" ] \
+    || { [ -e "$monitor_log_dir" ] && [ ! -d "$monitor_log_dir" ]; }; then
+    echo "ABORTA: el directorio del CSV de recursos es inseguro." >&2
+    exit 1
+  fi
+  if { [ -e "$resource_csv" ] || [ -L "$resource_csv" ]; } \
+    && { [ ! -f "$resource_csv" ] || [ -L "$resource_csv" ]; }; then
+    echo "ABORTA: el CSV de recursos debe ser un archivo regular, nunca symlink." >&2
     exit 1
   fi
 
@@ -168,7 +180,9 @@ main() {
       echo "No se pudo leer el User efectivo de una unit habilitada; se aborta cerrado." >&2
       exit 1
     fi
-    [ "$unit_user" = "hermes" ] || continue
+    if [ "$unit_user" != "hermes" ] && [ "$unit_user" != "$hermes_uid" ]; then
+      continue
+    fi
     case "$unit_name" in
       hermes-gateway.service|hermes-dashboard.service|"user@$hermes_uid.service") ;;
       *)
@@ -227,19 +241,13 @@ main() {
     changed=1
   fi
 
-  if [ "$changed" -eq 1 ]; then
-    "$systemctl_bin" daemon-reload
-  else
-    echo "units al día"
-  fi
-
   # --- runtime de monitoreo -----------------------------------------------
   # Se conserva el layout relativo de Python; así funcionan tanto imports
   # sibling planos como módulos runtime anidados, sin desplegar tests/caches.
   ensure_runtime_dir() {
     local runtime_dir="$1"
     "$install_bin" -d -o root -g root -m 0755 "$runtime_dir"
-    chmod 0755 "$runtime_dir"
+    "$chmod_bin" 0755 "$runtime_dir"
     "$chown_bin" root:root "$runtime_dir"
   }
   ensure_runtime_dir "$monitoring_dir"
@@ -258,12 +266,31 @@ main() {
     if [ ! -f "$dest" ] || ! cmp -s "$monitoring_src/$rel" "$dest"; then
       "$install_bin" -o root -g root -m 0644 "$monitoring_src/$rel" "$dest"
     fi
-    chmod 0644 "$dest"
+    "$chmod_bin" 0644 "$dest"
     "$chown_bin" root:root "$dest"
   done < <(cd "$monitoring_src" && find . -type f -name '*.py' ! -path './tests/*' ! -path '*/__pycache__/*' | sed 's|^\./||' | sort)
 
   "$install_bin" -d -o root -g root -m 0750 "$monitor_state_dir"
   "$install_bin" -d -o root -g root -m 0750 "$monitor_log_dir"
+
+  # El tracker recibe write access sólo a este inode, no al directorio. Crear
+  # cuando falta y nunca truncar un CSV existente.
+  if [ ! -e "$resource_csv" ] && [ ! -L "$resource_csv" ]; then
+    "$install_bin" -o root -g root -m 0640 /dev/null "$resource_csv"
+  elif [ ! -f "$resource_csv" ] || [ -L "$resource_csv" ]; then
+    echo "NO SE PUDO asegurar el CSV de recursos como archivo regular." >&2
+    rc=1
+  fi
+  if [ -f "$resource_csv" ] && [ ! -L "$resource_csv" ]; then
+    if ! "$chmod_bin" 0640 "$resource_csv"; then
+      echo "NO SE PUDO dejar el CSV de recursos en modo 0640." >&2
+      rc=1
+    fi
+    if ! "$chown_bin" root:root "$resource_csv"; then
+      echo "NO SE PUDO dejar el CSV de recursos con owner root:root." >&2
+      rc=1
+    fi
+  fi
 
   # Crear el archivo vacío sólo si no existe. Un symlink o tipo inesperado no
   # se sigue: credenciales futuras deben vivir en un regular root-only.
@@ -275,7 +302,10 @@ main() {
     exit 1
   fi
   if [ -f "$monitoring_env_file" ] && [ ! -L "$monitoring_env_file" ]; then
-    chmod 0600 "$monitoring_env_file"
+    if ! "$chmod_bin" 0600 "$monitoring_env_file"; then
+      echo "NO SE PUDO dejar $monitoring_env_file en modo 0600." >&2
+      rc=1
+    fi
     if ! "$chown_bin" root:root "$monitoring_env_file"; then
       echo "NO SE PUDO dejar $monitoring_env_file con owner root:root." >&2
       rc=1
@@ -286,8 +316,22 @@ main() {
   if [ ! -f "$logrotate_dest" ] || ! cmp -s "$logrotate_src" "$logrotate_dest"; then
     "$install_bin" -o root -g root -m 0644 "$logrotate_src" "$logrotate_dest"
   fi
-  chmod 0644 "$logrotate_dest"
+  "$chmod_bin" 0644 "$logrotate_dest"
   "$chown_bin" root:root "$logrotate_dest"
+
+  # Ninguna configuración parcial se activa. Los archivos systemd pueden
+  # haberse copiado, pero un fallo de modo/ownership previo bloquea reload,
+  # Caddy, migración de enables legacy y timers.
+  if [ "$rc" -ne 0 ]; then
+    echo "INCOMPLETO: monitoreo no quedó con permisos seguros; no se activa ninguna configuración." >&2
+    exit "$rc"
+  fi
+
+  if [ "$changed" -eq 1 ]; then
+    "$systemctl_bin" daemon-reload
+  else
+    echo "units al día"
+  fi
 
   # --- caddy: TLS delante de la API (ops/caddy/README.md) ------------------
   if ! command -v "$caddy_bin" >/dev/null 2>&1; then

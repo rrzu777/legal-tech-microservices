@@ -35,11 +35,12 @@ setup() { # setup <nombre> — repo falso completo y sano
   REPO="$base/repo"; SYSD="$base/systemd"; LOG_SYSCTL="$base/systemctl.log"
   SYSTEM_UNITS="$base/system-units"; SYSTEM_UNIT_USERS="$base/system-unit-users"
   USER_UNITS="$base/hermes-user-units"
-  LOG_INSTALL="$base/install.log"; LOG_CHOWN="$base/chown.log"
+  LOG_INSTALL="$base/install.log"; LOG_CHOWN="$base/chown.log"; LOG_CHMOD="$base/chmod.log"
   LOG_ID="$base/id.log"; LOG_PS="$base/ps.log"
   ENVF="$base/dotenv"; MON="$base/monitoring"; CRON="$base/estrado-cron"
   MON_ENV="$base/legaltech-monitoring.env"
   MON_STATE="$base/var/lib/legaltech-monitor"; MON_LOG="$base/var/log/legaltech"
+  RESOURCE_CSV="$MON_LOG/resources.csv"
   LOGROTATE_DEST="$base/etc/logrotate.d/legaltech-resources"
   mkdir -p "$SYSD" "$MON" "$CRON" "$REPO/estrado-pjud-service/.venv/bin"
   touch "$CRON/run-cron.sh"
@@ -96,7 +97,7 @@ EOF
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
-  : > "$LOG_INSTALL"; : > "$LOG_CHOWN"; : > "$LOG_ID"; : > "$LOG_PS"
+  : > "$LOG_INSTALL"; : > "$LOG_CHOWN"; : > "$LOG_CHMOD"; : > "$LOG_ID"; : > "$LOG_PS"
   INSTALL_BIN="$base/install"
   cat > "$INSTALL_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -115,9 +116,18 @@ EOF
   cat > "$CHOWN_BIN" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$PROV_CHOWN_LOG"
+[ ! -e "$PROV_CHOWN_FAIL_FILE" ] || [ "${!#}" != "$PROV_MONITORING_ENV_FILE" ] || exit 1
 exit 0
 EOF
   chmod +x "$CHOWN_BIN"
+  CHMOD_BIN="$base/chmod"
+  cat > "$CHMOD_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PROV_CHMOD_LOG"
+[ ! -e "$PROV_CHMOD_FAIL_FILE" ] || [ "${!#}" != "$PROV_MONITORING_ENV_FILE" ] || exit 1
+exec /bin/chmod "$@"
+EOF
+  chmod +x "$CHMOD_BIN"
   printf '4242\n' > "$base/hermes.uid"
   printf 'hermes\n' > "$base/hermes.reverse"
   printf 'user@4242.service init.scope\nuser@4242.service hermes-gateway.service\nuser@4242.service hermes-dashboard.service\n' > "$base/hermes.ps"
@@ -155,10 +165,14 @@ run_prov() {
         PROV_ENV_OWNER="${ENV_OWNER:-$(id -un)}" PROV_ENV_GROUP="${ENV_GROUP:-$(id -gn)}" \
         PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
         PROV_MONITORING_ENV_FILE="$MON_ENV" PROV_MONITOR_STATE_DIR="$MON_STATE" \
-        PROV_MONITOR_LOG_DIR="$MON_LOG" PROV_LOGROTATE_DEST="$LOGROTATE_DEST" \
+        PROV_MONITOR_LOG_DIR="$MON_LOG" PROV_RESOURCE_CSV="$RESOURCE_CSV" \
+        PROV_LOGROTATE_DEST="$LOGROTATE_DEST" \
         PROV_ID_BIN="$ID_BIN" PROV_PS_BIN="$PS_BIN" \
         PROV_INSTALL_BIN="$INSTALL_BIN" PROV_INSTALL_LOG="$LOG_INSTALL" \
         PROV_CHOWN_BIN="$CHOWN_BIN" PROV_CHOWN_LOG="$LOG_CHOWN" \
+        PROV_CHOWN_FAIL_FILE="$REPO/../chown-monitor-env.fail" \
+        PROV_CHMOD_BIN="$CHMOD_BIN" PROV_CHMOD_LOG="$LOG_CHMOD" \
+        PROV_CHMOD_FAIL_FILE="$REPO/../chmod-monitor-env.fail" \
         PROV_ENABLE_PJUD_WORKER="${PROV_ENABLE_PJUD_WORKER:-0}" \
         PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
@@ -255,6 +269,12 @@ expect_not_group_other_writable "monitor.py no es escribible por grupo/otros" "$
 expect_contains "pide ownership root:root para Python" "$(cat "$LOG_INSTALL")" "-o root -g root -m 0644"
 expect_eq "StateDirectory provisionado con modo restrictivo" "$(file_mode "$MON_STATE")" "750"
 expect_eq "LogsDirectory provisionado con modo restrictivo" "$(file_mode "$MON_LOG")" "750"
+expect_eq "CSV precreado 0640" "$(file_mode "$RESOURCE_CSV")" "640"
+expect_eq "CSV nuevo nace vacío" "$(wc -c < "$RESOURCE_CSV" | tr -d ' ')" "0"
+expect_contains "CSV se instala root:root" "$(cat "$LOG_INSTALL")" \
+  "-o root -g root -m 0640 /dev/null $RESOURCE_CSV"
+expect_eq "CSV recibe ownership exacto" \
+  "$(grep -cFx "root:root $RESOURCE_CSV" "$LOG_CHOWN" || true)" "1"
 expect_eq "archivo de credenciales nace 0600" "$(file_mode "$MON_ENV")" "600"
 expect_eq "archivo de credenciales nace vacío" "$(wc -c < "$MON_ENV" | tr -d ' ')" "0"
 expect_contains "pide credenciales root:root" "$(cat "$LOG_INSTALL")" "-o root -g root -m 0600 /dev/null $MON_ENV"
@@ -302,8 +322,6 @@ for monitor in legaltech-monitor legaltech-resource-tracker; do
   expect_eq "$monitor MemoryMax" "$(unit_property "$UNIT" Service MemoryMax)" "128M"
   expect_eq "$monitor CPUQuota" "$(unit_property "$UNIT" Service CPUQuota)" "20%"
   expect_eq "$monitor TasksMax" "$(unit_property "$UNIT" Service TasksMax)" "64"
-  expect_eq "$monitor crea LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectory)" "legaltech"
-  expect_eq "$monitor restringe LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectoryMode)" "0750"
   expect_contains "$monitor llama --once explícito" "$(unit_property "$UNIT" Service ExecStart)" "--once"
   expect_missing "$monitor no contiene credenciales" "$(cat "$UNIT")" "valor-secreto-falso"
 
@@ -311,12 +329,15 @@ for monitor in legaltech-monitor legaltech-resource-tracker; do
     expect_eq "monitor usa env externo opcional" "$(unit_property "$UNIT" Service EnvironmentFile)" "-/etc/legaltech-monitoring.env"
     expect_eq "monitor crea StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" "legaltech-monitor"
     expect_eq "monitor restringe StateDirectory" "$(unit_property "$UNIT" Service StateDirectoryMode)" "0750"
+    expect_eq "monitor crea LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectory)" "legaltech"
+    expect_eq "monitor restringe LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectoryMode)" "0750"
     expect_eq "monitor permite sólo estado/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/lib/legaltech-monitor /var/log/legaltech"
     expect_eq "monitor conserva red para Telegram" "$(unit_property "$UNIT" Service RestrictAddressFamilies)" ""
   else
     expect_eq "tracker no recibe credenciales" "$(unit_property "$UNIT" Service EnvironmentFile)" ""
     expect_eq "tracker no recibe StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" ""
-    expect_eq "tracker escribe sólo CSV/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/log/legaltech"
+    expect_eq "tracker no recibe LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectory)" ""
+    expect_eq "tracker escribe sólo el CSV" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/log/legaltech/resources.csv"
     expect_eq "tracker sólo puede abrir sockets AF_UNIX" "$(unit_property "$UNIT" Service RestrictAddressFamilies)" "AF_UNIX"
   fi
 
@@ -341,11 +362,13 @@ expect_contains "enumera units de usuario habilitadas aunque estén inactivas" "
 
 echo "== segunda corrida: idempotente, sin daemon-reload ni recarga de caddy"
 printf 'TOKEN_Y_CHAT_SE_CONFIGURAN_FUERA_DEL_REPO=preservar\n' > "$MON_ENV"
+printf 'csv-existente-preservado\n' > "$RESOURCE_CSV"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "sigue habiendo UN daemon-reload (no re-instaló)" "$(reloads)" "1"
 expect_eq "sigue habiendo UNA recarga de caddy" "$(caddy_reloads)" "1"
 expect_contains "no truncó credenciales existentes" "$(cat "$MON_ENV")" "TOKEN_Y_CHAT_SE_CONFIGURAN_FUERA_DEL_REPO=preservar"
+expect_contains "no truncó CSV existente" "$(cat "$RESOURCE_CSV")" "csv-existente-preservado"
 expect_contains "lo dice" "$OUT" "units al día"
 
 echo "== habilitación del worker: requiere flag explícito"
@@ -425,6 +448,16 @@ expect_eq "exit 1" "$RC" "1"
 expect_contains "nombra la unit de sistema inesperada" "$OUT" "rogue-system.service"
 expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 
+echo "== unit de sistema inactiva con User=<UID Hermes>: falla cerrado"
+setup numericuserrogue
+printf 'rogue-numeric.service enabled\n' >> "$SYSTEM_UNITS"
+printf 'rogue-numeric.service 4242\n' >> "$SYSTEM_UNIT_USERS"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "nombra la unit con User numérico" "$OUT" "rogue-numeric.service"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
 echo "== enumeración persistente falla: aborta cerrado"
 setup enumfail; touch "$TMP/enumfail/user-units.fail"; run_prov
 expect_eq "exit 1" "$RC" "1"
@@ -450,6 +483,39 @@ expect_contains "explica path inseguro" "$OUT" "archivo regular"
 expect_eq "no ejecuta install" "$(wc -l < "$LOG_INSTALL" | tr -d ' ')" "0"
 expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 expect_eq "no hace daemon-reload" "$(reloads)" "0"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
+echo "== CSV de recursos symlink: aborta antes de cualquier mutación"
+setup csvsymlink
+mkdir -p "$MON_LOG"
+touch "$TMP/csvsymlink/csv-target"
+ln -s "$TMP/csvsymlink/csv-target" "$RESOURCE_CSV"
+run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica CSV inseguro" "$OUT" "CSV"
+expect_eq "no ejecuta install" "$(wc -l < "$LOG_INSTALL" | tr -d ' ')" "0"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_eq "cero daemon-reload" "$(reloads)" "0"
+if [ -e "$CADDYF" ]; then bad "no muta Caddy"; else ok "no muta Caddy"; fi
+expect_missing "no deshabilita servicios" "$(cat "$LOG_SYSCTL")" "disable legaltech-monitor.service"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
+echo "== chown de credenciales falla: no activa configuración parcial"
+setup monenvchownfail; touch "$TMP/monenvchownfail/chown-monitor-env.fail"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica fallo de ownership" "$OUT" "owner root:root"
+expect_eq "cero daemon-reload" "$(reloads)" "0"
+if [ -e "$CADDYF" ]; then bad "no muta Caddy"; else ok "no muta Caddy"; fi
+expect_missing "no deshabilita servicios" "$(cat "$LOG_SYSCTL")" "disable legaltech-monitor.service"
+expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
+
+echo "== chmod de credenciales falla: no activa configuración parcial"
+setup monenvchmodfail; touch "$TMP/monenvchmodfail/chmod-monitor-env.fail"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica fallo de modo" "$OUT" "modo 0600"
+expect_eq "cero daemon-reload" "$(reloads)" "0"
+if [ -e "$CADDYF" ]; then bad "no muta Caddy"; else ok "no muta Caddy"; fi
+expect_missing "no deshabilita servicios" "$(cat "$LOG_SYSCTL")" "disable legaltech-monitor.service"
 expect_missing "no habilita timers" "$(cat "$LOG_SYSCTL")" "enable estrado-pjud.service"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"

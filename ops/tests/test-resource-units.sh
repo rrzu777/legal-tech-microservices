@@ -95,7 +95,8 @@ assert_absent_property ops/systemd/legaltech-monitor.service Service RestrictAdd
 
 assert_absent_property ops/systemd/legaltech-resource-tracker.service Service EnvironmentFile
 assert_absent_property ops/systemd/legaltech-resource-tracker.service Service StateDirectory
-assert_property ops/systemd/legaltech-resource-tracker.service Service ReadWritePaths /var/log/legaltech
+assert_absent_property ops/systemd/legaltech-resource-tracker.service Service LogsDirectory
+assert_property ops/systemd/legaltech-resource-tracker.service Service ReadWritePaths /var/log/legaltech/resources.csv
 assert_property ops/systemd/legaltech-resource-tracker.service Service RestrictAddressFamilies AF_UNIX
 
 if command -v systemd-analyze >/dev/null 2>&1; then
