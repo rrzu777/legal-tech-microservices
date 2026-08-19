@@ -61,8 +61,10 @@ apagado, pero sí impide afirmar funcionalidad completa del canal.
 
 ## Objetivos
 
-- Colocar API, worker y monitores de JurisTrack bajo un presupuesto agregado
-  con prioridad sobre cargas no críticas.
+- Colocar API y worker de JurisTrack bajo un presupuesto agregado con
+  prioridad sobre cargas no críticas.
+- Mantener los monitores fuera del slice observado, con límites pequeños,
+  para que una presión interna no elimine también la alerta.
 - Impedir que un loop del worker consuma toda la CPU o la memoria del host.
 - Limitar también la memoria total de Hermes.
 - Agregar swap como buffer de emergencia, sin usarlo para justificar
@@ -105,7 +107,7 @@ apagado, pero sí impide afirmar funcionalidad completa del canal.
 
 ### 1. Presupuesto de JurisTrack
 
-`legaltech.slice` será el presupuesto agregado de API, worker y monitores:
+`legaltech.slice` será el presupuesto agregado de API y worker:
 
 - `CPUWeight=1000`;
 - `MemoryLow=3G`;
@@ -130,6 +132,11 @@ servicio y el gate de memoria disponible completan la protección.
 El worker podrá usar dos cores cuando los necesite, pero no los seis. La
 prioridad del slice favorece JurisTrack frente a Hermes y al futuro invitado
 cuando haya contención.
+
+`legaltech-monitor.service` y `legaltech-resource-tracker.service` vivirán en
+`system.slice`, no en el slice que observan. Cada uno conservará un hard cap
+pequeño de memoria, CPU y tareas. Así una presión u OOM dentro de
+`legaltech.slice` no elimina simultáneamente el proceso que debe detectarla.
 
 ### 2. Presupuesto de Hermes
 
@@ -322,4 +329,3 @@ El VPS queda listo para el siguiente cambio sólo si, durante 24 horas:
 
 Con ese gate, el perfil de 2 vCPU, 3 GiB y 20 GiB es razonable. Sin el gate no
 se inferirá seguridad a partir de una sola captura de `free` o `docker stats`.
-
