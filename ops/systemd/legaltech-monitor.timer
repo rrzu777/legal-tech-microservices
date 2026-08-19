@@ -1,0 +1,12 @@
+[Unit]
+Description=Run LegalTech critical monitor every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+RandomizedDelaySec=60s
+Unit=legaltech-monitor.service
+
+[Install]
+WantedBy=timers.target

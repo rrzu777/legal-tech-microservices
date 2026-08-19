@@ -12,9 +12,11 @@
 #     cambió; si el paquete caddy falta, receta y exit 1 — ops/caddy/README.md)
 #   - .env presente, 0640 root:estrado y con TODAS las variables de
 #     ops/env.inventory (compara NOMBRES; los valores nunca se imprimen)
-#   - venv, usuarios de las units y /opt/legaltech-monitoring (los scripts de
-#     monitoreo NO viven en este repo — solo se avisa si faltan)
-#   - systemctl enable de las units; el worker requiere opt-in explícito
+#   - venv, usuarios de las units y código de ops/monitoring instalado en
+#     /opt/legaltech-monitoring
+#   - estado/logs, credenciales vacías si faltan y logrotate del monitoreo
+#   - drop-in de user-<uid>.slice sólo tras validar UID/ownership de Hermes
+#   - systemctl enable de API/timers; el worker requiere opt-in explícito
 #
 # Qué NO cubre: el crontab y /opt/estrado-cron (eso es ops/cron/deploy-cron.sh
 # + el procedimiento del crontab.snapshot), el paquete caddy y las reglas de
@@ -25,7 +27,7 @@
 # en el laptop (ver ops/tests/test-provision.sh): PROV_REPO_DIR,
 # PROV_SYSTEMD_DIR, PROV_SYSTEMCTL, PROV_ENV_FILE, PROV_REQUIRED_USERS,
 # PROV_ENV_OWNER, PROV_ENV_GROUP, PROV_MONITORING_DIR, PROV_CADDY_BIN,
-# PROV_CADDYFILE_DEST.
+# PROV_CADDYFILE_DEST y los destinos/binarios PROV_* usados por el harness.
 set -euo pipefail
 
 main() {
@@ -37,12 +39,23 @@ main() {
   local env_group="${PROV_ENV_GROUP:-estrado}"
   local required_users="${PROV_REQUIRED_USERS:-estrado www-data}"
   local monitoring_dir="${PROV_MONITORING_DIR:-/opt/legaltech-monitoring}"
+  local monitoring_env_file="${PROV_MONITORING_ENV_FILE:-/etc/legaltech-monitoring.env}"
+  local monitor_state_dir="${PROV_MONITOR_STATE_DIR:-/var/lib/legaltech-monitor}"
+  local monitor_log_dir="${PROV_MONITOR_LOG_DIR:-/var/log/legaltech}"
+  local logrotate_dest="${PROV_LOGROTATE_DEST:-/etc/logrotate.d/legaltech-resources}"
   local cron_dir="${PROV_CRON_DIR:-/opt/estrado-cron}"
   local caddy_bin="${PROV_CADDY_BIN:-caddy}"
+  local id_bin="${PROV_ID_BIN:-id}"
+  local ps_bin="${PROV_PS_BIN:-ps}"
+  local install_bin="${PROV_INSTALL_BIN:-install}"
+  local chown_bin="${PROV_CHOWN_BIN:-chown}"
   local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
   local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
   local enable_pjud_worker="${PROV_ENABLE_PJUD_WORKER:-0}"
   local src="$repo_dir/ops/systemd"
+  local template_src="$repo_dir/ops/systemd-templates/hermes-user.slice.conf"
+  local monitoring_src="$repo_dir/ops/monitoring"
+  local logrotate_src="$repo_dir/ops/logrotate/legaltech-resources"
   local changed=0 rc=0 rel dest
 
   # Las fuentes se validan ANTES de usarlas: un `while read` alimentado por un
@@ -50,10 +63,57 @@ main() {
   # dice "no falta nada" — o sea que un PROV_REPO_DIR malo o un checkout a
   # medias (el escenario exacto de una reconstrucción) imprimiría "todo OK"
   # sin haber verificado NADA. La ausencia no es señal.
-  if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ] || [ ! -r "$caddyfile_src" ]; then
-    echo "ABORTA: falta $src, $repo_dir/ops/env.inventory o $caddyfile_src — ¿PROV_REPO_DIR o checkout incompletos?" >&2
+  if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ] \
+    || [ ! -r "$caddyfile_src" ] || [ ! -r "$template_src" ] \
+    || [ ! -r "$logrotate_src" ] || [ ! -r "$monitoring_src/monitor.py" ] \
+    || [ ! -r "$monitoring_src/resource-tracker.py" ] \
+    || [ ! -r "$monitoring_src/alert_policy.py" ] \
+    || [ ! -r "$monitoring_src/resource_metrics.py" ]; then
+    echo "ABORTA: checkout incompleto; faltan fuentes declaradas de systemd, monitoreo, logrotate, Caddy o env.inventory." >&2
     exit 1
   fi
+
+  # --- Hermes: validar identidad y ownership ANTES de mutar el host -------
+  # `unit` es la unit de sistema y `uunit` la unit del user manager. Mirar
+  # sólo nombres de cgroup evita inspeccionar argumentos o payloads del
+  # proceso. Cualquier owner persistente fuera de este set explícito aborta.
+  local hermes_uid hermes_reverse hermes_ownership system_unit user_unit extra
+  if ! hermes_uid=$("$id_bin" -u hermes 2>/dev/null); then
+    echo "FALTA el usuario hermes; no se instala el límite de su user slice." >&2
+    exit 1
+  fi
+  if [[ ! "$hermes_uid" =~ ^[0-9]+$ ]]; then
+    echo "UID inválido para hermes; se requiere un UID numérico." >&2
+    exit 1
+  fi
+  if ! hermes_reverse=$("$id_bin" -nu "$hermes_uid" 2>/dev/null) \
+    || [ "$hermes_reverse" != "hermes" ]; then
+    echo "El reverse lookup del UID de hermes no devuelve exactamente hermes." >&2
+    exit 1
+  fi
+  if ! hermes_ownership=$("$ps_bin" -U "$hermes_uid" -o unit=,uunit= 2>/dev/null); then
+    echo "No se pudo verificar el ownership persistente de hermes; se aborta cerrado." >&2
+    exit 1
+  fi
+  while read -r system_unit user_unit extra; do
+    [ -z "${system_unit:-}" ] && continue
+    if [ "$system_unit" != "user@$hermes_uid.service" ] \
+      || [ -n "${extra:-}" ]; then
+      echo "Ownership persistente inesperado para hermes; revisar units antes de provisionar." >&2
+      exit 1
+    fi
+    case "$user_unit" in
+      init.scope|hermes-gateway.service|hermes-dashboard.service) ;;
+      *)
+        if [[ "$user_unit" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
+          echo "Unit persistente inesperada para hermes: $user_unit" >&2
+        else
+          echo "Unit persistente inesperada para hermes." >&2
+        fi
+        exit 1
+        ;;
+    esac
+  done <<< "$hermes_ownership"
 
   # --- units: instalar solo lo que difiere -------------------------------
   while IFS= read -r rel; do
@@ -64,15 +124,67 @@ main() {
     echo "==> instala $rel"
     # Sin `install -D`: es GNU-only y los tests corren en el laptop (BSD).
     mkdir -p "$(dirname "$dest")"
-    install -m 644 "$src/$rel" "$dest"
+    "$install_bin" -o root -g root -m 0644 "$src/$rel" "$dest"
     changed=1
   done < <(cd "$src" && find . -type f | sed 's|^\./||' | sort)
+
+  # El template queda libre de UID en Git; sólo este render runtime crea el
+  # path numérico. No hay sustituciones de contenido que puedan inyectar
+  # propiedades: el UID validado participa únicamente en el nombre.
+  dest="$systemd_dir/user-$hermes_uid.slice.d/50-legaltech-resource-limits.conf"
+  if [ ! -f "$dest" ] || ! cmp -s "$template_src" "$dest"; then
+    echo "==> instala límite de user-$hermes_uid.slice"
+    mkdir -p "$(dirname "$dest")"
+    "$install_bin" -o root -g root -m 0644 "$template_src" "$dest"
+    changed=1
+  fi
 
   if [ "$changed" -eq 1 ]; then
     "$systemctl_bin" daemon-reload
   else
     echo "units al día"
   fi
+
+  # --- runtime de monitoreo -----------------------------------------------
+  # Se conserva el layout relativo de Python; así funcionan tanto imports
+  # sibling planos como módulos runtime anidados, sin desplegar tests/caches.
+  "$install_bin" -d -o root -g root -m 0755 "$monitoring_dir"
+  while IFS= read -r rel; do
+    dest="$monitoring_dir/$rel"
+    mkdir -p "$(dirname "$dest")"
+    if [ ! -f "$dest" ] || ! cmp -s "$monitoring_src/$rel" "$dest"; then
+      "$install_bin" -o root -g root -m 0644 "$monitoring_src/$rel" "$dest"
+    fi
+    chmod 0644 "$dest"
+    "$chown_bin" root:root "$dest"
+  done < <(cd "$monitoring_src" && find . -type f -name '*.py' ! -path './tests/*' ! -path '*/__pycache__/*' | sed 's|^\./||' | sort)
+
+  "$install_bin" -d -o root -g root -m 0750 "$monitor_state_dir"
+  "$install_bin" -d -o root -g root -m 0750 "$monitor_log_dir"
+
+  # Crear el archivo vacío sólo si no existe. Un symlink o tipo inesperado no
+  # se sigue: credenciales futuras deben vivir en un regular root-only.
+  if [ ! -e "$monitoring_env_file" ] && [ ! -L "$monitoring_env_file" ]; then
+    mkdir -p "$(dirname "$monitoring_env_file")"
+    "$install_bin" -o root -g root -m 0600 /dev/null "$monitoring_env_file"
+  elif [ ! -f "$monitoring_env_file" ] || [ -L "$monitoring_env_file" ]; then
+    echo "NO SE PUDO asegurar $monitoring_env_file como archivo regular root-only." >&2
+    rc=1
+  fi
+  if [ -f "$monitoring_env_file" ] && [ ! -L "$monitoring_env_file" ]; then
+    chmod 0600 "$monitoring_env_file"
+    if ! "$chown_bin" root:root "$monitoring_env_file"; then
+      echo "NO SE PUDO dejar $monitoring_env_file con owner root:root." >&2
+      rc=1
+    fi
+  fi
+
+  mkdir -p "$(dirname "$logrotate_dest")"
+  if [ ! -f "$logrotate_dest" ] || ! cmp -s "$logrotate_src" "$logrotate_dest"; then
+    "$install_bin" -o root -g root -m 0644 "$logrotate_src" "$logrotate_dest"
+  fi
+  chmod 0644 "$logrotate_dest"
+  "$chown_bin" root:root "$logrotate_dest"
 
   # --- caddy: TLS delante de la API (ops/caddy/README.md) ------------------
   if ! command -v "$caddy_bin" >/dev/null 2>&1; then
@@ -160,33 +272,25 @@ main() {
     fi
   done
 
-  # --- scripts de monitoreo (viven FUERA de este repo) --------------------
-  if [ ! -f "$monitoring_dir/monitor.py" ] || [ ! -f "$monitoring_dir/resource-tracker.py" ]; then
-    echo "FALTA $monitoring_dir/{monitor.py,resource-tracker.py} — no viven en este repo; sin ellos esas dos units quedan en crash-loop." >&2
-    rc=1
-  fi
-
   # --- cron instalado (el contenido del crontab lo vigila el watchdog #10) --
   if [ ! -f "$cron_dir/run-cron.sh" ]; then
     echo "FALTA $cron_dir/run-cron.sh — un VPS reconstruido sin los crons revive el silencio de los 120 días. Correr ops/cron/deploy-cron.sh desde el laptop e instalar crontab.snapshot a mano (ver ops/cron/README.md)." >&2
     rc=1
   fi
 
-  # La lista de units a habilitar se deriva de los archivos del espejo (los
-  # .service de primer nivel; el slice no es enable-able y el drop-in no es
-  # unit): agregar una unit al espejo no exige acordarse de una segunda lista.
   local enable_units=()
-  while IFS= read -r rel; do
-    if [ "$rel" = "estrado-pjud-worker.service" ] \
-      && [ "$enable_pjud_worker" != "1" ]; then
-      continue
-    fi
-    enable_units+=("$rel")
-  done < <(cd "$src" && find . -maxdepth 1 -name '*.service' -type f | sed 's|^\./||' | sort)
+  if [ "$enable_pjud_worker" = "1" ]; then
+    enable_units+=(estrado-pjud-worker.service)
+  fi
+  enable_units+=(
+    estrado-pjud.service
+    legaltech-monitor.timer
+    legaltech-resource-tracker.timer
+  )
   "$systemctl_bin" enable "${enable_units[@]}"
 
   if [ "$rc" -eq 0 ]; then
-    echo "OK: units instaladas; worker sólo habilitado con PROV_ENABLE_PJUD_WORKER=1; .env completo, venv y usuarios presentes."
+    echo "OK: units y timers instalados; worker sólo habilitado con PROV_ENABLE_PJUD_WORKER=1; monitoreo, .env, venv y usuarios presentes."
   else
     echo "INCOMPLETO: resolver lo listado arriba y volver a correr (es idempotente)." >&2
   fi

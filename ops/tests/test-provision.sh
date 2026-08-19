@@ -33,11 +33,25 @@ expect_same_file() { # <nombre> <esperado> <actual>
 setup() { # setup <nombre> — repo falso completo y sano
   local base="$TMP/$1"
   REPO="$base/repo"; SYSD="$base/systemd"; LOG_SYSCTL="$base/systemctl.log"
+  LOG_INSTALL="$base/install.log"; LOG_CHOWN="$base/chown.log"
+  LOG_ID="$base/id.log"; LOG_PS="$base/ps.log"
   ENVF="$base/dotenv"; MON="$base/monitoring"; CRON="$base/estrado-cron"
+  MON_ENV="$base/legaltech-monitoring.env"
+  MON_STATE="$base/var/lib/legaltech-monitor"; MON_LOG="$base/var/log/legaltech"
+  LOGROTATE_DEST="$base/etc/logrotate.d/legaltech-resources"
   mkdir -p "$SYSD" "$MON" "$CRON" "$REPO/estrado-pjud-service/.venv/bin"
   touch "$CRON/run-cron.sh"
   mkdir -p "$REPO/ops"
   cp -R "$OPS_DIR/systemd" "$REPO/ops/systemd"
+  cp -R "$OPS_DIR/systemd-templates" "$REPO/ops/systemd-templates"
+  cp -R "$OPS_DIR/monitoring" "$REPO/ops/monitoring"
+  if [ -d "$OPS_DIR/logrotate" ]; then
+    cp -R "$OPS_DIR/logrotate" "$REPO/ops/logrotate"
+  else
+    mkdir -p "$REPO/ops/logrotate"
+  fi
+  mkdir -p "$REPO/ops/monitoring/runtime"
+  printf '# recursive runtime fixture\n' > "$REPO/ops/monitoring/runtime/helper.py"
   cp "$OPS_DIR/env.inventory" "$REPO/ops/env.inventory"
   # .env completo: cada nombre del inventario con un valor de mentira
   grep -vE '^#|^$' "$REPO/ops/env.inventory" | sed 's/$/=valor-secreto-falso/' > "$ENVF"
@@ -46,11 +60,53 @@ setup() { # setup <nombre> — repo falso completo y sano
   chmod 600 "$ENVF"
   touch "$REPO/estrado-pjud-service/.venv/bin/python"
   chmod +x "$REPO/estrado-pjud-service/.venv/bin/python"
-  touch "$MON/monitor.py" "$MON/resource-tracker.py"
   printf '#!/bin/bash\necho "$@" >> "%s"\nexit 0\n' "$LOG_SYSCTL" > "$base/systemctl"
   chmod +x "$base/systemctl"
   : > "$LOG_SYSCTL"
   SYSCTL="$base/systemctl"
+  : > "$LOG_INSTALL"; : > "$LOG_CHOWN"; : > "$LOG_ID"; : > "$LOG_PS"
+  INSTALL_BIN="$base/install"
+  cat > "$INSTALL_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PROV_INSTALL_LOG"
+args=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o|-g) shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec /usr/bin/install "${args[@]}"
+EOF
+  chmod +x "$INSTALL_BIN"
+  CHOWN_BIN="$base/chown"
+  cat > "$CHOWN_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PROV_CHOWN_LOG"
+exit 0
+EOF
+  chmod +x "$CHOWN_BIN"
+  printf '4242\n' > "$base/hermes.uid"
+  printf 'hermes\n' > "$base/hermes.reverse"
+  printf 'user@4242.service init.scope\nuser@4242.service hermes-gateway.service\nuser@4242.service hermes-dashboard.service\n' > "$base/hermes.ps"
+  ID_BIN="$base/id"
+  cat > "$ID_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LOG_ID"
+case "\$1" in
+  -u) [ -f "$base/hermes.uid" ] || exit 1; cat "$base/hermes.uid" ;;
+  -nu) cat "$base/hermes.reverse" ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$ID_BIN"
+  PS_BIN="$base/ps"
+  cat > "$PS_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LOG_PS"
+cat "$base/hermes.ps"
+EOF
+  chmod +x "$PS_BIN"
   # caddy: espejo del Caddyfile en el repo falso, binario stub y destino
   # propio. El stub SÍ se ejecuta (`caddy validate` corre antes de instalar):
   # exit 0 = config válido; el test del Caddyfile roto lo pisa con exit 1.
@@ -66,6 +122,11 @@ run_prov() {
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
         PROV_ENV_OWNER="${ENV_OWNER:-$(id -un)}" PROV_ENV_GROUP="${ENV_GROUP:-$(id -gn)}" \
         PROV_MONITORING_DIR="$MON" PROV_CRON_DIR="$CRON" \
+        PROV_MONITORING_ENV_FILE="$MON_ENV" PROV_MONITOR_STATE_DIR="$MON_STATE" \
+        PROV_MONITOR_LOG_DIR="$MON_LOG" PROV_LOGROTATE_DEST="$LOGROTATE_DEST" \
+        PROV_ID_BIN="$ID_BIN" PROV_PS_BIN="$PS_BIN" \
+        PROV_INSTALL_BIN="$INSTALL_BIN" PROV_INSTALL_LOG="$LOG_INSTALL" \
+        PROV_CHOWN_BIN="$CHOWN_BIN" PROV_CHOWN_LOG="$LOG_CHOWN" \
         PROV_ENABLE_PJUD_WORKER="${PROV_ENABLE_PJUD_WORKER:-0}" \
         PROV_CADDY_BIN="$CADDY_BIN" PROV_CADDYFILE_DEST="$CADDYF" bash "$PROV" 2>&1)
   RC=$?
@@ -81,6 +142,31 @@ file_owner() {
 }
 file_group() {
   stat -f '%Sg' "$1" 2>/dev/null || stat -c '%G' "$1"
+}
+expect_not_group_other_writable() {
+  local name="$1" mode
+  if [ ! -e "$2" ]; then
+    bad "$name (no existe $2)"
+    return
+  fi
+  mode=$(file_mode "$2")
+  if (( (8#$mode & 8#022) == 0 )); then
+    ok "$name"
+  else
+    bad "$name (modo $mode permite escritura de grupo/otros)"
+  fi
+}
+unit_property() { # archivo sección propiedad
+  awk -v wanted_section="$2" -v wanted_key="$3" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      section=$0; sub(/^[[:space:]]*\[/, "", section); sub(/\][[:space:]]*$/, "", section); next
+    }
+    section == wanted_section {
+      line=$0; sub(/^[[:space:]]*/, "", line)
+      key=line; sub(/[[:space:]]*=.*/, "", key)
+      if (key == wanted_key) { sub(/^[^=]*=/, "", line); sub(/[[:space:]]*$/, "", line); print line }
+    }
+  ' "$1"
 }
 
 echo "== API interactiva: Playwright headed tiene display, browser y tmp escribible"
@@ -110,9 +196,11 @@ expect_eq "exit 0" "$RC" "0"
 expect_eq "un daemon-reload" "$(reloads)" "1"
 N_SRC=$(find "$OPS_DIR/systemd" -type f | wc -l | tr -d ' ')
 N_DST=$(find "$SYSD" -type f | wc -l | tr -d ' ')
-expect_eq "instaló todos los archivos (incluido el drop-in)" "$N_DST" "$N_SRC"
-expect_contains "habilita las 3 units seguras y deja el worker bajo gate explícito" "$(cat "$LOG_SYSCTL")" \
-  "enable estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
+expect_eq "instaló units más el drop-in Hermes renderizado" "$N_DST" "$((N_SRC + 1))"
+expect_contains "habilita API y timers; deja el worker bajo gate explícito" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud.service legaltech-monitor.timer legaltech-resource-tracker.timer"
+expect_missing "no habilita los oneshot directamente" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud.service legaltech-monitor.service"
 expect_missing "no habilita el worker por defecto" "$(cat "$LOG_SYSCTL")" \
   "enable estrado-pjud-worker.service"
 expect_contains "lo dice" "$OUT" "OK:"
@@ -122,11 +210,69 @@ expect_eq ".env conserva el grupo declarado" "$(file_group "$ENVF")" "$(id -gn)"
 expect_same_file "instaló el Caddyfile del repo" "$REPO/ops/caddy/Caddyfile" "$CADDYF"
 expect_eq "una recarga de caddy" "$(caddy_reloads)" "1"
 
+echo "== monitoreo: instala código, directorios, credenciales y logrotate seguros"
+expect_same_file "instala monitor.py desde el repo" "$REPO/ops/monitoring/monitor.py" "$MON/monitor.py"
+expect_same_file "instala imports sibling del monitor" "$REPO/ops/monitoring/alert_policy.py" "$MON/alert_policy.py"
+expect_same_file "instala Python runtime recursivamente" "$REPO/ops/monitoring/runtime/helper.py" "$MON/runtime/helper.py"
+if [ -e "$MON/tests/test_monitor_cli.py" ]; then
+  bad "no instala tests Python en runtime"
+else
+  ok "no instala tests Python en runtime"
+fi
+expect_not_group_other_writable "monitor.py no es escribible por grupo/otros" "$MON/monitor.py"
+expect_contains "pide ownership root:root para Python" "$(cat "$LOG_INSTALL")" "-o root -g root -m 0644"
+expect_eq "StateDirectory provisionado con modo restrictivo" "$(file_mode "$MON_STATE")" "750"
+expect_eq "LogsDirectory provisionado con modo restrictivo" "$(file_mode "$MON_LOG")" "750"
+expect_eq "archivo de credenciales nace 0600" "$(file_mode "$MON_ENV")" "600"
+expect_eq "archivo de credenciales nace vacío" "$(wc -c < "$MON_ENV" | tr -d ' ')" "0"
+expect_contains "pide credenciales root:root" "$(cat "$LOG_INSTALL")" "-o root -g root -m 0600 /dev/null $MON_ENV"
+expect_eq "logrotate queda 0644" "$(file_mode "$LOGROTATE_DEST")" "644"
+LOGROTATE_RULE=$(cat "$LOGROTATE_DEST")
+expect_contains "logrotate diario" "$LOGROTATE_RULE" "daily"
+expect_contains "logrotate conserva 14" "$LOGROTATE_RULE" "rotate 14"
+expect_contains "logrotate comprime" "$LOGROTATE_RULE" "compress"
+expect_contains "logrotate evita dependencia de reopen" "$LOGROTATE_RULE" "copytruncate"
+
+echo "== units y timers instalados: contrato observable completo"
+for monitor in legaltech-monitor legaltech-resource-tracker; do
+  UNIT="$SYSD/$monitor.service"
+  expect_eq "$monitor es oneshot" "$(unit_property "$UNIT" Service Type)" "oneshot"
+  expect_eq "$monitor queda fuera del slice vigilado" "$(unit_property "$UNIT" Service Slice)" "system.slice"
+  expect_eq "$monitor MemoryMax" "$(unit_property "$UNIT" Service MemoryMax)" "128M"
+  expect_eq "$monitor CPUQuota" "$(unit_property "$UNIT" Service CPUQuota)" "20%"
+  expect_eq "$monitor TasksMax" "$(unit_property "$UNIT" Service TasksMax)" "64"
+  expect_eq "$monitor usa env externo opcional" "$(unit_property "$UNIT" Service EnvironmentFile)" "-/etc/legaltech-monitoring.env"
+  expect_eq "$monitor crea StateDirectory" "$(unit_property "$UNIT" Service StateDirectory)" "legaltech-monitor"
+  expect_eq "$monitor restringe StateDirectory" "$(unit_property "$UNIT" Service StateDirectoryMode)" "0750"
+  expect_eq "$monitor crea LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectory)" "legaltech"
+  expect_eq "$monitor restringe LogsDirectory" "$(unit_property "$UNIT" Service LogsDirectoryMode)" "0750"
+  expect_eq "$monitor permite sólo estado/logs" "$(unit_property "$UNIT" Service ReadWritePaths)" "/var/lib/legaltech-monitor /var/log/legaltech"
+  expect_contains "$monitor llama --once explícito" "$(unit_property "$UNIT" Service ExecStart)" "--once"
+  expect_missing "$monitor no contiene credenciales" "$(cat "$UNIT")" "valor-secreto-falso"
+
+  TIMER="$SYSD/$monitor.timer"
+  expect_eq "$monitor timer arranca tras 5min" "$(unit_property "$TIMER" Timer OnBootSec)" "5min"
+  expect_eq "$monitor timer repite cada 5min" "$(unit_property "$TIMER" Timer OnUnitActiveSec)" "5min"
+  expect_eq "$monitor timer es persistente" "$(unit_property "$TIMER" Timer Persistent)" "true"
+  expect_eq "$monitor timer agrega jitter" "$(unit_property "$TIMER" Timer RandomizedDelaySec)" "60s"
+  expect_eq "$monitor timer no declara Slice" "$(unit_property "$TIMER" Timer Slice)" ""
+  expect_missing "$monitor timer no pertenece a legaltech.slice" "$(cat "$TIMER")" "legaltech.slice"
+done
+
+echo "== Hermes: UID dinámico validado y template renderizado"
+HERMES_DROPIN="$SYSD/user-4242.slice.d/50-legaltech-resource-limits.conf"
+expect_same_file "drop-in usa el template UID-free" "$REPO/ops/systemd-templates/hermes-user.slice.conf" "$HERMES_DROPIN"
+expect_contains "resuelve id -u hermes" "$(cat "$LOG_ID")" "-u hermes"
+expect_contains "valida reverse mapping del UID" "$(cat "$LOG_ID")" "-nu 4242"
+expect_contains "inspecciona units/procesos del UID" "$(cat "$LOG_PS")" "-U 4242 -o unit=,uunit="
+
 echo "== segunda corrida: idempotente, sin daemon-reload ni recarga de caddy"
+printf 'TOKEN_Y_CHAT_SE_CONFIGURAN_FUERA_DEL_REPO=preservar\n' > "$MON_ENV"
 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_eq "sigue habiendo UN daemon-reload (no re-instaló)" "$(reloads)" "1"
 expect_eq "sigue habiendo UNA recarga de caddy" "$(caddy_reloads)" "1"
+expect_contains "no truncó credenciales existentes" "$(cat "$MON_ENV")" "TOKEN_Y_CHAT_SE_CONFIGURAN_FUERA_DEL_REPO=preservar"
 expect_contains "lo dice" "$OUT" "units al día"
 
 echo "== habilitación del worker: requiere flag explícito"
@@ -134,9 +280,36 @@ setup workeroptin
 PROV_ENABLE_PJUD_WORKER=1 run_prov
 expect_eq "exit 0" "$RC" "0"
 expect_contains "habilita worker sólo con opt-in" "$(cat "$LOG_SYSCTL")" \
-  "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.service legaltech-resource-tracker.service"
+  "enable estrado-pjud-worker.service estrado-pjud.service legaltech-monitor.timer legaltech-resource-tracker.timer"
+
+echo "== Hermes ausente: falla antes de instalar o habilitar"
+setup nohermes; rm "$TMP/nohermes/hermes.uid"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica ausencia de Hermes" "$OUT" "hermes"
+expect_eq "no instala systemd" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_missing "no habilita nada" "$(cat "$LOG_SYSCTL")" "enable"
+
+echo "== UID Hermes no numérico: falla cerrado"
+setup baduid; printf 'no-es-uid\n' > "$TMP/baduid/hermes.uid"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica UID inválido" "$OUT" "UID"
+expect_eq "no instala drop-in" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
+echo "== reverse lookup distinto de Hermes: falla cerrado"
+setup reverse; printf 'otro-usuario\n' > "$TMP/reverse/hermes.reverse"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "explica reverse lookup" "$OUT" "reverse"
+expect_eq "no instala drop-in" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
+echo "== unit persistente inesperada de Hermes: falla cerrado"
+setup rogue; printf 'user@4242.service rogue-daemon.service\n' > "$TMP/rogue/hermes.ps"; run_prov
+expect_eq "exit 1" "$RC" "1"
+expect_contains "nombra sólo la unit inesperada" "$OUT" "rogue-daemon.service"
+expect_eq "no instala drop-in" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+expect_missing "no habilita nada" "$(cat "$LOG_SYSCTL")" "enable"
 
 echo "== unit editada a mano en el destino: se pisa con la del repo"
+setup drift; run_prov
 echo "# drift manual" >> "$SYSD/estrado-pjud.service"
 run_prov
 expect_eq "exit 0" "$RC" "0"
@@ -220,10 +393,10 @@ setup novenv; rm "$REPO/estrado-pjud-service/.venv/bin/python"; run_prov
 expect_eq "exit 1" "$RC" "1"
 expect_contains "receta de la venv" "$OUT" "python3 -m venv"
 
-echo "== monitoreo externo ausente: avisa que no vive en este repo"
-setup nomon; rm "$MON/monitor.py"; run_prov
+echo "== fuente de monitoreo ausente: checkout a medias, aborta"
+setup nomon; rm "$REPO/ops/monitoring/monitor.py"; run_prov
 expect_eq "exit 1" "$RC" "1"
-expect_contains "lo dice" "$OUT" "no viven en este repo"
+expect_contains "lo dice" "$OUT" "ABORTA"
 
 echo "== usuario requerido ausente: lo nombra y exit 1"
 setup nouser

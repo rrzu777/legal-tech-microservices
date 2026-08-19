@@ -1,22 +1,29 @@
 [Unit]
 Description=LegalTech Resource Tracker
-After=network.target estrado-pjud.service
+After=network-online.target estrado-pjud.service
 
 [Service]
-Type=simple
+Type=oneshot
 User=root
 WorkingDirectory=/opt/legaltech-monitoring
-ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/resource-tracker.py
+EnvironmentFile=-/etc/legaltech-monitoring.env
+ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/resource-tracker.py --once
 
-MemoryMax=256M
-CPUQuota=25%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=legaltech-monitor
+StateDirectoryMode=0750
+LogsDirectory=legaltech
+LogsDirectoryMode=0750
+ReadWritePaths=/var/lib/legaltech-monitor /var/log/legaltech
 
-Restart=always
-RestartSec=10
+MemoryMax=128M
+CPUQuota=20%
+TasksMax=64
+Slice=system.slice
 
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=legaltech-resource-tracker
-
-[Install]
-WantedBy=multi-user.target
