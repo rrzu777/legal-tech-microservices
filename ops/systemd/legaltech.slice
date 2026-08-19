@@ -1,8 +1,8 @@
 [Unit]
-Description=LegalTech High Priority Slice
-Before=slices.target
+Description=JurisTrack aggregate resource budget
 
 [Slice]
 CPUWeight=1000
-MemoryMax=10737418240
-MemoryHigh=8589934592
+MemoryLow=3G
+MemoryHigh=6G
+MemoryMax=8G

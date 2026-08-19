@@ -2,6 +2,7 @@
 Description=Estrado PJUD Sync Worker
 After=network.target
 Wants=network-online.target
+PartOf=legaltech.slice
 
 [Service]
 Type=notify
@@ -16,6 +17,12 @@ RestartSec=10
 WatchdogSec=300
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/legal-tech-microservices/estrado-pjud-service/.env
+Slice=legaltech.slice
+MemoryHigh=2G
+MemoryMax=3G
+CPUQuota=200%
+CPUWeight=800
+TasksMax=512
 
 # Security hardening
 NoNewPrivileges=true

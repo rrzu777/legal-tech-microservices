@@ -42,6 +42,7 @@ MemoryMax=4294967296
 MemoryHigh=3221225472
 CPUQuota=200%
 CPUWeight=500
+TasksMax=512
 
 Restart=always
 RestartSec=5
