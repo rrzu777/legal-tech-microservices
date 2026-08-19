@@ -224,3 +224,18 @@ def test_monitor_runs_as_a_flat_installed_script_without_repo_pythonpath():
 
     assert result.returncode == 0
     assert "--state-dir" in result.stdout
+
+
+def test_flat_installed_cli_rejects_once_combined_with_dry_run():
+    result = subprocess.run(
+        [sys.executable, str(MONITOR_PATH), "--once", "--dry-run"],
+        cwd="/tmp",
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "Invalid monitoring arguments\n"

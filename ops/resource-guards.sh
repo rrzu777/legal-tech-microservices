@@ -1004,7 +1004,7 @@ run_apply_steps() {
   fi
   "$systemctl_bin" start legaltech-monitor.timer legaltech-resource-tracker.timer >"$null_file" 2>&1 || return 1
   "$python_bin" "$monitoring_dir/resource-tracker.py" --once >"$null_file" 2>&1 || return 1
-  "$python_bin" "$monitoring_dir/monitor.py" --once --dry-run >"$null_file" 2>&1 || return 1
+  "$python_bin" "$monitoring_dir/monitor.py" --dry-run >"$null_file" 2>&1 || return 1
   run_postflight || return 1
 }
 

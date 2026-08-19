@@ -725,7 +725,10 @@ expect_count 'API restarted once when changed' 'systemctl restart estrado-pjud.s
 expect_count 'worker restarted once when changed and idle' 'systemctl restart estrado-pjud-worker.service' 1
 expect_count 'Hermes services restarted once when drop-in changed' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service hermes-dashboard.service' 1
 expect_before 'timers start before tracker invocation' 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer' 'python '
-expect_contains 'monitor is invoked only in dry-run mode' "$(cat "$EVENTS")" 'monitor.py --once --dry-run'
+monitor_invocations=$(grep -F "python $FAKE/monitoring/monitor.py" "$EVENTS" 2>/dev/null || true)
+expect_exact_count 'monitor is invoked exactly once in dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run" 1
+expect_missing 'monitor dry-run invocation excludes once mode' "$monitor_invocations" '--once'
+expect_missing 'monitor dry-run invocation excludes synthetic alert mode' "$monitor_invocations" '--test-alert'
 expect_missing 'orchestration output contains no service credential' "$OUT$(cat "$EVENTS")" "$SECRET_SENTINEL"
 expect_missing 'suppressed dependency output contains no service credential' "$(cat "$CASE_DIR/null")" "$SECRET_SENTINEL"
 SUCCESS_EVENTS=$(cat "$EVENTS")
