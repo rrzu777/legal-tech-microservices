@@ -103,6 +103,13 @@ exit 0'
 
   write_stub swapon '
 printf "swapon %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
+case "${SWAP_TEST_SWAPON_FAIL_STATE:-none}" in
+  absent) exit 8 ;;
+  active) printf "%s file 4194300 0 -2\n" "$1" >> "$SWAP_TEST_PROC_SWAPS"; exit 8 ;;
+  malformed) printf "malformed swaps state\n" > "$SWAP_TEST_PROC_SWAPS"; exit 8 ;;
+  none) ;;
+  *) exit 9 ;;
+esac
 [ "${SWAP_TEST_SWAPON_FAIL:-0}" != 1 ] || exit 8
 printf "%s file 4194300 0 -2\n" "$1" >> "$SWAP_TEST_PROC_SWAPS"
 '
@@ -110,10 +117,16 @@ printf "%s file 4194300 0 -2\n" "$1" >> "$SWAP_TEST_PROC_SWAPS"
   write_stub swapoff '
 printf "swapoff %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_SWAPOFF_FAIL:-0}" != 1 ] || exit 8
+[ "${SWAP_TEST_SWAPOFF_KEEP_ACTIVE:-0}" != 1 ] || exit 0
 tmp="$SWAP_TEST_PROC_SWAPS.swapoff"
+found=0
 while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in "$1 "*) ;; *) printf "%s\n" "$line" >> "$tmp";; esac
+  case "$line" in
+    "$1 "*) found=1 ;;
+    *) printf "%s\n" "$line" >> "$tmp" ;;
+  esac
 done < "$SWAP_TEST_PROC_SWAPS"
+[ "$found" -eq 1 ] || { /bin/rm "$tmp"; exit 8; }
 /bin/mv "$tmp" "$SWAP_TEST_PROC_SWAPS"'
 
   write_stub sysctl '
@@ -184,6 +197,8 @@ run_swap() {
     SWAP_TEST_DF_FAIL="${DF_FAIL:-0}" SWAP_TEST_FALLOCATE_FAIL="${FALLOCATE_FAIL:-0}" \
     SWAP_TEST_CHMOD_FAIL="${CHMOD_FAIL:-0}" SWAP_TEST_MKSWAP_FAIL="${MKSWAP_FAIL:-0}" \
     SWAP_TEST_SWAPON_FAIL="${SWAPON_FAIL:-0}" SWAP_TEST_SWAPOFF_FAIL="${SWAPOFF_FAIL:-0}" \
+    SWAP_TEST_SWAPON_FAIL_STATE="${SWAPON_FAIL_STATE:-none}" \
+    SWAP_TEST_SWAPOFF_KEEP_ACTIVE="${SWAPOFF_KEEP_ACTIVE:-0}" \
     SWAP_TEST_SYSCTL_FAIL="${SYSCTL_FAIL:-0}" SWAP_TEST_FREE_FAIL="${FREE_FAIL:-0}" \
     SWAP_TEST_FREE_MALFORMED="${FREE_MALFORMED:-0}" SWAP_TEST_CP_FAIL="${CP_FAIL:-0}" \
     SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" \
@@ -493,6 +508,75 @@ run_swap apply
 expect_eq "fallo de df aborta" "$RC" "1"
 expect_eq "df fallido no muta" "$(grep -Ec '^(fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p|rm) ' "$CALL_LOG" || true)" "0"
 unset DF_FAIL
+
+echo "== swapon fallido clasifica estado antes de limpiar"
+setup swapon-failure-inactive
+/bin/cp "$FSTAB_FILE" "$TMP/swapon-inactive.fstab"
+SWAPON_FAIL_STATE=absent
+run_swap apply
+expect_eq "swapon no-cero sin target aborta apply" "$RC" "1"
+expect_eq "target ausente no requiere swapoff" "$(count_log "swapoff $SWAP_FILE")" "0"
+if [ ! -e "$SWAP_FILE" ]; then
+  ok "target ausente permite borrar swapfile propio"
+else
+  bad "target ausente permite borrar swapfile propio"
+fi
+expect_file_eq "target ausente conserva fstab" "$TMP/swapon-inactive.fstab" "$FSTAB_FILE"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "target ausente no deja backup"; else bad "target ausente no deja backup"; fi
+if [ ! -e "$SYSCTL_FILE" ]; then ok "target ausente no deja sysctl"; else bad "target ausente no deja sysctl"; fi
+expect_eq "target ausente no deja temporales" "$(fstab_temp_count)" "0"
+unset SWAPON_FAIL_STATE
+run_swap apply
+expect_eq "retry tras swapon fallido e inactivo sale 0" "$RC" "0"
+
+setup swapon-failure-active
+SWAPON_FAIL_STATE=active
+run_swap apply
+expect_eq "swapon no-cero con target activo aborta apply" "$RC" "1"
+expect_eq "target activo provoca swapoff exacto" "$(count_log "swapoff $SWAP_FILE")" "1"
+expect_eq "cleanup confirma target inactivo" \
+  "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "0"
+if [ ! -e "$SWAP_FILE" ]; then
+  ok "target activo sólo se borra tras swapoff confirmado"
+else
+  bad "target activo sólo se borra tras swapoff confirmado"
+fi
+SWAPON_ACTIVE_ORDER=$(grep -E "^(swapon|swapoff|rm) $SWAP_FILE$" "$CALL_LOG" | \
+  cut -d' ' -f1 | tr '\n' ' ')
+expect_eq "cleanup desactiva antes de borrar target" "$SWAPON_ACTIVE_ORDER" "swapon swapoff rm "
+unset SWAPON_FAIL_STATE
+
+setup swapon-failure-still-active
+SWAPON_FAIL_STATE=active
+SWAPOFF_KEEP_ACTIVE=1
+run_swap apply
+expect_eq "swapoff no confirmado mantiene apply fallido" "$RC" "1"
+expect_eq "swapoff no confirmado se intenta una vez" "$(count_log "swapoff $SWAP_FILE")" "1"
+expect_eq "estado posterior aún muestra target activo" \
+  "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" || true)" "1"
+if [ -f "$SWAP_FILE" ]; then
+  ok "swapoff no confirmado conserva archivo activo"
+else
+  bad "swapoff no confirmado conserva archivo activo"
+fi
+expect_eq "swapoff no confirmado impide rm del archivo" "$(count_log "rm $SWAP_FILE")" "0"
+unset SWAPON_FAIL_STATE SWAPOFF_KEEP_ACTIVE
+
+setup swapon-failure-unknown
+SWAPON_FAIL_STATE=malformed
+run_swap apply
+expect_eq "swapon no-cero con estado desconocido aborta" "$RC" "1"
+expect_eq "estado desconocido no intenta swapoff" "$(count_log "swapoff $SWAP_FILE")" "0"
+if [ -f "$SWAP_FILE" ]; then
+  ok "estado desconocido conserva swapfile posiblemente activo"
+else
+  bad "estado desconocido conserva swapfile posiblemente activo"
+fi
+expect_eq "estado desconocido no ejecuta cleanup destructivo" \
+  "$(grep -Ec '^(swapoff|rm) ' "$CALL_LOG" || true)" "0"
+if [ ! -e "$FSTAB_FILE.legaltech-swap.bak" ]; then ok "estado desconocido no deja backup"; else bad "estado desconocido no deja backup"; fi
+if [ ! -e "$SYSCTL_FILE" ]; then ok "estado desconocido no deja sysctl"; else bad "estado desconocido no deja sysctl"; fi
+unset SWAPON_FAIL_STATE
 
 echo "== apply revierte sólo su transacción si falla el segundo rename"
 setup second-rename-failure

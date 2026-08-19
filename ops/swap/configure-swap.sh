@@ -104,6 +104,7 @@ sysctl_state=absent
 current_temp=''
 apply_created_swap_file=0
 apply_activated_swap=0
+apply_activation_unknown=0
 apply_created_backup=0
 apply_promoted_fstab=0
 apply_created_sysctl=0
@@ -382,7 +383,9 @@ cleanup_current_apply() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
   local cleanup_failed=0 configuration_safe=1
 
-  if [ "$apply_activated_swap" -eq 1 ]; then
+  if [ "$apply_activation_unknown" -eq 1 ]; then
+    cleanup_failed=1
+  elif [ "$apply_activated_swap" -eq 1 ]; then
     if "$swapoff_bin" "$swap_file" && inspect_active_swaps && \
        [ "$active_target_count" -eq 0 ]; then
       apply_activated_swap=0
@@ -427,7 +430,8 @@ cleanup_current_apply() {
   fi
 
   if [ "$apply_created_swap_file" -eq 1 ] && \
-     [ "$apply_activated_swap" -eq 0 ] && [ "$configuration_safe" -eq 1 ]; then
+     [ "$apply_activated_swap" -eq 0 ] && [ "$apply_activation_unknown" -eq 0 ] && \
+     [ "$configuration_safe" -eq 1 ]; then
     if inspect_swap_file 0; then
       if [ "$swap_file_exists" -eq 0 ] || "$rm_bin" "$swap_file"; then
         apply_created_swap_file=0
@@ -459,6 +463,7 @@ apply_swap() {
   local state
   apply_created_swap_file=0
   apply_activated_swap=0
+  apply_activation_unknown=0
   apply_created_backup=0
   apply_promoted_fstab=0
   apply_created_sysctl=0
@@ -482,8 +487,19 @@ apply_swap() {
   "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
   inspect_swap_file || { abort_current_apply; return 1; }
   "$mkswap_bin" "$swap_file" || { abort_current_apply; return 1; }
-  apply_activated_swap=1
-  "$swapon_bin" "$swap_file" || { abort_current_apply; return 1; }
+  if "$swapon_bin" "$swap_file"; then
+    apply_activated_swap=1
+  else
+    if inspect_active_swaps; then
+      if [ "$active_target_count" -eq 1 ]; then
+        apply_activated_swap=1
+      fi
+    else
+      apply_activation_unknown=1
+    fi
+    abort_current_apply
+    return 1
+  fi
   replace_fstab_with_managed_block || { abort_current_apply; return 1; }
   apply_created_sysctl=1
   printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
