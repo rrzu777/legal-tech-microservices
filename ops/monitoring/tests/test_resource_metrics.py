@@ -74,7 +74,26 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
 
     def run_command(command, timeout):
         calls.append((command, timeout))
-        return (FIXTURES / "systemctl-show.txt").read_text()
+        unit_name = command[2]
+        control_groups = {
+            "legaltech.slice": "/legaltech.slice",
+            "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+            "estrado-pjud-worker.service": (
+                "/legaltech.slice/estrado-pjud-worker.service"
+            ),
+            "legaltech-monitor.service": "/system.slice/legaltech-monitor.service",
+            "legaltech-resource-tracker.service": (
+                "/system.slice/legaltech-resource-tracker.service"
+            ),
+            "legaltech-monitor.timer": "/system.slice/legaltech-monitor.timer",
+            "legaltech-resource-tracker.timer": (
+                "/system.slice/legaltech-resource-tracker.timer"
+            ),
+            "user-4242.slice": "/user.slice/user-4242.slice",
+        }
+        return (FIXTURES / "systemctl-show.txt").read_text().replace(
+            "/system.slice/legaltech.slice", control_groups[unit_name]
+        )
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
@@ -114,6 +133,9 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
     assert all("--property=UnitFileState" in command for command, _ in calls)
     assert all("--property=Result" in command for command, _ in calls)
     assert snapshot.units["legaltech-monitor.service"].result == "success"
+    assert snapshot.units["user-4242.slice"].control_group == (
+        "/user.slice/user-4242.slice"
+    )
 
 
 def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_error():

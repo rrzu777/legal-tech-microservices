@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,6 +28,7 @@ def unit(
     load_state: str = "loaded",
     unit_file_state: str = "enabled",
     result: str = "success",
+    control_group: str | None = None,
 ) -> UnitSnapshot:
     return UnitSnapshot(
         name=name,
@@ -43,6 +45,7 @@ def unit(
         load_state=load_state,
         unit_file_state=unit_file_state,
         result=result,
+        control_group=control_group,
     )
 
 
@@ -79,16 +82,27 @@ def snapshot(
                 "legaltech.slice",
                 memory_current=slice_memory,
                 memory_high=slice_high,
+                control_group="/legaltech.slice",
             ),
             "estrado-pjud.service": unit(
                 "estrado-pjud.service",
                 active_state=api_active,
                 restarts=api_restarts,
+                control_group=(
+                    "/legaltech.slice/estrado-pjud.service"
+                    if api_active == "active"
+                    else None
+                ),
             ),
             "estrado-pjud-worker.service": unit(
                 "estrado-pjud-worker.service",
                 active_state=worker_active,
                 restarts=worker_restarts,
+                control_group=(
+                    "/legaltech.slice/estrado-pjud-worker.service"
+                    if worker_active == "active"
+                    else None
+                ),
             ),
             "legaltech-monitor.service": unit(
                 "legaltech-monitor.service",
@@ -102,8 +116,12 @@ def snapshot(
             "legaltech-resource-tracker.timer": unit(
                 "legaltech-resource-tracker.timer"
             ),
-            "user-4242.slice": unit("user-4242.slice"),
+            "user-4242.slice": unit(
+                "user-4242.slice",
+                control_group="/user.slice/user-4242.slice",
+            ),
         },
+        hermes_user_slice="user-4242.slice",
     )
 
 
@@ -368,9 +386,70 @@ def test_disabled_inactive_worker_is_optional_but_enabled_inactive_worker_is_not
     assert enabled_rules["unit.inactive:estrado-pjud-worker.service"].active is True
 
 
-def test_complete_snapshot_has_no_required_observer_alert_and_can_emit_heartbeat():
+@pytest.mark.parametrize(
+    "control_group",
+    [None, "", "   ", "legaltech.slice/unit.service", "/legaltech.slice/\nunit"],
+)
+@pytest.mark.parametrize(
+    ("unit_name", "rule_key"),
+    [
+        ("legaltech.slice", "unit.operational:legaltech.slice"),
+        (
+            "estrado-pjud.service",
+            "unit.inactive:estrado-pjud.service",
+        ),
+        (
+            "estrado-pjud-worker.service",
+            "unit.inactive:estrado-pjud-worker.service",
+        ),
+        ("user-4242.slice", "unit.operational:user-4242.slice"),
+    ],
+)
+def test_invalid_required_continuous_unit_cgroup_is_immediate_and_blocks_heartbeat(
+    unit_name, rule_key, control_group
+):
+    sample = snapshot()
+    sample.units[unit_name] = replace(
+        sample.units[unit_name], control_group=control_group
+    )
+
+    rule = rules_by_key(sample)[rule_key]
+    events, _ = evaluate(sample, {}, datetime(2026, 8, 19, 12, 0, tzinfo=UTC))
+
+    assert rule.active is True
+    assert rule.persist_for_seconds == 0
+    assert any(event.key == rule_key for event in events)
+    assert all(event.key != "healthy-heartbeat" for event in events)
+
+
+def test_disabled_inactive_worker_does_not_require_a_cgroup_for_healthy_heartbeat():
+    sample = snapshot(worker_active="inactive")
+    sample.units["estrado-pjud-worker.service"] = replace(
+        sample.units["estrado-pjud-worker.service"],
+        unit_file_state="disabled",
+        control_group=None,
+    )
+
+    events, _ = evaluate(sample, {}, datetime(2026, 8, 19, 12, 0, tzinfo=UTC))
+
+    assert [event.key for event in events] == ["healthy-heartbeat"]
+
+
+def test_timers_and_inactive_successful_oneshots_need_no_cgroup_for_heartbeat():
     now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
-    results = evaluate_rules(snapshot(), {})
+    sample = snapshot()
+    units_without_cgroups = (
+        "legaltech-monitor.timer",
+        "legaltech-resource-tracker.timer",
+        "legaltech-monitor.service",
+        "legaltech-resource-tracker.service",
+    )
+
+    assert all(
+        sample.units[name].control_group is None for name in units_without_cgroups
+    )
+
+    results = evaluate_rules(sample, {})
     events, _ = advance_state(results, {}, now)
 
     assert all(

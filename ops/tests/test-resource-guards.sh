@@ -175,7 +175,12 @@ printf '%s\n' 'user@1002.service hermes-gateway.service' 'user@1002.service herm
 EOF
   write_stub systemctl <<'EOF'
 printf 'systemctl %s\n' "$*" >> "$RG_TEST_STATE/events"
-if [ -f "$RG_TEST_STATE/fail-command" ] && [ "$*" = "$(cat "$RG_TEST_STATE/fail-command")" ]; then exit 1; fi
+if [ -f "$RG_TEST_STATE/fail-command" ] && [ "$*" = "$(cat "$RG_TEST_STATE/fail-command")" ]; then
+  if [ -e "$RG_TEST_STATE/fail-command-once" ]; then
+    rm -f "$RG_TEST_STATE/fail-command" "$RG_TEST_STATE/fail-command-once"
+  fi
+  exit 1
+fi
 if [ "${1:-}" = daemon-reload ] && [ -e "$RG_TEST_STATE/daemon-fail" ]; then exit 1; fi
 if [ "${1:-}" = list-unit-files ]; then
   case "$(cat "$RG_TEST_STATE/list-shape" 2>/dev/null || true)" in
@@ -321,7 +326,13 @@ if [ "${1:-}" = show ]; then
 fi
 case "${1:-}" in
   is-enabled|is-active)
-    kind=${1#is-}; unit=${2:-}; value=$(cat "$(state_file "$unit" "$kind")") || exit 1
+    kind=${1#is-}; unit=${2:-}
+    if [ "$kind" = enabled ] && [ "$unit" = estrado-pjud.service ] \
+      && [ -f "$RG_TEST_STATE/api-is-enabled-output" ]; then
+      cat "$RG_TEST_STATE/api-is-enabled-output"
+      exit "$(cat "$RG_TEST_STATE/api-is-enabled-status")"
+    fi
+    value=$(cat "$(state_file "$unit" "$kind")") || exit 1
     printf '%s\n' "$value"
     if [ "$kind" = enabled ]; then
       case "$value" in
@@ -341,6 +352,11 @@ case "${1:-}" in
     for unit in "$@"; do
       [ "$unit" = -- ] && continue
       current=$(cat "$(state_file "$unit" enabled)") || exit 1
+      if [ "$action" = disable ] && [ "$unit" = estrado-pjud.service ] \
+        && [ -e "$RG_TEST_STATE/ignore-first-api-disable" ]; then
+        rm -f "$RG_TEST_STATE/ignore-first-api-disable"
+        continue
+      fi
       [ "$current" = static ] || printf '%s\n' "$value" > "$(state_file "$unit" enabled)"
     done
     ;;
@@ -846,6 +862,83 @@ run_swappiness_namespace_regressions() {
   expect_contains 'failed metadata rollback is loud' "$OUT" 'ROLLBACK INCOMPLETO'
 }
 
+run_api_enablement_regressions() {
+  echo '== successful apply preserves exact API enablement without changing activity'
+
+  setup
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'enabled active API apply succeeds' "$RC" 0
+  expect_eq 'enabled API remains enabled' \
+    "$(cat "$STATE/unit-estrado-pjud.service-enabled")" enabled
+  expect_eq 'enabled API remains active' \
+    "$(cat "$STATE/unit-estrado-pjud.service-active")" active
+  expect_count 'enabled API is never stopped' 'systemctl stop estrado-pjud.service' 0
+
+  setup
+  printf '%s\n' disabled > "$STATE/unit-estrado-pjud.service-enabled"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'disabled active API apply succeeds' "$RC" 0
+  expect_eq 'disabled API is reconciled back to disabled' \
+    "$(cat "$STATE/unit-estrado-pjud.service-enabled")" disabled
+  expect_eq 'disabled API remains active throughout' \
+    "$(cat "$STATE/unit-estrado-pjud.service-active")" active
+  expect_exact_count 'disabled API is reconciled once' \
+    'systemctl disable estrado-pjud.service' 1
+  expect_count 'disabled active API is never stopped' \
+    'systemctl stop estrado-pjud.service' 0
+  expect_count 'enablement reconciliation never restarts API' \
+    'systemctl restart estrado-pjud.service' 0
+
+  setup
+  printf '%s\n' disabled > "$STATE/unit-estrado-pjud.service-enabled"
+  printf '%s\n' 'disable estrado-pjud.service' > "$STATE/fail-command"
+  : > "$STATE/fail-command-once"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'API enablement command failure fails apply' "$RC" 1
+  expect_eq 'command failure rollback restores API disabled' \
+    "$(cat "$STATE/unit-estrado-pjud.service-enabled")" disabled
+  expect_eq 'command failure rollback preserves API active' \
+    "$(cat "$STATE/unit-estrado-pjud.service-active")" active
+  expect_eq 'command failure invokes transaction rollback once' \
+    "$(printf '%s\n' "$OUT" | grep -cF 'ROLLBACK OK' || true)" 1
+  expect_contains 'command failure rollback completes' "$OUT" 'ROLLBACK OK'
+
+  setup
+  printf '%s\n' disabled > "$STATE/unit-estrado-pjud.service-enabled"
+  : > "$STATE/ignore-first-api-disable"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'post-reconciliation mismatch fails apply' "$RC" 1
+  expect_eq 'mismatch rollback restores API disabled' \
+    "$(cat "$STATE/unit-estrado-pjud.service-enabled")" disabled
+  expect_eq 'mismatch rollback preserves API active' \
+    "$(cat "$STATE/unit-estrado-pjud.service-active")" active
+  expect_eq 'mismatch invokes transaction rollback once' \
+    "$(printf '%s\n' "$OUT" | grep -cF 'ROLLBACK OK' || true)" 1
+  expect_contains 'mismatch rollback completes' "$OUT" 'ROLLBACK OK'
+
+  setup
+  printf '%s\n' 'enabled enabled' > "$STATE/api-is-enabled-output"
+  printf '%s\n' 0 > "$STATE/api-is-enabled-status"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'ambiguous API enablement output fails closed' "$RC" 1
+  expect_count 'ambiguous enablement blocks before provision' provision 0
+
+  setup
+  printf '%s\n' disabled > "$STATE/api-is-enabled-output"
+  printf '%s\n' 0 > "$STATE/api-is-enabled-status"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'valid-looking API enablement with wrong status fails closed' "$RC" 1
+  expect_count 'wrong enablement status blocks before provision' provision 0
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = api-enablement ]; then
+  run_api_enablement_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = legacy-monitors ]; then
   run_legacy_monitor_migration_regression
   echo
@@ -882,6 +975,7 @@ run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
 run_swappiness_namespace_regressions
+run_api_enablement_regressions
 
 echo '== explicit test guard rejects a partial override set'
 setup

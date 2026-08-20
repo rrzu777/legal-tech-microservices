@@ -21,7 +21,7 @@ MONITOR_PATH = Path(__file__).parents[1] / "monitor.py"
 UTC = timezone.utc
 
 
-def unit(name, active_state="active", restarts=0):
+def unit(name, active_state="active", restarts=0, control_group=None):
     return UnitSnapshot(
         name=name,
         active_state=active_state,
@@ -34,6 +34,7 @@ def unit(name, active_state="active", restarts=0):
         tasks_max=10,
         cpu_usage_ns=1,
         n_restarts=restarts,
+        control_group=control_group,
     )
 
 
@@ -43,9 +44,22 @@ def sample(api_active="active"):
         timestamp_utc="2026-08-19T12:00:00Z",
         host=HostSnapshot(100, 50, 100, 0, 0.1, 100, 10, 100, 10),
         units={
-            "legaltech.slice": unit("legaltech.slice"),
-            "estrado-pjud.service": unit("estrado-pjud.service", api_active),
-            "estrado-pjud-worker.service": unit("estrado-pjud-worker.service"),
+            "legaltech.slice": unit(
+                "legaltech.slice", control_group="/legaltech.slice"
+            ),
+            "estrado-pjud.service": unit(
+                "estrado-pjud.service",
+                api_active,
+                control_group=(
+                    "/legaltech.slice/estrado-pjud.service"
+                    if api_active == "active"
+                    else None
+                ),
+            ),
+            "estrado-pjud-worker.service": unit(
+                "estrado-pjud-worker.service",
+                control_group="/legaltech.slice/estrado-pjud-worker.service",
+            ),
             "legaltech-monitor.service": unit(
                 "legaltech-monitor.service", "inactive"
             ),
@@ -56,8 +70,12 @@ def sample(api_active="active"):
             "legaltech-resource-tracker.timer": unit(
                 "legaltech-resource-tracker.timer"
             ),
-            "user-4242.slice": unit("user-4242.slice"),
+            "user-4242.slice": unit(
+                "user-4242.slice",
+                control_group="/user.slice/user-4242.slice",
+            ),
         },
+        hermes_user_slice="user-4242.slice",
     )
 
 

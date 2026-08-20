@@ -60,7 +60,9 @@ def evaluate_rules(
     for unit_name in CRITICAL_UNITS:
         unit = snapshot.units.get(unit_name)
         expected = unit_name == "estrado-pjud.service" or _worker_is_expected(unit)
-        inactive = expected and not _continuous_unit_is_available(unit)
+        inactive = expected and not _continuous_unit_is_available(
+            unit, require_control_group=True
+        )
         results.append(
             RuleResult(
                 key=f"unit.inactive:{unit_name}",
@@ -74,9 +76,9 @@ def evaluate_rules(
         )
 
     required_continuous_units = (
-        ("legaltech.slice", False),
-        ("legaltech-monitor.timer", True),
-        ("legaltech-resource-tracker.timer", True),
+        ("legaltech.slice", False, True),
+        ("legaltech-monitor.timer", True, False),
+        ("legaltech-resource-tracker.timer", True, False),
     )
     hermes_user_slice = snapshot.hermes_user_slice or next(
         (
@@ -86,10 +88,16 @@ def evaluate_rules(
         ),
         "hermes-user.slice",
     )
-    required_continuous_units += ((hermes_user_slice, False),)
-    for unit_name, enabled_required in required_continuous_units:
+    required_continuous_units += ((hermes_user_slice, False, True),)
+    for (
+        unit_name,
+        enabled_required,
+        control_group_required,
+    ) in required_continuous_units:
         unit = snapshot.units.get(unit_name)
-        unavailable = not _continuous_unit_is_available(unit) or (
+        unavailable = not _continuous_unit_is_available(
+            unit, require_control_group=control_group_required
+        ) or (
             enabled_required
             and unit is not None
             and unit.unit_file_state not in {"enabled", "enabled-runtime"}
@@ -277,12 +285,30 @@ def _worker_is_expected(unit: Any) -> bool:
     )
 
 
-def _continuous_unit_is_available(unit: Any) -> bool:
+def _continuous_unit_is_available(
+    unit: Any, *, require_control_group: bool = False
+) -> bool:
     return (
         unit is not None
         and unit.diagnostic is None
         and unit.load_state == "loaded"
         and unit.active_state == "active"
+        and (
+            not require_control_group
+            or _control_group_is_valid(unit.control_group)
+        )
+    )
+
+
+def _control_group_is_valid(control_group: Any) -> bool:
+    return (
+        isinstance(control_group, str)
+        and bool(control_group.strip())
+        and control_group.startswith("/")
+        and not any(
+            ord(character) < 32 or ord(character) == 127
+            for character in control_group
+        )
     )
 
 

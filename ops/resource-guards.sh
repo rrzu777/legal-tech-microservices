@@ -1151,6 +1151,7 @@ run_apply_steps() {
   [ "$after_monitor" = "$desired_monitor" ] || return 1
   [ "$after_tracker" = "$desired_tracker" ] || return 1
   [ "$provision_rc" -eq 0 ] || return 1
+  restore_enabled_state system estrado-pjud.service "${desired_enabled_states[0]}" || return 1
   if [ "${swap_initial_state:-unknown}" = clean ]; then
     printf '%s\n' attempted > "$backup_dir/swap-state" || return 1
   fi
