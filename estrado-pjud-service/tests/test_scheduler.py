@@ -1,6 +1,6 @@
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 
@@ -25,15 +25,49 @@ class TestScheduler:
         mock_sb = MagicMock()
         chain = MagicMock()
         mock_sb.rpc.return_value = chain
-        chain.execute.return_value = MagicMock(data=[])
+        chain.execute.side_effect = [
+            MagicMock(data=[{
+                "reconciled_count": 0,
+                "historical_unowned_count": 0,
+            }]),
+            MagicMock(data=[]),
+        ]
 
         await Scheduler(_mock_config(), mock_sb).verify_claim_contract(now=OFFICE_NOW)
 
-        mock_sb.rpc.assert_called_once_with("claim_pjud_sync_cases", {
-            "p_worker_id": "test-worker",
-            "p_limit": 0,
-            "p_now": OFFICE_NOW.isoformat(),
-        })
+        assert mock_sb.rpc.call_args_list == [
+            call("reconcile_stale_pjud_sync_runs", {}),
+            call("claim_pjud_sync_cases", {
+                "p_worker_id": "test-worker",
+                "p_limit": 0,
+                "p_now": OFFICE_NOW.isoformat(),
+            }),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_periodic_reconciliation_runs_without_claiming_outside_office(self):
+        """The maintenance RPC must not need a case claim or caller cutoff."""
+        from worker.scheduler import RECONCILE_INTERVAL_S, Scheduler
+
+        mock_sb = MagicMock()
+        chain = MagicMock()
+        mock_sb.rpc.return_value = chain
+        chain.execute.return_value = MagicMock(data=[{
+            "reconciled_count": 1,
+            "historical_unowned_count": 2,
+        }])
+        scheduler = Scheduler(_mock_config(), mock_sb)
+        scheduler._last_reconciliation_monotonic = 0.0
+
+        with patch(
+            "worker.scheduler.time.monotonic",
+            return_value=RECONCILE_INTERVAL_S,
+        ):
+            assert await scheduler.get_next_batch(now=NIGHT_NOW) == []
+
+        mock_sb.rpc.assert_called_once_with(
+            "reconcile_stale_pjud_sync_runs", {},
+        )
 
     @pytest.mark.asyncio
     async def test_get_next_batch_builds_correct_query(self):

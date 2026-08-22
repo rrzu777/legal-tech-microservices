@@ -8,6 +8,7 @@ from postgrest.exceptions import APIError
 
 from app.bandwidth import record_proxy_request, record_proxy_response
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.failure_kind import MintUnavailableError
 from worker.proxy_usage import ProxyUsageTracker
 from app.usage_context import usage_scope
 
@@ -24,6 +25,87 @@ def _supabase():
     chain.insert.return_value = chain
     chain.upsert.return_value = chain
     return sb
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_passes_allowlisted_lifecycle_failure_code():
+    """Dropping the closed code would make a failed mint unclassifiable."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="mint",
+            transaction_key="mint-closed-failure",
+            failure_code="mint_navigation_failed",
+        ) as usage:
+            record_proxy_request(10)
+            usage.status = "error"
+            usage.error_kind = "infra"
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["failure_code"] == "mint_navigation_failed"
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_maps_mint_exception_without_raw_detail():
+    """A typed mint failure must persist only its closed aggregate code."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with pytest.raises(MintUnavailableError):
+            async with tracker.track(
+                operation="mint",
+                transaction_key="mint-deadline-failure",
+            ):
+                record_proxy_request(10)
+                raise MintUnavailableError("deadline_exceeded")
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["failure_code"] == "mint_deadline_exceeded"
+    assert "deadline_exceeded" not in str({
+        key: value for key, value in payload.items() if key != "failure_code"
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "failure_code"),
+    [
+        ("mint", "secret-provider-error"),
+        ("search", "remote_protocol_disconnect"),
+    ],
+)
+async def test_usage_tracker_rejects_open_or_non_lifecycle_failure_code_before_reservation(
+    operation, failure_code,
+):
+    """Invalid taxonomy input must fail before any budget or provider traffic."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with pytest.raises(ValueError, match="failure_code"):
+        async with tracker.track(
+            operation=operation,
+            failure_code=failure_code,
+        ):
+            pytest.fail("provider work must not start")
+
+    sb.rpc.assert_not_called()
 
 
 @pytest.mark.asyncio

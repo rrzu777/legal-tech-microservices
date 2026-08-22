@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +15,7 @@ def _make_case(**overrides):
     base = {
         "id": "case-uuid-1",
         "law_firm_id": "firm-uuid-1",
+        "sync_claim_token": "claim-token-uuid-1",
         "case_number": "C-1234-2024",
         "case_type": "rol",
         "matter": "civil",
@@ -87,6 +88,27 @@ def _mock_detail_response(blocked=False):
     }
 
 
+def _configure_sync_run_rpc(mock_sb, *, failures=None):
+    """Return an exact begin-RPC row while leaving other RPCs generic."""
+    failures = failures or {}
+    rpc_chain = MagicMock()
+
+    def execute_rpc():
+        rpc_name, payload = mock_sb.rpc.call_args.args
+        if rpc_name in failures:
+            raise failures[rpc_name]
+        if rpc_name == "begin_pjud_scheduled_sync_run":
+            return MagicMock(data=[{
+                "id": payload["p_run_id"],
+                "status": "running",
+                "error_code": None,
+            }])
+        return MagicMock(data=[])
+
+    rpc_chain.execute.side_effect = execute_rpc
+    mock_sb.rpc.return_value = rpc_chain
+
+
 def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
                  mock_metrics=None, mock_backoff=None):
     """Build a SyncEngine with all mocked dependencies."""
@@ -114,7 +136,7 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
-        mock_sb.rpc.return_value = chain
+        _configure_sync_run_rpc(mock_sb)
 
     if mock_notifier is None:
         mock_notifier = AsyncMock()
@@ -129,12 +151,133 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         notifier=mock_notifier,
         metrics=mock_metrics,
         backoff=mock_backoff,
-        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+        config=MagicMock(
+            OJV_TIMEOUT_S=25,
+            R2_ENABLED=False,
+            WORKER_ID="test-worker",
+        ),
     )
     return engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff
 
 
 class TestSyncEngine:
+    @pytest.mark.asyncio
+    async def test_begin_sync_run_replays_exact_identity_after_transport_disconnect(self):
+        """Changing any replay argument could create a second attribution root."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        run_id = "run-uuid-1"
+        started_at = datetime(2026, 8, 22, 10, 30, 0)
+        response = MagicMock(data=[{
+            "id": run_id,
+            "status": "running",
+            "error_code": None,
+        }])
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(side_effect=[
+                httpx.RemoteProtocolError("response lost after commit"),
+                response,
+            ]),
+        ), patch("worker.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            assert await engine._begin_sync_run(
+                _make_case(), run_id, started_at,
+            ) == run_id
+
+        expected_payload = {
+            "p_run_id": run_id,
+            "p_case_id": "case-uuid-1",
+            "p_law_firm_id": "firm-uuid-1",
+            "p_worker_id": "test-worker",
+            "p_claim_token": "claim-token-uuid-1",
+            "p_started_at": started_at.isoformat(),
+        }
+        assert mock_sb.rpc.call_args_list == [
+            call("begin_pjud_scheduled_sync_run", expected_payload),
+            call("begin_pjud_scheduled_sync_run", expected_payload),
+        ]
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_begin_sync_run_does_not_retry_deterministic_rpc_error(self):
+        """A deterministic claim mismatch must not be treated as ambiguous."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        deterministic = RuntimeError("sync_claim_mismatch")
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(side_effect=deterministic),
+        ), patch("worker.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(RuntimeError, match="sync_claim_mismatch"):
+                await engine._begin_sync_run(
+                    _make_case(), "run-uuid-1", datetime(2026, 8, 22, 10, 30),
+                )
+
+        assert mock_sb.rpc.call_count == 1
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sync_run_mismatch_stops_before_pool_rate_limit_or_usage(self):
+        """A non-exact RPC row cannot authorize any provider-attributed work."""
+        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        engine._proxy_usage = MagicMock()
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(return_value=MagicMock(data=[{
+                "id": "different-run",
+                "status": "running",
+                "error_code": None,
+            }])),
+        ):
+            result = await engine.sync_case(_make_case())
+
+        assert result["status"] == "sync_run_unavailable"
+        mock_pool.acquire.assert_not_awaited()
+        mock_pool.enforce_global_rate_limit.assert_not_awaited()
+        engine._proxy_usage.track.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_claim_token_stops_before_rpc_or_provider_traffic(self):
+        """A claim without its durable token cannot start a scheduled run."""
+        engine, mock_pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        engine._proxy_usage = MagicMock()
+
+        result = await engine.sync_case(_make_case(sync_claim_token=None))
+
+        assert result["status"] == "sync_run_unavailable"
+        mock_sb.rpc.assert_not_called()
+        mock_pool.acquire.assert_not_awaited()
+        mock_pool.enforce_global_rate_limit.assert_not_awaited()
+        engine._proxy_usage.track.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_finish_run_sanitizes_caps_and_classifies_transport_error(self):
+        """Raw internal URLs and unbounded details must not reach run storage."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        error = httpx.RemoteProtocolError(
+            "disconnect https://internal.example/private token " + "x" * 400
+        )
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(return_value=MagicMock(data=[])),
+        ):
+            await engine._finish_run(
+                "run-uuid-1",
+                datetime.now().astimezone(),
+                "error",
+                0,
+                error,
+            )
+
+        payload = mock_sb.from_.return_value.update.call_args.args[0]
+        assert payload["error_message"] == (
+            "disconnect [redacted] token " + "x" * 400
+        )[:300]
+        assert payload["error_code"] == "remote_protocol_disconnect"
+        assert "internal.example" not in repr(payload)
+
     @pytest.mark.asyncio
     async def test_sync_run_persistence_failure_stops_before_proxy_traffic(self):
         """A missing durable run must never fall through to a shared None key."""
@@ -179,6 +322,7 @@ class TestSyncEngine:
         chain.range.return_value = chain
         chain.upsert.return_value = chain
         chain.in_.return_value = chain
+        _configure_sync_run_rpc(mock_sb)
 
         mock_notifier = AsyncMock()
         mock_metrics = MagicMock()
@@ -257,6 +401,7 @@ class TestSyncEngine:
         chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        _configure_sync_run_rpc(mock_sb)
 
         mock_notifier = AsyncMock()
         mock_metrics = MagicMock()
@@ -309,6 +454,7 @@ class TestSyncEngine:
         chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        _configure_sync_run_rpc(mock_sb)
 
         engine = SyncEngine(
             pool=mock_pool,
@@ -737,7 +883,6 @@ class TestSyncEngine:
 
         # Return 0 for before-count, 2 for after-count
         execute_returns = [
-            MagicMock(data={"id": "sync-run-1"}, count=None),  # sync run insert
             MagicMock(data=[], count=None),  # existing movement identities
             MagicMock(data=[], count=0),   # before count
             MagicMock(data=[], count=None),  # upsert
@@ -755,6 +900,7 @@ class TestSyncEngine:
             return MagicMock(data=[], count=None)
 
         chain.execute.side_effect = controlled_execute
+        _configure_sync_run_rpc(mock_sb)
 
         from worker.engine import SyncEngine
         engine = SyncEngine(
@@ -796,6 +942,7 @@ class TestSyncEngine:
         chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
         chain.update.return_value = chain
         chain.eq.return_value = chain
+        _configure_sync_run_rpc(mock_sb)
 
         from worker.engine import SyncEngine
         engine = SyncEngine(

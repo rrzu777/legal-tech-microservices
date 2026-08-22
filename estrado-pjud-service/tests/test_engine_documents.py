@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.test_engine import (
+    _configure_sync_run_rpc,
     _make_case,
     _make_engine,
     _mock_detail_response,
@@ -171,9 +172,16 @@ async def test_source_registry_uses_one_bounded_batch_for_many_movements(monkeyp
 @pytest.mark.asyncio
 async def test_registry_failure_still_finishes_and_schedules_full_case_sync():
     engine, _, supabase, *_ = _make_engine()
+    _configure_sync_run_rpc(
+        supabase,
+        failures={
+            "upsert_pjud_document_source_batch": RuntimeError(
+                "registry unavailable"
+            ),
+        },
+    )
     chain = supabase.from_.return_value
     chain.execute.side_effect = [
-        MagicMock(data={"id": "run-1"}),
         MagicMock(data=[]),
         MagicMock(data=[], count=0),
         MagicMock(data=[
@@ -181,7 +189,6 @@ async def test_registry_failure_still_finishes_and_schedules_full_case_sync():
             {"id": "movement-2", "external_movement_key": "C-1234-2024:Principal:2"},
         ]),
         MagicMock(data=[], count=2),
-        RuntimeError("registry unavailable"),
         MagicMock(data=[]),
         MagicMock(data=[]),
         MagicMock(data=[]),

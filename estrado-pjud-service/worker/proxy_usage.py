@@ -7,12 +7,17 @@ import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Literal, cast
 
 import httpx
 from postgrest.exceptions import APIError
 
 from app.bandwidth import ProxyUsageCapture, capture_proxy_usage
+from app.failure_kind import (
+    BlockedPageError,
+    MintUnavailableError,
+    RejectedDetailSessionError,
+)
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.usage_context import current_usage_scope
@@ -59,6 +64,48 @@ _SESSION_REASONS: frozenset[str] = frozenset({
 })
 _SESSION_REASONS_WITHOUT_AGE = frozenset({"startup", "missing_bundle"})
 _SESSION_OPERATIONS = frozenset({"health", "mint"})
+FailureCode = Literal[
+    "mint_navigation_failed",
+    "mint_deadline_exceeded",
+    "mint_browser_unavailable",
+    "session_rejected",
+    "remote_protocol_disconnect",
+    "unknown_infra",
+]
+_FAILURE_CODES: frozenset[str] = frozenset({
+    "mint_navigation_failed",
+    "mint_deadline_exceeded",
+    "mint_browser_unavailable",
+    "session_rejected",
+    "remote_protocol_disconnect",
+    "unknown_infra",
+})
+
+
+def proxy_failure_code(error: BaseException) -> FailureCode:
+    """Map lifecycle exceptions without retaining any exception text."""
+    if isinstance(error, MintUnavailableError):
+        return {
+            "navigation_failed": "mint_navigation_failed",
+            "deadline_exceeded": "mint_deadline_exceeded",
+            "browser_unavailable": "mint_browser_unavailable",
+        }.get(error.code, "unknown_infra")
+    if isinstance(error, (BlockedPageError, RejectedDetailSessionError)):
+        return "session_rejected"
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "remote_protocol_disconnect"
+    return "unknown_infra"
+
+
+def _validate_failure_code(
+    operation: str,
+    failure_code: FailureCode | str | None,
+) -> FailureCode | None:
+    if failure_code is None:
+        return None
+    if operation not in _SESSION_OPERATIONS or failure_code not in _FAILURE_CODES:
+        raise ValueError("failure_code must be allowlisted lifecycle telemetry")
+    return cast(FailureCode, failure_code)
 
 
 def _is_transient_telemetry_api_error(exc: APIError) -> bool:
@@ -338,7 +385,9 @@ class ProxyUsageTracker:
         session_cycle_id: uuid.UUID | None = None,
         session_reason: SessionReason | None = None,
         session_age_seconds: int | None = None,
+        failure_code: FailureCode | None = None,
     ):
+        failure_code = _validate_failure_code(operation, failure_code)
         (
             normalized_session_cycle_id,
             normalized_session_reason,
@@ -423,6 +472,7 @@ class ProxyUsageTracker:
                         session_cycle_id=normalized_session_cycle_id,
                         session_reason=normalized_session_reason,
                         session_age_seconds=normalized_session_age_seconds,
+                        failure_code=failure_code,
                     )
                 except Exception as exc:
                     if caught is not None:
@@ -450,6 +500,7 @@ class ProxyUsageTracker:
         session_cycle_id: str | None,
         session_reason: SessionReason | None,
         session_age_seconds: int | None,
+        failure_code: FailureCode | None,
     ) -> None:
         has_provider_usage = usage.request_count > 0
         has_savings_event = usage.documents_skipped > 0
@@ -462,6 +513,8 @@ class ProxyUsageTracker:
         if error is not None:
             status = "error"
             error_kind = "billing" if is_proxy_billing_error(error) else "infra"
+            if operation in _SESSION_OPERATIONS and failure_code is None:
+                failure_code = proxy_failure_code(error)
         elif usage.status is not None:
             status = usage.status
             error_kind = usage.error_kind
@@ -502,6 +555,7 @@ class ProxyUsageTracker:
             "documents_skipped": usage.documents_skipped,
             "status": status,
             "error_kind": error_kind,
+            "failure_code": failure_code,
             "provider": self._provider,
             "price_per_gb_usd": self._price_per_gb_usd,
         }

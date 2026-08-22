@@ -18,7 +18,11 @@ import pytest
 from app.failure_kind import MissingCsrfTokenError, slot_still_healthy
 from app.session import OJVSession
 from tests.helpers import AdapterQueGraba
-from tests.test_engine import _make_case, _mock_search_response
+from tests.test_engine import (
+    _configure_sync_run_rpc,
+    _make_case,
+    _mock_search_response,
+)
 
 
 @pytest.mark.parametrize("token", [None, ""], ids=["None", "cadena-vacia"])
@@ -79,6 +83,7 @@ async def test_el_worker_no_re_mintea_el_slot_ni_penaliza_la_causa():
     for metodo in ("insert", "select", "single", "update", "eq"):
         getattr(chain, metodo).return_value = chain
     chain.execute.return_value = MagicMock(data={"id": "sync-run-1"}, count=0)
+    _configure_sync_run_rpc(mock_sb)
 
     engine = SyncEngine(
         pool=mock_pool,

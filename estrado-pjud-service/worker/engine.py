@@ -20,6 +20,7 @@ from app.document_metadata import (
     sanitize_pjud_case_external_payload,
     sanitize_pjud_movement_payload,
 )
+from app.errors import safe_error
 from app.failure_kind import (
     UpstreamChangedError,
     block_cause,
@@ -60,6 +61,22 @@ _PARSE_ALERT_COOLDOWN_S = 3600
 _MOVEMENT_PAGE_SIZE = 1_000
 _DOCUMENT_SOURCE_TIMEOUT_S = 2.0
 _MAX_LOOKUP_CANDIDATES = 100
+_BEGIN_SYNC_RUN_REPLAY_DELAYS_S = (0.1,)
+_SYNC_RUN_ERROR_CODES = frozenset({
+    "worker_interrupted",
+    "sync_run_unavailable",
+    "invalid_identifier",
+    "unsupported_matter",
+    "case_not_found",
+    "parse_failed",
+    "pjud_timeout",
+    "upstream_changed",
+    "remote_protocol_disconnect",
+    "ojv_blocked",
+    "infra_unavailable",
+    "credential_unavailable",
+    "unknown_case_error",
+})
 _LOOKUP_CANDIDATE_FIELDS = (
     "rol", "ruc", "tribunal", "caratulado", "fecha_ingreso",
     "tribunal_code", "corte", "corte_code", "libro", "libro_code",
@@ -68,6 +85,46 @@ _LOOKUP_CANDIDATE_FIELDS = (
 
 class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
+
+
+def _sync_run_error_code(error: BaseException | str | None) -> str | None:
+    """Map worker outcomes to the database's closed scheduled-run taxonomy."""
+    if error is None:
+        return None
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "remote_protocol_disconnect"
+    if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+        return "pjud_timeout"
+    if isinstance(error, UpstreamChangedError):
+        return "upstream_changed"
+    if isinstance(error, InvalidCanonicalIdentityError):
+        return "invalid_identifier"
+
+    normalized = safe_error(error).strip().lower()
+    if normalized in _SYNC_RUN_ERROR_CODES:
+        return normalized
+    if normalized in {"invalid identifier", "invalid_identity"}:
+        return "invalid_identifier"
+    if (
+        normalized == "unsupported matter"
+        or "auth_type no soportado" in normalized
+    ):
+        return "unsupported_matter"
+    if "not found" in normalized or "no encontrada" in normalized:
+        return "case_not_found"
+    if normalized == "parse_failed" or normalized.startswith("parse error:"):
+        return "parse_failed"
+    if normalized == "no detail key available":
+        return "parse_failed"
+    if normalized in {"blocked by ojv", "detail blocked"}:
+        return "ojv_blocked"
+    if "remoteprotocolerror" in normalized:
+        return "remote_protocol_disconnect"
+    if "timeout" in normalized:
+        return "pjud_timeout"
+    if "credential" in normalized:
+        return "credential_unavailable"
+    return "unknown_case_error"
 
 MATTER_TO_COMPETENCIA = {
     "civil": "civil",
@@ -677,25 +734,76 @@ class SyncEngine:
             }).eq("id", case["id"])
         )
 
+    async def _begin_sync_run(
+        self,
+        case: dict,
+        run_id: str,
+        started_at: datetime,
+    ) -> str:
+        """Start one claim-bound run, replaying only an ambiguous transport."""
+        claim_token = case.get("sync_claim_token")
+        worker_id = getattr(self._config, "WORKER_ID", None)
+        if not all((
+            run_id,
+            case.get("id"),
+            case.get("law_firm_id"),
+            worker_id,
+            claim_token,
+        )):
+            raise RuntimeError("sync_run_identity_unavailable")
+
+        payload = {
+            "p_run_id": run_id,
+            "p_case_id": case["id"],
+            "p_law_firm_id": case["law_firm_id"],
+            "p_worker_id": worker_id,
+            "p_claim_token": claim_token,
+            "p_started_at": started_at.isoformat(),
+        }
+        attempts = len(_BEGIN_SYNC_RUN_REPLAY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._sb.rpc("begin_pjud_scheduled_sync_run", payload)
+                )
+            except (httpx.TransportError, asyncio.TimeoutError):
+                if attempt + 1 >= attempts:
+                    raise
+                logger.warning(
+                    "Ambiguous scheduled-run start transport; replaying exact RPC"
+                )
+                await asyncio.sleep(_BEGIN_SYNC_RUN_REPLAY_DELAYS_S[attempt])
+                continue
+
+            rows = response.data if isinstance(response.data, list) else []
+            if len(rows) != 1:
+                raise RuntimeError("sync_run_exact_row_unavailable")
+            row = rows[0]
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"id", "status", "error_code"}
+                or str(row.get("id")) != run_id
+                or row.get("status") != "running"
+                or row.get("error_code") is not None
+            ):
+                raise RuntimeError("sync_run_exact_row_mismatch")
+            return run_id
+
+        raise RuntimeError("sync_run_unavailable")
+
     async def sync_case(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
 
-        # Create sync run
         sync_run_id = str(uuid.uuid4())
         try:
-            await run_query(
-                self._sb.from_("case_sync_runs")
-                .insert({
-                    "id": sync_run_id,
-                    "law_firm_id": case["law_firm_id"],
-                    "case_id": case["id"],
-                    "status": "running",
-                    "trigger": "scheduled_sync",
-                    "started_at": started_at.isoformat(),
-                })
+            sync_run_id = await self._begin_sync_run(
+                case, sync_run_id, started_at,
             )
-        except Exception:
-            logger.exception("Failed to create sync_run")
+        except Exception as exc:
+            logger.error(
+                "Failed to begin claim-bound sync_run failure_type=%s",
+                type(exc).__name__,
+            )
             # A durable run is the attribution root for every paid operation.
             # Continuing with ``None`` would collapse all failed inserts onto
             # the same ``None:search`` idempotency key and can associate a
@@ -1926,6 +2034,8 @@ class SyncEngine:
             return
         now = datetime.now(TZ_SANTIAGO)
         duration_ms = int((now - started_at).total_seconds() * 1000)
+        error_message = safe_error(error)[:300] if error is not None else None
+        error_code = _sync_run_error_code(error)
         try:
             await run_query(
                 self._sb.from_("case_sync_runs").update({
@@ -1933,7 +2043,8 @@ class SyncEngine:
                     "finished_at": now.isoformat(),
                     "duration_ms": duration_ms,
                     "new_movements_count": new_movements,
-                    "error_message": error,
+                    "error_message": error_message,
+                    "error_code": error_code,
                 }).eq("id", run_id)
             )
         except Exception:
