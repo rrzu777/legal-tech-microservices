@@ -105,10 +105,6 @@ def _sync_run_error_code(
     """Map worker outcomes to the database's closed scheduled-run taxonomy."""
     if error is None:
         return None
-    if failure_kind == "infra":
-        return "infra_unavailable"
-    if failure_kind == "ojv":
-        return "ojv_blocked"
     if isinstance(error, httpx.RemoteProtocolError):
         return "remote_protocol_disconnect"
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
@@ -142,6 +138,10 @@ def _sync_run_error_code(
         return "pjud_timeout"
     if "credential" in normalized:
         return "credential_unavailable"
+    if failure_kind == "infra":
+        return "infra_unavailable"
+    if failure_kind == "ojv":
+        return "ojv_blocked"
     return "unknown_case_error"
 
 MATTER_TO_COMPETENCIA = {

@@ -668,6 +668,29 @@ class TestSyncEngine:
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
 
     @pytest.mark.asyncio
+    async def test_sync_remote_protocol_keeps_specific_run_error_code(self):
+        """Typed disconnect detail must survive its broader infra attribution."""
+        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+
+        with patch(
+            "worker.engine.search_pjud_via_session", new_callable=AsyncMock,
+        ) as mock_search, patch.object(
+            engine, "_finish_run", new_callable=AsyncMock,
+        ) as mock_finish:
+            mock_search.side_effect = httpx.RemoteProtocolError(
+                "response lost after request",
+            )
+            result = await engine.sync_case(_make_case())
+
+        assert result["success"] is False
+        assert mock_finish.await_args.kwargs["error_code"] == (
+            "remote_protocol_disconnect"
+        )
+        mock_pool.release.assert_awaited_once_with(
+            mock_pool.acquire.return_value, healthy=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_sync_read_timeout_is_infra_non_penalizing(self):
         """G2: httpx.ReadTimeout is also an httpx.TransportError subclass and
         must be caught by the same infra handler (proves the base-class
