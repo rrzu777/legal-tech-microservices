@@ -41,6 +41,10 @@ omitido, configura/verifica swap, reinicia sólo las superficies modificadas,
 activa los timers y corre el postflight. Un error posterior a la primera mutación
 intenta rollback exactamente una vez.
 
+La integración y el rollout de producción son gates separados. Tener este
+runbook o sus tests verdes no autoriza integrar, desplegar, rotar credenciales,
+probar alertas live ni crear el entorno del guest.
+
 Antes de operar, confirmar que el SHA desplegado corresponde al commit revisado:
 
 ```bash
@@ -64,12 +68,34 @@ El gate exige:
 - al menos 8 GiB libres en `/` y 6 GiB de `MemAvailable`;
 - ambos endpoints públicos con HTTP 200;
 - inventario y UID persistente de Hermes inequívocos;
-- heartbeat del worker con edad máxima de 300 segundos;
-- conteo exacto cero de claims activos dentro del cutoff de 14400 segundos;
 - estado de swap limpio o administrado y verificable.
 
-El conteo consulta sólo un agregado. Nunca continuar si el conteo no es
-exactamente cero y nunca reiniciar el worker con un claim activo o desconocido.
+El `preflight` permanece host-local y no consulta heartbeat ni claims. Esos
+queries protegidos se ejecutan dentro de `apply` sólo cuando el worker cambió y
+fue capturado activo, después del backup y la revalidación del SHA. El conteo
+consulta sólo un agregado. Nunca continuar si no es exactamente cero ni iniciar
+el worker con un claim activo o desconocido.
+
+### Ventana nocturna del worker PJUD
+
+Programar el rollout completo entre las **20:00 y las 03:59, hora de Santiago**.
+Las 04:00 ya están fuera de la ventana. Si la definición del worker cambió y el
+worker fue capturado activo, `apply` falla antes de detenerlo salvo que pruebe,
+con el archivo protegido del worker:
+
+- exactamente un `WORKER_ID` válido;
+- exactamente un `PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=false`;
+- `PJUD_OFF_HOURS_VALIDATION_ONCE` ausente o exactamente una vez en `false`;
+- heartbeat fresco `idle_off_hours` del `WORKER_ID` exacto, con
+  `process_outside_office_hours_enabled=false`;
+- si hay proxy configurado, `proxy_control_status=enabled` y razón nula;
+- conteo agregado exacto de claims activos igual a cero.
+
+No imprimir el archivo protegido, la URL, la key, el worker ID ni el cuerpo del
+heartbeat. Un resultado ausente, ambiguo, stale/futuro, un proxy pausado o con
+telemetría no disponible, o un claim activo es condición de **STOP**. No corregir
+el gate mutando `pjud_proxy_control` ni forzando sync, retry, mint, validación o
+tráfico de proxy.
 
 ### 2. Aplicación
 
@@ -84,8 +110,21 @@ otro namespace.
 
 Este rollout fuerza `PROV_SKIP_CADDY=1`: no valida, instala, recarga ni reinicia
 Caddy. También mantiene `PROV_ENABLE_PJUD_WORKER=0`; no convierte el worker en
-una unit habilitada. Si los archivos del worker cambian, su restart ocurre sólo
-después de repetir heartbeat fresco y conteo exacto cero.
+una unit habilitada. Si el worker cambió y estaba activo, el orden es fail-closed:
+
+1. backup y revalidación del SHA;
+2. gates nocturnos, heartbeat exacto y claims cero;
+3. marcador durable, `systemctl stop`, prueba de inactividad/PID/cgroup antiguo
+   ausente y drain acotado hasta claims cero;
+4. provisión, swap y `daemon-reload`;
+5. `systemctl start` bajo la nueva unit, nunca `restart`;
+6. cgroup exacto, heartbeat estrictamente más nuevo `idle_off_hours` con
+   `mint_attempts=0`, claims finales cero y postflight.
+
+El wait post-start es acotado pero puede consumir aproximadamente 395 segundos
+más overhead si cada probe HTTP agota su timeout. Reservar ese margen dentro de
+la ventana. Un worker capturado inactivo o sin cambios permanece sin stop/start
+y no ejecuta estas consultas protegidas.
 
 ### 3. Postflight explícito
 
@@ -97,7 +136,20 @@ sudo ./ops/resource-guards.sh postflight
 timers habilitados y activos, swap administrado y ambos endpoints públicos en
 HTTP 200. Los servicios de monitoreo deben permanecer en `system.slice`, fuera
 de `legaltech.slice`, para no quedar ciegos ante presión sobre la superficie que
-observan.
+observan. Los workloads continuos capturados activos deben estar exactamente en:
+
+- `legaltech.slice` -> `/legaltech.slice`;
+- `estrado-pjud.service` -> `/legaltech.slice/estrado-pjud.service`;
+- `estrado-pjud-worker.service` ->
+  `/legaltech.slice/estrado-pjud-worker.service`;
+- `user-<uid>.slice` de Hermes -> `/user.slice/user-<uid>.slice`;
+- cada servicio Hermes activo -> un descendiente de ese slice cuyo componente
+  final sea su unit exacta.
+
+Las units capturadas inactivas deben seguir inactivas, con PID cero y sin cgroup
+live. Cualquier identidad distinta hace fallar el apply y dispara su rollback.
+`monitor.py --dry-run` es sólo diagnóstico no mutante: exit cero por sí solo no
+prueba postflight ni salud.
 
 ### 4. Rollback
 
@@ -113,24 +165,47 @@ con manifiesto válido. Restaura exclusivamente los paths del manifiesto y los
 estados capturados de las units. Si el gate de RAM impide retirar swap, informa
 `ROLLBACK INCOMPLETO` y no hace borrado amplio.
 
+El rollback de swap es reanudable. Si `swapoff` ya tuvo éxito y una restauración
+o eliminación posterior falla, conservar todos los artefactos y volver a
+ejecutar **el mismo comando del orquestador con el mismo `BACKUP_DIR`** una vez
+resuelta la causa:
+
+```bash
+sudo ./ops/resource-guards.sh rollback --backup-dir "$BACKUP_DIR"
+```
+
+El segundo intento valida el estado parcial producido por la transacción y
+continúa sin repetir `swapoff`. No editar ni borrar manualmente fstab, backup,
+sysctl, swapfile o metadata para "destrabar" el clasificador. Un estado corrupto
+o ambiguo requiere diagnóstico y no se repara heurísticamente. Si el worker debe
+ser restaurado activo, reintentar sólo dentro de 20:00-03:59 y con sus flags
+seguros; fuera de esa ventana el rollback falla de forma audible.
+
 No ejecutar `swapoff` manualmente bajo presión. El rollback de
 `ops/swap/configure-swap.sh` es quien valida memoria antes de retirar swap; en un
 rollout orquestado debe llamarlo `resource-guards.sh`, no el operador por fuera.
 
-## Gate operativo de 24 horas
+## Gate operativo y siguiente ciclo hábil
 
-Tras aplicar, observar al inicio, mitad y fin de la ventana sólo métricas
-agregadas: RAM disponible, swap, carga, disco/inodos, estado y consumo por unit,
-restarts/OOM, timers y códigos de salud. No registrar contenido de causas,
-cookies, payloads o telemetría de proxy, identificadores de usuario ni otros
-datos personales.
+Tras aplicar, mantener el worker naturalmente idle durante la noche. Observar al
+inicio, mitad y fin de la ventana sólo métricas agregadas: RAM disponible, swap,
+carga, disco/inodos, estado/cgroup y consumo por unit, restarts/OOM, timers y
+códigos de salud. En el siguiente ciclo hábil normal, observar que el worker
+reanuda por su scheduler y produce evidencia agregada sana. No provocar ese ciclo
+con sync/retry manual, mint, validación pagada ni mutaciones de proxy.
+
+No registrar contenido de causas, cookies, payloads o telemetría de proxy,
+identificadores de usuario ni otros datos personales. `paused` o
+`telemetry_unavailable` es STOP: diagnosticar y conservar el fail-closed, nunca
+reactivar automáticamente.
 
 El monitor local no puede detectar la pérdida total del host o de su red. Sigue
 siendo gate instalar y verificar un monitor externo independiente para **ambos**
 endpoints públicos; sin él no afirmar cobertura de caída total.
 
-No provisionar el guest como parte de este cambio. El gate de 24 horas debe pasar
-antes de abrir un trabajo separado para guest provisioning.
+No provisionar el guest como parte de este cambio. La observación nocturna, el
+siguiente ciclo hábil natural y la cobertura externa deben quedar verdes antes
+de abrir un trabajo separado para guest provisioning.
 
 ## Otras superficies
 

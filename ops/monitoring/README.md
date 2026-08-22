@@ -13,6 +13,22 @@ Los oneshots corren cada cinco minutos, con hasta un minuto de jitter. Ambos
 permanecen en `system.slice`, no en `legaltech.slice`. El tracker sólo admite
 `AF_UNIX`; el monitor necesita red exclusivamente para entregar alertas.
 
+El collector valida propiedades systemd con cardinalidad exacta. Para workloads
+continuos activos, la policy exige estas identidades runtime:
+
+- `legaltech.slice`: `/legaltech.slice`;
+- API: `/legaltech.slice/estrado-pjud.service`;
+- worker: `/legaltech.slice/estrado-pjud-worker.service`;
+- slice Hermes resuelto dinámicamente: `/user.slice/user-<uid>.slice`;
+- `hermes-gateway.service` y `hermes-dashboard.service`: descendientes del slice
+  Hermes resuelto y con el nombre exacto de la unit como componente final.
+
+Un cgroup incorrecto, una lectura fallida o propiedades ambiguas activa la
+alerta estable de disponibilidad y suprime `healthy-heartbeat`. El mensaje queda
+sanitizado: no contiene el path observado ni diagnósticos del productor. Units
+opcionales probadamente disabled/inactive, timers e inactive one-shots exitosos
+no necesitan un cgroup de proceso.
+
 ## Datos permitidos
 
 El tracker y el monitor trabajan sólo con agregados del host y de systemd:
@@ -42,6 +58,8 @@ sudo /usr/bin/python3 /opt/legaltech-monitoring/monitor.py --dry-run
 ```
 
 Éxito: JSON con `"dry_run":true` y la lista de eventos evaluados.
+Este comando es diagnóstico: exit cero no implica que los eventos estén sanos y
+no sustituye el postflight exacto de `resource-guards.sh`.
 
 Evaluación live una vez, cargando el archivo protegido sin incluir sus valores en
 el comando ni en el historial:
@@ -103,6 +121,13 @@ su red se pierden por completo. Por eso sigue siendo obligatorio un monitor
 externo independiente para `https://juristrack.cl/` y
 `https://estrado.juristrack.cl/api/v1/health`; hasta verificarlo, la cobertura de
 caída total permanece pendiente.
+
+Durante el rollout nocturno revisar los cgroups exactos y que no exista alerta
+de disponibilidad antes de aceptar la observación. Mantener el worker idle hasta
+el siguiente ciclo hábil natural. La observación no autoriza sync/retry manual,
+mint o validación pagada, llamadas de proxy ni mutaciones de
+`pjud_proxy_control`. `paused` o telemetría no disponible es una condición de
+STOP, no una razón para forzar reactivación.
 
 ## Tests locales
 

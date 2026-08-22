@@ -45,9 +45,35 @@ sudo ./ops/swap/configure-swap.sh rollback
 internamente `swapoff`, restaura byte por byte el fstab desde el backup validado
 y elimina los paths que administra.
 
+El cleanup es reanudable y sólo reconoce estados producidos por su propio orden:
+
+- `managed-active`: configuración completa y target exacto activo;
+- `managed-deactivated`: swappiness original restaurado, target inactivo y
+  bloque/backup de fstab todavía presentes;
+- `fstab-restored`: target inactivo, fstab original restaurado y un sufijo válido
+  de artefactos aún pendiente de eliminación;
+- `clean`: sin target activo ni artefactos administrados.
+
+Si una operación falla después de `swapoff`, el comando sale no-cero y conserva
+uno de esos estados parciales. Resolver la causa y reintentar exactamente:
+
+```bash
+sudo ./ops/swap/configure-swap.sh rollback
+```
+
+El retry omite el gate de RAM y `swapoff` cuando el target ya está inactivo,
+revalida swappiness/identidad de cada artefacto y continúa en orden: restaurar
+fstab, eliminar sysctl, eliminar swapfile inactivo y eliminar metadata al final.
+Nunca reactiva swap ni sintetiza un backup.
+
 No ejecutar `swapoff` manualmente bajo presión ni editar/eliminar a mano el
 marker, backup, sysctl o swapfile. Si el gate de RAM falla, conservar el estado y
 resolver la presión antes de reintentar el subcomando `rollback`.
+
+Symlinks, hardlinks, ownership/modos inesperados, contenido corrupto, markers
+duplicados, un target activo inesperado o un bloque sin backup validado son
+estado inseguro. El script falla antes de mutar; no intentar convertirlos
+manualmente en un estado aceptado.
 
 Cuando swap fue aplicado por `ops/resource-guards.sh`, usar el rollback del
 orquestador con la ruta exacta que imprimió `apply`:
@@ -57,7 +83,9 @@ sudo ./ops/resource-guards.sh rollback --backup-dir "$BACKUP_DIR"
 ```
 
 Así se conserva la restauración namespace-limited del manifiesto completo; no
-llamar `configure-swap.sh rollback` por separado en ese flujo.
+llamar `configure-swap.sh rollback` por separado en ese flujo. Si el orquestador
+informa `ROLLBACK INCOMPLETO` tras una falla parcial de swap, reejecutar el
+rollback de `resource-guards.sh` con el mismo `BACKUP_DIR`, no este subcomando.
 
 ## Tests locales
 
