@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
-from app.bandwidth import record_proxy_request, record_proxy_response
+from app.bandwidth import record_proxy_request, record_proxy_response_increment
 from app.cookie_scope import CookieRecord, legacy_cookie_records, playwright_cookie_records
 from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
@@ -16,6 +16,7 @@ _CONSULTA_PATH = "/consultaUnificada.php"
 _FORM_READY_SELECTOR = "select#competencia, select[name='competencia']"
 _MINT_TIMEOUT_MS = 30_000
 _CLEANUP_TIMEOUT_S = 1.0
+_CDP_DRAIN_TURNS = 2
 
 # El challenge JS de F5 NO se resuelve en un browser headless ni en uno con
 # el flag de automatización visible. Verificado empíricamente (6 jul 2026):
@@ -69,6 +70,47 @@ class CookieMinter:
         except (asyncio.TimeoutError, PlaywrightError):
             logger.warning("pjud_mint_%s_cleanup_unavailable", label)
 
+    async def _detach_cdp_session(self, session) -> None:
+        try:
+            await asyncio.wait_for(
+                session.detach(),
+                timeout=_CLEANUP_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning("pjud_mint_cdp_cleanup_unavailable")
+
+    async def _create_cdp_meter(self, context, page):
+        session = None
+        try:
+            session = await asyncio.wait_for(
+                context.new_cdp_session(page),
+                timeout=_CLEANUP_TIMEOUT_S,
+            )
+
+            def _record_data_received(event) -> None:
+                if not isinstance(event, dict):
+                    return
+                record_proxy_response_increment(event.get("encodedDataLength"))
+
+            session.on("Network.dataReceived", _record_data_received)
+            await asyncio.wait_for(
+                session.send("Network.enable"),
+                timeout=_CLEANUP_TIMEOUT_S,
+            )
+            return session
+        except Exception:
+            logger.warning("pjud_mint_transfer_telemetry_unavailable")
+            if session is not None:
+                await self._detach_cdp_session(session)
+            return None
+
+    @staticmethod
+    async def _drain_cdp_callbacks(session) -> None:
+        if session is None:
+            return
+        for _ in range(_CDP_DRAIN_TURNS):
+            await asyncio.sleep(0)
+
     async def mint(self) -> MintResult:
         launch_kwargs = {"headless": False, "args": _ANTIBOT_ARGS}
         if self._proxy:
@@ -84,11 +126,9 @@ class CookieMinter:
                 raise MintUnavailableError("browser_unavailable") from None
             context = None
             page = None
-            observed_requests = 0
+            cdp_session = None
 
             def _record_started(request) -> None:
-                nonlocal observed_requests
-                observed_requests += 1
                 try:
                     body = request.post_data_buffer or b""
                 except Exception:
@@ -99,8 +139,9 @@ class CookieMinter:
                 context = await browser.new_context()
                 page = await context.new_page()
                 # This fires as soon as Chromium starts a request, including
-                # navigations that later timeout before performance data can be read.
+                # navigations that later timeout before CDP reports response bytes.
                 page.on("request", _record_started)
+                cdp_session = await self._create_cdp_meter(context, page)
                 try:
                     await page.goto(
                         f"{self._base_url}{_CONSULTA_PATH}",
@@ -120,24 +161,6 @@ class CookieMinter:
                 ua = await page.evaluate("() => navigator.userAgent")
                 pw_cookies = await context.cookies()
                 cookies = playwright_cookie_records(pw_cookies)
-                try:
-                    transfers = await page.evaluate(
-                        """() => [
-                          ...performance.getEntriesByType('navigation'),
-                          ...performance.getEntriesByType('resource'),
-                        ].map((entry) => ({
-                          transferSize: entry.transferSize || entry.encodedBodySize || 0,
-                        }))"""
-                    )
-                    if isinstance(transfers, list):
-                        for transfer in transfers:
-                            if not isinstance(transfer, dict):
-                                continue
-                            if observed_requests == 0:
-                                record_proxy_request(0)
-                            record_proxy_response(int(transfer.get("transferSize") or 0))
-                except Exception:
-                    logger.warning("pjud_mint_transfer_telemetry_unavailable")
                 logger.info(
                     "PJUD form ready; cookie_count=%d has_php_session=%s has_ts_family=%s",
                     len(cookies), any(cookie.name == "PHPSESSID" for cookie in cookies),
@@ -145,10 +168,8 @@ class CookieMinter:
                 )
                 return MintResult(cookies=cookies, user_agent=ua)
             finally:
-                # Do not inspect performance after a cancelled navigation: that
-                # delays closing a live page and lets its in-flight requests keep
-                # using the paid proxy past the acquisition deadline.
-                # Closing the browser is Playwright's atomic shutdown for all
-                # pages and contexts; starting there prevents a stuck child
-                # close from postponing the network cutoff.
-                await self._close_playwright_resource(browser, "browser")
+                await self._drain_cdp_callbacks(cdp_session)
+                cleanup = [self._close_playwright_resource(browser, "browser")]
+                if cdp_session is not None:
+                    cleanup.append(self._detach_cdp_session(cdp_session))
+                await asyncio.gather(*cleanup)

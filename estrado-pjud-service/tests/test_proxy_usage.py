@@ -1264,6 +1264,32 @@ async def test_unmeasurable_response_consumes_conservative_reserved_floor():
 
 
 @pytest.mark.asyncio
+async def test_navigation_failure_without_cdp_evidence_retains_mint_floor():
+    """Removing the zero-byte floor would under-reserve an unmeasured failed mint."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with pytest.raises(MintUnavailableError):
+            async with tracker.track(operation="mint"):
+                record_proxy_request(0)
+                raise MintUnavailableError("navigation_failed")
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["bytes_down"] == 0
+    assert payload["estimated_bytes_floor"] == 10_000_000
+    assert payload["measurement_status"] == "estimated_floor"
+    assert payload["failure_code"] == "mint_navigation_failed"
+
+
+@pytest.mark.asyncio
 async def test_billing_error_is_recorded_for_ops_without_raw_message():
     sb = _supabase()
     tracker = ProxyUsageTracker(sb, enabled=True)
