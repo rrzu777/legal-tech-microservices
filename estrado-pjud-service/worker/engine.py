@@ -51,6 +51,7 @@ from worker.proxy_usage import (
     DEFAULT_PRICE_PER_GB_USD,
     ProxyUsageTracker,
 )
+from worker.session_pool import ReleaseDisposition
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -95,6 +96,18 @@ _LOOKUP_CANDIDATE_FIELDS = (
 
 class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
+
+
+def _release_disposition_for_error(
+    error: BaseException,
+    *,
+    transport_revalidation_enabled: bool,
+) -> ReleaseDisposition:
+    if transport_revalidation_enabled and isinstance(
+        error, httpx.RemoteProtocolError,
+    ):
+        return "validate_before_reuse"
+    return "healthy" if slot_still_healthy(error) else "replace_before_reuse"
 
 
 def _sync_run_error_code(
@@ -838,6 +851,7 @@ class SyncEngine:
 
         session = None
         session_healthy = True
+        release_disposition: ReleaseDisposition | None = None
         remint_on_release = True
         try:
             # Legacy v1 needs the historical parsed form. Canonical v2 parses
@@ -1228,7 +1242,23 @@ class SyncEngine:
             #
             # La excepción es la falta de token CSRF, donde re-mintear no puede
             # corregir nada y sale carísimo: ver `slot_still_healthy`.
-            session_healthy = slot_still_healthy(e)
+            mapped_disposition = _release_disposition_for_error(
+                e,
+                transport_revalidation_enabled=(
+                    getattr(
+                        self._config,
+                        "WORKER_TRANSPORT_REVALIDATION_ENABLED",
+                        False,
+                    )
+                    is True
+                ),
+            )
+            session_healthy = mapped_disposition == "healthy"
+            release_disposition = (
+                mapped_disposition
+                if mapped_disposition == "validate_before_reuse"
+                else None
+            )
             msg = f"{kind}: {type(e).__name__}: {e}"
             if session_healthy:
                 # Tiene que hacer ruido. Sin el re-mint esto falla barato, y
@@ -1261,7 +1291,12 @@ class SyncEngine:
         finally:
             if session:
                 if remint_on_release:
-                    await self._pool.release(session, healthy=session_healthy)
+                    if release_disposition is not None:
+                        await self._pool.release(
+                            session, disposition=release_disposition,
+                        )
+                    else:
+                        await self._pool.release(session, healthy=session_healthy)
                 else:
                     await self._pool.release(session, healthy=False, remint=False)
 
@@ -1358,6 +1393,7 @@ class SyncEngine:
             return {"success": False, "new_movements": 0}
 
         session_healthy = True
+        release_disposition: ReleaseDisposition | None = None
         remint_on_release = True
         try:
             try:
@@ -1405,7 +1441,23 @@ class SyncEngine:
                 httpx.TransportError,
                 httpx.HTTPStatusError,
             ) as e:
-                session_healthy = False
+                mapped_disposition = _release_disposition_for_error(
+                    e,
+                    transport_revalidation_enabled=(
+                        getattr(
+                            self._config,
+                            "WORKER_TRANSPORT_REVALIDATION_ENABLED",
+                            False,
+                        )
+                        is True
+                    ),
+                )
+                session_healthy = mapped_disposition == "healthy"
+                release_disposition = (
+                    mapped_disposition
+                    if mapped_disposition == "validate_before_reuse"
+                    else None
+                )
                 if is_proxy_billing_error(e):
                     remint_on_release = False
                     await self._finish_run(
@@ -1452,7 +1504,14 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
         finally:
             if remint_on_release:
-                await self._pool.release_familia_bundle(slot, healthy=session_healthy)
+                if release_disposition is not None:
+                    await self._pool.release_familia_bundle(
+                        slot, disposition=release_disposition,
+                    )
+                else:
+                    await self._pool.release_familia_bundle(
+                        slot, healthy=session_healthy,
+                    )
             else:
                 await self._pool.release_familia_bundle(
                     slot, healthy=False, remint=False,

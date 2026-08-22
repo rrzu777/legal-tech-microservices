@@ -25,6 +25,7 @@ class WorkerConfig(BaseSettings):
     HEARTBEAT_INTERVAL_S: int = 60
     SESSION_MAX_AGE_S: int = 1500
     WORKER_SESSION_REUSE_VALIDATION_ENABLED: bool = False
+    WORKER_TRANSPORT_REVALIDATION_ENABLED: bool = False
     SESSION_REUSE_ROLLOUT_STARTED_AT: datetime | None = None
     SESSION_SOFT_VERIFY_AGE_S: int = Field(default=1200, gt=0)
     SESSION_HARD_MAX_AGE_S: int = Field(default=3000, gt=0)

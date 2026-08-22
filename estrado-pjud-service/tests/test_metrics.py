@@ -168,6 +168,32 @@ class TestWorkerMetrics:
         assert meta["mint_failures"] == 6
         assert meta["mint_failure_rate"] == 0.12
 
+    def test_heartbeat_publica_solo_contadores_agregados_fijos_del_pool(self):
+        pool = self._fake_pool()
+        pool.slot_state_counts = {
+            "healthy": 2,
+            "validate_before_reuse": 1,
+            "replace_before_reuse": 0,
+            "cooldown": 1,
+            "private_slot_id": "must-not-leak",
+        }
+        pool.validation_successes = 4
+        pool.validation_failures = 2
+        pool.validations_avoided_mint = 3
+
+        metadata = self._make(pool=pool).heartbeat_payload("running")["metadata"]
+
+        assert metadata["slot_state_counts"] == {
+            "healthy": 2,
+            "validate_before_reuse": 1,
+            "replace_before_reuse": 0,
+            "cooldown": 1,
+        }
+        assert metadata["session_validation_successes"] == 4
+        assert metadata["session_validation_failures"] == 2
+        assert metadata["session_validations_avoided_mint"] == 3
+        assert "private_slot_id" not in str(metadata)
+
     def test_heartbeat_declara_descarga_inline_deshabilitada(self):
         metadata = self._make(pool=self._fake_pool()).heartbeat_payload("running")["metadata"]
 

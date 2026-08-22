@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from app.cookie_store import CookieStoreLockTimeoutError
+from app.failure_kind import PoolUnavailableError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 
 
@@ -835,3 +836,203 @@ async def test_revalidation_swap_does_not_wait_for_retired_session_close(monkeyp
     await asyncio.wait_for(started.wait(), timeout=0.03)
     await asyncio.wait_for(cancelled.wait(), timeout=0.05)
     await pool.release(acquired)
+
+
+def test_transport_revalidation_is_disabled_by_default():
+    from worker.config import WorkerConfig
+
+    assert (
+        WorkerConfig.model_fields[
+            "WORKER_TRANSPORT_REVALIDATION_ENABLED"
+        ].default
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_disposition_revalidates_once_and_avoids_mint(monkeypatch):
+    """Removing the disposition branch would lend the old session unchecked."""
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    created = _patch_revalidation_candidate(monkeypatch, sp)
+    pool = _reuse_pool()
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+    pool._store = _ReuseStore(_bundle(now - 60))
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        busy=True,
+        bundle_saved_at=now - 60,
+    )
+    pool._slots = [slot]
+    pool._checkout[old] = slot
+    pool._mint_slot = AsyncMock()
+
+    await pool.release(old, disposition="validate_before_reuse")
+
+    assert pool.slot_state_counts == {
+        "healthy": 0,
+        "validate_before_reuse": 1,
+        "replace_before_reuse": 0,
+        "cooldown": 0,
+    }
+
+    acquired = await pool.acquire()
+
+    assert acquired is created[0]
+    assert created[0].revalidate_count == 1
+    pool._mint_slot.assert_not_awaited()
+    assert pool.validation_successes == 1
+    assert pool.validation_failures == 0
+    assert pool.validations_avoided_mint == 1
+    assert pool.slot_state_counts["healthy"] == 1
+    await pool.release(acquired)
+
+
+@pytest.mark.asyncio
+async def test_rejected_quarantine_validation_mints_once_in_same_cycle(monkeypatch):
+    """A rejected probe may buy one replacement, never a second lifecycle cycle."""
+    from app.failure_kind import BlockedPageError
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    _patch_revalidation_candidate(
+        monkeypatch, sp, error=BlockedPageError("challenge"),
+    )
+    pool = _reuse_pool()
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+    pool._store = _ReuseStore(_bundle(now - 60))
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        busy=True,
+        bundle_saved_at=now - 60,
+    )
+    pool._slots = [slot]
+    pool._checkout[old] = slot
+    replacement = _ReusableSession()
+    mint_cycles = []
+
+    async def mint_once(target, *, max_attempts=None):
+        assert max_attempts == 1
+        mint_cycles.append(target.session_cycle_id)
+        target.session = replacement
+        target.bundle_saved_at = now
+
+    pool._mint_slot = mint_once
+
+    await pool.release(old, disposition="validate_before_reuse")
+    acquired = await pool.acquire()
+
+    assert acquired is replacement
+    assert len(mint_cycles) == 1
+    assert mint_cycles[0] is not None
+    assert pool.validation_successes == 0
+    assert pool.validation_failures == 1
+    assert pool.validations_avoided_mint == 0
+    assert pool.slot_state_counts["healthy"] == 1
+    await pool.release(acquired)
+
+
+@pytest.mark.asyncio
+async def test_flag_off_failed_eager_replacement_enters_cooldown(monkeypatch):
+    """A failed legacy refresh must not silently lend the preserved old session."""
+    from worker import session_pool as sp
+
+    pool = _make_pool()
+    pool._pool_size = 1
+    pool._sem = asyncio.Semaphore(0)
+    pool._monotonic_now = lambda: 1_000.0
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        session=old,
+        busy=True,
+        last_mint_ts=0.0,
+    )
+    pool._slots = [slot]
+    pool._checkout[old] = slot
+    pool._refresh_slot = AsyncMock(
+        side_effect=httpx.ConnectError("replacement unavailable"),
+    )
+
+    await pool.release(old, healthy=False)
+
+    assert pool.slot_state_counts["cooldown"] == 1
+    assert slot.lifecycle_failures == 1
+    assert slot.next_probe_at > pool._monotonic_now()
+    with pytest.raises(PoolUnavailableError) as exc_info:
+        await asyncio.wait_for(pool.acquire(), timeout=0.02)
+    assert exc_info.value.code == "mint_exhausted"
+    assert pool._refresh_slot.await_count == 1
+    assert slot.busy is False
+
+
+@pytest.mark.asyncio
+async def test_all_cooldown_returns_promptly_without_health_or_mint(monkeypatch):
+    """Skipping the eligibility check would create paid traffic during cooldown."""
+    from worker import session_pool as sp
+
+    pool = _reuse_pool()
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+    pool._monotonic_now = lambda: 100.0
+    slot = sp._Slot(
+        index=0,
+        session=_ReusableSession(),
+        disposition="cooldown",
+        next_probe_at=200.0,
+        lifecycle_failures=1,
+    )
+    pool._slots = [slot]
+    pool._revalidate_bundle = AsyncMock()
+    pool._mint_slot = AsyncMock()
+
+    with pytest.raises(PoolUnavailableError) as exc_info:
+        await asyncio.wait_for(pool.acquire(), timeout=0.02)
+
+    assert exc_info.value.code == "mint_exhausted"
+    pool._revalidate_bundle.assert_not_awaited()
+    pool._mint_slot.assert_not_awaited()
+    assert slot.busy is False
+    assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_control_failure_hard_stops_without_cooldown(monkeypatch):
+    """Budget control must propagate instead of becoming a retryable slot probe."""
+    from worker import session_pool as sp
+
+    control = AsyncMock()
+    pool = _make_pool()
+    pool._pool_size = 1
+    pool._sem = asyncio.Semaphore(0)
+    pool._proxy_control = control
+    old = _ReusableSession()
+    slot = sp._Slot(index=0, session=old, busy=True)
+    pool._slots = [slot]
+    pool._checkout[old] = slot
+    failure = ProxyBudgetExceededError("budget denied")
+    pool._refresh_slot = AsyncMock(side_effect=failure)
+
+    with pytest.raises(ProxyBudgetExceededError):
+        await pool.release(old, healthy=False)
+
+    assert pool.slot_state_counts == {
+        "healthy": 0,
+        "validate_before_reuse": 0,
+        "replace_before_reuse": 1,
+        "cooldown": 0,
+    }
+    assert control.mock_calls == []
+    assert slot.lifecycle_failures == 0
+    assert slot.busy is False
+    assert pool._sem._value == 1

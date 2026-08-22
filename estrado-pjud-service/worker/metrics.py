@@ -67,6 +67,20 @@ class Metrics:
         self._maybe_reset_daily()
         attempts = getattr(self._pool, "mint_attempts", 0) if self._pool else 0
         failures = getattr(self._pool, "mint_failures", 0) if self._pool else 0
+        raw_slot_counts = (
+            getattr(self._pool, "slot_state_counts", {}) if self._pool else {}
+        )
+
+        def aggregate_count(name: str, source=raw_slot_counts) -> int:
+            value = source.get(name, 0) if isinstance(source, dict) else 0
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+        slot_state_counts = {
+            "healthy": aggregate_count("healthy"),
+            "validate_before_reuse": aggregate_count("validate_before_reuse"),
+            "replace_before_reuse": aggregate_count("replace_before_reuse"),
+            "cooldown": aggregate_count("cooldown"),
+        }
         control = self._proxy_control.snapshot if self._proxy_control else None
         reuse_enabled = (
             getattr(self._config, "WORKER_SESSION_REUSE_VALIDATION_ENABLED", False)
@@ -110,6 +124,24 @@ class Metrics:
                     "worker_canary" if reuse_enabled else "off"
                 ),
                 "session_reuse_rollout_started_at": rollout_started_at_iso,
+                "transport_revalidation_enabled": (
+                    getattr(
+                        self._config,
+                        "WORKER_TRANSPORT_REVALIDATION_ENABLED",
+                        False,
+                    )
+                    is True
+                ),
+                "slot_state_counts": slot_state_counts,
+                "session_validation_successes": aggregate_count(
+                    "validation_successes", vars(self._pool) if self._pool else {},
+                ),
+                "session_validation_failures": aggregate_count(
+                    "validation_failures", vars(self._pool) if self._pool else {},
+                ),
+                "session_validations_avoided_mint": aggregate_count(
+                    "validations_avoided_mint", vars(self._pool) if self._pool else {},
+                ),
                 "process_outside_office_hours_enabled": (
                     self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
                 ),

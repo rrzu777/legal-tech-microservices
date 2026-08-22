@@ -691,6 +691,26 @@ class TestSyncEngine:
         )
 
     @pytest.mark.asyncio
+    async def test_sync_remote_protocol_flag_releases_for_validation(self):
+        """The enabled flag must reach the real pool release boundary."""
+        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        engine._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+
+        with patch(
+            "worker.engine.search_pjud_via_session", new_callable=AsyncMock,
+        ) as mock_search:
+            mock_search.side_effect = httpx.RemoteProtocolError(
+                "response lost after request",
+            )
+            result = await engine.sync_case(_make_case())
+
+        assert result["success"] is False
+        mock_pool.release.assert_awaited_once_with(
+            mock_pool.acquire.return_value,
+            disposition="validate_before_reuse",
+        )
+
+    @pytest.mark.asyncio
     async def test_sync_read_timeout_is_infra_non_penalizing(self):
         """G2: httpx.ReadTimeout is also an httpx.TransportError subclass and
         must be caught by the same infra handler (proves the base-class
