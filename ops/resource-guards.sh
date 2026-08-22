@@ -36,6 +36,7 @@ readonly -a OVERRIDE_NAMES=(
   RG_CADDYFILE RG_LOGROTATE_FILE RG_JURISTRACK_HEALTH_URL
   RG_ESTRADO_HEALTH_URL RG_GIT_BIN RG_DF_BIN RG_FREE_BIN RG_ID_BIN RG_PS_BIN
   RG_SYSTEMCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_SLEEP_BIN RG_STAT_BIN RG_SHA256_BIN
+  RG_FLOCK_BIN RG_READLINK_BIN RG_LOCK_FILE RG_FD_ROOT
   RG_FIND_BIN RG_CP_BIN RG_RM_BIN RG_MKDIR_BIN RG_CHMOD_BIN RG_CHOWN_BIN
   RG_MKTEMP_BIN RG_JQ_BIN RG_PROVISION_BIN RG_SWAP_BIN RG_PYTHON_BIN
   RG_TEST_ROOT_UID RG_TEST_ROOT_GID RG_WORKER_FENCE_POLL_DELAY_SECONDS
@@ -98,6 +99,10 @@ jq_bin=${RG_JQ_BIN:-/usr/bin/jq}
 provision_bin=${RG_PROVISION_BIN:-$repo_dir/ops/provision.sh}
 swap_bin=${RG_SWAP_BIN:-$repo_dir/ops/swap/configure-swap.sh}
 python_bin=${RG_PYTHON_BIN:-/usr/bin/python3}
+flock_bin=${RG_FLOCK_BIN:-/usr/bin/flock}
+readlink_bin=${RG_READLINK_BIN:-/usr/bin/readlink}
+lock_file=${RG_LOCK_FILE:-/run/lock/legaltech-resource-guards.lock}
+fd_root=${RG_FD_ROOT:-/proc/self/fd}
 root_uid=${RG_TEST_ROOT_UID:-0}
 root_gid=${RG_TEST_ROOT_GID:-0}
 worker_fence_poll_delay_seconds=${RG_WORKER_FENCE_POLL_DELAY_SECONDS:-1}
@@ -110,7 +115,8 @@ for absolute_value in \
   "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" "$sleep_bin" \
   "$stat_bin" "$sha256_bin" "$find_bin" "$cp_bin" "$rm_bin" \
   "$mkdir_bin" "$chmod_bin" "$chown_bin" "$mktemp_bin" "$jq_bin" \
-  "$provision_bin" "$swap_bin" "$python_bin"
+  "$provision_bin" "$swap_bin" "$python_bin" \
+  "$flock_bin" "$readlink_bin" "$lock_file" "$fd_root"
 do
   case "$absolute_value" in /*) ;; *) usage ;; esac
 done
@@ -157,9 +163,14 @@ esac
 
 temp_dir=''
 curl_header_file=''
+resource_lock_fd=''
 cleanup() {
   if [ -n "$temp_dir" ]; then
     case "$temp_dir" in "$tmp_root"/legaltech-resource-guards.*) "$rm_bin" -rf -- "$temp_dir" >"$null_file" 2>&1 || true ;; esac
+  fi
+  if [ -n "$resource_lock_fd" ]; then
+    "$flock_bin" -u "$resource_lock_fd" >"$null_file" 2>&1 || true
+    exec {resource_lock_fd}>&-
   fi
 }
 trap cleanup EXIT
@@ -194,6 +205,23 @@ safe_existing_path() {
     output=$("$find_bin" "$path" -type f -links +1 -print -quit 2>"$null_file") || return 1
     [ -z "$output" ] || return 1
   else
+    return 1
+  fi
+}
+
+acquire_resource_mutation_lock() {
+  local fd_target
+  if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+    path_has_symlink_component "${lock_file%/*}" && return 1
+    ( umask 077; set -o noclobber; : > "$lock_file" ) 2>"$null_file" || true
+  fi
+  safe_existing_path "$lock_file" && validate_root_path "$lock_file" 600 || return 1
+  exec {resource_lock_fd}>"$lock_file" || return 1
+  fd_target=$("$readlink_bin" "$fd_root/$resource_lock_fd" 2>"$null_file") || return 1
+  [ "$fd_target" = "$lock_file" ] || return 1
+  safe_existing_path "$lock_file" && validate_root_path "$lock_file" 600 || return 1
+  if ! "$flock_bin" -n "$resource_lock_fd" >"$null_file" 2>&1; then
+    fail 'another resource mutation is already in progress'
     return 1
   fi
 }
@@ -694,6 +722,33 @@ capture_monitor_runtime_states() {
   done
 }
 
+worker_runtime_has_exact_identity() { # active pid control-group-or-- effective-slice
+  local active=$1 pid=$2 control_group=$3 effective_slice=$4
+  case "$effective_slice" in system.slice|legaltech.slice) ;; *) return 1 ;; esac
+  case "$active" in
+    active)
+      is_uint "$pid" && [ "$pid" -gt 0 ] \
+        && [ "$control_group" = "/$effective_slice/estrado-pjud-worker.service" ]
+      ;;
+    inactive)
+      [ "$pid" = 0 ] && [ "$control_group" = - ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+capture_worker_runtime_state() {
+  local runtime active pid control_group effective_slice result state
+  state=$(read_unit_state system is-active estrado-pjud-worker.service) || return 1
+  runtime=$(read_effective_runtime system estrado-pjud-worker.service) || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  [ "$active" = "$state" ] \
+    && worker_runtime_has_exact_identity "$active" "$pid" "$control_group" "$effective_slice" \
+    || return 1
+  printf '%s\t%s\t%s\t%s\t%s\n' estrado-pjud-worker.service \
+    "$active" "$pid" "$control_group" "$effective_slice"
+}
+
 load_and_validate_unit_states() {
   local unit enabled active extra count=0
   desired_enabled_states=()
@@ -738,6 +793,23 @@ load_and_validate_monitor_runtime() {
     count=$((count + 1))
   done < "$backup_dir/monitor-runtime.tsv"
   [ "$count" -eq "${#monitor_runtime_units[@]}" ]
+}
+
+load_and_validate_worker_runtime() {
+  local unit active pid control_group effective_slice extra count=0
+  while IFS=$'\t' read -r unit active pid control_group effective_slice extra; do
+    count=$((count + 1))
+    [ "$count" -eq 1 ] && [ "$unit" = estrado-pjud-worker.service ] \
+      && [ -z "${extra:-}" ] || return 1
+    worker_runtime_has_exact_identity "$active" "$pid" "$control_group" "$effective_slice" \
+      || return 1
+    [ "$active" = "${desired_active_states[1]}" ] || return 1
+    captured_worker_active=$active
+    captured_worker_pid=$pid
+    captured_worker_control_group=$control_group
+    captured_worker_slice=$effective_slice
+  done < "$backup_dir/worker-runtime.tsv"
+  [ "$count" -eq 1 ]
 }
 
 validate_root_path() { # path mode
@@ -795,6 +867,7 @@ create_backup() {
   printf '%s\n' "$expected_sha" > "$backup_dir/expected-sha" || return 1
   : > "$backup_dir/changes" || return 1
   capture_unit_states > "$backup_dir/unit-states.tsv" || return 1
+  capture_worker_runtime_state > "$backup_dir/worker-runtime.tsv" || return 1
   capture_monitor_runtime_states > "$backup_dir/monitor-runtime.tsv" || return 1
   if [ "${swap_initial_state:-unknown}" = managed ]; then
     printf '%s\n' preexisting > "$backup_dir/swap-state" || return 1
@@ -802,9 +875,11 @@ create_backup() {
     printf '%s\n' 'not-attempted' > "$backup_dir/swap-state" || return 1
   fi
   "$chmod_bin" 0600 "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" \
-    "$backup_dir/unit-states.tsv" "$backup_dir/monitor-runtime.tsv" || return 1
+    "$backup_dir/unit-states.tsv" "$backup_dir/worker-runtime.tsv" \
+    "$backup_dir/monitor-runtime.tsv" || return 1
   "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" \
-    "$backup_dir/unit-states.tsv" "$backup_dir/monitor-runtime.tsv" || return 1
+    "$backup_dir/unit-states.tsv" "$backup_dir/worker-runtime.tsv" \
+    "$backup_dir/monitor-runtime.tsv" || return 1
   printf '%s\n' "$backup_dir"
 }
 
@@ -1004,6 +1079,8 @@ validate_backup_dir() {
   validate_root_path "$1/unit-states.tsv" 600 || return 1
   [ -f "$1/monitor-runtime.tsv" ] && [ ! -L "$1/monitor-runtime.tsv" ] || return 1
   validate_root_path "$1/monitor-runtime.tsv" 600 || return 1
+  [ -f "$1/worker-runtime.tsv" ] && [ ! -L "$1/worker-runtime.tsv" ] || return 1
+  validate_root_path "$1/worker-runtime.tsv" 600 || return 1
 }
 
 validate_manifest() {
@@ -1152,7 +1229,7 @@ restore_unit_states() {
         if [ "$worker_restore_allowed" -eq 1 ] \
           && load_worker_fence_config && maintenance_window_is_open; then
           if "$systemctl_bin" start "$unit" >"$null_file" 2>&1; then
-            worker_runtime_is_active || rc=1
+            worker_runtime_matches_capture active || rc=1
           else
             rc=1
           fi
@@ -1183,6 +1260,10 @@ restore_unit_states() {
     fi
     current=$(read_unit_state system is-active "$unit") || { rc=1; continue; }
     [ "$current" = "$desired" ] || rc=1
+    if [ "$unit" = estrado-pjud-worker.service ] \
+      && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; }; then
+      worker_runtime_matches_capture "$desired" || rc=1
+    fi
   done
   return "$rc"
 }
@@ -1210,6 +1291,12 @@ restore_hermes_unit_states() {
   return "$rc"
 }
 
+run_swap_mutator() { # apply|rollback
+  case "$1" in apply|rollback) ;; *) return 1 ;; esac
+  is_uint "$resource_lock_fd" || return 1
+  LEGALTECH_RESOURCE_LOCK_FD="$resource_lock_fd" "$swap_bin" "$1"
+}
+
 do_rollback() {
   local uid rollback_rc=0 swap_rc=0 swap_state
   backup_dir=$1
@@ -1219,6 +1306,7 @@ do_rollback() {
   validate_manifest || { fail 'rollback manifest is unsafe or invalid'; return 1; }
   load_and_validate_changes || { fail 'rollback affected-unit metadata is invalid'; return 1; }
   load_and_validate_unit_states || { fail 'rollback live-unit metadata is invalid'; return 1; }
+  load_and_validate_worker_runtime || { fail 'rollback worker runtime metadata is invalid'; return 1; }
   load_and_validate_monitor_runtime || { fail 'rollback monitor runtime metadata is invalid'; return 1; }
   worker_restore_allowed=1
   if [ "${desired_active_states[1]}" = active ] \
@@ -1230,7 +1318,7 @@ do_rollback() {
   swap_state=$(<"$backup_dir/swap-state")
   case "$swap_state" in
     attempted)
-      if ! "$swap_bin" rollback >"$null_file" 2>&1; then swap_rc=1; rollback_rc=1; fi
+      if ! run_swap_mutator rollback >"$null_file" 2>&1; then swap_rc=1; rollback_rc=1; fi
       ;;
     not-attempted|preexisting) ;;
     *) fail 'rollback swap metadata is invalid'; return 1 ;;
@@ -1289,25 +1377,43 @@ worker_runtime_is_active() {
 }
 
 worker_runtime_is_stopped() { # old PID
-  local old_pid=$1 runtime active pid control_group effective_slice result
+  local old_pid=$1 expected_slice=$2 runtime active pid control_group effective_slice result
   runtime=$(read_worker_runtime) || return 1
   IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
   [ "$active" = inactive ] && [ "$pid" -eq 0 ] \
-    && [ "$control_group" = - ] && [ "$effective_slice" = legaltech.slice ] \
+    && [ "$control_group" = - ] && [ "$effective_slice" = "$expected_slice" ] \
     && old_pid_is_gone "$old_pid"
+}
+
+worker_runtime_matches_capture() { # expected active|inactive
+  local expected_active=$1 runtime active pid control_group effective_slice result
+  runtime=$(read_worker_runtime) || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  [ "$active" = "$expected_active" ] \
+    && [ "$effective_slice" = "$captured_worker_slice" ] || return 1
+  case "$expected_active" in
+    active)
+      [ "$pid" -gt 0 ] && [ "$control_group" = "$captured_worker_control_group" ]
+      ;;
+    inactive) [ "$pid" = 0 ] && [ "$control_group" = - ] ;;
+    *) return 1 ;;
+  esac
 }
 
 stop_worker_for_change() {
   local runtime active old_pid old_control_group effective_slice result
   runtime=$(read_worker_runtime) || return 1
   IFS='|' read -r active old_pid old_control_group effective_slice result <<< "$runtime"
-  [ "$active" = active ] && [ "$old_pid" -gt 0 ] \
-    && [ "$old_control_group" = "$WORKER_CGROUP" ] \
-    && [ "$effective_slice" = legaltech.slice ] || return 1
+  [ "$active" = "$captured_worker_active" ] && [ "$active" = active ] \
+    && [ "$old_pid" = "$captured_worker_pid" ] \
+    && [ "$old_control_group" = "$captured_worker_control_group" ] \
+    && [ "$effective_slice" = "$captured_worker_slice" ] \
+    && worker_runtime_has_exact_identity "$active" "$old_pid" \
+      "$old_control_group" "$effective_slice" || return 1
   record_change worker-stop || return 1
   "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
   [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
-  worker_runtime_is_stopped "$old_pid"
+  worker_runtime_is_stopped "$old_pid" "$effective_slice"
 }
 
 verify_started_worker_is_idle() {
@@ -1331,15 +1437,14 @@ quiesce_worker_for_restore() {
   IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
   case "$active" in
     inactive)
-      [ "$pid" -eq 0 ] && [ "$control_group" = - ] \
-        && [ "$effective_slice" = legaltech.slice ]
+      worker_runtime_has_exact_identity "$active" "$pid" "$control_group" "$effective_slice"
       ;;
     active)
-      [ "$pid" -gt 0 ] && [ "$control_group" = "$WORKER_CGROUP" ] \
-        && [ "$effective_slice" = legaltech.slice ] || return 1
+      worker_runtime_has_exact_identity "$active" "$pid" "$control_group" "$effective_slice" \
+        || return 1
       "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
-      worker_runtime_is_stopped "$pid"
+      worker_runtime_is_stopped "$pid" "$effective_slice"
       ;;
     *) return 1 ;;
   esac
@@ -1392,7 +1497,8 @@ run_apply_steps() {
   fi
   create_backup "$uid" >"$null_file" || return 1
   validate_backup_dir "$backup_dir" && validate_manifest \
-    && load_and_validate_unit_states && load_and_validate_monitor_runtime || return 1
+    && load_and_validate_unit_states && load_and_validate_worker_runtime \
+    && load_and_validate_monitor_runtime || return 1
   check_git || return 1
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
@@ -1435,7 +1541,7 @@ run_apply_steps() {
   if [ "${swap_initial_state:-unknown}" = clean ]; then
     printf '%s\n' attempted > "$backup_dir/swap-state" || return 1
   fi
-  "$swap_bin" apply >"$null_file" 2>&1 || return 1
+  run_swap_mutator apply >"$null_file" 2>&1 || return 1
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || return 1
   verify_monitor_migration "$monitor_will_change" 0 || return 1
@@ -1495,6 +1601,10 @@ run_apply() {
   fi
   printf '%s\n' "APPLY OK; backup: $backup_dir"
 }
+
+case "$command_name" in
+  apply|rollback) acquire_resource_mutation_lock || exit "$EXIT_ERROR" ;;
+esac
 
 case "$command_name" in
   preflight) run_preflight ;;

@@ -41,6 +41,14 @@ omitido, configura/verifica swap, reinicia sólo las superficies modificadas,
 activa los timers y corre el postflight. Un error posterior a la primera mutación
 intenta rollback exactamente una vez.
 
+Los mutadores `apply` y `rollback` comparten el lock no bloqueante
+`/run/lock/legaltech-resource-guards.lock` con los mutadores standalone de swap.
+El archivo queda root-owned `0600`; que exista no significa que el lock esté
+ocupado. Si otro owner está vivo, el comando falla antes de backup, stop,
+provisión, swap o restore con `another resource mutation is already in progress`.
+Esperar a que termine el owner; no borrar ni reemplazar el archivo para saltarse
+la exclusión. Un proceso terminado libera el lock automáticamente.
+
 La integración y el rollout de producción son gates separados. Tener este
 runbook o sus tests verdes no autoriza integrar, desplegar, rotar credenciales,
 probar alertas live ni crear el entorno del guest.
@@ -120,6 +128,14 @@ una unit habilitada. Si el worker cambió y estaba activo, el orden es fail-clos
 5. `systemctl start` bajo la nueva unit, nunca `restart`;
 6. cgroup exacto, heartbeat estrictamente más nuevo `idle_off_hours` con
    `mint_attempts=0`, claims finales cero y postflight.
+
+La identidad previa no se presupone en `legaltech.slice`: el backup captura en
+una sola lectura el PID, `Slice` efectiva y cgroup exacto de la unit instalada.
+Por eso una primera migración válida desde
+`/system.slice/estrado-pjud-worker.service` puede detener y probar ausente el
+runtime antiguo antes de instalar; sólo después de `daemon-reload` el reemplazo
+debe aparecer en `/legaltech.slice/estrado-pjud-worker.service`. Un rollback
+restaura y vuelve a verificar la identidad previa capturada.
 
 El wait post-start es acotado pero puede consumir aproximadamente 395 segundos
 más overhead si cada probe HTTP agota su timeout. Reservar ese margen dentro de

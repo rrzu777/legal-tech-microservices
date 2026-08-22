@@ -69,7 +69,7 @@ setup() {
   STATE="$CASE_DIR/state"
   BIN="$CASE_DIR/bin"
   EVENTS="$STATE/events"
-  mkdir -p "$FAKE/repo/estrado-pjud-service" "$FAKE/repo/ops/systemd" "$FAKE/systemd" "$CASE_DIR/tmp" \
+  mkdir -p "$FAKE/repo/estrado-pjud-service" "$FAKE/repo/ops/systemd" "$FAKE/systemd" "$FAKE/run" "$CASE_DIR/tmp" \
     "$FAKE/etc/sysctl.d" "$FAKE/etc/caddy" "$FAKE/etc/logrotate.d" \
     "$FAKE/monitoring" "$FAKE/backups" "$STATE" "$BIN"
   chmod 700 "$FAKE/backups"
@@ -79,6 +79,7 @@ setup() {
   : > "$STATE/git-status"
   printf '%s\n' 1787356980 > "$STATE/now"
   printf '%s\n' 20 > "$STATE/local-hour"
+  printf '%s\n' 20240309T160000Z > "$STATE/backup-timestamp"
   printf '%s\n' 200 > "$STATE/juristrack-code"
   printf '%s\n' 200 > "$STATE/estrado-code"
   printf '%s\n' 0 > "$STATE/claim-count"
@@ -93,6 +94,8 @@ setup() {
     legaltech-monitor.timer legaltech-resource-tracker.timer; do
     printf 'original %s\n' "$file" > "$FAKE/systemd/$file"
   done
+  printf '%s\n' '[Service]' 'Slice=legaltech.slice' 'ExecStart=/bin/true' \
+    > "$FAKE/systemd/estrado-pjud-worker.service"
   cp "$FAKE/systemd/legaltech-monitor.service" "$FAKE/repo/ops/systemd/legaltech-monitor.service"
   cp "$FAKE/systemd/legaltech-resource-tracker.service" "$FAKE/repo/ops/systemd/legaltech-resource-tracker.service"
   mkdir -p "$FAKE/systemd/estrado-pjud-worker.service.d" \
@@ -311,7 +314,11 @@ if [ "${1:-}" = show ]; then
     case "$unit" in hermes-*) printf '%s\n' hermes ;; *) printf '\n' ;; esac
     exit 0
   fi
-  if [ -e "$RG_TEST_STATE/postflight-fail" ] && [ -e "$RG_TEST_STATE/postflight-armed" ]; then exit 1; fi
+  if [ -e "$RG_TEST_STATE/postflight-fail" ] && [ -e "$RG_TEST_STATE/postflight-armed" ]; then
+    # Fail one postflight read, then let rollback prove the restored runtime.
+    rm -f "$RG_TEST_STATE/postflight-armed"
+    exit 1
+  fi
   property_value() {
   if [ -e "$RG_TEST_STATE/property-bad" ]; then
     bad_key=$(cat "$RG_TEST_STATE/property-bad")
@@ -351,7 +358,6 @@ if [ "${1:-}" = show ]; then
     estrado-pjud.service:CPUWeight) echo 500 ;;
     estrado-pjud.service:TasksMax) echo 512 ;;
     estrado-pjud-worker.service:PartOf) echo legaltech.slice ;;
-    estrado-pjud-worker.service:Slice) echo legaltech.slice ;;
     estrado-pjud-worker.service:MemoryHigh) echo 2147483648 ;;
     estrado-pjud-worker.service:MemoryMax) echo 3221225472 ;;
     estrado-pjud-worker.service:CPUQuotaPerSecUSec) echo 2s ;;
@@ -479,7 +485,8 @@ case "${1:-}" in
               printf '%s\n' /system.slice/estrado-pjud-worker.service \
                 > "$RG_TEST_STATE/unit-$unit-control-group"
             else
-              printf '%s\n' /legaltech.slice/estrado-pjud-worker.service \
+              worker_slice=$(cat "$RG_TEST_STATE/unit-$unit-slice") || exit 1
+              printf '/%s/%s\n' "$worker_slice" "$unit" \
                 > "$RG_TEST_STATE/unit-$unit-control-group"
             fi
             printf '%s\n' "$unit" > "$RG_TEST_STATE/pid-$new_pid-unit"
@@ -502,6 +509,14 @@ case "${1:-}" in
     done
     ;;
   daemon-reload)
+    if grep -q '^Slice=legaltech.slice$' \
+      "$RG_SYSTEMD_DIR/estrado-pjud-worker.service" 2>/dev/null; then
+      printf '%s\n' legaltech.slice \
+        > "$RG_TEST_STATE/unit-estrado-pjud-worker.service-slice"
+    else
+      printf '%s\n' system.slice \
+        > "$RG_TEST_STATE/unit-estrado-pjud-worker.service-slice"
+    fi
     for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
       if grep -q '^changed monitor definition$' "$RG_SYSTEMD_DIR/$unit" 2>/dev/null; then
         printf '%s\n' system.slice > "$RG_TEST_STATE/unit-$unit-slice"
@@ -628,7 +643,7 @@ EOF
   write_stub date <<'EOF'
 case "$*" in
   '-u +%s') cat "$RG_TEST_STATE/now" ;;
-  '-u +%Y%m%dT%H%M%SZ') echo 20240309T160000Z ;;
+  '-u +%Y%m%dT%H%M%SZ') cat "$RG_TEST_STATE/backup-timestamp" ;;
   '+%H')
     cat "$RG_TEST_STATE/local-hour"
     [ ! -e "$RG_TEST_STATE/date-hour-fail-after-output" ]
@@ -648,6 +663,37 @@ case "$*" in
   *'2026-08-21T23:50:00Z'*'+%s') echo 1787356200 ;;
   *'2026-08-22T00:04:00Z'*'+%s%N') echo 1787357040000000000 ;;
   *'2026-08-22T00:04:00Z'*'+%s') echo 1787357040 ;;
+  *) exit 1 ;;
+esac
+EOF
+  write_stub flock <<'EOF'
+case "${1:-}" in
+  -n)
+    if [ -e "$RG_TEST_STATE/flock-fail-after-output" ]; then
+      printf '%s\n' acquired
+      exit 7
+    fi
+    if mkdir "$RG_TEST_STATE/resource-lock-held" 2>/dev/null; then
+      printf '%s\n' "$PPID" > "$RG_TEST_STATE/resource-lock-held/owner"
+      exit 0
+    fi
+    [ "$(cat "$RG_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)" = "$PPID" ]
+    ;;
+  -u)
+    [ "$(cat "$RG_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)" = "$PPID" ] || exit 1
+    rm -rf "$RG_TEST_STATE/resource-lock-held"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+  write_stub readlink <<'EOF'
+case "${1:-}" in
+  "$RG_TEST_FD_ROOT"/[0-9]*)
+    fd=${1##*/}
+    [ -e "/dev/fd/$fd" ] || exit 1
+    printf '%s\n' "$RG_LOCK_FILE"
+    [ ! -e "$RG_TEST_STATE/readlink-fail-after-output" ]
+    ;;
   *) exit 1 ;;
 esac
 EOF
@@ -679,6 +725,10 @@ esac
 EOF
   write_stub provision <<'EOF'
 printf '%s\n' provision >> "$RG_TEST_STATE/events"
+if [ -p "$RG_TEST_STATE/hold-ready" ] && mkdir "$RG_TEST_STATE/provision-owner" 2>/dev/null; then
+  printf '%s\n' ready > "$RG_TEST_STATE/hold-ready"
+  IFS= read -r _release < "$RG_TEST_STATE/hold-release"
+fi
 [ "${PROV_SKIP_CADDY:-0}" = 1 ] || { printf '%s\n' caddy-not-skipped >> "$RG_TEST_STATE/events"; exit 98; }
 for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
   [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = static ] || printf '%s\n' disabled > "$RG_TEST_STATE/unit-$unit-enabled"
@@ -722,6 +772,15 @@ if [ -e "$RG_TEST_STATE/mutate-credential" ]; then printf 'changed protected con
 EOF
   write_stub swap <<'EOF'
 printf 'swap %s\n' "$1" >> "$RG_TEST_STATE/events"
+case "$1" in
+  apply|rollback)
+    fd=${LEGALTECH_RESOURCE_LOCK_FD:-}
+    case "$fd" in ''|*[!0-9]*) exit 96 ;; esac
+    [ -e "/dev/fd/$fd" ] || exit 96
+    [ "$(cat "$RG_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)" = "$PPID" ] || exit 96
+    printf 'swap handoff %s\n' "$1" >> "$RG_TEST_STATE/events"
+    ;;
+esac
 if [ "$1" = preflight ]; then
   [ ! -e "$RG_TEST_STATE/swap-preflight-fail" ] || exit 1
   if [ -e "$RG_TEST_STATE/swap-applied" ]; then printf '%s\n' managed; else printf '%s\n' clean; fi
@@ -862,6 +921,9 @@ run_guard() {
     RG_GIT_BIN="$BIN/git" RG_DF_BIN="$BIN/df" RG_FREE_BIN="$BIN/free" \
     RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" \
     RG_CURL_BIN="$BIN/curl" RG_DATE_BIN="$BIN/date" RG_STAT_BIN="$BIN/stat" \
+    RG_FLOCK_BIN="$BIN/flock" RG_READLINK_BIN="$BIN/readlink" \
+    RG_LOCK_FILE="$FAKE/run/legaltech-resource-guards.lock" RG_FD_ROOT="$FAKE/fd" \
+    RG_TEST_FD_ROOT="$FAKE/fd" \
     RG_SLEEP_BIN="$BIN/sleep" \
     RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN="$BIN/find" RG_CP_BIN="$BIN/cp" \
     RG_RM_BIN=/bin/rm RG_MKDIR_BIN=/bin/mkdir RG_CHMOD_BIN="$BIN/chmod" \
@@ -900,6 +962,18 @@ configure_active_worker() {
   printf '%s\n' /legaltech.slice/estrado-pjud-worker.service \
     > "$STATE/unit-estrado-pjud-worker.service-control-group"
   printf '%s\n' estrado-pjud-worker.service > "$STATE/pid-4201-unit"
+}
+
+configure_active_legacy_worker() {
+  configure_active_worker
+  printf '%s\n' system.slice > "$STATE/unit-estrado-pjud-worker.service-slice"
+  printf '%s\n' /system.slice/estrado-pjud-worker.service \
+    > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  printf '%s\n' '[Unit]' 'Description=legacy worker' '[Service]' 'ExecStart=/bin/true' \
+    > "$FAKE/systemd/estrado-pjud-worker.service"
+  printf '%s\n' '[Unit]' 'Description=guarded worker' '[Service]' \
+    'Slice=legaltech.slice' 'ExecStart=/bin/true' \
+    > "$FAKE/repo/ops/systemd/estrado-pjud-worker.service"
 }
 
 configure_active_legacy_monitors() {
@@ -1402,6 +1476,153 @@ run_worker_fence_regressions() {
   done
 }
 
+run_worker_pre_target_cgroup_regressions() {
+  local backup_path
+  echo '== active worker migrates from its captured old runtime identity to the target cgroup'
+  setup
+  configure_active_legacy_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'legacy system.slice worker apply succeeds' "$RC" 0
+  expect_before 'legacy runtime is captured before worker stop' \
+    'systemctl show estrado-pjud-worker.service --property=ActiveState' \
+    'systemctl stop estrado-pjud-worker.service'
+  expect_before 'legacy worker is proven gone before provision' \
+    'ps pid=4201' provision
+  expect_eq 'replacement worker runs only in target cgroup' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-control-group")" \
+    /legaltech.slice/estrado-pjud-worker.service
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  expect_eq 'backup records one exact legacy worker runtime row' \
+    "$(wc -l < "$backup_path/worker-runtime.tsv" 2>/dev/null | tr -d ' ')" 1
+  expect_contains 'backup records the old system slice identity' \
+    "$(cat "$backup_path/worker-runtime.tsv" 2>/dev/null)" \
+    $'estrado-pjud-worker.service\tactive\t4201\t/system.slice/estrado-pjud-worker.service\tsystem.slice'
+
+  echo '== rollback restores and proves the captured old worker identity'
+  setup
+  configure_active_legacy_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  : > "$STATE/health-after-first"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'later failure keeps legacy-worker apply failed' "$RC" 1
+  expect_count 'legacy-worker rollback happens only after provisioning the target' provision 1
+  expect_contains 'legacy-worker rollback completes' "$OUT" 'ROLLBACK OK'
+  expect_eq 'rollback restores legacy effective slice' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-slice")" system.slice
+  expect_eq 'rollback restores legacy cgroup identity' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-control-group")" \
+    /system.slice/estrado-pjud-worker.service
+
+  echo '== captured old identity is exact and inactive legacy paths remain query-free'
+  setup
+  configure_active_legacy_worker
+  printf '%s\n' /custom.slice/estrado-pjud-worker.service \
+    > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'old cgroup inconsistent with effective Slice fails closed' "$RC" 1
+  expect_count 'ambiguous old identity stops no worker' 'stop estrado-pjud-worker.service' 0
+  expect_count 'ambiguous old identity performs no provision' provision 0
+
+  setup
+  configure_active_legacy_worker
+  printf '%s\n' inactive > "$STATE/unit-estrado-pjud-worker.service-active"
+  printf '%s\n' 0 > "$STATE/unit-estrado-pjud-worker.service-main-pid"
+  : > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  rm -f "$STATE/pid-4201-unit"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'inactive legacy worker migrates without activation' "$RC" 0
+  expect_count 'inactive legacy worker performs no protected heartbeat query' 'curl heartbeat' 0
+  expect_count 'inactive legacy worker performs no protected claims query' 'curl claims' 0
+  expect_count 'inactive legacy worker is never stopped' 'stop estrado-pjud-worker.service' 0
+  expect_count 'inactive legacy worker is never started' 'start estrado-pjud-worker.service' 0
+
+  setup
+  : > "$STATE/postflight-fail"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'later failure keeps inactive-worker apply failed' "$RC" 1
+  expect_contains 'rollback proves and restores captured inactive worker identity' \
+    "$OUT" 'ROLLBACK OK'
+  expect_eq 'rollback leaves captured inactive worker without a cgroup' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")|$(cat "$STATE/unit-estrado-pjud-worker.service-main-pid")|$(cat "$STATE/unit-estrado-pjud-worker.service-control-group")|$(cat "$STATE/unit-estrado-pjud-worker.service-slice")" \
+    'inactive|0||legaltech.slice'
+
+  setup
+  configure_active_legacy_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  printf '%s\t%s\t%s\t%s\t%s\n' estrado-pjud-worker.service active 4201 \
+    /custom.slice/estrado-pjud-worker.service custom.slice \
+    > "$backup_path/worker-runtime.tsv"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'corrupt captured worker identity rejects standalone rollback' "$RC" 1
+  expect_count 'corrupt worker metadata performs no swap rollback' 'swap rollback' 0
+  expect_count 'corrupt worker metadata performs no daemon reload' 'systemctl daemon-reload' 0
+}
+
+run_mutator_lock_regressions() {
+  local first_pid backup_path backups_before provision_before
+  echo '== a held resource apply excludes every other host mutator'
+  setup
+  mkfifo "$STATE/hold-ready" "$STATE/hold-release"
+  (
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    printf '%s\n' "$RC" > "$STATE/first-rc"
+    printf '%s' "$OUT" > "$STATE/first-out"
+  ) &
+  first_pid=$!
+  IFS= read -r _ready < "$STATE/hold-ready"
+  backups_before=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  provision_before=$(grep -cxF provision "$EVENTS" 2>/dev/null || true)
+  printf '%s\n' 20240309T160001Z > "$STATE/backup-timestamp"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'second apply is rejected while the first owns the host lock' "$RC" 1
+  expect_contains 'second apply reports fixed lock contention' "$OUT" 'another resource mutation is already in progress'
+  expect_eq 'contended apply creates no backup' \
+    "$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" "$backups_before"
+  expect_eq 'contended apply never provisions' \
+    "$(grep -cxF provision "$EVENTS" 2>/dev/null || true)" "$provision_before"
+
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'rollback is rejected while apply owns the host lock' "$RC" 1
+  expect_contains 'contended rollback reports fixed lock contention' "$OUT" 'another resource mutation is already in progress'
+  expect_count 'contended rollback does not delegate swap rollback' 'swap rollback' 0
+
+  printf '%s\n' release > "$STATE/hold-release"
+  wait "$first_pid"
+  if [ "$(cat "$STATE/first-rc")" = 0 ]; then
+    ok 'first owner retains the lock through its complete apply'
+  else
+    bad "first owner retains the lock through its complete apply (output=$(cat "$STATE/first-out"); events=$(tail -n 20 "$EVENTS" | tr '\n' ';'))"
+  fi
+
+  rm -f "$STATE/hold-ready" "$STATE/hold-release"
+  printf '%s\n' 20240309T160002Z > "$STATE/backup-timestamp"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'normal exit leaves no stale host lock' "$RC" 0
+
+  echo '== unsafe lock identity and producer failures block before every mutation'
+  for scenario in unsafe-mode readlink-failure flock-failure; do
+    setup
+    case "$scenario" in
+      unsafe-mode)
+        : > "$FAKE/run/legaltech-resource-guards.lock"
+        chmod 0644 "$FAKE/run/legaltech-resource-guards.lock"
+        ;;
+      readlink-failure) : > "$STATE/readlink-fail-after-output" ;;
+      flock-failure) : > "$STATE/flock-fail-after-output" ;;
+    esac
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario lock gate fails closed" "$RC" 1
+    expect_count "$scenario creates no backup entries" backup-copy 0
+    expect_count "$scenario performs no provision" provision 0
+    expect_count "$scenario performs no swap mutation" 'swap apply' 0
+  done
+}
+
 run_runtime_cgroup_regressions() {
   local scenario key value mutate rollback_count
   echo '== exact runtime cgroups fail closed and roll back once'
@@ -1481,6 +1702,22 @@ if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-heartbeat-wait ]; then
   exit
 fi
 
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-pre-target-cgroup ]; then
+  run_worker_pre_target_cgroup_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = mutator-lock ]; then
+  run_mutator_lock_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = runtime-cgroups ]; then
   run_runtime_cgroup_regressions
   echo
@@ -1551,6 +1788,8 @@ run_absent_timer_regressions
 run_swappiness_namespace_regressions
 run_incomplete_rollback_retry_regression
 run_api_enablement_regressions
+run_worker_pre_target_cgroup_regressions
+run_mutator_lock_regressions
 run_worker_fence_regressions
 run_runtime_cgroup_regressions
 

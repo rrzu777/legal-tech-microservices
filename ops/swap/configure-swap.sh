@@ -43,7 +43,8 @@ for variable_name in \
   SWAP_SWAPPINESS_METADATA_FILE SWAP_TEST_ROOT_UID SWAP_TEST_ROOT_GID \
   SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
   SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
-  SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN
+  SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN \
+  SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_LOCK_FILE SWAP_FD_ROOT
 do
   if [ "${!variable_name+x}" = x ]; then
     override_present=1
@@ -61,7 +62,8 @@ if [ "$test_mode" = 1 ]; then
     SWAP_SWAPPINESS_METADATA_FILE SWAP_TEST_ROOT_UID SWAP_TEST_ROOT_GID \
     SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
     SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
-    SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN
+    SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN \
+    SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_LOCK_FILE SWAP_FD_ROOT
   do
     [ "${!variable_name+x}" = x ] || usage
   done
@@ -88,12 +90,17 @@ cp_bin=${SWAP_CP_BIN:-/usr/bin/cp}
 mv_bin=${SWAP_MV_BIN:-/usr/bin/mv}
 stat_bin=${SWAP_STAT_BIN:-/usr/bin/stat}
 rm_bin=${SWAP_RM_BIN:-/usr/bin/rm}
+flock_bin=${SWAP_FLOCK_BIN:-/usr/bin/flock}
+readlink_bin=${SWAP_READLINK_BIN:-/usr/bin/readlink}
+lock_file=${SWAP_LOCK_FILE:-/run/lock/legaltech-resource-guards.lock}
+fd_root=${SWAP_FD_ROOT:-/proc/self/fd}
 
 for absolute_value in \
   "$swap_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" "$proc_swaps_file" \
   "$df_bin" "$fallocate_bin" "$dd_bin" "$chmod_bin" "$mkswap_bin" \
   "$swapon_bin" "$swapoff_bin" "$sysctl_bin" "$free_bin" "$cp_bin" \
-  "$mv_bin" "$stat_bin" "$rm_bin"
+  "$mv_bin" "$stat_bin" "$rm_bin" \
+  "$flock_bin" "$readlink_bin" "$lock_file" "$fd_root"
 do
   case "$absolute_value" in
     /*) ;;
@@ -114,6 +121,8 @@ swappiness_metadata_state=absent
 previous_swappiness=''
 rollback_state=invalid
 current_temp=''
+mutation_lock_fd=''
+mutation_lock_owned=0
 apply_created_swap_file=0
 apply_activated_swap=0
 apply_activation_unknown=0
@@ -128,8 +137,63 @@ cleanup_temp() {
     set +e
     "$rm_bin" "$current_temp" >/dev/null 2>&1
   fi
+  if [ "$mutation_lock_owned" -eq 1 ] && [ -n "$mutation_lock_fd" ]; then
+    "$flock_bin" -u "$mutation_lock_fd" >/dev/null 2>&1 || true
+    exec {mutation_lock_fd}>&-
+  fi
 }
 trap cleanup_temp EXIT
+
+path_has_symlink_component() {
+  local current=$1 parent
+  while [ "$current" != / ] && [ -n "$current" ]; do
+    [ ! -L "$current" ] || return 0
+    parent=${current%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$current" ] || break
+    current=$parent
+  done
+  return 1
+}
+
+validate_mutation_lock_file() {
+  local metadata kind mode size links uid gid extra
+  [ -f "$lock_file" ] && [ ! -L "$lock_file" ] \
+    && ! path_has_symlink_component "$lock_file" || return 1
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$lock_file") || return 1
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && [ "$mode" = 600 ] && [ "$links" = 1 ] \
+    && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] \
+    && [ -z "$extra" ]
+}
+
+lock_fd_targets_exact_file() { # fd
+  local fd=$1 target
+  is_uint "$fd" && [ "$fd" -ge 3 ] || return 1
+  target=$("$readlink_bin" "$fd_root/$fd" 2>/dev/null) || return 1
+  [ "$target" = "$lock_file" ] && validate_mutation_lock_file
+}
+
+acquire_mutation_lock() {
+  local inherited_fd=${LEGALTECH_RESOURCE_LOCK_FD:-}
+  if [ -n "$inherited_fd" ]; then
+    lock_fd_targets_exact_file "$inherited_fd" || return 1
+    "$flock_bin" -n "$inherited_fd" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+    path_has_symlink_component "${lock_file%/*}" && return 1
+    ( umask 077; set -o noclobber; : > "$lock_file" ) 2>/dev/null || true
+  fi
+  validate_mutation_lock_file || return 1
+  exec {mutation_lock_fd}>"$lock_file" || return 1
+  lock_fd_targets_exact_file "$mutation_lock_fd" || return 1
+  if ! "$flock_bin" -n "$mutation_lock_fd" >/dev/null 2>&1; then
+    printf '%s\n' 'ERROR: another resource mutation is already in progress' >&2
+    return 1
+  fi
+  mutation_lock_owned=1
+}
 
 inspect_fstab() {
   [ -f "$fstab_file" ] && [ ! -L "$fstab_file" ] || return 1
@@ -755,6 +819,10 @@ rollback_swap() {
   inspect_rollback_state >/dev/null || return 1
   [ "$rollback_state" = clean ]
 }
+
+case "$command_name" in
+  apply|rollback) acquire_mutation_lock || fail ;;
+esac
 
 case "$command_name" in
   preflight) preflight_state || fail; exit 0 ;;

@@ -8,6 +8,14 @@ se ejecuta como root con paths absolutos.
 El script falla cerrado ante archivos, links, metadata, estado activo o salida de
 sistema ambiguos. Exige al menos 8 GiB libres antes de `preflight`/`apply`.
 
+`apply` y `rollback` toman sin espera el mismo lock root-only `0600` en
+`/run/lock/legaltech-resource-guards.lock` que usa el orquestador. La delegación
+interna desde `resource-guards.sh` hereda y valida el descriptor ya bloqueado;
+una invocación standalone no puede autorizarse sólo declarando una variable de
+entorno. Ante `another resource mutation is already in progress`, esperar al
+owner: no borrar el archivo de lock ni ejecutar swap por fuera. La salida normal
+o fallida del owner libera el lock; el archivo vacío puede permanecer.
+
 ## Subcomandos
 
 Desde `/opt/legal-tech-microservices` en el VPS:

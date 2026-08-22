@@ -5,7 +5,8 @@
 set -uo pipefail
 
 SWAP_SCRIPT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/configure-swap.sh}"
-TMP=$(mktemp -d)
+TMP_RAW=$(mktemp -d)
+TMP=$(cd "$TMP_RAW" && pwd -P)
 trap '/bin/rm -r -- "$TMP"' EXIT
 PASS=0
 FAIL=0
@@ -54,6 +55,7 @@ write_stub() {
 setup() {
   local name="$1" base="$TMP/$1"
   ROOT="$base/root"
+  STATE_DIR="$base"
   BIN_DIR="$base/bin"
   CALL_LOG="$base/calls.log"
   SWAP_FILE="$ROOT/swapfile"
@@ -62,8 +64,9 @@ setup() {
   SWAPPINESS_METADATA_FILE="$ROOT/etc/sysctl.d/60-legaltech-swap.previous"
   PROC_SWAPS_FILE="$ROOT/proc/swaps"
   SWAPPINESS_STATE="$base/swappiness"
+  LOCK_FILE="$ROOT/run/legaltech-resource-guards.lock"
   MV_COUNT_FILE="$base/mv-count"
-  mkdir -p "$BIN_DIR" "$ROOT/etc/sysctl.d" "$ROOT/proc"
+  mkdir -p "$BIN_DIR" "$ROOT/etc/sysctl.d" "$ROOT/proc" "$ROOT/run"
   printf 'UUID=root / ext4 defaults 0 1\n# unrelated tail\n' > "$FSTAB_FILE"
   printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
   printf '10\n' > "$SWAPPINESS_STATE"
@@ -79,9 +82,17 @@ setup() {
   unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL RM_FAIL_PATH
   unset STAT_OVERRIDE_PATH STAT_OVERRIDE_MODE STAT_OVERRIDE_LINKS
   unset STAT_OVERRIDE_UID STAT_OVERRIDE_GID
+  unset FLOCK_FAIL_AFTER_OUTPUT READLINK_FAIL_AFTER_OUTPUT
+  unset HANDOFF_FD
 
   write_stub df '
 printf "df %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
+[ ! -p "$SWAP_TEST_STATE/hold-ready" ] || {
+  if mkdir "$SWAP_TEST_STATE/df-owner" 2>/dev/null; then
+    printf "%s\n" ready > "$SWAP_TEST_STATE/hold-ready"
+    IFS= read -r _release < "$SWAP_TEST_STATE/hold-release"
+  fi
+}
 [ "${SWAP_TEST_DF_FAIL:-0}" != 1 ] || exit 7
 printf "Avail\n%s\n" "$SWAP_TEST_FREE_BYTES"'
 
@@ -212,6 +223,42 @@ printf "rm %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_RM_FAIL:-0}" != 1 ] || exit 8
 [ -z "${SWAP_TEST_RM_FAIL_PATH:-}" ] || [ "${1:-}" != "$SWAP_TEST_RM_FAIL_PATH" ] || exit 8
 exec /bin/rm "$@"'
+
+  write_stub flock '
+case "${1:-}" in
+  -n)
+    if [ "${SWAP_TEST_FLOCK_FAIL_AFTER_OUTPUT:-0}" = 1 ]; then
+      printf "%s\n" acquired
+      exit 7
+    fi
+    if [ -n "${LEGALTECH_RESOURCE_LOCK_FD:-}" ] \
+      && [ "${2:-}" = "$LEGALTECH_RESOURCE_LOCK_FD" ] \
+      && [ -e "/dev/fd/$LEGALTECH_RESOURCE_LOCK_FD" ]; then
+      exit 0
+    fi
+    if mkdir "$SWAP_TEST_STATE/resource-lock-held" 2>/dev/null; then
+      printf "%s\n" "$PPID" > "$SWAP_TEST_STATE/resource-lock-held/owner"
+      exit 0
+    fi
+    [ "$(cat "$SWAP_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)" = "$PPID" ]
+    ;;
+  -u)
+    [ "$(cat "$SWAP_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)" = "$PPID" ] || exit 1
+    rm -rf "$SWAP_TEST_STATE/resource-lock-held"
+    ;;
+  *) exit 2 ;;
+esac'
+
+  write_stub readlink '
+case "${1:-}" in
+  "$SWAP_TEST_FD_ROOT"/[0-9]*)
+    fd=${1##*/}
+    [ -e "/dev/fd/$fd" ] || exit 1
+    printf "%s\n" "$SWAP_LOCK_FILE"
+    [ "${SWAP_TEST_READLINK_FAIL_AFTER_OUTPUT:-0}" != 1 ]
+    ;;
+  *) exit 1 ;;
+esac'
 }
 
 run_swap() {
@@ -225,7 +272,10 @@ run_swap() {
     SWAP_SWAPOFF_BIN="$BIN_DIR/swapoff" SWAP_SYSCTL_BIN="$BIN_DIR/sysctl" \
     SWAP_FREE_BIN="$BIN_DIR/free" SWAP_CP_BIN="$BIN_DIR/cp" \
     SWAP_MV_BIN="$BIN_DIR/mv" SWAP_STAT_BIN="$BIN_DIR/stat" \
-    SWAP_RM_BIN="$BIN_DIR/rm" SWAP_TEST_CALL_LOG="$CALL_LOG" \
+    SWAP_RM_BIN="$BIN_DIR/rm" SWAP_FLOCK_BIN="$BIN_DIR/flock" \
+    SWAP_READLINK_BIN="$BIN_DIR/readlink" SWAP_LOCK_FILE="$LOCK_FILE" \
+    SWAP_FD_ROOT="$ROOT/fd" SWAP_TEST_FD_ROOT="$ROOT/fd" \
+    SWAP_TEST_STATE="$STATE_DIR" SWAP_TEST_CALL_LOG="$CALL_LOG" \
     SWAP_TEST_PROC_SWAPS="$PROC_SWAPS_FILE" \
     SWAP_TEST_MV_COUNT_FILE="$MV_COUNT_FILE" \
     SWAP_TEST_SWAPPINESS_STATE="$SWAPPINESS_STATE" \
@@ -253,6 +303,9 @@ run_swap() {
     SWAP_TEST_STAT_OVERRIDE_GID="${STAT_OVERRIDE_GID:-}" \
     SWAP_TEST_RM_FAIL="${RM_FAIL:-0}" \
     SWAP_TEST_RM_FAIL_PATH="${RM_FAIL_PATH:-}" \
+    SWAP_TEST_FLOCK_FAIL_AFTER_OUTPUT="${FLOCK_FAIL_AFTER_OUTPUT:-0}" \
+    SWAP_TEST_READLINK_FAIL_AFTER_OUTPUT="${READLINK_FAIL_AFTER_OUTPUT:-0}" \
+    LEGALTECH_RESOURCE_LOCK_FD="${HANDOFF_FD:-}" \
     bash "$SWAP_SCRIPT" "$@" 2>&1)
   RC=$?
 }
@@ -490,6 +543,85 @@ run_rollback_retry_regressions() {
   expect_eq 'managed sysctl with noncanonical mode is unknown' "$RC" 1
   expect_eq 'unsafe sysctl mode blocks all mutations' "$(mutation_count)" "$before_mutations"
 }
+
+run_mutator_lock_regressions() {
+  local first_pid mutations_before parent_fd
+  echo '== standalone swap mutators share the host lock without stale ownership'
+  setup lock-concurrent-apply
+  mkfifo "$STATE_DIR/hold-ready" "$STATE_DIR/hold-release"
+  (
+    run_swap apply
+    printf '%s\n' "$RC" > "$STATE_DIR/first-rc"
+    printf '%s' "$OUT" > "$STATE_DIR/first-out"
+  ) &
+  first_pid=$!
+  IFS= read -r _ready < "$STATE_DIR/hold-ready"
+  mutations_before=$(mutation_count)
+  run_swap apply
+  expect_eq 'second standalone swap apply is rejected while owner is live' "$RC" 1
+  expect_contains 'contended standalone apply reports fixed lock error' "$OUT" \
+    'another resource mutation is already in progress'
+  expect_eq 'contended standalone apply performs no mutation' "$(mutation_count)" "$mutations_before"
+  printf '%s\n' release > "$STATE_DIR/hold-release"
+  wait "$first_pid"
+  expect_eq 'first standalone swap owner completes normally' "$(cat "$STATE_DIR/first-rc")" 0
+  rm -f "$STATE_DIR/hold-ready" "$STATE_DIR/hold-release"
+  run_swap rollback
+  expect_eq 'owner exit releases lock for standalone rollback' "$RC" 0
+
+  setup lock-external
+  mkdir "$STATE_DIR/resource-lock-held"
+  printf '%s\n' external > "$STATE_DIR/resource-lock-held/owner"
+  mutations_before=$(mutation_count)
+  run_swap apply
+  expect_eq 'externally contended standalone apply fails closed' "$RC" 1
+  expect_contains 'external contention has fixed diagnostic' "$OUT" \
+    'another resource mutation is already in progress'
+  expect_eq 'external contention occurs before swap mutation' "$(mutation_count)" "$mutations_before"
+
+  for producer in readlink flock; do
+    setup "lock-${producer}-producer-failure"
+    case "$producer" in
+      readlink) READLINK_FAIL_AFTER_OUTPUT=1 ;;
+      flock) FLOCK_FAIL_AFTER_OUTPUT=1 ;;
+    esac
+    run_swap apply
+    expect_eq "$producer output-then-failure blocks standalone apply" "$RC" 1
+    expect_eq "$producer producer failure performs no swap mutation" "$(mutation_count)" 0
+  done
+
+  setup lock-spoofed-handoff
+  HANDOFF_FD=9 run_swap apply
+  expect_eq 'closed inherited-lock descriptor is rejected' "$RC" 1
+  expect_eq 'spoofed handoff performs no swap mutation' "$(mutation_count)" 0
+
+  setup lock-valid-handoff
+  ( umask 077; : > "$LOCK_FILE" )
+  exec {parent_fd}>"$LOCK_FILE"
+  SWAP_TEST_STATE="$STATE_DIR" "$BIN_DIR/flock" -n "$parent_fd"
+  HANDOFF_FD=$parent_fd run_swap apply
+  expect_eq 'validated inherited owner can delegate swap apply without deadlock' "$RC" 0
+  HANDOFF_FD='' run_swap rollback
+  expect_eq 'standalone rollback still contends while parent retains inherited lock' "$RC" 1
+  expect_contains 'standalone contention survives child handoff exit' "$OUT" \
+    'another resource mutation is already in progress'
+  SWAP_TEST_STATE="$STATE_DIR" "$BIN_DIR/flock" -u "$parent_fd"
+  exec {parent_fd}>&-
+  run_swap rollback
+  expect_eq 'parent release permits later standalone rollback' "$RC" 0
+}
+
+if [ "${SWAP_FOCUS:-}" = mutator-lock ]; then
+  run_mutator_lock_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_mutator_lock_regressions
+fi
 
 if [ "${SWAP_FOCUS:-}" = rollback-retry ]; then
   run_rollback_retry_regressions
