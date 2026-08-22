@@ -104,6 +104,50 @@ async def test_process_batch_skips_not_yet_started_on_shutdown():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_drains_running_case_before_batch_release_and_skips_undispatched():
+    running_started = asyncio.Event()
+    allow_running_to_finish = asyncio.Event()
+    running_finished = asyncio.Event()
+
+    class DrainTrackingEngine:
+        def __init__(self):
+            self.ran = []
+
+        async def sync_case(self, case):
+            self.ran.append(case["id"])
+            running_started.set()
+            await allow_running_to_finish.wait()
+            running_finished.set()
+
+    engine = DrainTrackingEngine()
+    shutdown_event = asyncio.Event()
+    task = asyncio.create_task(
+        process_batch(
+            [{"id": 1}, {"id": 2}, {"id": 3}],
+            engine,
+            1,
+            shutdown_event,
+            FakeBackoff(),
+            processing_window=lambda: True,
+        )
+    )
+
+    await asyncio.wait_for(running_started.wait(), timeout=0.1)
+    shutdown_event.set()
+    await asyncio.sleep(0)
+
+    assert engine.ran == [1]
+    assert running_finished.is_set() is False
+    assert task.done() is False
+
+    allow_running_to_finish.set()
+    await asyncio.wait_for(task, timeout=0.1)
+
+    assert running_finished.is_set() is True
+    assert engine.ran == [1]
+
+
+@pytest.mark.asyncio
 async def test_process_batch_skips_when_circuit_breaker_opens_mid_batch():
     delay_event = asyncio.Event()
     engine = ConcurrencyTrackingEngine(delay_event=delay_event)

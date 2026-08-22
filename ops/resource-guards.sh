@@ -9,6 +9,9 @@ readonly MIN_DISK_BYTES=8589934592
 readonly MIN_RAM_BYTES=6442450944
 readonly ACTIVE_LEASE_SECONDS=14400
 readonly HEARTBEAT_MAX_AGE_SECONDS=300
+readonly WORKER_DRAIN_ATTEMPTS=5
+readonly WORKER_HEARTBEAT_ATTEMPTS=5
+readonly WORKER_CGROUP=/legaltech.slice/estrado-pjud-worker.service
 
 usage() {
   printf '%s\n' \
@@ -32,10 +35,10 @@ readonly -a OVERRIDE_NAMES=(
   RG_MONITORING_DIR RG_MONITOR_ENV_FILE RG_FSTAB_FILE RG_SYSCTL_FILE RG_SWAPPINESS_METADATA_FILE
   RG_CADDYFILE RG_LOGROTATE_FILE RG_JURISTRACK_HEALTH_URL
   RG_ESTRADO_HEALTH_URL RG_GIT_BIN RG_DF_BIN RG_FREE_BIN RG_ID_BIN RG_PS_BIN
-  RG_SYSTEMCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_STAT_BIN RG_SHA256_BIN
+  RG_SYSTEMCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_SLEEP_BIN RG_STAT_BIN RG_SHA256_BIN
   RG_FIND_BIN RG_CP_BIN RG_RM_BIN RG_MKDIR_BIN RG_CHMOD_BIN RG_CHOWN_BIN
   RG_MKTEMP_BIN RG_JQ_BIN RG_PROVISION_BIN RG_SWAP_BIN RG_PYTHON_BIN
-  RG_TEST_ROOT_UID RG_TEST_ROOT_GID
+  RG_TEST_ROOT_UID RG_TEST_ROOT_GID RG_WORKER_FENCE_POLL_DELAY_SECONDS
 )
 
 test_mode=${RG_TEST_MODE:-0}
@@ -80,6 +83,7 @@ ps_bin=${RG_PS_BIN:-/usr/bin/ps}
 systemctl_bin=${RG_SYSTEMCTL_BIN:-/usr/bin/systemctl}
 curl_bin=${RG_CURL_BIN:-/usr/bin/curl}
 date_bin=${RG_DATE_BIN:-/usr/bin/date}
+sleep_bin=${RG_SLEEP_BIN:-/usr/bin/sleep}
 stat_bin=${RG_STAT_BIN:-/usr/bin/stat}
 sha256_bin=${RG_SHA256_BIN:-/usr/bin/sha256sum}
 find_bin=${RG_FIND_BIN:-/usr/bin/find}
@@ -95,12 +99,13 @@ swap_bin=${RG_SWAP_BIN:-$repo_dir/ops/swap/configure-swap.sh}
 python_bin=${RG_PYTHON_BIN:-/usr/bin/python3}
 root_uid=${RG_TEST_ROOT_UID:-0}
 root_gid=${RG_TEST_ROOT_GID:-0}
+worker_fence_poll_delay_seconds=${RG_WORKER_FENCE_POLL_DELAY_SECONDS:-1}
 
 for absolute_value in \
   "$repo_dir" "$systemd_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
   "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" \
   "$caddyfile" "$logrotate_file" "$git_bin" "$df_bin" "$free_bin" \
-  "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" \
+  "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" "$sleep_bin" \
   "$stat_bin" "$sha256_bin" "$find_bin" "$cp_bin" "$rm_bin" \
   "$mkdir_bin" "$chmod_bin" "$chown_bin" "$mktemp_bin" "$jq_bin" \
   "$provision_bin" "$swap_bin" "$python_bin"
@@ -109,6 +114,8 @@ do
 done
 is_uint "$root_uid" || usage
 is_uint "$root_gid" || usage
+is_uint "$worker_fence_poll_delay_seconds" || usage
+[ "$worker_fence_poll_delay_seconds" -le 30 ] || usage
 
 if [ "$test_mode" != 1 ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
   fail 'must run as root' || exit "$EXIT_ERROR"
@@ -235,8 +242,16 @@ validate_managed_source() {
   fi
 }
 
-prepare_temp_credentials() {
-  local url_count=0 key_count=0 line value credential_fields credential_mode credential_owner credential_group _credential_links expected_gid
+worker_id=''
+worker_id_encoded=''
+worker_proxy_mode=0
+worker_last_heartbeat_epoch=''
+worker_pre_stop_heartbeat_epoch=''
+worker_restore_allowed=1
+
+load_worker_fence_config() {
+  local url_count=0 key_count=0 worker_count=0 outside_count=0 validation_count=0 proxy_count=0
+  local line value proxy_url='' credential_fields credential_mode credential_owner credential_group _credential_links expected_gid
   [ -d "$tmp_root" ] && [ ! -L "$tmp_root" ] || return 1
   path_has_symlink_component "$tmp_root" && return 1
   safe_existing_path "$credential_file" || return 1
@@ -248,6 +263,9 @@ prepare_temp_credentials() {
   [ "$credential_group" = "$expected_gid" ] && [ "$credential_mode" = 640 ] || return 1
   SUPABASE_URL=''
   SUPABASE_SERVICE_KEY=''
+  worker_id=''
+  worker_id_encoded=''
+  worker_proxy_mode=0
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line%$'\r'}
     case "$line" in
@@ -261,16 +279,47 @@ prepare_temp_credentials() {
         value=${line#SUPABASE_SERVICE_KEY=}
         SUPABASE_SERVICE_KEY=$value
         ;;
+      WORKER_ID=*)
+        worker_count=$((worker_count + 1))
+        worker_id=${line#WORKER_ID=}
+        ;;
+      PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=*)
+        outside_count=$((outside_count + 1))
+        value=${line#PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=}
+        [ "$value" = false ] || return 1
+        ;;
+      PJUD_OFF_HOURS_VALIDATION_ONCE=*)
+        validation_count=$((validation_count + 1))
+        value=${line#PJUD_OFF_HOURS_VALIDATION_ONCE=}
+        [ "$value" = false ] || return 1
+        ;;
+      OJV_PROXY_URL=*)
+        proxy_count=$((proxy_count + 1))
+        proxy_url=${line#OJV_PROXY_URL=}
+        ;;
     esac
   done < "$credential_file"
   [ "$url_count" -eq 1 ] && [ "$key_count" -eq 1 ] \
+    && [ "$worker_count" -eq 1 ] && [ "$outside_count" -eq 1 ] \
+    && [ "$validation_count" -le 1 ] && [ "$proxy_count" -le 1 ] \
     && [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ] || return 1
+  [[ "$worker_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]] || return 1
   if [ "$test_mode" = 1 ]; then
     [[ "$SUPABASE_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[^\"[:space:]]*)?$ ]] || return 1
   else
     [[ "$SUPABASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^\"[:space:]]*)?$ ]] || return 1
   fi
-  case "$SUPABASE_URL$SUPABASE_SERVICE_KEY" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  case "$SUPABASE_URL$SUPABASE_SERVICE_KEY$worker_id$proxy_url" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  if [ -n "$proxy_url" ]; then
+    case "$proxy_url" in http://?*|https://?*) ;; *) return 1 ;; esac
+    case "$proxy_url" in *' '*|*$'\t'*|*'"'*) return 1 ;; esac
+    worker_proxy_mode=1
+  fi
+  if ! worker_id_encoded=$("$jq_bin" -nr --arg value "$worker_id" '$value | @uri' 2>"$null_file"); then
+    return 1
+  fi
+  [ -n "$worker_id_encoded" ] && [[ "$worker_id_encoded" != *$'\n'* ]] || return 1
+  unset proxy_url
 
   if [ -z "$temp_dir" ]; then
     temp_dir=$("$mktemp_bin" -d "$tmp_root/legaltech-resource-guards.XXXXXX") || return 1
@@ -307,20 +356,42 @@ write_curl_config() { # config, url, output, optional request, optional dump hea
   "$chown_bin" "$root_uid:$root_gid" "$config" || return 1
 }
 
-heartbeat_is_fresh() {
+maintenance_window_is_open() {
+  local hour
+  if ! hour=$(TZ=America/Santiago LC_ALL=C "$date_bin" +%H 2>"$null_file"); then
+    return 1
+  fi
+  [[ "$hour" =~ ^[0-9]{2}$ ]] || return 1
+  hour=$((10#$hour))
+  { [ "$hour" -ge 20 ] && [ "$hour" -le 23 ]; } \
+    || { [ "$hour" -ge 0 ] && [ "$hour" -le 3 ]; }
+}
+
+worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-epoch
+  local require_zero_mint=${1:-0} minimum_epoch=${2:-}
   local config="$temp_dir/heartbeat.curl" body="$temp_dir/heartbeat.body"
   local http timestamp now_epoch heartbeat_epoch age
   write_curl_config "$config" \
-    "${SUPABASE_URL%/}/rest/v1/sync_worker_heartbeats?select=status,last_heartbeat_at&order=last_heartbeat_at.desc&limit=1" \
+    "${SUPABASE_URL%/}/rest/v1/sync_worker_heartbeats?worker_id=eq.${worker_id_encoded}&select=status,last_heartbeat_at,metadata" \
     "$body" || return 1
   if ! http=$("$curl_bin" --config "$config" --write-out '%{http_code}' 2>"$null_file"); then return 1; fi
   [ "$http" = 200 ] || return 1
-  if ! timestamp=$("$jq_bin" -er '
+  if ! timestamp=$("$jq_bin" -er \
+    --argjson proxy_mode "$worker_proxy_mode" \
+    --argjson require_zero_mint "$require_zero_mint" '
     if type == "array" and length == 1 and
        (.[0] | type == "object") and
-       (.[0] | keys | sort) == ["last_heartbeat_at", "status"] and
-       (.[0].status | IN("starting", "paused", "running", "backoff", "idle_off_hours", "stopped")) and
-       (.[0].last_heartbeat_at | type == "string")
+       (.[0] | keys | sort) == ["last_heartbeat_at", "metadata", "status"] and
+       .[0].status == "idle_off_hours" and
+       (.[0].last_heartbeat_at | type == "string") and
+       (.[0].metadata | type == "object") and
+       .[0].metadata.process_outside_office_hours_enabled == false and
+       (.[0].metadata.mint_attempts | type == "number" and . >= 0 and . == floor) and
+       ($require_zero_mint == 0 or .[0].metadata.mint_attempts == 0) and
+       ($proxy_mode == false or (
+         .[0].metadata.proxy_control_status == "enabled" and
+         .[0].metadata.proxy_control_reason == null
+       ))
     then .[0].last_heartbeat_at else empty end
   ' "$body" 2>"$null_file"); then return 1; fi
   now_epoch=$(LC_ALL=C "$date_bin" -u +%s 2>"$null_file") || return 1
@@ -328,7 +399,11 @@ heartbeat_is_fresh() {
   is_uint "$now_epoch" && is_uint "$heartbeat_epoch" || return 1
   [ "$now_epoch" -ge "$heartbeat_epoch" ] || return 1
   age=$((now_epoch - heartbeat_epoch))
-  [ "$age" -le "$HEARTBEAT_MAX_AGE_SECONDS" ]
+  [ "$age" -le "$HEARTBEAT_MAX_AGE_SECONDS" ] || return 1
+  if [ -n "$minimum_epoch" ]; then
+    is_uint "$minimum_epoch" && [ "$heartbeat_epoch" -gt "$minimum_epoch" ] || return 1
+  fi
+  worker_last_heartbeat_epoch=$heartbeat_epoch
 }
 
 active_claim_count() {
@@ -369,11 +444,15 @@ active_claim_count() {
   printf '%s\n' "$count"
 }
 
-check_exact_zero_and_fresh_heartbeat() {
-  local count
-  heartbeat_is_fresh || return 1
-  count=$(active_claim_count) || return 1
-  [ "$count" = 0 ]
+wait_for_zero_claims() {
+  local attempt count
+  for ((attempt = 1; attempt <= WORKER_DRAIN_ATTEMPTS; attempt++)); do
+    count=$(active_claim_count) || return 1
+    [ "$count" = 0 ] && return 0
+    [ "$attempt" -lt "$WORKER_DRAIN_ATTEMPTS" ] || return 1
+    "$sleep_bin" "$worker_fence_poll_delay_seconds" >"$null_file" 2>&1 || return 1
+  done
+  return 1
 }
 
 check_git() {
@@ -462,11 +541,7 @@ run_preflight() {
   check_public_health || { fail 'a public health endpoint is not exactly HTTP 200'; return 1; }
   worker_activity=$(read_unit_state system is-active estrado-pjud-worker.service) \
     || { fail 'worker activity is unknown'; return 1; }
-  if [ "$worker_activity" = active ]; then
-    prepare_temp_credentials || { fail 'protected Supabase configuration is invalid'; return 1; }
-    check_exact_zero_and_fresh_heartbeat \
-      || { fail 'worker heartbeat or exact active-claim count is unsafe'; return 1; }
-  fi
+  case "$worker_activity" in active|inactive) ;; *) return 1 ;; esac
   swap_state=$("$swap_bin" preflight 2>"$null_file") || { fail 'swap preflight is unsafe'; return 1; }
   case "$swap_state" in
     clean) swap_initial_state=clean ;;
@@ -880,11 +955,12 @@ validate_manifest() {
 
 load_and_validate_changes() {
   local change
-  changed_api=0 changed_worker=0 changed_hermes=0 changed_monitor=0 changed_tracker=0
+  changed_api=0 changed_worker=0 worker_stopped=0 changed_hermes=0 changed_monitor=0 changed_tracker=0
   while IFS= read -r change || [ -n "$change" ]; do
     case "$change" in
       api) [ "$changed_api" -eq 0 ] || return 1; changed_api=1 ;;
       worker) [ "$changed_worker" -eq 0 ] || return 1; changed_worker=1 ;;
+      worker-stop) [ "$worker_stopped" -eq 0 ] || return 1; worker_stopped=1 ;;
       hermes) [ "$changed_hermes" -eq 0 ] || return 1; changed_hermes=1 ;;
       monitor) [ "$changed_monitor" -eq 0 ] || return 1; changed_monitor=1 ;;
       tracker) [ "$changed_tracker" -eq 0 ] || return 1; changed_tracker=1 ;;
@@ -978,10 +1054,16 @@ restore_unit_states() {
       elif [ "$current" = active ]; then
         "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
       fi
-    elif [ "$unit" = estrado-pjud-worker.service ] && [ "$changed_worker" -eq 1 ]; then
+    elif [ "$unit" = estrado-pjud-worker.service ] \
+      && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; }; then
       if [ "$desired" = active ]; then
-        if prepare_temp_credentials && check_exact_zero_and_fresh_heartbeat; then
-          "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
+        if [ "$worker_restore_allowed" -eq 1 ] \
+          && load_worker_fence_config && maintenance_window_is_open; then
+          if "$systemctl_bin" start "$unit" >"$null_file" 2>&1; then
+            worker_runtime_is_active || rc=1
+          else
+            rc=1
+          fi
         else
           rc=1
         fi
@@ -997,7 +1079,7 @@ restore_unit_states() {
       fi
     elif [ "$current" != "$desired" ]; then
       if [ "$unit" = estrado-pjud-worker.service ] && [ "$desired" = active ]; then
-        if prepare_temp_credentials && check_exact_zero_and_fresh_heartbeat; then
+        if load_worker_fence_config && maintenance_window_is_open; then
           "$systemctl_bin" start "$unit" >"$null_file" 2>&1 || rc=1
         else
           rc=1
@@ -1046,6 +1128,13 @@ do_rollback() {
   load_and_validate_changes || { fail 'rollback affected-unit metadata is invalid'; return 1; }
   load_and_validate_unit_states || { fail 'rollback live-unit metadata is invalid'; return 1; }
   load_and_validate_monitor_runtime || { fail 'rollback monitor runtime metadata is invalid'; return 1; }
+  worker_restore_allowed=1
+  if [ "${desired_active_states[1]}" = active ] \
+    && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
+    && ! quiesce_worker_for_restore; then
+    rollback_rc=1
+    worker_restore_allowed=0
+  fi
   swap_state=$(<"$backup_dir/swap-state")
   case "$swap_state" in
     attempted)
@@ -1093,6 +1182,76 @@ old_pid_is_gone() {
   [ "$rc" -eq 1 ] && [ -z "$output" ]
 }
 
+read_worker_runtime() {
+  read_effective_runtime system estrado-pjud-worker.service
+}
+
+worker_runtime_is_active() {
+  local runtime active pid control_group effective_slice result
+  runtime=$(read_worker_runtime) || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  [ "$active" = active ] && [ "$pid" -gt 0 ] \
+    && [ "$control_group" = "$WORKER_CGROUP" ] \
+    && [ "$effective_slice" = legaltech.slice ]
+}
+
+worker_runtime_is_stopped() { # old PID
+  local old_pid=$1 runtime active pid control_group effective_slice result
+  runtime=$(read_worker_runtime) || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  [ "$active" = inactive ] && [ "$pid" -eq 0 ] \
+    && [ "$control_group" = - ] && [ "$effective_slice" = legaltech.slice ] \
+    && old_pid_is_gone "$old_pid"
+}
+
+stop_worker_for_change() {
+  local runtime active old_pid old_control_group effective_slice result
+  runtime=$(read_worker_runtime) || return 1
+  IFS='|' read -r active old_pid old_control_group effective_slice result <<< "$runtime"
+  [ "$active" = active ] && [ "$old_pid" -gt 0 ] \
+    && [ "$old_control_group" = "$WORKER_CGROUP" ] \
+    && [ "$effective_slice" = legaltech.slice ] || return 1
+  record_change worker-stop || return 1
+  "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+  [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
+  worker_runtime_is_stopped "$old_pid"
+}
+
+verify_started_worker_is_idle() {
+  local attempt count
+  worker_runtime_is_active || return 1
+  for ((attempt = 1; attempt <= WORKER_HEARTBEAT_ATTEMPTS; attempt++)); do
+    if worker_heartbeat_is_idle 1 "$worker_pre_stop_heartbeat_epoch"; then
+      count=$(active_claim_count) || return 1
+      [ "$count" = 0 ]
+      return
+    fi
+    [ "$attempt" -lt "$WORKER_HEARTBEAT_ATTEMPTS" ] || return 1
+    "$sleep_bin" "$worker_fence_poll_delay_seconds" >"$null_file" 2>&1 || return 1
+  done
+  return 1
+}
+
+quiesce_worker_for_restore() {
+  local runtime active pid control_group effective_slice result
+  runtime=$(read_worker_runtime) || return 1
+  IFS='|' read -r active pid control_group effective_slice result <<< "$runtime"
+  case "$active" in
+    inactive)
+      [ "$pid" -eq 0 ] && [ "$control_group" = - ] \
+        && [ "$effective_slice" = legaltech.slice ]
+      ;;
+    active)
+      [ "$pid" -gt 0 ] && [ "$control_group" = "$WORKER_CGROUP" ] \
+        && [ "$effective_slice" = legaltech.slice ] || return 1
+      "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+      [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
+      worker_runtime_is_stopped "$pid"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 verify_monitor_migration() { # change-flag monitor-array-index
   local changed=$1 monitor_index=$2 unit runtime active pid control_group effective_slice result old_pid
   [ "$changed" -eq 1 ] || return 0
@@ -1108,12 +1267,15 @@ verify_monitor_migration() { # change-flag monitor-array-index
 
 run_apply_steps() {
   local uid=$1 api_path worker_path worker_dropin_path hermes_path monitor_path tracker_path
+  local worker_source worker_dropin_source desired_worker desired_worker_dropin worker_count
   local monitor_source tracker_source before_api before_worker before_worker_dropin before_hermes before_monitor before_tracker
   local desired_monitor desired_tracker after_api after_worker after_worker_dropin after_hermes after_monitor after_tracker
-  local monitor_will_change=0 tracker_will_change=0 provision_rc=0
+  local monitor_will_change=0 tracker_will_change=0 worker_will_change=0 provision_rc=0
   api_path="$systemd_dir/estrado-pjud.service"
   worker_path="$systemd_dir/estrado-pjud-worker.service"
   worker_dropin_path="$systemd_dir/estrado-pjud-worker.service.d/xvfb.conf"
+  worker_source="$repo_dir/ops/systemd/estrado-pjud-worker.service"
+  worker_dropin_source="$repo_dir/ops/systemd/estrado-pjud-worker.service.d/xvfb.conf"
   hermes_path="$systemd_dir/user-$uid.slice.d/50-legaltech-resource-limits.conf"
   monitor_path="$systemd_dir/legaltech-monitor.service"
   tracker_path="$systemd_dir/legaltech-resource-tracker.service"
@@ -1122,6 +1284,8 @@ run_apply_steps() {
   before_api=$(digest_path "$api_path") || return 1
   before_worker=$(digest_path "$worker_path") || return 1
   before_worker_dropin=$(digest_path "$worker_dropin_path") || return 1
+  desired_worker=$(digest_path "$worker_source") || return 1
+  desired_worker_dropin=$(digest_path "$worker_dropin_source") || return 1
   before_hermes=$(digest_path "$hermes_path") || return 1
   before_monitor=$(digest_path "$monitor_path") || return 1
   before_tracker=$(digest_path "$tracker_path") || return 1
@@ -1129,13 +1293,29 @@ run_apply_steps() {
   desired_tracker=$(digest_path "$tracker_source") || return 1
   [ "$before_monitor" = "$desired_monitor" ] || monitor_will_change=1
   [ "$before_tracker" = "$desired_tracker" ] || tracker_will_change=1
+  if [ "$before_worker" != "$desired_worker" ] \
+    || [ "$before_worker_dropin" != "$desired_worker_dropin" ]; then
+    worker_will_change=1
+  fi
   create_backup "$uid" >"$null_file" || return 1
   validate_backup_dir "$backup_dir" && validate_manifest \
     && load_and_validate_unit_states && load_and_validate_monitor_runtime || return 1
   check_git || return 1
+  if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
+    load_worker_fence_config || return 1
+    maintenance_window_is_open || return 1
+    worker_heartbeat_is_idle 0 || return 1
+    worker_pre_stop_heartbeat_epoch=$worker_last_heartbeat_epoch
+    worker_count=$(active_claim_count) || return 1
+    [ "$worker_count" = 0 ] || return 1
+  fi
+  mutation_started=1
+  if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
+    stop_worker_for_change || return 1
+    wait_for_zero_claims || return 1
+  fi
   if [ "$monitor_will_change" -eq 1 ]; then record_change monitor || return 1; fi
   if [ "$tracker_will_change" -eq 1 ]; then record_change tracker || return 1; fi
-  mutation_started=1
   stop_legacy_monitor_if_changed "$monitor_will_change" 0 2 || return 1
   stop_legacy_monitor_if_changed "$tracker_will_change" 1 3 || return 1
   PROV_ENABLE_PJUD_WORKER=0 PROV_SKIP_CADDY=1 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
@@ -1146,7 +1326,14 @@ run_apply_steps() {
   after_monitor=$(digest_path "$monitor_path") || return 1
   after_tracker=$(digest_path "$tracker_path") || return 1
   if [ "$before_api" != "$after_api" ]; then record_change api || return 1; fi
-  if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then record_change worker || return 1; fi
+  if [ "$worker_will_change" -eq 1 ]; then
+    [ "$after_worker" = "$desired_worker" ] \
+      && [ "$after_worker_dropin" = "$desired_worker_dropin" ] || return 1
+    record_change worker || return 1
+  else
+    [ "$after_worker" = "$before_worker" ] \
+      && [ "$after_worker_dropin" = "$before_worker_dropin" ] || return 1
+  fi
   if [ "$before_hermes" != "$after_hermes" ]; then record_change hermes || return 1; fi
   [ "$after_monitor" = "$desired_monitor" ] || return 1
   [ "$after_tracker" = "$desired_tracker" ] || return 1
@@ -1181,11 +1368,11 @@ run_apply_steps() {
       fi
     done
   fi
-  if [ "$before_worker" != "$after_worker" ] || [ "$before_worker_dropin" != "$after_worker_dropin" ]; then
+  if [ "$worker_will_change" -eq 1 ]; then
     if [ "${desired_active_states[1]}" = active ]; then
-      [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = active ] || return 1
-      check_exact_zero_and_fresh_heartbeat || return 1
-      "$systemctl_bin" restart estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+      [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
+      "$systemctl_bin" start estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+      verify_started_worker_is_idle || return 1
     else
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
     fi

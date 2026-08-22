@@ -77,12 +77,14 @@ setup() {
   : > "$CASE_DIR/null"
   printf '%s\n' "$EXPECTED_SHA" > "$STATE/git-sha"
   : > "$STATE/git-status"
-  printf '%s\n' 1710000000 > "$STATE/now"
+  printf '%s\n' 1787356980 > "$STATE/now"
+  printf '%s\n' 20 > "$STATE/local-hour"
   printf '%s\n' 200 > "$STATE/juristrack-code"
   printf '%s\n' 200 > "$STATE/estrado-code"
   printf '%s\n' 0 > "$STATE/claim-count"
-  printf '%s\n' fresh > "$STATE/heartbeat"
-  printf 'SUPABASE_URL=https://db.invalid\nSUPABASE_SERVICE_KEY=%s\n' "$SECRET_SENTINEL" \
+  printf '%s\n' safe > "$STATE/heartbeat-pre"
+  printf '%s\n' safe-new > "$STATE/heartbeat-post"
+  printf 'SUPABASE_URL=https://db.invalid\nSUPABASE_SERVICE_KEY=%s\nWORKER_ID=worker-1\nPJUD_PROCESS_OUTSIDE_OFFICE_HOURS=false\nOJV_PROXY_URL=https://proxy.invalid\n' "$SECRET_SENTINEL" \
     > "$FAKE/repo/estrado-pjud-service/.env"
   chmod 640 "$FAKE/repo/estrado-pjud-service/.env"
 
@@ -96,6 +98,10 @@ setup() {
   mkdir -p "$FAKE/systemd/estrado-pjud-worker.service.d" \
     "$FAKE/systemd/user-1002.slice.d"
   printf 'original xvfb\n' > "$FAKE/systemd/estrado-pjud-worker.service.d/xvfb.conf"
+  mkdir -p "$FAKE/repo/ops/systemd/estrado-pjud-worker.service.d"
+  cp "$FAKE/systemd/estrado-pjud-worker.service" "$FAKE/repo/ops/systemd/estrado-pjud-worker.service"
+  cp "$FAKE/systemd/estrado-pjud-worker.service.d/xvfb.conf" \
+    "$FAKE/repo/ops/systemd/estrado-pjud-worker.service.d/xvfb.conf"
   printf 'original hermes\n' > "$FAKE/systemd/user-1002.slice.d/50-legaltech-resource-limits.conf"
   printf 'monitor credential placeholder\n' > "$FAKE/monitoring.env"
   chmod 600 "$FAKE/monitoring.env"
@@ -112,6 +118,10 @@ setup() {
   printf '%s\n' active > "$STATE/unit-estrado-pjud.service-active"
   printf '%s\n' disabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
   printf '%s\n' inactive > "$STATE/unit-estrado-pjud-worker.service-active"
+  printf '%s\n' 0 > "$STATE/unit-estrado-pjud-worker.service-main-pid"
+  : > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  printf '%s\n' legaltech.slice > "$STATE/unit-estrado-pjud-worker.service-slice"
+  printf '%s\n' success > "$STATE/unit-estrado-pjud-worker.service-result"
   for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
     printf '%s\n' disabled > "$STATE/unit-$unit-enabled"
     printf '%s\n' inactive > "$STATE/unit-$unit-active"
@@ -133,6 +143,7 @@ setup() {
     cp -R "$TMP/stub-bin/." "$BIN/"
   else
   write_stub git <<'EOF'
+printf 'git %s\n' "$*" >> "$RG_TEST_STATE/events"
 case "${1:-}" in
   status) cat "$RG_TEST_STATE/git-status" ;;
   rev-parse) cat "$RG_TEST_STATE/git-sha" ;;
@@ -284,11 +295,11 @@ if [ "${1:-}" = show ]; then
     user-1002.slice:MemoryMax) echo 2621440000 ;;
     user-1002.slice:TasksMax) echo 1024 ;;
     user-1002.slice:CPUWeight) echo 200 ;;
-    legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) cat "$RG_TEST_STATE/unit-$unit-slice" ;;
-    legaltech-monitor.service:MainPID|legaltech-resource-tracker.service:MainPID) cat "$RG_TEST_STATE/unit-$unit-main-pid" ;;
-    legaltech-monitor.service:ControlGroup|legaltech-resource-tracker.service:ControlGroup) cat "$RG_TEST_STATE/unit-$unit-control-group" ;;
-    legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
-    legaltech-monitor.service:Result|legaltech-resource-tracker.service:Result) cat "$RG_TEST_STATE/unit-$unit-result" ;;
+    estrado-pjud-worker.service:Slice|legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) cat "$RG_TEST_STATE/unit-$unit-slice" ;;
+    estrado-pjud-worker.service:MainPID|legaltech-monitor.service:MainPID|legaltech-resource-tracker.service:MainPID) cat "$RG_TEST_STATE/unit-$unit-main-pid" ;;
+    estrado-pjud-worker.service:ControlGroup|legaltech-monitor.service:ControlGroup|legaltech-resource-tracker.service:ControlGroup) cat "$RG_TEST_STATE/unit-$unit-control-group" ;;
+    estrado-pjud-worker.service:ActiveState|legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
+    estrado-pjud-worker.service:Result|legaltech-monitor.service:Result|legaltech-resource-tracker.service:Result) cat "$RG_TEST_STATE/unit-$unit-result" ;;
     legaltech-monitor.service:Type|legaltech-resource-tracker.service:Type) echo oneshot ;;
     legaltech-monitor.service:User|legaltech-resource-tracker.service:User) echo root ;;
     legaltech-monitor.service:WorkingDirectory|legaltech-resource-tracker.service:WorkingDirectory) echo /opt/legaltech-monitoring ;;
@@ -365,8 +376,33 @@ case "${1:-}" in
     case "$action" in stop) value=inactive ;; *) value=active ;; esac
     for unit in "$@"; do
       [ "$unit" = -- ] && continue
+      if [ "$unit" = estrado-pjud-worker.service ] && [ "$action" = stop ] \
+        && [ -e "$RG_TEST_STATE/worker-stop-keeps-active" ]; then
+        continue
+      fi
       printf '%s\n' "$value" > "$(state_file "$unit" active)"
       case "$unit" in
+        estrado-pjud-worker.service)
+          old_pid=$(cat "$RG_TEST_STATE/unit-$unit-main-pid") || exit 1
+          if [ "$action" = stop ]; then
+            if [ ! -e "$RG_TEST_STATE/worker-residual-runtime" ]; then
+              case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
+              printf '%s\n' 0 > "$RG_TEST_STATE/unit-$unit-main-pid"
+              : > "$RG_TEST_STATE/unit-$unit-control-group"
+            fi
+          else
+            new_pid=5201
+            printf '%s\n' "$new_pid" > "$RG_TEST_STATE/unit-$unit-main-pid"
+            if [ -e "$RG_TEST_STATE/worker-wrong-start-cgroup" ]; then
+              printf '%s\n' /system.slice/estrado-pjud-worker.service \
+                > "$RG_TEST_STATE/unit-$unit-control-group"
+            else
+              printf '%s\n' /legaltech.slice/estrado-pjud-worker.service \
+                > "$RG_TEST_STATE/unit-$unit-control-group"
+            fi
+            printf '%s\n' "$unit" > "$RG_TEST_STATE/pid-$new_pid-unit"
+          fi
+          ;;
         legaltech-monitor.service|legaltech-resource-tracker.service)
           old_pid=$(cat "$RG_TEST_STATE/unit-$unit-main-pid") || exit 1
           case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
@@ -419,14 +455,22 @@ if [ -n "$config" ]; then
     range=$(grep -c -F 'header = "Range: 0-0"' "$config" || true)
     printf 'curl claims method=HEAD %s prefer=%s range=%s\n' "$url" "$prefer" "$range" >> "$RG_TEST_STATE/events"
     header=$(sed -n 's/^dump-header = "\(.*\)"$/\1/p' "$config")
-    case "$(cat "$RG_TEST_STATE/claim-count")" in
+    if [ -s "$RG_TEST_STATE/claim-sequence" ]; then
+      claim_state=$(sed -n '1p' "$RG_TEST_STATE/claim-sequence")
+      sed '1d' "$RG_TEST_STATE/claim-sequence" > "$RG_TEST_STATE/claim-sequence.next"
+      mv "$RG_TEST_STATE/claim-sequence.next" "$RG_TEST_STATE/claim-sequence"
+    else
+      claim_state=$(cat "$RG_TEST_STATE/claim-count")
+    fi
+    case "$claim_state" in
       missing) printf 'HTTP/1.1 200 OK\r\n\r\n' > "$header" ;;
       malformed) printf 'HTTP/1.1 200 OK\r\nContent-Range: */*\r\n\r\n' > "$header" ;;
       wildcard) printf 'HTTP/1.1 200 OK\r\nContent-Range: */2\r\n\r\n' > "$header" ;;
       httpfail) exit 22 ;;
+      output-then-fail) printf 'HTTP/1.1 200 OK\r\nContent-Range: */0\r\n\r\n' > "$header"; printf '200'; exit 22 ;;
       zero-star) printf 'HTTP/1.1 200 OK\r\nContent-Range: */0\r\n\r\n' > "$header" ;;
       value) count=$(cat "$RG_TEST_STATE/claim-value"); printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$count" > "$header" ;;
-      *) count=$(cat "$RG_TEST_STATE/claim-count"); printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$count" > "$header" ;;
+      *) printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$claim_state" > "$header" ;;
     esac
     printf '200'
     if [ -e "$RG_TEST_STATE/claim-after-first" ]; then
@@ -439,11 +483,41 @@ if [ -n "$config" ]; then
   fi
   printf 'curl heartbeat %s\n' "$url" >> "$RG_TEST_STATE/events"
   output=$(sed -n 's/^output = "\(.*\)"$/\1/p' "$config")
-  case "$(cat "$RG_TEST_STATE/heartbeat")" in
-    fresh) printf '[{"status":"running","last_heartbeat_at":"2024-03-09T15:59:00Z"}]' > "$output" ;;
-    stale) printf '[{"status":"running","last_heartbeat_at":"2024-03-09T15:40:00Z"}]' > "$output" ;;
+  heartbeat_calls_file="$RG_TEST_STATE/heartbeat-calls"
+  heartbeat_calls=0
+  [ ! -f "$heartbeat_calls_file" ] || heartbeat_calls=$(cat "$heartbeat_calls_file")
+  heartbeat_calls=$((heartbeat_calls + 1))
+  printf '%s\n' "$heartbeat_calls" > "$heartbeat_calls_file"
+  if [ "$heartbeat_calls" -eq 1 ]; then
+    heartbeat_state=$(cat "$RG_TEST_STATE/heartbeat-pre")
+  else
+    heartbeat_state=$(cat "$RG_TEST_STATE/heartbeat-post")
+  fi
+  case "$heartbeat_state" in
+    safe) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    safe-historical-mint) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":7}}]' > "$output" ;;
+    safe-new) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:02:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    wrong-worker)
+      case "$url" in
+        *'worker_id=eq.worker-1'*) printf '[]' > "$output" ;;
+        *) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+      esac
+      ;;
+    zero-rows) printf '[]' > "$output" ;;
+    multiple) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}},{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    stale) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-21T23:50:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    future) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:04:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    running|stopped|paused|unknown) printf '[{"status":"%s","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' "$heartbeat_state" > "$output" ;;
+    missing-metadata) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z"}]' > "$output" ;;
+    malformed-metadata) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":[]}]' > "$output" ;;
+    override-true) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":true,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    proxy-paused) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"paused","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    proxy-unavailable) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"unavailable","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    telemetry-unavailable) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":"telemetry_unavailable","mint_attempts":0}}]' > "$output" ;;
+    mint-nonzero) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:02:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":1}}]' > "$output" ;;
     malformed) printf '{"message":"unsafe-detail"}' > "$output" ;;
     httpfail) exit 22 ;;
+    output-then-fail) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output"; printf '200'; exit 22 ;;
   esac
   printf '200'
   exit 0
@@ -466,11 +540,21 @@ EOF
 case "$*" in
   '-u +%s') cat "$RG_TEST_STATE/now" ;;
   '-u +%Y%m%dT%H%M%SZ') echo 20240309T160000Z ;;
-  *'@'*'+%Y-%m-%dT%H:%M:%SZ') echo 2024-03-09T12:00:00Z ;;
-  *'2024-03-09T15:59:00Z'*'+%s') echo 1709999940 ;;
-  *'2024-03-09T15:40:00Z'*'+%s') echo 1709998800 ;;
+  '+%H')
+    cat "$RG_TEST_STATE/local-hour"
+    [ ! -e "$RG_TEST_STATE/date-hour-fail-after-output" ]
+    ;;
+  *'@'*'+%Y-%m-%dT%H:%M:%SZ') echo 2026-08-21T20:03:00Z ;;
+  *'2026-08-22T00:00:00Z'*'+%s') echo 1787356800 ;;
+  *'2026-08-22T00:02:00Z'*'+%s') echo 1787356920 ;;
+  *'2026-08-21T23:50:00Z'*'+%s') echo 1787356200 ;;
+  *'2026-08-22T00:04:00Z'*'+%s') echo 1787357040 ;;
   *) exit 1 ;;
 esac
+EOF
+  write_stub sleep <<'EOF'
+printf 'sleep %s\n' "$*" >> "$RG_TEST_STATE/events"
+exit 0
 EOF
   write_stub stat <<'EOF'
 path=${@: -1}
@@ -517,13 +601,15 @@ fi
 case "${RG_TEST_MUTATE:-none}" in
   all)
     printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service"
-    printf 'changed worker\n' >> "$RG_SYSTEMD_DIR/estrado-pjud-worker.service"
+    cp "$RG_REPO_DIR/ops/systemd/estrado-pjud-worker.service" \
+      "$RG_SYSTEMD_DIR/estrado-pjud-worker.service"
     printf 'changed hermes\n' >> "$RG_SYSTEMD_DIR/user-1002.slice.d/50-legaltech-resource-limits.conf"
     cp "$RG_REPO_DIR/ops/systemd/legaltech-monitor.service" "$RG_SYSTEMD_DIR/legaltech-monitor.service"
     cp "$RG_REPO_DIR/ops/systemd/legaltech-resource-tracker.service" "$RG_SYSTEMD_DIR/legaltech-resource-tracker.service"
     ;;
   api) printf 'changed api\n' >> "$RG_SYSTEMD_DIR/estrado-pjud.service" ;;
-  dropin) printf 'changed xvfb\n' >> "$RG_SYSTEMD_DIR/estrado-pjud-worker.service.d/xvfb.conf" ;;
+  dropin) cp "$RG_REPO_DIR/ops/systemd/estrado-pjud-worker.service.d/xvfb.conf" \
+    "$RG_SYSTEMD_DIR/estrado-pjud-worker.service.d/xvfb.conf" ;;
   hermes) printf 'changed hermes\n' >> "$RG_SYSTEMD_DIR/user-1002.slice.d/50-legaltech-resource-limits.conf" ;;
   monitors)
     cp "$RG_REPO_DIR/ops/systemd/legaltech-monitor.service" "$RG_SYSTEMD_DIR/legaltech-monitor.service"
@@ -598,6 +684,9 @@ exit 0
 EOF
   write_stub jq <<'EOF'
 /usr/bin/jq "$@"
+rc=$?
+[ ! -e "$RG_TEST_STATE/jq-fail-after-output" ] || exit 1
+exit "$rc"
 EOF
   write_stub cp <<'EOF'
 printf 'backup-copy %s\n' "${@: -1}" >> "$RG_TEST_STATE/events"
@@ -642,6 +731,15 @@ run_guard() {
       done
       ;;
   esac
+  case "${TEST_MUTATE:-none}" in
+    all)
+      printf 'changed worker source\n' >> "$FAKE/repo/ops/systemd/estrado-pjud-worker.service"
+      ;;
+    dropin)
+      printf 'changed worker drop-in source\n' \
+        >> "$FAKE/repo/ops/systemd/estrado-pjud-worker.service.d/xvfb.conf"
+      ;;
+  esac
   set +e
   OUT=$(env \
     RG_TEST_MODE=1 RG_TEST_STATE="$STATE" RG_TEST_OUTSIDE="$FAKE/outside" \
@@ -659,12 +757,14 @@ run_guard() {
     RG_GIT_BIN="$BIN/git" RG_DF_BIN="$BIN/df" RG_FREE_BIN="$BIN/free" \
     RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" \
     RG_CURL_BIN="$BIN/curl" RG_DATE_BIN="$BIN/date" RG_STAT_BIN="$BIN/stat" \
+    RG_SLEEP_BIN="$BIN/sleep" \
     RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN="$BIN/find" RG_CP_BIN="$BIN/cp" \
     RG_RM_BIN=/bin/rm RG_MKDIR_BIN=/bin/mkdir RG_CHMOD_BIN="$BIN/chmod" \
     RG_CHOWN_BIN=/usr/sbin/chown RG_MKTEMP_BIN=/usr/bin/mktemp RG_JQ_BIN="$BIN/jq" \
     RG_PROVISION_BIN="$BIN/provision" RG_SWAP_BIN="$BIN/swap" RG_PYTHON_BIN="$BIN/python" \
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
     RG_TEST_RAM_BYTES="${TEST_RAM_BYTES:-7516192768}" \
+    RG_WORKER_FENCE_POLL_DELAY_SECONDS=0 \
     RG_TEST_MUTATE="${TEST_MUTATE:-none}" \
     bash "$SCRIPT" "$@" 2>&1)
   RC=$?
@@ -678,14 +778,22 @@ reset_preflight_state() {
   printf '%s\n' 200 > "$STATE/juristrack-code"
   printf '%s\n' 200 > "$STATE/estrado-code"
   printf '%s\n' 0 > "$STATE/claim-count"
-  printf '%s\n' fresh > "$STATE/heartbeat"
-  rm -f "$STATE/id-fail" "$STATE/ps-fail" "$STATE/claim-after-first"
+  : > "$STATE/claim-sequence"
+  printf '%s\n' safe > "$STATE/heartbeat-pre"
+  printf '%s\n' safe-new > "$STATE/heartbeat-post"
+  rm -f "$STATE/heartbeat-calls" "$STATE/id-fail" "$STATE/ps-fail" \
+    "$STATE/claim-after-first" "$STATE/date-hour-fail-after-output" \
+    "$STATE/jq-fail-after-output"
   unset TEST_DISK_BYTES TEST_RAM_BYTES
 }
 
 configure_active_worker() {
   printf '%s\n' enabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
   printf '%s\n' active > "$STATE/unit-estrado-pjud-worker.service-active"
+  printf '%s\n' 4201 > "$STATE/unit-estrado-pjud-worker.service-main-pid"
+  printf '%s\n' /legaltech.slice/estrado-pjud-worker.service \
+    > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  printf '%s\n' estrado-pjud-worker.service > "$STATE/pid-4201-unit"
 }
 
 configure_active_legacy_monitors() {
@@ -754,16 +862,19 @@ run_activity_preservation_regressions() {
   expect_count 'changed inactive worker requires no claims query' 'curl claims' 0
 
   setup
-  printf '%s\n' enabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
-  printf '%s\n' active > "$STATE/unit-estrado-pjud-worker.service-active"
+  configure_active_worker
   TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'changed active worker apply succeeds' "$RC" 0
-  expect_exact_count 'changed active worker restarts once' \
-    'systemctl restart estrado-pjud-worker.service' 1
-  expect_count 'changed active worker keeps preflight and immediate heartbeat gates' \
+  expect_exact_count 'changed active worker stops once' \
+    'systemctl stop estrado-pjud-worker.service' 1
+  expect_exact_count 'changed active worker starts once' \
+    'systemctl start estrado-pjud-worker.service' 1
+  expect_count 'changed active worker checks pre-stop and post-start heartbeat' \
     'curl heartbeat' 2
-  expect_count 'changed active worker keeps preflight and immediate claims gates' \
-    'curl claims' 2
+  expect_count 'changed active worker checks pre-stop, post-stop, and post-start claims' \
+    'curl claims' 3
+  expect_count 'changed active worker is never restarted' \
+    'systemctl restart estrado-pjud-worker.service' 0
 
   setup
   printf '%s\n' inactive > "$STATE/unit-estrado-pjud.service-active"
@@ -931,6 +1042,191 @@ run_api_enablement_regressions() {
   expect_count 'wrong enablement status blocks before provision' provision 0
 }
 
+write_safe_worker_env() {
+  printf 'SUPABASE_URL=https://db.invalid\nSUPABASE_SERVICE_KEY=%s\nWORKER_ID=worker-1\nPJUD_PROCESS_OUTSIDE_OFFICE_HOURS=false\nOJV_PROXY_URL=https://proxy.invalid\n' \
+    "$SECRET_SENTINEL" > "$FAKE/repo/estrado-pjud-service/.env"
+  chmod 640 "$FAKE/repo/estrado-pjud-service/.env"
+}
+
+configure_worker_precondition_scenario() {
+  local scenario=$1 env_file="$FAKE/repo/estrado-pjud-service/.env"
+  case "$scenario" in
+    before-window) printf '%s\n' 19 > "$STATE/local-hour" ;;
+    after-window) printf '%s\n' 04 > "$STATE/local-hour" ;;
+    hour-missing) : > "$STATE/local-hour" ;;
+    hour-multiline) printf '20\n21\n' > "$STATE/local-hour" ;;
+    hour-nondecimal) printf '%s\n' xx > "$STATE/local-hour" ;;
+    hour-producer-fail) : > "$STATE/date-hour-fail-after-output" ;;
+    worker-missing) /usr/bin/sed '/^WORKER_ID=/d' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    worker-duplicate) printf '%s\n' 'WORKER_ID=worker-2' >> "$env_file" ;;
+    worker-empty) /usr/bin/sed 's/^WORKER_ID=.*/WORKER_ID=/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    worker-invalid) /usr/bin/sed 's/^WORKER_ID=.*/WORKER_ID=worker secret/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    override-missing) /usr/bin/sed '/^PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=/d' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    override-duplicate) printf '%s\n' 'PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=false' >> "$env_file" ;;
+    override-true) /usr/bin/sed 's/^PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=.*/PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=true/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    override-malformed) /usr/bin/sed 's/^PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=.*/PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=FALSE/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    validation-once-true) printf '%s\n' 'PJUD_OFF_HOURS_VALIDATION_ONCE=true' >> "$env_file" ;;
+    validation-once-duplicate) printf '%s\n' 'PJUD_OFF_HOURS_VALIDATION_ONCE=false' 'PJUD_OFF_HOURS_VALIDATION_ONCE=false' >> "$env_file" ;;
+    validation-once-malformed) printf '%s\n' 'PJUD_OFF_HOURS_VALIDATION_ONCE=FALSE' >> "$env_file" ;;
+    heartbeat-wrong-worker) printf '%s\n' wrong-worker > "$STATE/heartbeat-pre" ;;
+    heartbeat-zero) printf '%s\n' zero-rows > "$STATE/heartbeat-pre" ;;
+    heartbeat-multiple) printf '%s\n' multiple > "$STATE/heartbeat-pre" ;;
+    heartbeat-stale) printf '%s\n' stale > "$STATE/heartbeat-pre" ;;
+    heartbeat-future) printf '%s\n' future > "$STATE/heartbeat-pre" ;;
+    heartbeat-running) printf '%s\n' running > "$STATE/heartbeat-pre" ;;
+    heartbeat-stopped) printf '%s\n' stopped > "$STATE/heartbeat-pre" ;;
+    heartbeat-paused) printf '%s\n' paused > "$STATE/heartbeat-pre" ;;
+    heartbeat-unknown) printf '%s\n' unknown > "$STATE/heartbeat-pre" ;;
+    metadata-missing) printf '%s\n' missing-metadata > "$STATE/heartbeat-pre" ;;
+    metadata-malformed) printf '%s\n' malformed-metadata > "$STATE/heartbeat-pre" ;;
+    metadata-override) printf '%s\n' override-true > "$STATE/heartbeat-pre" ;;
+    proxy-paused) printf '%s\n' proxy-paused > "$STATE/heartbeat-pre" ;;
+    proxy-unavailable) printf '%s\n' proxy-unavailable > "$STATE/heartbeat-pre" ;;
+    proxy-telemetry) printf '%s\n' telemetry-unavailable > "$STATE/heartbeat-pre" ;;
+    heartbeat-producer-fail) printf '%s\n' output-then-fail > "$STATE/heartbeat-pre" ;;
+    jq-producer-fail) : > "$STATE/jq-fail-after-output" ;;
+    claims-producer-fail) printf '%s\n' output-then-fail > "$STATE/claim-count" ;;
+    claims-active) printf '%s\n' 1 > "$STATE/claim-count" ;;
+    *) return 1 ;;
+  esac
+}
+
+run_worker_fence_regressions() {
+  local scenario rollback_count backup_path
+  local -a unsafe_scenarios=(
+    before-window after-window hour-missing hour-multiline hour-nondecimal hour-producer-fail
+    worker-missing worker-duplicate worker-empty worker-invalid
+    override-missing override-duplicate override-true override-malformed
+    validation-once-true validation-once-duplicate validation-once-malformed
+    heartbeat-wrong-worker heartbeat-zero heartbeat-multiple heartbeat-stale heartbeat-future
+    heartbeat-running heartbeat-stopped heartbeat-paused heartbeat-unknown
+    metadata-missing metadata-malformed metadata-override
+    proxy-paused proxy-unavailable proxy-telemetry heartbeat-producer-fail jq-producer-fail
+    claims-producer-fail claims-active
+  )
+
+  echo '== changed active worker refuses every unsafe fence precondition before stop or provision'
+  for scenario in "${unsafe_scenarios[@]}"; do
+    setup
+    configure_active_worker
+    configure_worker_precondition_scenario "$scenario"
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario refuses changed-active apply" "$RC" 1
+    expect_exact_count "$scenario performs no worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$scenario performs no provision" provision 0
+    expect_missing "$scenario diagnostic hides service credential" "$OUT" "$SECRET_SENTINEL"
+    expect_missing "$scenario diagnostic hides proxy URL" "$OUT" 'proxy.invalid'
+    expect_missing "$scenario diagnostic hides heartbeat body" "$OUT" 'last_heartbeat_at'
+    expect_missing "$scenario diagnostic hides proxy reason detail" "$OUT" 'telemetry_unavailable'
+  done
+
+  echo '== pre-stop heartbeat permits historical mint attempts but post-start requires zero'
+  setup
+  configure_active_worker
+  printf '%s\n' safe-historical-mint > "$STATE/heartbeat-pre"
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'historical pre-stop mint attempts remain safe' "$RC" 0
+
+  echo '== changed active worker follows the stop-drain-start transaction exactly'
+  setup
+  configure_active_worker
+  printf '%s\n' 0 1 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'safe changed-active worker apply succeeds' "$RC" 0
+  expect_last_before 'backup completes before immutable SHA recheck' backup-copy 'git rev-parse HEAD'
+  expect_last_before 'SHA recheck precedes safe pre-stop heartbeat' 'git rev-parse HEAD' 'curl heartbeat'
+  expect_before 'pre-stop heartbeat precedes zero-claim check' 'curl heartbeat' 'curl claims'
+  expect_before 'pre-stop zero claims precede worker stop' 'curl claims' 'systemctl stop estrado-pjud-worker.service'
+  expect_last_before 'worker stop precedes inactive verification' 'systemctl stop estrado-pjud-worker.service' 'systemctl is-active estrado-pjud-worker.service'
+  expect_before 'worker stop precedes bounded post-stop drain' 'systemctl stop estrado-pjud-worker.service' 'sleep 0'
+  expect_before 'bounded drain completes before provision' 'sleep 0' provision
+  expect_before 'provision precedes daemon reload' provision 'systemctl daemon-reload'
+  expect_before 'daemon reload precedes worker start' 'systemctl daemon-reload' 'systemctl start estrado-pjud-worker.service'
+  expect_last_before 'worker start precedes post-start heartbeat' 'systemctl start estrado-pjud-worker.service' 'curl heartbeat'
+  expect_last_before 'post-start heartbeat precedes final zero claims' 'curl heartbeat' 'curl claims'
+  expect_last_before 'final zero claims precede postflight' 'curl claims' 'systemctl show legaltech.slice'
+  expect_exact_count 'worker is stopped exactly once' 'systemctl stop estrado-pjud-worker.service' 1
+  expect_exact_count 'replacement worker is started exactly once' 'systemctl start estrado-pjud-worker.service' 1
+  expect_count 'worker is never restarted' 'systemctl restart estrado-pjud-worker.service' 0
+  expect_contains 'heartbeat query filters exact encoded worker identity' "$(cat "$EVENTS")" \
+    'sync_worker_heartbeats?worker_id=eq.worker-1&select=status,last_heartbeat_at,metadata'
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  expect_eq 'durable worker-stop marker is recorded exactly once' \
+    "$(grep -cxF worker-stop "$backup_path/changes" 2>/dev/null || true)" 1
+
+  echo '== inactive and unchanged workers execute no fence operations'
+  setup
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'changed inactive worker apply succeeds' "$RC" 0
+  expect_count 'changed inactive worker performs no protected heartbeat query' 'curl heartbeat' 0
+  expect_count 'changed inactive worker performs no protected claims query' 'curl claims' 0
+  expect_count 'changed inactive worker performs no worker stop' 'stop estrado-pjud-worker.service' 0
+  expect_count 'changed inactive worker performs no worker start' 'start estrado-pjud-worker.service' 0
+
+  setup
+  configure_active_worker
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'unchanged active worker apply succeeds' "$RC" 0
+  expect_count 'unchanged active worker performs no protected heartbeat query' 'curl heartbeat' 0
+  expect_count 'unchanged active worker performs no protected claims query' 'curl claims' 0
+  expect_count 'unchanged active worker performs no worker stop' 'stop estrado-pjud-worker.service' 0
+  expect_count 'unchanged active worker performs no worker start' 'start estrado-pjud-worker.service' 0
+
+  echo '== persistent post-stop claims roll back once and restore only with start'
+  setup
+  configure_active_worker
+  printf '%s\n' 0 1 1 1 1 1 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'persistent drain timeout fails apply' "$RC" 1
+  expect_count 'persistent drain timeout never provisions' provision 0
+  expect_eq 'persistent drain timeout invokes exactly one rollback' \
+    "$(printf '%s\n' "$OUT" | grep -cF 'ROLLBACK OK' || true)" 1
+  expect_exact_count 'rollback starts restored worker exactly once' \
+    'systemctl start estrado-pjud-worker.service' 1
+  expect_count 'rollback never restarts worker' 'systemctl restart estrado-pjud-worker.service' 0
+
+  echo '== worker fence failures each trigger one rollback and no paid action'
+  for scenario in stop-failure inactive-mismatch residual-runtime start-failure wrong-cgroup missing-new-heartbeat mint-attempt new-claim; do
+    setup
+    configure_active_worker
+    printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+    case "$scenario" in
+      stop-failure)
+        printf '%s\n' 'stop estrado-pjud-worker.service' > "$STATE/fail-command"
+        : > "$STATE/fail-command-once"
+        ;;
+      inactive-mismatch) : > "$STATE/worker-stop-keeps-active" ;;
+      residual-runtime) : > "$STATE/worker-residual-runtime" ;;
+      start-failure)
+        printf '%s\n' 'start estrado-pjud-worker.service' > "$STATE/fail-command"
+        : > "$STATE/fail-command-once"
+        ;;
+      wrong-cgroup) : > "$STATE/worker-wrong-start-cgroup" ;;
+      missing-new-heartbeat) printf '%s\n' safe > "$STATE/heartbeat-post" ;;
+      mint-attempt) printf '%s\n' mint-nonzero > "$STATE/heartbeat-post" ;;
+      new-claim) printf '%s\n' 0 0 1 > "$STATE/claim-sequence" ;;
+    esac
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario fails changed-active apply" "$RC" 1
+    rollback_count=$(printf '%s\n' "$OUT" | grep -Ec 'ROLLBACK (OK|INCOMPLETO)' || true)
+    expect_eq "$scenario triggers exactly one rollback result" "$rollback_count" 1
+    expect_count "$scenario rollback never restarts worker" 'systemctl restart estrado-pjud-worker.service' 0
+    for forbidden in '/api/v1/sync' '/proxy' '/session/mint' '/retry'; do
+      expect_missing "$scenario emits no $forbidden action" "$(cat "$EVENTS")" "$forbidden"
+    done
+  done
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-fence ]; then
+  run_worker_fence_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = api-enablement ]; then
   run_api_enablement_regressions
   echo
@@ -976,6 +1272,7 @@ run_activity_preservation_regressions
 run_absent_timer_regressions
 run_swappiness_namespace_regressions
 run_api_enablement_regressions
+run_worker_fence_regressions
 
 echo '== explicit test guard rejects a partial override set'
 setup
@@ -992,23 +1289,19 @@ set -e
 expect_eq 'ambient provision path override is rejected' "$RC" 2
 expect_count 'ambient provision override executes no host command' 'systemctl ' 0
 
-echo '== preflight accepts only a fully known safe state'
+echo '== preflight remains host-local and leaves unchanged worker telemetry untouched'
 setup
 configure_active_worker
 run_guard preflight --expected-sha "$EXPECTED_SHA"
 expect_eq 'safe preflight exits zero' "$RC" 0
-expect_count 'preflight checks one heartbeat' 'curl heartbeat' 1
-expect_count 'preflight checks one exact claim count' 'curl claims' 1
+expect_count 'preflight performs no heartbeat query' 'curl heartbeat' 0
+expect_count 'preflight performs no claims query' 'curl claims' 0
 expect_contains 'preflight disk target is injected inside the fake root' "$(cat "$EVENTS")" "df -Pk $FAKE"
-expect_contains 'claim adapter uses exact count-only filter and 14400-second UTC cutoff' "$(cat "$EVENTS")" \
-  'curl claims method=HEAD https://db.invalid/rest/v1/cases?select=id&sync_worker_id=not.is.null&sync_claimed_at=gte.2024-03-09T12:00:00Z prefer=1 range=1'
-expect_contains 'heartbeat adapter requests one operational row only' "$(cat "$EVENTS")" \
-  'curl heartbeat https://db.invalid/rest/v1/sync_worker_heartbeats?select=status,last_heartbeat_at&order=last_heartbeat_at.desc&limit=1'
 expect_missing 'service credential never appears in curl argv' "$(cat "$EVENTS")" 'credential leaked in argv'
 expect_missing 'preflight does not expose service credential' "$OUT$(cat "$EVENTS")" "$SECRET_SENTINEL"
 printf '%s\n' zero-star > "$STATE/claim-count"
 run_guard preflight --expected-sha "$EXPECTED_SHA"
-expect_eq 'exact wildcard zero Content-Range form is accepted' "$RC" 0
+expect_eq 'irrelevant claim fixture does not affect host-local preflight' "$RC" 0
 
 echo '== systemd inventory accepts real three-column output and rejects ambiguity'
 setup
@@ -1052,14 +1345,18 @@ echo '== protected service configuration is parsed as data and fails closed'
 setup
 configure_active_worker
 printf '%s\n' 'SUPABASE_SERVICE_KEY=second-placeholder' >> "$FAKE/repo/estrado-pjud-service/.env"
-run_guard preflight --expected-sha "$EXPECTED_SHA"
-expect_eq 'duplicate required credential refuses preflight' "$RC" 1
+TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'duplicate required credential refuses changed-worker apply' "$RC" 1
+expect_count 'duplicate required credential performs no worker stop' 'stop estrado-pjud-worker.service' 0
+expect_count 'duplicate required credential performs no provision' provision 0
 expect_missing 'duplicate credential values are never diagnosed' "$OUT" 'second-placeholder'
 setup
 configure_active_worker
 chmod 644 "$FAKE/repo/estrado-pjud-service/.env"
-run_guard preflight --expected-sha "$EXPECTED_SHA"
-expect_eq 'world-readable service configuration refuses preflight' "$RC" 1
+TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+expect_eq 'world-readable service configuration refuses changed-worker apply' "$RC" 1
+expect_count 'world-readable configuration performs no worker stop' 'stop estrado-pjud-worker.service' 0
+expect_count 'world-readable configuration performs no provision' provision 0
 
 run_negative_preflight() {
   local scenario=$1 provision_count backup_count
@@ -1073,12 +1370,6 @@ run_negative_preflight() {
     uid) : > "$STATE/id-fail" ;;
     juris) echo 503 > "$STATE/juristrack-code" ;;
     estrado) echo 503 > "$STATE/estrado-code" ;;
-    stale) echo stale > "$STATE/heartbeat" ;;
-    missing|malformed|wildcard|httpfail) echo "$scenario" > "$STATE/claim-count" ;;
-    nonzero) echo 1 > "$STATE/claim-count" ;;
-  esac
-  case "$scenario" in
-    stale|missing|malformed|wildcard|nonzero|httpfail) configure_active_worker ;;
   esac
   run_guard apply --expected-sha "$EXPECTED_SHA"
   provision_count=$(grep -c -F provision "$EVENTS" 2>/dev/null || true)
@@ -1086,7 +1377,7 @@ run_negative_preflight() {
   printf '%s|%s|%s|%s\n' "$scenario" "$RC" "$provision_count" "$backup_count"
 }
 
-negative_scenarios=(dirty sha disk ram uid juris estrado stale missing malformed wildcard nonzero httpfail)
+negative_scenarios=(dirty sha disk ram uid juris estrado)
 negative_pids=()
 for scenario in "${negative_scenarios[@]}"; do
   run_negative_preflight "$scenario" > "$TMP/negative-$scenario" &
@@ -1120,11 +1411,14 @@ expect_before 'backup precedes provision' backup-copy provision
 expect_before 'provision precedes swap apply' provision 'swap apply'
 expect_last_before 'swap apply precedes final verify' 'swap apply' 'swap verify'
 expect_before 'daemon reload precedes API restart' 'systemctl daemon-reload' 'systemctl restart estrado-pjud.service'
-expect_second_before 'immediate second count precedes worker restart' 'curl claims' 'systemctl restart estrado-pjud-worker.service'
-expect_count 'heartbeat gate is repeated for worker restart' 'curl heartbeat' 2
-expect_count 'claim gate is repeated for worker restart' 'curl claims' 2
+expect_before 'worker stop precedes provision' 'systemctl stop estrado-pjud-worker.service' provision
+expect_last_before 'daemon reload precedes worker start' 'systemctl daemon-reload' 'systemctl start estrado-pjud-worker.service'
+expect_count 'worker fence checks pre-stop and post-start heartbeat' 'curl heartbeat' 2
+expect_count 'worker fence checks pre-stop, post-stop, and post-start claims' 'curl claims' 3
 expect_count 'API restarted once when changed' 'systemctl restart estrado-pjud.service' 1
-expect_count 'worker restarted once when changed and idle' 'systemctl restart estrado-pjud-worker.service' 1
+expect_exact_count 'worker stopped once when changed and idle' 'systemctl stop estrado-pjud-worker.service' 1
+expect_exact_count 'worker started once when changed and idle' 'systemctl start estrado-pjud-worker.service' 1
+expect_count 'worker never restarts during fenced apply' 'systemctl restart estrado-pjud-worker.service' 0
 expect_exact_count 'active Hermes gateway restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-gateway.service' 1
 expect_exact_count 'active Hermes dashboard restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
 expect_before 'timers start before tracker invocation' 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer' 'python '
@@ -1254,9 +1548,11 @@ setup
 configure_active_worker
 TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'drop-in-only apply succeeds' "$RC" 0
-expect_count 'drop-in-only change restarts worker' 'systemctl restart estrado-pjud-worker.service' 1
-expect_count 'drop-in-only change repeats heartbeat gate' 'curl heartbeat' 2
-expect_count 'drop-in-only change repeats exact claim gate' 'curl claims' 2
+expect_exact_count 'drop-in-only change stops worker once' 'systemctl stop estrado-pjud-worker.service' 1
+expect_exact_count 'drop-in-only change starts worker once' 'systemctl start estrado-pjud-worker.service' 1
+expect_count 'drop-in-only change checks heartbeat before and after start' 'curl heartbeat' 2
+expect_count 'drop-in-only change checks claims across all three fence phases' 'curl claims' 3
+expect_count 'drop-in-only change never restarts worker' 'systemctl restart estrado-pjud-worker.service' 0
 
 echo '== partial provision failure records affected units for rollback restart'
 setup
