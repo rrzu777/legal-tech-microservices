@@ -103,7 +103,9 @@ done
 is_uint "$root_uid" && is_uint "$root_gid" || usage
 
 fstab_state=invalid
+fstab_mode=''
 backup_state=invalid
+backup_mode=''
 active_target_count=0
 active_target_used_bytes=0
 swap_file_exists=0
@@ -132,9 +134,17 @@ trap cleanup_temp EXIT
 inspect_fstab() {
   [ -f "$fstab_file" ] && [ ! -L "$fstab_file" ] || return 1
 
-  local line first _rest
+  local metadata kind mode size links uid gid extra line first _rest
   local stage=0 blocks=0
   local expected_entry="$swap_file none swap sw 0 0"
+  fstab_mode=''
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$fstab_file") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && is_uint "$size" && [ "$links" = 1 ] && \
+    [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && [ -z "$extra" ] || return 1
+  case "$mode" in 600|640|644) ;; *) return 1 ;; esac
+  fstab_mode=$mode
   while IFS= read -r line || [ -n "$line" ]; do
     if [ "$stage" -eq 1 ]; then
       [ "$line" = "$expected_entry" ] || return 1
@@ -227,7 +237,13 @@ inspect_sysctl_file() {
   fi
   [ -f "$sysctl_file" ] && [ ! -L "$sysctl_file" ] || return 1
 
-  local content=''
+  local metadata kind mode size links uid gid extra content=''
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$sysctl_file") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && [ "$mode" = 600 ] && is_uint "$size" && \
+    [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && \
+    [ -z "$extra" ] || return 1
   if IFS= read -r -d '' content < "$sysctl_file"; then
     :
   else
@@ -314,17 +330,16 @@ read_text_file() {
 }
 
 validate_backup_metadata() {
-  local path="$1" metadata kind mode size links extra
-  metadata=$("$stat_bin" -c '%F|%a|%s|%h' "$path") || return 1
-  kind=''; mode=''; size=''; links=''; extra=''
-  IFS='|' read -r kind mode size links extra <<< "$metadata" || return 1
+  local path="$1" metadata kind mode size links uid gid extra
+  backup_mode=''
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$path") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
   [ "$kind" = 'regular file' ] && is_uint "$size" && \
-    [ "$links" = 1 ] && [ -z "$extra" ] || return 1
-  case "$mode" in
-    [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
-    *) return 1 ;;
-  esac
-  [ $((8#$mode & 8#0133)) -eq 0 ]
+    [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && \
+    [ -z "$extra" ] || return 1
+  case "$mode" in 600|640|644) ;; *) return 1 ;; esac
+  backup_mode=$mode
 }
 
 text_files_equal() {
@@ -360,6 +375,7 @@ inspect_fstab_backup() {
   [ "$fstab_state" = managed ] || return 1
   [ -f "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
   validate_backup_metadata "$backup_path" || return 1
+  [ "$backup_mode" = "$fstab_mode" ] || return 1
   backup_reconstructs_managed_fstab "$backup_path" || return 1
   backup_state=managed
 }
@@ -510,7 +526,10 @@ replace_fstab_with_managed_block() {
 
 replace_fstab_without_managed_block() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
+  inspect_fstab || return 1
+  [ "$fstab_state" = managed ] || return 1
   validate_backup_metadata "$backup_path" || return 1
+  [ "$backup_mode" = "$fstab_mode" ] || return 1
   backup_reconstructs_managed_fstab "$backup_path" || return 1
   "$mv_bin" "$backup_path" "$fstab_file" || return 1
   [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] || return 1

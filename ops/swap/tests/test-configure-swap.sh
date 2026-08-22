@@ -77,6 +77,8 @@ setup() {
   unset SWAPON_FAIL_STATE SWAPOFF_KEEP_ACTIVE SYSCTL_FAIL FREE_FAIL
   unset SYSCTL_RESTORE_FAIL SYSCTL_VERIFY_FAIL FREE_MALFORMED FREE_FAIL_AFTER_OUTPUT
   unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL RM_FAIL_PATH
+  unset STAT_OVERRIDE_PATH STAT_OVERRIDE_MODE STAT_OVERRIDE_LINKS
+  unset STAT_OVERRIDE_UID STAT_OVERRIDE_GID
 
   write_stub df '
 printf "df %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -191,6 +193,14 @@ metadata=$("$SWAP_TEST_PYTHON" -c '\''import os,stat,sys
 s=os.lstat(sys.argv[1])
 kind="regular file" if stat.S_ISREG(s.st_mode) else ("symbolic link" if stat.S_ISLNK(s.st_mode) else "other")
 print(f"{kind}|{stat.S_IMODE(s.st_mode):o}|{s.st_size}|{s.st_nlink}|{s.st_uid}|{s.st_gid}")'\'' "$path") || exit 8
+IFS="|" read -r kind mode size links uid gid <<< "$metadata" || exit 8
+if [ -n "${SWAP_TEST_STAT_OVERRIDE_PATH:-}" ] && [ "$path" = "$SWAP_TEST_STAT_OVERRIDE_PATH" ]; then
+  mode=${SWAP_TEST_STAT_OVERRIDE_MODE:-$mode}
+  links=${SWAP_TEST_STAT_OVERRIDE_LINKS:-$links}
+  uid=${SWAP_TEST_STAT_OVERRIDE_UID:-$uid}
+  gid=${SWAP_TEST_STAT_OVERRIDE_GID:-$gid}
+  metadata="$kind|$mode|$size|$links|$uid|$gid"
+fi
 case "$*" in
   *%u*) printf "%s\n" "$metadata" ;;
   *%h*) printf "%s\n" "${metadata%|*|*}" ;;
@@ -236,6 +246,11 @@ run_swap() {
     SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" \
     SWAP_TEST_MV_FAIL_ON_CALL="${MV_FAIL_ON_CALL:-0}" \
     SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
+    SWAP_TEST_STAT_OVERRIDE_PATH="${STAT_OVERRIDE_PATH:-}" \
+    SWAP_TEST_STAT_OVERRIDE_MODE="${STAT_OVERRIDE_MODE:-}" \
+    SWAP_TEST_STAT_OVERRIDE_LINKS="${STAT_OVERRIDE_LINKS:-}" \
+    SWAP_TEST_STAT_OVERRIDE_UID="${STAT_OVERRIDE_UID:-}" \
+    SWAP_TEST_STAT_OVERRIDE_GID="${STAT_OVERRIDE_GID:-}" \
     SWAP_TEST_RM_FAIL="${RM_FAIL:-0}" \
     SWAP_TEST_RM_FAIL_PATH="${RM_FAIL_PATH:-}" \
     bash "$SWAP_SCRIPT" "$@" 2>&1)
@@ -259,6 +274,11 @@ managed_fstab() {
   append_managed_block
   printf '%s\n' 10 > "$SWAPPINESS_METADATA_FILE"
   /bin/chmod 600 "$SWAPPINESS_METADATA_FILE"
+}
+
+write_managed_sysctl() {
+  printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+  /bin/chmod 600 "$SYSCTL_FILE"
 }
 
 make_valid_file() {
@@ -405,6 +425,70 @@ run_rollback_retry_regressions() {
   run_swap rollback
   expect_eq 'fstab-restored with unexpected exact swap entry is unknown' "$RC" 1
   expect_eq 'unexpected fstab entry partial state is untouched' "$(mutation_count)" "$before_mutations"
+
+  echo '== rollback validates exact ownership links and modes before deactivation'
+
+  prepare_retryable_managed_state corrupt-backup-owner
+  STAT_OVERRIDE_PATH="$FSTAB_FILE.legaltech-swap.bak"
+  STAT_OVERRIDE_UID=$(( $(/usr/bin/id -u) + 1 ))
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'backup with non-root owner is unknown' "$RC" 1
+  expect_eq 'unsafe backup owner blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-backup-mode
+  STAT_OVERRIDE_PATH="$FSTAB_FILE.legaltech-swap.bak"
+  STAT_OVERRIDE_MODE=600
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'backup mode differing from managed fstab is unknown' "$RC" 1
+  expect_eq 'backup mode mismatch blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-backup-hardlink
+  /bin/ln "$FSTAB_FILE.legaltech-swap.bak" "$ROOT/shared-fstab-backup"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'hardlinked fstab backup is unknown before deactivation' "$RC" 1
+  expect_eq 'hardlinked backup blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-fstab-owner
+  STAT_OVERRIDE_PATH=$FSTAB_FILE
+  STAT_OVERRIDE_UID=$(( $(/usr/bin/id -u) + 1 ))
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed fstab with non-root owner is unknown' "$RC" 1
+  expect_eq 'unsafe fstab owner blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-fstab-mode
+  STAT_OVERRIDE_PATH=$FSTAB_FILE
+  STAT_OVERRIDE_MODE=600
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed fstab mode differing from backup is unknown' "$RC" 1
+  expect_eq 'fstab mode mismatch blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-sysctl-hardlink
+  /bin/ln "$SYSCTL_FILE" "$ROOT/shared-sysctl"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'hardlinked managed sysctl is unknown' "$RC" 1
+  expect_eq 'hardlinked sysctl blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-sysctl-owner
+  STAT_OVERRIDE_PATH=$SYSCTL_FILE
+  STAT_OVERRIDE_GID=$(( $(/usr/bin/id -g) + 1 ))
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed sysctl with non-root group is unknown' "$RC" 1
+  expect_eq 'unsafe sysctl ownership blocks all mutations' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-sysctl-mode
+  STAT_OVERRIDE_PATH=$SYSCTL_FILE
+  STAT_OVERRIDE_MODE=644
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed sysctl with noncanonical mode is unknown' "$RC" 1
+  expect_eq 'unsafe sysctl mode blocks all mutations' "$(mutation_count)" "$before_mutations"
 }
 
 if [ "${SWAP_FOCUS:-}" = rollback-retry ]; then
@@ -729,7 +813,7 @@ expect_eq "falla sin marker fstab" "$RC" "1"
 setup malformed-proc
 make_valid_file
 managed_fstab
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf 'garbage header\n%s file 4194300 0 -2\n' "$SWAP_FILE" > "$PROC_SWAPS_FILE"
 run_swap verify
 expect_eq "falla con header proc swaps malformado" "$RC" "1"
@@ -738,7 +822,7 @@ setup non-exact-marker
 make_valid_file
 save_fstab_backup
 printf 'UUID=root / ext4 defaults 0 1\n# BEGIN LEGALTECH MANAGED SWAP\n\n%s none swap sw 0 0\n# END LEGALTECH MANAGED SWAP\n' "$SWAP_FILE" > "$FSTAB_FILE"
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 run_swap verify
 expect_eq "falla con contenido extra dentro del marker" "$RC" "1"
@@ -770,7 +854,7 @@ managed_fstab
 make_valid_file
 /bin/chmod 644 "$SWAP_FILE"
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 run_swap apply
 expect_eq "rechaza modo incorrecto" "$RC" "1"
 expect_eq "no corrige ambiguo en silencio" "$(count_log 'chmod ')" "0"
@@ -779,7 +863,7 @@ setup wrong-type
 managed_fstab
 mkdir "$SWAP_FILE"
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 run_swap apply
 expect_eq "rechaza tipo incorrecto" "$RC" "1"
 expect_eq "no borra tipo incorrecto" "$(count_log 'rm ')" "0"
@@ -813,7 +897,7 @@ setup arbitrary-managed-backup
 printf 'arbitrary regular backup\n' > "$FSTAB_FILE.legaltech-swap.bak"
 append_managed_block
 make_valid_file
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 run_swap apply
 expect_eq "managed rechaza backup cuyo contenido no restaura fstab" "$RC" "1"
@@ -832,7 +916,7 @@ setup hardlink-managed-backup
 ln "$ROOT/shared-backup" "$FSTAB_FILE.legaltech-swap.bak"
 append_managed_block
 make_valid_file
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 run_swap verify
 expect_eq "managed rechaza backup con link count mayor a uno" "$RC" "1"
@@ -842,7 +926,7 @@ save_fstab_backup
 /bin/chmod 666 "$FSTAB_FILE.legaltech-swap.bak"
 append_managed_block
 make_valid_file
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 run_swap verify
 expect_eq "managed rechaza backup escribible por grupo u otros" "$RC" "1"
@@ -852,7 +936,7 @@ save_fstab_backup
 /bin/chmod 755 "$FSTAB_FILE.legaltech-swap.bak"
 append_managed_block
 make_valid_file
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 run_swap verify
 expect_eq "managed rechaza backup ejecutable" "$RC" "1"
@@ -872,7 +956,7 @@ for variant in "${NONCANONICAL_VARIANTS[@]}"; do
   printf '# BEGIN LEGALTECH MANAGED SWAP\n%s\n# END LEGALTECH MANAGED SWAP\n' \
     "$bad_entry" >> "$FSTAB_FILE"
   make_valid_file
-  printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+  write_managed_sysctl
   printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
   /bin/cp "$FSTAB_FILE" "$TMP/noncanonical-$case_number.fstab"
   /bin/cp "$FSTAB_FILE.legaltech-swap.bak" "$TMP/noncanonical-$case_number.backup"
@@ -1037,7 +1121,7 @@ echo "== rollback inseguro no toca configuración"
 setup rollback-refuse
 make_valid_file
 managed_fstab
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 # Linux /proc/swaps reports Size and Used in KiB; 1048576 KiB is 1 GiB.
 printf '%s file 4194300 1048576 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 cp "$FSTAB_FILE" "$TMP/refuse.fstab"
@@ -1095,7 +1179,7 @@ echo "== rollback falla cerrado ante free malformado"
 setup rollback-malformed
 make_valid_file
 managed_fstab
-printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+write_managed_sysctl
 printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
 FREE_MALFORMED=1
 run_swap rollback
