@@ -7,7 +7,7 @@ import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal, cast
+from typing import Literal
 
 import httpx
 from postgrest.exceptions import APIError
@@ -72,16 +72,6 @@ FailureCode = Literal[
     "remote_protocol_disconnect",
     "unknown_infra",
 ]
-_FAILURE_CODES: frozenset[str] = frozenset({
-    "mint_navigation_failed",
-    "mint_deadline_exceeded",
-    "mint_browser_unavailable",
-    "session_rejected",
-    "remote_protocol_disconnect",
-    "unknown_infra",
-})
-
-
 def proxy_failure_code(error: BaseException) -> FailureCode:
     """Map lifecycle exceptions without retaining any exception text."""
     if isinstance(error, MintUnavailableError):
@@ -95,18 +85,6 @@ def proxy_failure_code(error: BaseException) -> FailureCode:
     if isinstance(error, httpx.RemoteProtocolError):
         return "remote_protocol_disconnect"
     return "unknown_infra"
-
-
-def _validate_failure_code(
-    operation: str,
-    failure_code: FailureCode | str | None,
-) -> FailureCode | None:
-    if failure_code is None:
-        return None
-    if operation not in _SESSION_OPERATIONS or failure_code not in _FAILURE_CODES:
-        raise ValueError("failure_code must be allowlisted lifecycle telemetry")
-    return cast(FailureCode, failure_code)
-
 
 def _is_transient_telemetry_api_error(exc: APIError) -> bool:
     """Only database concurrency outcomes may safely reuse the same claim."""
@@ -385,9 +363,7 @@ class ProxyUsageTracker:
         session_cycle_id: uuid.UUID | None = None,
         session_reason: SessionReason | None = None,
         session_age_seconds: int | None = None,
-        failure_code: FailureCode | None = None,
     ):
-        failure_code = _validate_failure_code(operation, failure_code)
         (
             normalized_session_cycle_id,
             normalized_session_reason,
@@ -472,7 +448,6 @@ class ProxyUsageTracker:
                         session_cycle_id=normalized_session_cycle_id,
                         session_reason=normalized_session_reason,
                         session_age_seconds=normalized_session_age_seconds,
-                        failure_code=failure_code,
                     )
                 except Exception as exc:
                     if caught is not None:
@@ -500,7 +475,6 @@ class ProxyUsageTracker:
         session_cycle_id: str | None,
         session_reason: SessionReason | None,
         session_age_seconds: int | None,
-        failure_code: FailureCode | None,
     ) -> None:
         has_provider_usage = usage.request_count > 0
         has_savings_event = usage.documents_skipped > 0
@@ -513,8 +487,6 @@ class ProxyUsageTracker:
         if error is not None:
             status = "error"
             error_kind = "billing" if is_proxy_billing_error(error) else "infra"
-            if operation in _SESSION_OPERATIONS and failure_code is None:
-                failure_code = proxy_failure_code(error)
         elif usage.status is not None:
             status = usage.status
             error_kind = usage.error_kind
@@ -524,6 +496,12 @@ class ProxyUsageTracker:
         else:
             status = "skipped"
             error_kind = None
+
+        failure_code = (
+            proxy_failure_code(error)
+            if error is not None and operation in _SESSION_OPERATIONS
+            else None
+        )
 
         event_reservation_id = reservation_id if has_provider_usage else None
         uses_estimated_floor = has_provider_usage and usage.bytes_down == 0

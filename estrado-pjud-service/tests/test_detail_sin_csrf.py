@@ -102,6 +102,8 @@ async def test_el_worker_no_re_mintea_el_slot_ni_penaliza_la_causa():
         result = await engine.sync_case(_make_case())
 
     assert result["success"] is False
-    mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+    mock_pool.release.assert_awaited_once_with(
+        mock_session, disposition="healthy",
+    )
     # Y sigue sin ser culpa de la causa: eso es lo que evita el `suspended`.
     mock_update_error.assert_not_called()

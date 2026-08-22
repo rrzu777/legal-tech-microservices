@@ -194,6 +194,37 @@ class TestWorkerMetrics:
         assert metadata["session_validations_avoided_mint"] == 3
         assert "private_slot_id" not in str(metadata)
 
+    def test_heartbeat_applies_expired_cooldown_before_another_borrow(self):
+        """Natural heartbeat sees effective recovery state without claiming work."""
+        from worker.session_pool import SessionPool, _Slot
+
+        pool = SessionPool.__new__(SessionPool)
+        pool._pool_size = 1
+        pool._slots = [_Slot(
+            index=0,
+            disposition="cooldown",
+            recovery_disposition="validate_before_reuse",
+            next_probe_at=99.0,
+            lifecycle_failures=1,
+        )]
+        pool._monotonic_now = lambda: 100.0
+        pool.mint_attempts = 0
+        pool.mint_failures = 0
+        pool.validation_successes = 0
+        pool.validation_failures = 1
+        pool.validations_avoided_mint = 0
+
+        metadata = self._make(pool=pool).heartbeat_payload("running")["metadata"]
+
+        assert metadata["slot_state_counts"] == {
+            "healthy": 0,
+            "validate_before_reuse": 1,
+            "replace_before_reuse": 0,
+            "cooldown": 0,
+        }
+        assert pool._slots[0].recovery_disposition is None
+        assert pool._slots[0].lifecycle_failures == 1
+
     def test_heartbeat_declara_descarga_inline_deshabilitada(self):
         metadata = self._make(pool=self._fake_pool()).heartbeat_payload("running")["metadata"]
 

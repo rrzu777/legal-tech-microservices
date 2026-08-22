@@ -329,6 +329,17 @@ class TestSyncEngine:
         assert payload["error_code"] == "remote_protocol_disconnect"
         assert "internal.example" not in repr(payload)
 
+    def test_sync_run_taxonomy_does_not_classify_arbitrary_substrings(self):
+        """Untrusted text cannot impersonate a closed lifecycle code."""
+        from worker.engine import _sync_run_error_code
+
+        assert _sync_run_error_code(
+            RuntimeError(
+                "customer credential timeout RemoteProtocolError was not found"
+            ),
+            failure_kind="case",
+        ) == "unknown_case_error"
+
     @pytest.mark.asyncio
     async def test_sync_run_persistence_failure_stops_before_proxy_traffic(self):
         """A missing durable run must never fall through to a shared None key."""
@@ -402,7 +413,9 @@ class TestSyncEngine:
             "p_latest_movement_date": "2024-07-01",
         })
         mock_pool.acquire.assert_called_once()
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="healthy",
+        )
         mock_backoff.record_success.assert_called_once()
 
     @pytest.mark.asyncio
@@ -476,8 +489,10 @@ class TestSyncEngine:
 
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
-        # Per-slot reactive re-mint on block: release(healthy=False).
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        # Per-slot reactive re-mint on block.
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
         # Anti-apagón: a block must never penalize the case via _update_case_error
         # nor increment consecutive_sync_failures.
         mock_update_error.assert_not_called()
@@ -565,8 +580,10 @@ class TestSyncEngine:
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
         mock_metrics.record_error.assert_called_once()
-        # Per-slot reactive re-mint on block: release(healthy=False).
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        # Per-slot reactive re-mint on block.
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
         # Anti-apagón: a block must never penalize the case via _update_case_error.
         mock_update_error.assert_not_called()
         assert result.get("status") is None
@@ -616,7 +633,9 @@ class TestSyncEngine:
         mock_update_error.assert_not_called()
         assert result["status"] == "pjud_timeout"
         assert find_update_payload(mock_sb, last_sync_status="pjud_timeout") is not None
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
         update_calls = mock_sb.from_.return_value.update.call_args_list
         for call in update_calls:
             payload = call[0][0] if call[0] else {}
@@ -641,7 +660,9 @@ class TestSyncEngine:
         mock_update_error.assert_not_called()
         mock_metrics.record_error.assert_called_once_with("infra")
         assert find_update_payload(mock_sb, last_sync_status="upstream_changed") is not None
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="healthy",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_transport_error_is_infra_non_penalizing(self):
@@ -665,7 +686,9 @@ class TestSyncEngine:
         mock_metrics.record_error.assert_called_once()
         mock_update_error.assert_not_called()
         assert mock_finish.await_args.kwargs["error_code"] == "infra_unavailable"
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_remote_protocol_keeps_specific_run_error_code(self):
@@ -687,7 +710,8 @@ class TestSyncEngine:
             "remote_protocol_disconnect"
         )
         mock_pool.release.assert_awaited_once_with(
-            mock_pool.acquire.return_value, healthy=False,
+            mock_pool.acquire.return_value,
+            disposition="replace_before_reuse",
         )
 
     @pytest.mark.asyncio
@@ -730,7 +754,9 @@ class TestSyncEngine:
         mock_backoff.record_blocked.assert_not_called()
         mock_update_error.assert_not_called()
         assert result["status"] == "pjud_timeout"
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_proxy_error_is_infra_non_penalizing(self):
@@ -750,7 +776,9 @@ class TestSyncEngine:
         assert result["success"] is False
         mock_backoff.record_blocked.assert_called_once()
         mock_update_error.assert_not_called()
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_proxy_402_trips_persistent_billing_breaker_without_raw_user_error(self):
@@ -774,7 +802,7 @@ class TestSyncEngine:
         mock_metrics.record_error.assert_called_with("infra")
         mock_pool.release.assert_awaited_once_with(
             mock_pool.acquire.return_value,
-            healthy=False,
+            disposition="replace_before_reuse",
             remint=False,
         )
 
@@ -810,7 +838,7 @@ class TestSyncEngine:
         assert "budget detail" not in str(blocked.await_args)
         mock_metrics.record_error.assert_called_with("infra")
         mock_pool.release.assert_awaited_once_with(
-            mock_pool.acquire.return_value, healthy=True,
+            mock_pool.acquire.return_value, disposition="healthy",
         )
         assert alert.await_args.args[2] == "proxy_budget_blocked"
         assert "case" in alert.await_args.args[3]
@@ -838,7 +866,7 @@ class TestSyncEngine:
         engine._proxy_control.refresh.assert_awaited_once()
         mock_backoff.open_permanently.assert_called_once_with("proxy_cost_control")
         mock_pool.release.assert_awaited_once_with(
-            mock_pool.acquire.return_value, healthy=True,
+            mock_pool.acquire.return_value, disposition="healthy",
         )
 
     @pytest.mark.asyncio
@@ -865,7 +893,9 @@ class TestSyncEngine:
 
         assert result["success"] is False
         mock_update_error.assert_not_called()
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="replace_before_reuse",
+        )
         # Y con la culpa donde corresponde: el 503 salió del servidor de ellos.
         assert mock_blocked.await_args[0][1] == "ojv"
         assert mock_finish.await_args.kwargs["error_code"] == "ojv_blocked"
@@ -933,7 +963,9 @@ class TestSyncEngine:
         mock_update_error.assert_called_once()
         mock_backoff.record_failure.assert_called_once()
         mock_backoff.record_blocked.assert_not_called()
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="healthy",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_prefers_fresh_search_key_over_stored(self):
@@ -1062,8 +1094,10 @@ class TestSyncEngine:
 
         assert result["success"] is False
         # Session must be released in finally block. A generic (non-block)
-        # exception is not an "IP is bad" signal, so healthy stays True.
-        mock_pool.release.assert_awaited_once_with(mock_session, healthy=True)
+        # exception is not an "IP is bad" signal, so the slot stays healthy.
+        mock_pool.release.assert_awaited_once_with(
+            mock_session, disposition="healthy",
+        )
 
     @pytest.mark.asyncio
     async def test_sync_apelaciones_uses_corte_from_external_payload(self):

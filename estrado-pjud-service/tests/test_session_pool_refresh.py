@@ -944,6 +944,81 @@ async def test_rejected_quarantine_validation_mints_once_in_same_cycle(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "validation_error",
+    [
+        httpx.RemoteProtocolError("health response disconnected"),
+        httpx.HTTPStatusError(
+            "OJV unavailable",
+            request=httpx.Request("GET", "https://ojv.invalid/health"),
+            response=httpx.Response(503),
+        ),
+    ],
+    ids=["disconnect", "http-5xx"],
+)
+async def test_inconclusive_validation_enters_cooldown_without_mint(
+    monkeypatch, validation_error,
+):
+    """An unproven rejection must preserve validation intent, not buy an IP."""
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    _patch_revalidation_candidate(monkeypatch, sp, error=validation_error)
+    pool = _reuse_pool()
+    pool._monotonic_now = lambda: 100.0
+    pool._store = _ReuseStore(_bundle(now - 60))
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        bundle_saved_at=now - 60,
+        disposition="validate_before_reuse",
+    )
+    pool._slots = [slot]
+    pool._mint_slot = AsyncMock()
+
+    with pytest.raises(type(validation_error)):
+        await pool.acquire()
+
+    pool._mint_slot.assert_not_awaited()
+    assert slot.disposition == "cooldown"
+    assert slot.recovery_disposition == "validate_before_reuse"
+    assert slot.next_probe_at > pool._monotonic_now()
+    assert slot.busy is False
+    assert pool._sem._value == 1
+
+
+def test_slot_counts_apply_expired_cooldown_without_borrow():
+    """Heartbeat must expose effective recovery state before another claim."""
+    from worker import session_pool as sp
+
+    pool = _reuse_pool()
+    pool._monotonic_now = lambda: 100.0
+    slot = sp._Slot(
+        index=0,
+        session=_ReusableSession(),
+        disposition="cooldown",
+        recovery_disposition="validate_before_reuse",
+        next_probe_at=99.0,
+        lifecycle_failures=1,
+    )
+    pool._slots = [slot]
+
+    assert pool.slot_state_counts == {
+        "healthy": 0,
+        "validate_before_reuse": 1,
+        "replace_before_reuse": 0,
+        "cooldown": 0,
+    }
+    assert slot.disposition == "validate_before_reuse"
+    assert slot.recovery_disposition is None
+    assert slot.lifecycle_failures == 1
+
+
+@pytest.mark.asyncio
 async def test_flag_off_failed_eager_replacement_enters_cooldown(monkeypatch):
     """A failed legacy refresh must not silently lend the preserved old session."""
     from worker import session_pool as sp
@@ -1113,6 +1188,31 @@ async def test_invalid_release_disposition_frees_checkout_capacity():
 
 
 @pytest.mark.asyncio
+async def test_contradictory_release_arguments_fail_and_free_capacity():
+    """Legacy boolean and disposition cannot request opposite transitions."""
+    from worker import session_pool as sp
+
+    pool = _make_pool()
+    pool._pool_size = 1
+    pool._sem = asyncio.Semaphore(0)
+    session = _ReusableSession()
+    slot = sp._Slot(index=0, session=session, busy=True)
+    pool._slots = [slot]
+    pool._checkout[session] = slot
+
+    with pytest.raises(ValueError, match="contradictory release arguments"):
+        await pool.release(
+            session,
+            healthy=True,
+            disposition="replace_before_reuse",
+        )
+
+    assert session not in pool._checkout
+    assert slot.busy is False
+    assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
 async def test_validation_cooldown_restores_validation_intent(monkeypatch):
     """Recovery intent is captured at failure time, not recomputed from flags."""
     from worker import session_pool as sp
@@ -1137,14 +1237,13 @@ async def test_validation_cooldown_restores_validation_intent(monkeypatch):
     pool._revalidate_bundle = AsyncMock(
         side_effect=httpx.RemoteProtocolError("health response lost"),
     )
-    pool._mint_slot = AsyncMock(
-        side_effect=httpx.ConnectError("replacement unavailable"),
-    )
+    pool._mint_slot = AsyncMock()
 
-    with pytest.raises(httpx.ConnectError, match="replacement unavailable"):
+    with pytest.raises(httpx.RemoteProtocolError, match="health response lost"):
         await pool.acquire()
 
     assert slot.disposition == "cooldown"
+    pool._mint_slot.assert_not_awaited()
     pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = False
     monotonic_now = slot.next_probe_at + 0.001
     pool._revalidate_bundle = AsyncMock()

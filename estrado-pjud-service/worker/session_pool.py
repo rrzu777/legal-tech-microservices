@@ -21,6 +21,7 @@ from app.failure_kind import (
     BlockedPageError,
     MintUnavailableError,
     PoolUnavailableError,
+    RejectedDetailSessionError,
     new_egress_may_help,
 )
 from app.minter import CookieMinter
@@ -56,6 +57,7 @@ RecoveryDisposition = Literal[
     "validate_before_reuse",
     "replace_before_reuse",
 ]
+ValidationOutcome = Literal["rejected", "inconclusive", "hard_stop"]
 _SLOT_DISPOSITIONS: tuple[SlotDisposition, ...] = (
     "healthy",
     "validate_before_reuse",
@@ -217,6 +219,9 @@ class SessionPool:
     @property
     def slot_state_counts(self) -> dict[SlotDisposition, int]:
         """Fixed aggregate view; never exposes a slot or session identity."""
+        now = self._monotonic_now()
+        for slot in self._slots:
+            self._apply_expired_cooldown(slot, now=now)
         return {
             disposition: sum(
                 slot.disposition == disposition for slot in self._slots
@@ -271,6 +276,14 @@ class SessionPool:
         slot.disposition = "cooldown"
         slot.recovery_disposition = recovery_disposition
         slot.next_probe_at = self._monotonic_now() + max(0.0, delay_s)
+
+    @staticmethod
+    def _apply_expired_cooldown(slot: _Slot, *, now: float) -> None:
+        if slot.disposition != "cooldown" or now < slot.next_probe_at:
+            return
+        slot.disposition = slot.recovery_disposition or "replace_before_reuse"
+        slot.recovery_disposition = None
+        slot.next_probe_at = 0.0
 
     # -- Minteo por-slot ------------------------------------------------
 
@@ -622,9 +635,10 @@ class SessionPool:
             self._retire_session(old_session, slot.index)
 
     @staticmethod
-    def _validation_failure_allows_mint(exc: BaseException) -> bool:
+    def _validation_outcome(exc: BaseException) -> ValidationOutcome:
         if (
-            is_proxy_billing_error(exc)
+            not isinstance(exc, Exception)
+            or is_proxy_billing_error(exc)
             or isinstance(
                 exc,
                 (
@@ -635,10 +649,16 @@ class SessionPool:
                 ),
             )
         ):
-            return False
+            return "hard_stop"
+        if isinstance(exc, (BlockedPageError, RejectedDetailSessionError)):
+            return "rejected"
         if isinstance(exc, httpx.HTTPStatusError):
-            return exc.response.status_code in {401, 403}
-        return new_egress_may_help(exc)
+            return (
+                "rejected"
+                if exc.response.status_code in {401, 403}
+                else "inconclusive"
+            )
+        return "inconclusive"
 
     @staticmethod
     def _replacement_mint_reason(exc: BaseException) -> SessionReason:
@@ -714,6 +734,9 @@ class SessionPool:
         cycle_id, _ = self._begin_session_cycle(
             slot, age_seconds, session_reason,
         )
+        # Any failed validation must remain quarantined until its outcome is
+        # closed. This also preserves validation provenance through cooldown.
+        slot.disposition = "validate_before_reuse"
         try:
             await self._revalidate_bundle(
                 slot,
@@ -723,7 +746,11 @@ class SessionPool:
                 session_age_seconds=age_seconds,
             )
         except BaseException as exc:
-            if not self._validation_failure_allows_mint(exc):
+            outcome = self._validation_outcome(exc)
+            if outcome == "hard_stop":
+                raise
+            if outcome == "inconclusive":
+                self._enter_cooldown(slot)
                 raise
             await self._mint_once_for_acquisition(
                 slot,
@@ -871,14 +898,9 @@ class SessionPool:
             for candidate in self._slots:
                 if candidate.busy:
                     continue
+                self._apply_expired_cooldown(candidate, now=now)
                 if candidate.disposition == "cooldown":
-                    if now < candidate.next_probe_at:
-                        continue
-                    candidate.disposition = (
-                        candidate.recovery_disposition
-                        or "replace_before_reuse"
-                    )
-                    candidate.recovery_disposition = None
+                    continue
                 slot = candidate
                 break
             if slot is None:
@@ -945,6 +967,12 @@ class SessionPool:
         if disposition is not None:
             if disposition not in _SLOT_DISPOSITIONS:
                 raise ValueError("invalid slot disposition")
+            if healthy is not None:
+                legacy_disposition: ReleaseDisposition = (
+                    "healthy" if healthy else "replace_before_reuse"
+                )
+                if disposition != legacy_disposition:
+                    raise ValueError("contradictory release arguments")
             return disposition
         return "healthy" if healthy is not False else "replace_before_reuse"
 

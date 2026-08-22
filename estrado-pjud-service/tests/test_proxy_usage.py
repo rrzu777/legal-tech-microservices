@@ -28,8 +28,8 @@ def _supabase():
 
 
 @pytest.mark.asyncio
-async def test_usage_tracker_passes_allowlisted_lifecycle_failure_code():
-    """Dropping the closed code would make a failed mint unclassifiable."""
+async def test_successful_lifecycle_event_never_has_a_failure_code():
+    """A successful mint must not be relabelled as a lifecycle failure."""
     sb = _supabase()
     tracker = ProxyUsageTracker(sb, enabled=True)
 
@@ -43,15 +43,26 @@ async def test_usage_tracker_passes_allowlisted_lifecycle_failure_code():
     ]):
         async with tracker.track(
             operation="mint",
-            transaction_key="mint-closed-failure",
-            failure_code="mint_navigation_failed",
+            transaction_key="mint-success",
         ) as usage:
             record_proxy_request(10)
-            usage.status = "error"
-            usage.error_kind = "infra"
 
     payload = sb.from_.return_value.insert.call_args.args[0]
-    assert payload["failure_code"] == "mint_navigation_failed"
+    assert payload["status"] == "success"
+    assert payload["failure_code"] is None
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_does_not_accept_public_failure_code_injection():
+    """Callers cannot attach a failure code to a successful lifecycle event."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=False)
+
+    with pytest.raises(TypeError, match="failure_code"):
+        async with tracker.track(
+            operation="mint",
+            failure_code="mint_navigation_failed",  # type: ignore[call-arg]
+        ):
+            pass
 
 
 @pytest.mark.asyncio
@@ -81,31 +92,6 @@ async def test_usage_tracker_maps_mint_exception_without_raw_detail():
     assert "deadline_exceeded" not in str({
         key: value for key, value in payload.items() if key != "failure_code"
     })
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("operation", "failure_code"),
-    [
-        ("mint", "secret-provider-error"),
-        ("search", "remote_protocol_disconnect"),
-    ],
-)
-async def test_usage_tracker_rejects_open_or_non_lifecycle_failure_code_before_reservation(
-    operation, failure_code,
-):
-    """Invalid taxonomy input must fail before any budget or provider traffic."""
-    sb = _supabase()
-    tracker = ProxyUsageTracker(sb, enabled=True)
-
-    with pytest.raises(ValueError, match="failure_code"):
-        async with tracker.track(
-            operation=operation,
-            failure_code=failure_code,
-        ):
-            pytest.fail("provider work must not start")
-
-    sb.rpc.assert_not_called()
 
 
 @pytest.mark.asyncio

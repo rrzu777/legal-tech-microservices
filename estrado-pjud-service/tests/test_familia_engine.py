@@ -106,9 +106,9 @@ async def test_login_block_does_not_penalize_and_remints(monkeypatch):
     engine._handle_blocked.assert_awaited_once_with("c1", "ojv", "F5")
     assert engine._finish_run.await_args.kwargs["error_code"] == "ojv_blocked"
     engine._update_case_error.assert_not_awaited()  # NO penaliza
-    # release con healthy=False (re-mint del slot).
+    # Release requests replacement of the slot.
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is False
+    assert kwargs.get("disposition") == "replace_before_reuse"
 
 
 @pytest.mark.asyncio
@@ -141,7 +141,7 @@ async def test_session_error_no_le_echa_la_culpa_al_portal(monkeypatch):
     # texto, no el manejo.
     engine._update_case_error.assert_not_awaited()
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is False
+    assert kwargs.get("disposition") == "replace_before_reuse"
 
 
 @pytest.mark.asyncio
@@ -206,7 +206,10 @@ async def test_proxy_402_trips_persistent_control_without_remint(monkeypatch):
     engine._metrics.record_error.assert_called_once_with("infra")
     assert engine._finish_run.await_args.args[4] == "infra_unavailable"
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs == {"healthy": False, "remint": False}
+    assert kwargs == {
+        "disposition": "replace_before_reuse",
+        "remint": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -236,7 +239,8 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
     # una causa `suspended`, asi que su propio cableado no vuelve a pasar.
     engine._report_invalid_credential.assert_awaited_once_with("cred1")
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is True  # credencial inválida NO es culpa de la IP
+    # An invalid credential is not the residential IP's fault.
+    assert kwargs.get("disposition") == "healthy"
 
 
 # NO hay un test "un bloqueo F5 NO reporta la credencial", aunque sea la

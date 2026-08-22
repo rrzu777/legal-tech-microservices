@@ -88,6 +88,22 @@ _SYNC_RUN_ERROR_CODES = frozenset({
     "credential_unavailable",
     "unknown_case_error",
 })
+_SYNC_RUN_EXACT_ERROR_TOKENS = {
+    "invalid identifier": "invalid_identifier",
+    "invalid_identity": "invalid_identifier",
+    "unsupported matter": "unsupported_matter",
+    "auth_type no soportado": "unsupported_matter",
+    "not found in ojv": "case_not_found",
+    "case not found in familia portal": "case_not_found",
+    "parse_failed": "parse_failed",
+    "no detail key available": "parse_failed",
+    "blocked by ojv": "ojv_blocked",
+    "detail blocked": "ojv_blocked",
+    "missing ojv_credential_id": "credential_unavailable",
+    "credential inactive or missing": "credential_unavailable",
+    "invalid credentials": "credential_unavailable",
+    "pool sin bundle f5": "infra_unavailable",
+}
 _LOOKUP_CANDIDATE_FIELDS = (
     "rol", "ruc", "tribunal", "caratulado", "fecha_ingreso",
     "tribunal_code", "corte", "corte_code", "libro", "libro_code",
@@ -130,27 +146,9 @@ def _sync_run_error_code(
     normalized = safe_error(error).strip().lower()
     if normalized in _SYNC_RUN_ERROR_CODES:
         return normalized
-    if normalized in {"invalid identifier", "invalid_identity"}:
-        return "invalid_identifier"
-    if (
-        normalized == "unsupported matter"
-        or "auth_type no soportado" in normalized
-    ):
-        return "unsupported_matter"
-    if "not found" in normalized or "no encontrada" in normalized:
-        return "case_not_found"
-    if normalized == "parse_failed" or normalized.startswith("parse error:"):
-        return "parse_failed"
-    if normalized == "no detail key available":
-        return "parse_failed"
-    if normalized in {"blocked by ojv", "detail blocked"}:
-        return "ojv_blocked"
-    if "remoteprotocolerror" in normalized:
-        return "remote_protocol_disconnect"
-    if "timeout" in normalized:
-        return "pjud_timeout"
-    if "credential" in normalized:
-        return "credential_unavailable"
+    exact_code = _SYNC_RUN_EXACT_ERROR_TOKENS.get(normalized)
+    if exact_code is not None:
+        return exact_code
     if failure_kind == "infra":
         return "infra_unavailable"
     if failure_kind == "ojv":
@@ -850,8 +848,7 @@ class SyncEngine:
             }
 
         session = None
-        session_healthy = True
-        release_disposition: ReleaseDisposition | None = None
+        release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
         try:
             # Legacy v1 needs the historical parsed form. Canonical v2 parses
@@ -956,7 +953,7 @@ class SyncEngine:
                     search_usage.error_kind = "ojv"
 
             if search_result["blocked"]:
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
@@ -1028,7 +1025,7 @@ class SyncEngine:
                     detail_usage.error_kind = "ojv"
 
             if detail["blocked"]:
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
@@ -1038,7 +1035,7 @@ class SyncEngine:
                 # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
                 # el external_payload bueno marcando "success". Corto-circuito
                 # sin penalizar la causa (no incrementa consecutive_sync_failures).
-                # session_healthy queda True a propósito: el contenido SÍ llegó
+                # La disposición queda healthy a propósito: el contenido SÍ llegó
                 # por esta IP (no es bloqueo ni caída de proxy), el problema es
                 # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
@@ -1138,7 +1135,7 @@ class SyncEngine:
             return {"success": True, "new_movements": new_count}
 
         except (asyncio.TimeoutError, httpx.TimeoutException) as e:
-            session_healthy = False
+            release_disposition = "replace_before_reuse"
             await self._finish_run(sync_run_id, started_at, "error", 0, "pjud_timeout")
             await self._handle_transient(case, "pjud_timeout", str(e))
             self._metrics.record_error("infra")
@@ -1149,7 +1146,6 @@ class SyncEngine:
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0, "status": "upstream_changed"}
         except (ProxyBudgetExceededError, ProxyUsagePersistenceError) as e:
-            session_healthy = True
             await self._finish_run(
                 sync_run_id, started_at, "blocked", 0, "infra_unavailable",
             )
@@ -1194,7 +1190,7 @@ class SyncEngine:
             # La app lo clasificaba bien desde la PR #55 (`pjudHttpError`); este
             # lado no, y los dos escriben sobre las mismas filas.
             if is_proxy_billing_error(e):
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 remint_on_release = False
                 await self._finish_run(
                     sync_run_id, started_at, "blocked", 0, "infra_unavailable",
@@ -1236,7 +1232,7 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
 
             # infra u ojv: transitorio. Se trata como bloqueo —re-mint del slot
-            # (session_healthy=False) SIN penalizar: sin `_update_case_error`,
+            # (`replace_before_reuse`) SIN penalizar: sin `_update_case_error`,
             # sin `consecutive_sync_failures++`—. El circuit breaker global vía
             # _handle_blocked/record_blocked da la protección sistémica.
             #
@@ -1253,14 +1249,9 @@ class SyncEngine:
                     is True
                 ),
             )
-            session_healthy = mapped_disposition == "healthy"
-            release_disposition = (
-                mapped_disposition
-                if mapped_disposition == "validate_before_reuse"
-                else None
-            )
+            release_disposition = mapped_disposition
             msg = f"{kind}: {type(e).__name__}: {e}"
-            if session_healthy:
+            if release_disposition == "healthy":
                 # Tiene que hacer ruido. Sin el re-mint esto falla barato, y
                 # barato + `logger.warning` = invisible hasta que alguien mire.
                 # El watchdog cuenta tracebacks (3 en una hora dispara alerta),
@@ -1291,14 +1282,15 @@ class SyncEngine:
         finally:
             if session:
                 if remint_on_release:
-                    if release_disposition is not None:
-                        await self._pool.release(
-                            session, disposition=release_disposition,
-                        )
-                    else:
-                        await self._pool.release(session, healthy=session_healthy)
+                    await self._pool.release(
+                        session, disposition=release_disposition,
+                    )
                 else:
-                    await self._pool.release(session, healthy=False, remint=False)
+                    await self._pool.release(
+                        session,
+                        disposition=release_disposition,
+                        remint=False,
+                    )
 
     async def _call_app_internal(
         self, method: str, path: str, what: str
@@ -1386,14 +1378,15 @@ class SyncEngine:
         # la causa (Gap #6). El slot queda busy hasta release_familia_bundle.
         bundle, slot = await self._pool.acquire_familia_bundle()
         if bundle is None:
-            await self._pool.release_familia_bundle(slot, healthy=True)
+            await self._pool.release_familia_bundle(
+                slot, disposition="healthy",
+            )
             await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
             await self._handle_blocked(case["id"], "infra", "Pool sin bundle F5")
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
-        session_healthy = True
-        release_disposition: ReleaseDisposition | None = None
+        release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
         try:
             try:
@@ -1452,12 +1445,7 @@ class SyncEngine:
                         is True
                     ),
                 )
-                session_healthy = mapped_disposition == "healthy"
-                release_disposition = (
-                    mapped_disposition
-                    if mapped_disposition == "validate_before_reuse"
-                    else None
-                )
+                release_disposition = mapped_disposition
                 if is_proxy_billing_error(e):
                     remint_on_release = False
                     await self._finish_run(
@@ -1504,22 +1492,24 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
         finally:
             if remint_on_release:
-                if release_disposition is not None:
-                    await self._pool.release_familia_bundle(
-                        slot, disposition=release_disposition,
-                    )
-                else:
-                    await self._pool.release_familia_bundle(
-                        slot, healthy=session_healthy,
-                    )
+                await self._pool.release_familia_bundle(
+                    slot, disposition=release_disposition,
+                )
             else:
                 await self._pool.release_familia_bundle(
-                    slot, healthy=False, remint=False,
+                    slot, disposition=release_disposition, remint=False,
                 )
 
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
-            await self._finish_run(sync_run_id, started_at, "error", 0, f"Parse error: {err}")
+            await self._finish_run(
+                sync_run_id,
+                started_at,
+                "error",
+                0,
+                f"Parse error: {err}",
+                error_code="parse_failed",
+            )
             await self._update_case_error(case, "Error al interpretar respuesta OJV Familia")
             return {"success": False, "new_movements": 0}
 

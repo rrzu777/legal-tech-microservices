@@ -79,7 +79,9 @@ async def test_worker_no_penaliza_causa_y_descarta_slot_rechazado():
         result = await engine.sync_case(_make_case())
 
     assert result == {"success": False, "new_movements": 0}
-    mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
+    mock_pool.release.assert_awaited_once_with(
+        mock_session, disposition="replace_before_reuse",
+    )
     mock_update_error.assert_not_called()
 
 
