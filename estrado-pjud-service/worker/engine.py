@@ -696,7 +696,19 @@ class SyncEngine:
             )
         except Exception:
             logger.exception("Failed to create sync_run")
-            sync_run_id = None
+            # A durable run is the attribution root for every paid operation.
+            # Continuing with ``None`` would collapse all failed inserts onto
+            # the same ``None:search`` idempotency key and can associate a
+            # later case with an earlier reservation. Stop before acquiring a
+            # session; the naturally due case can be claimed again after the
+            # persistence boundary recovers.
+            self._metrics.record_error("infra")
+            self._backoff.record_failure()
+            return {
+                "success": False,
+                "new_movements": 0,
+                "status": "sync_run_unavailable",
+            }
 
         session = None
         session_healthy = True
