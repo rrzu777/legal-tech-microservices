@@ -16,7 +16,6 @@ _CONSULTA_PATH = "/consultaUnificada.php"
 _FORM_READY_SELECTOR = "select#competencia, select[name='competencia']"
 _MINT_TIMEOUT_MS = 30_000
 _CLEANUP_TIMEOUT_S = 1.0
-_CDP_DRAIN_TURNS = 2
 
 # El challenge JS de F5 NO se resuelve en un browser headless ni en uno con
 # el flag de automatización visible. Verificado empíricamente (6 jul 2026):
@@ -105,11 +104,19 @@ class CookieMinter:
             return None
 
     @staticmethod
-    async def _drain_cdp_callbacks(session) -> None:
+    async def _fence_cdp_callbacks(session) -> None:
         if session is None:
             return
-        for _ in range(_CDP_DRAIN_TURNS):
-            await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(
+                session.send(
+                    "Runtime.evaluate",
+                    {"expression": "void 0", "returnByValue": True},
+                ),
+                timeout=_CLEANUP_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning("pjud_mint_cdp_fence_unavailable")
 
     async def mint(self) -> MintResult:
         launch_kwargs = {"headless": False, "args": _ANTIBOT_ARGS}
@@ -168,8 +175,10 @@ class CookieMinter:
                 )
                 return MintResult(cookies=cookies, user_agent=ua)
             finally:
-                await self._drain_cdp_callbacks(cdp_session)
-                cleanup = [self._close_playwright_resource(browser, "browser")]
-                if cdp_session is not None:
-                    cleanup.append(self._detach_cdp_session(cdp_session))
-                await asyncio.gather(*cleanup)
+                try:
+                    await self._fence_cdp_callbacks(cdp_session)
+                finally:
+                    cleanup = [self._close_playwright_resource(browser, "browser")]
+                    if cdp_session is not None:
+                        cleanup.append(self._detach_cdp_session(cdp_session))
+                    await asyncio.gather(*cleanup)
