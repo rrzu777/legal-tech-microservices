@@ -136,6 +136,27 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
 
 class TestSyncEngine:
     @pytest.mark.asyncio
+    async def test_sync_run_persistence_failure_stops_before_proxy_traffic(self):
+        """A missing durable run must never fall through to a shared None key."""
+        engine, mock_pool, _sb, _notifier, mock_metrics, mock_backoff = _make_engine()
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ):
+            result = await engine.sync_case(_make_case())
+
+        assert result == {
+            "success": False,
+            "new_movements": 0,
+            "status": "sync_run_unavailable",
+        }
+        mock_pool.acquire.assert_not_awaited()
+        mock_pool.enforce_global_rate_limit.assert_not_awaited()
+        mock_metrics.record_error.assert_called_once_with("infra")
+        mock_backoff.record_failure.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_sync_success_full_flow(self):
         from worker.engine import SyncEngine
 
