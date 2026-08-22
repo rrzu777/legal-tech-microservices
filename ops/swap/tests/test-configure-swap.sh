@@ -76,7 +76,7 @@ setup() {
   unset DF_FAIL FALLOCATE_FAIL CHMOD_FAIL MKSWAP_FAIL SWAPON_FAIL SWAPOFF_FAIL
   unset SWAPON_FAIL_STATE SWAPOFF_KEEP_ACTIVE SYSCTL_FAIL FREE_FAIL
   unset SYSCTL_RESTORE_FAIL SYSCTL_VERIFY_FAIL FREE_MALFORMED FREE_FAIL_AFTER_OUTPUT
-  unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL
+  unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL RM_FAIL_PATH
 
   write_stub df '
 printf "df %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -200,6 +200,7 @@ esac'
   write_stub rm '
 printf "rm %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_RM_FAIL:-0}" != 1 ] || exit 8
+[ -z "${SWAP_TEST_RM_FAIL_PATH:-}" ] || [ "${1:-}" != "$SWAP_TEST_RM_FAIL_PATH" ] || exit 8
 exec /bin/rm "$@"'
 }
 
@@ -236,6 +237,7 @@ run_swap() {
     SWAP_TEST_MV_FAIL_ON_CALL="${MV_FAIL_ON_CALL:-0}" \
     SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
     SWAP_TEST_RM_FAIL="${RM_FAIL:-0}" \
+    SWAP_TEST_RM_FAIL_PATH="${RM_FAIL_PATH:-}" \
     bash "$SWAP_SCRIPT" "$@" 2>&1)
   RC=$?
 }
@@ -273,6 +275,149 @@ expect_recoverable_active_apply_state() {
     "$(grep -cFx '# BEGIN LEGALTECH MANAGED SWAP' "$FSTAB_FILE" 2>/dev/null || true)" 1
   if [ -f "$SYSCTL_FILE" ]; then ok "$label keeps managed sysctl"; else bad "$label keeps managed sysctl"; fi
 }
+
+managed_artifact_count() {
+  local count=0 path
+  for path in "$SWAP_FILE" "$FSTAB_FILE.legaltech-swap.bak" \
+    "$SYSCTL_FILE" "$SWAPPINESS_METADATA_FILE"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then count=$((count + 1)); fi
+  done
+  printf '%s\n' "$count"
+}
+
+assert_retry_converges_clean() {
+  local label=$1 original_fstab=$2
+  run_swap rollback
+  expect_eq "$label retry succeeds" "$RC" 0
+  expect_file_eq "$label restores fstab byte-identically" "$original_fstab" "$FSTAB_FILE"
+  expect_eq "$label restores original live swappiness" "$(cat "$SWAPPINESS_STATE")" 60
+  expect_eq "$label leaves exact target inactive" \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+  expect_eq "$label removes every managed artifact" "$(managed_artifact_count)" 0
+}
+
+prepare_retryable_managed_state() {
+  local label=$1
+  setup "$label"
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  /bin/cp "$FSTAB_FILE" "$TMP/$label.fstab.before"
+  run_swap apply
+  expect_eq "$label fixture apply succeeds" "$RC" 0
+}
+
+run_rollback_retry_regressions() {
+  local before_mutations
+  echo '== rollback resumes every transaction-produced post-swapoff suffix'
+
+  prepare_retryable_managed_state retry-fstab
+  MV_FAIL=1
+  run_swap rollback
+  expect_eq 'fstab restoration failure is loud' "$RC" 1
+  expect_eq 'fstab restoration failure leaves target inactive' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+  expect_contains 'fstab restoration failure retains managed block' "$(cat "$FSTAB_FILE")" \
+    '# BEGIN LEGALTECH MANAGED SWAP'
+  expect_file_eq 'fstab restoration failure preserves reconstructing backup' \
+    "$TMP/retry-fstab.fstab.before" "$FSTAB_FILE.legaltech-swap.bak"
+  unset MV_FAIL
+  assert_retry_converges_clean 'fstab restoration failure' "$TMP/retry-fstab.fstab.before"
+
+  prepare_retryable_managed_state retry-sysctl
+  RM_FAIL_PATH=$SYSCTL_FILE
+  run_swap rollback
+  expect_eq 'sysctl removal failure is loud' "$RC" 1
+  expect_eq 'sysctl removal failure leaves target inactive' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+  expect_file_eq 'sysctl removal failure already restored fstab byte-identically' \
+    "$TMP/retry-sysctl.fstab.before" "$FSTAB_FILE"
+  if [ -e "$SYSCTL_FILE" ]; then ok 'sysctl removal failure retains validated sysctl'; else bad 'sysctl removal failure retains validated sysctl'; fi
+  if [ -e "$SWAP_FILE" ]; then ok 'sysctl removal failure retains later swapfile'; else bad 'sysctl removal failure retains later swapfile'; fi
+  if [ -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'sysctl removal failure retains metadata'; else bad 'sysctl removal failure retains metadata'; fi
+  unset RM_FAIL_PATH
+  assert_retry_converges_clean 'sysctl removal failure' "$TMP/retry-sysctl.fstab.before"
+
+  prepare_retryable_managed_state retry-swapfile
+  RM_FAIL_PATH=$SWAP_FILE
+  run_swap rollback
+  expect_eq 'swapfile removal failure is loud' "$RC" 1
+  expect_file_eq 'swapfile removal failure keeps original fstab bytes' \
+    "$TMP/retry-swapfile.fstab.before" "$FSTAB_FILE"
+  if [ ! -e "$SYSCTL_FILE" ]; then ok 'swapfile failure keeps prior sysctl removal'; else bad 'swapfile failure keeps prior sysctl removal'; fi
+  if [ -e "$SWAP_FILE" ]; then ok 'swapfile failure retains validated inactive swapfile'; else bad 'swapfile failure retains validated inactive swapfile'; fi
+  if [ -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'swapfile failure retains metadata last'; else bad 'swapfile failure retains metadata last'; fi
+  unset RM_FAIL_PATH
+  assert_retry_converges_clean 'swapfile removal failure' "$TMP/retry-swapfile.fstab.before"
+
+  prepare_retryable_managed_state retry-metadata
+  RM_FAIL_PATH=$SWAPPINESS_METADATA_FILE
+  run_swap rollback
+  expect_eq 'metadata removal failure is loud' "$RC" 1
+  expect_file_eq 'metadata failure keeps original fstab bytes' \
+    "$TMP/retry-metadata.fstab.before" "$FSTAB_FILE"
+  expect_eq 'metadata failure leaves only metadata' "$(managed_artifact_count)" 1
+  unset RM_FAIL_PATH
+  assert_retry_converges_clean 'metadata removal failure' "$TMP/retry-metadata.fstab.before"
+
+  echo '== corrupt partial rollback states fail closed without mutation'
+
+  prepare_retryable_managed_state corrupt-deactivated-sysctl
+  printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  printf 'vm.swappiness=11\n' > "$SYSCTL_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed-deactivated with wrong sysctl is unknown' "$RC" 1
+  expect_eq 'wrong sysctl partial state is untouched' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-deactivated-metadata
+  printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  /bin/chmod 0644 "$SWAPPINESS_METADATA_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'managed-deactivated with unsafe metadata is unknown' "$RC" 1
+  expect_eq 'unsafe metadata partial state is untouched' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-restored-hardlink
+  printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  /bin/mv "$FSTAB_FILE.legaltech-swap.bak" "$FSTAB_FILE"
+  /bin/ln "$SWAP_FILE" "$ROOT/shared-swapfile"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'fstab-restored with hardlinked swapfile is unknown' "$RC" 1
+  expect_eq 'hardlinked partial state is untouched' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-restored-active
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  /bin/mv "$FSTAB_FILE.legaltech-swap.bak" "$FSTAB_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'fstab-restored with unexpectedly active target is unknown' "$RC" 1
+  expect_eq 'unexpected active partial state is untouched' "$(mutation_count)" "$before_mutations"
+
+  prepare_retryable_managed_state corrupt-restored-fstab-entry
+  printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  /bin/mv "$FSTAB_FILE.legaltech-swap.bak" "$FSTAB_FILE"
+  printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> "$FSTAB_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'fstab-restored with unexpected exact swap entry is unknown' "$RC" 1
+  expect_eq 'unexpected fstab entry partial state is untouched' "$(mutation_count)" "$before_mutations"
+}
+
+if [ "${SWAP_FOCUS:-}" = rollback-retry ]; then
+  run_rollback_retry_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_rollback_retry_regressions
+fi
 
 run_apply_compensation_gate_regressions() {
   echo '== every apply compensation swapoff uses exact-target RAM gate'

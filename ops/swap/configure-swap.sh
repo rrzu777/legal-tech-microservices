@@ -110,6 +110,7 @@ swap_file_exists=0
 sysctl_state=absent
 swappiness_metadata_state=absent
 previous_swappiness=''
+rollback_state=invalid
 current_temp=''
 apply_created_swap_file=0
 apply_activated_swap=0
@@ -209,11 +210,12 @@ inspect_swap_file() {
   fi
   swap_file_exists=1
 
-  local metadata kind mode size extra
-  metadata=$("$stat_bin" -c '%F|%a|%s' "$swap_file") || return 1
-  kind=''; mode=''; size=''; extra=''
-  IFS='|' read -r kind mode size extra <<< "$metadata" || return 1
+  local metadata kind mode size links uid gid extra
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$swap_file") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
   [ "$kind" = 'regular file' ] && [ "$size" = "$SWAP_BYTES" ] && \
+    [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] && \
     [ -z "$extra" ] || return 1
   [ "$require_mode" -eq 0 ] || [ "$mode" = 600 ]
 }
@@ -387,6 +389,59 @@ inspect_managed_state() {
   return 1
 }
 
+inspect_rollback_state() {
+  local live_swappiness
+  rollback_state=invalid
+  inspect_fstab || return 1
+  inspect_fstab_backup || return 1
+  inspect_active_swaps || return 1
+  inspect_swap_file || return 1
+  inspect_sysctl_file || return 1
+  inspect_swappiness_metadata || return 1
+
+  if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ] && \
+     [ "$swap_file_exists" -eq 0 ] && [ "$active_target_count" -eq 0 ] && \
+     [ "$sysctl_state" = absent ] && [ "$swappiness_metadata_state" = absent ]; then
+    rollback_state=clean
+    printf '%s\n' "$rollback_state"
+    return 0
+  fi
+
+  if [ "$fstab_state" = managed ] && [ "$backup_state" = managed ] && \
+     [ "$swap_file_exists" -eq 1 ] && [ "$sysctl_state" = managed ] && \
+     [ "$swappiness_metadata_state" = managed ]; then
+    if [ "$active_target_count" -eq 1 ]; then
+      rollback_state=managed-active
+      printf '%s\n' "$rollback_state"
+      return 0
+    fi
+    if [ "$active_target_count" -eq 0 ]; then
+      live_swappiness=$(read_live_swappiness) || return 1
+      [ "$live_swappiness" = "$previous_swappiness" ] || return 1
+      rollback_state=managed-deactivated
+      printf '%s\n' "$rollback_state"
+      return 0
+    fi
+    return 1
+  fi
+
+  if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ] && \
+     [ "$active_target_count" -eq 0 ] && \
+     [ "$swappiness_metadata_state" = managed ]; then
+    case "$sysctl_state:$swap_file_exists" in
+      managed:1|absent:1|absent:0) ;;
+      *) return 1 ;;
+    esac
+    live_swappiness=$(read_live_swappiness) || return 1
+    [ "$live_swappiness" = "$previous_swappiness" ] || return 1
+    rollback_state=fstab-restored
+    printf '%s\n' "$rollback_state"
+    return 0
+  fi
+
+  return 1
+}
+
 check_free_disk() {
   local output line available='' line_number=0
   output=$("$df_bin" --output=avail -B1 /) || return 1
@@ -455,18 +510,12 @@ replace_fstab_with_managed_block() {
 
 replace_fstab_without_managed_block() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
-  current_temp="${fstab_file}.legaltech-swap.tmp.$$"
-  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
   validate_backup_metadata "$backup_path" || return 1
   backup_reconstructs_managed_fstab "$backup_path" || return 1
-  "$cp_bin" -p -n "$backup_path" "$current_temp" || return 1
-  validate_backup_metadata "$current_temp" || return 1
-  backup_reconstructs_managed_fstab "$current_temp" || return 1
-  "$mv_bin" "$current_temp" "$fstab_file" || return 1
-  current_temp=''
-  validate_backup_metadata "$backup_path" || return 1
-  text_files_equal "$backup_path" "$fstab_file" || return 1
-  "$rm_bin" "$backup_path" || return 1
+  "$mv_bin" "$backup_path" "$fstab_file" || return 1
+  [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
+  inspect_fstab || return 1
+  [ "$fstab_state" = absent ]
 }
 
 cleanup_current_apply() {
@@ -650,23 +699,42 @@ read_memory_safety() {
 
 rollback_swap() {
   local state
-  state=$(inspect_managed_state) || return 1
-  if [ "$state" = clean ]; then
-    return 0
+  inspect_rollback_state >/dev/null || return 1
+  state=$rollback_state
+  case "$state" in
+    clean) return 0 ;;
+    managed-active)
+      read_memory_safety || return 1
+      restore_live_swappiness || return 1
+      "$swapoff_bin" "$swap_file" || return 1
+      inspect_rollback_state >/dev/null || return 1
+      [ "$rollback_state" = managed-deactivated ] || return 1
+      ;;
+    managed-deactivated|fstab-restored) ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$rollback_state" = managed-deactivated ]; then
+    replace_fstab_without_managed_block || return 1
+    inspect_rollback_state >/dev/null || return 1
+    [ "$rollback_state" = fstab-restored ] || return 1
   fi
-  [ "$state" = managed ] || return 1
-  read_memory_safety || return 1
 
-  restore_live_swappiness || return 1
-
-  "$swapoff_bin" "$swap_file" || return 1
-  inspect_active_swaps || return 1
-  [ "$active_target_count" -eq 0 ] || return 1
-  replace_fstab_without_managed_block || return 1
-  "$rm_bin" "$sysctl_file" || return 1
-  "$rm_bin" "$swap_file" || return 1
-  validate_swappiness_metadata_file "$swappiness_metadata_file" || return 1
+  [ "$rollback_state" = fstab-restored ] || return 1
+  if [ "$sysctl_state" = managed ]; then
+    "$rm_bin" "$sysctl_file" || return 1
+    inspect_rollback_state >/dev/null || return 1
+    [ "$rollback_state" = fstab-restored ] || return 1
+  fi
+  if [ "$swap_file_exists" -eq 1 ]; then
+    "$rm_bin" "$swap_file" || return 1
+    inspect_rollback_state >/dev/null || return 1
+    [ "$rollback_state" = fstab-restored ] || return 1
+  fi
+  [ "$swappiness_metadata_state" = managed ] || return 1
   "$rm_bin" "$swappiness_metadata_file" || return 1
+  inspect_rollback_state >/dev/null || return 1
+  [ "$rollback_state" = clean ]
 }
 
 case "$command_name" in
