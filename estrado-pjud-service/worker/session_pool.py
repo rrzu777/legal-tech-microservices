@@ -5,6 +5,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 
@@ -16,7 +17,13 @@ from app.cookie_store import (
     CookieStoreConcurrentUpdateError,
     CookieStoreLockTimeoutError,
 )
-from app.failure_kind import BlockedPageError, MintUnavailableError, new_egress_may_help
+from app.failure_kind import (
+    BlockedPageError,
+    MintUnavailableError,
+    PoolUnavailableError,
+    RejectedDetailSessionError,
+    new_egress_may_help,
+)
 from app.minter import CookieMinter
 from app.proxy import build_sticky_proxy_url, generate_session_token, redact_proxy_url
 from app.proxy_billing import is_proxy_billing_error
@@ -37,6 +44,26 @@ _DEFAULT_MINT_TRAFFIC_BUDGET_S = 35.0
 _MAX_NEW_STICKY_IPS_PER_MINT = 3
 _CANDIDATE_CLOSE_TIMEOUT_S = 1.0
 _MAX_SESSION_TELEMETRY_AGE_S = 86_400
+_MAX_LIFECYCLE_BACKOFF_EXPONENT = 5
+
+SlotDisposition = Literal[
+    "healthy",
+    "validate_before_reuse",
+    "replace_before_reuse",
+    "cooldown",
+]
+ReleaseDisposition = SlotDisposition
+RecoveryDisposition = Literal[
+    "validate_before_reuse",
+    "replace_before_reuse",
+]
+ValidationOutcome = Literal["rejected", "inconclusive", "hard_stop"]
+_SLOT_DISPOSITIONS: tuple[SlotDisposition, ...] = (
+    "healthy",
+    "validate_before_reuse",
+    "replace_before_reuse",
+    "cooldown",
+)
 
 
 @dataclass
@@ -62,6 +89,10 @@ class _Slot:
     session_cycle_id: uuid.UUID | None = None
     session_cycle_reason: SessionReason | None = None
     session_cycle_age_seconds: int | None = None
+    disposition: SlotDisposition = "healthy"
+    recovery_disposition: RecoveryDisposition | None = None
+    next_probe_at: float = 0.0
+    lifecycle_failures: int = 0
 
 
 class SessionPool:
@@ -91,6 +122,9 @@ class SessionPool:
         # es distinguir eso de "el proveedor se cayo".
         self.mint_attempts: int = 0
         self.mint_failures: int = 0
+        self.validation_successes: int = 0
+        self.validation_failures: int = 0
+        self.validations_avoided_mint: int = 0
         self._sem = asyncio.Semaphore(self._pool_size)
         self._lock = asyncio.Lock()
         # Registro explícito de checkouts: sesión -> slot que la posee. NO
@@ -183,10 +217,73 @@ class SessionPool:
         return self._pool_size
 
     @property
+    def slot_state_counts(self) -> dict[SlotDisposition, int]:
+        """Fixed aggregate view; never exposes a slot or session identity."""
+        now = self._monotonic_now()
+        for slot in self._slots:
+            self._apply_expired_cooldown(slot, now=now)
+        return {
+            disposition: sum(
+                slot.disposition == disposition for slot in self._slots
+            )
+            for disposition in _SLOT_DISPOSITIONS
+        }
+
+    @property
     def _reuse_validation_enabled(self) -> bool:
         # WorkerConfig guarantees bool in production.  The identity check also
         # keeps partial config doubles and legacy callers on the flag-off path.
         return self._config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is True
+
+    @staticmethod
+    def _is_cost_control_error(exc: BaseException) -> bool:
+        return is_proxy_billing_error(exc) or isinstance(
+            exc,
+            (ProxyBudgetExceededError, ProxyUsagePersistenceError),
+        )
+
+    def _mark_slot_healthy(self, slot: _Slot, *, reset_failures: bool) -> None:
+        slot.disposition = "healthy"
+        slot.recovery_disposition = None
+        slot.next_probe_at = 0.0
+        if reset_failures:
+            slot.lifecycle_failures = 0
+
+    def _enter_cooldown(
+        self,
+        slot: _Slot,
+        *,
+        lifecycle_failure: bool = True,
+        delay_s: float | None = None,
+    ) -> None:
+        recovery_disposition: RecoveryDisposition = (
+            slot.disposition
+            if slot.disposition in {
+                "validate_before_reuse",
+                "replace_before_reuse",
+            }
+            else "replace_before_reuse"
+        )
+        if lifecycle_failure:
+            slot.lifecycle_failures += 1
+        base = max(0.0, float(self._config.BLOCK_PAUSE_S))
+        if delay_s is None:
+            exponent = min(
+                max(0, slot.lifecycle_failures - 1),
+                _MAX_LIFECYCLE_BACKOFF_EXPONENT,
+            )
+            delay_s = base * (2**exponent)
+        slot.disposition = "cooldown"
+        slot.recovery_disposition = recovery_disposition
+        slot.next_probe_at = self._monotonic_now() + max(0.0, delay_s)
+
+    @staticmethod
+    def _apply_expired_cooldown(slot: _Slot, *, now: float) -> None:
+        if slot.disposition != "cooldown" or now < slot.next_probe_at:
+            return
+        slot.disposition = slot.recovery_disposition or "replace_before_reuse"
+        slot.recovery_disposition = None
+        slot.next_probe_at = 0.0
 
     # -- Minteo por-slot ------------------------------------------------
 
@@ -198,16 +295,6 @@ class SessionPool:
         cerrar la vieja, así que si el minteo falla, el slot conserva su
         sesión (vieja pero viva) en vez de quedar con una cerrada/muerta.
         """
-        is_first_mint = slot.session is None
-        if not is_first_mint:
-            # Cooldown (G6): un slot que re-mintea en loop quema IPs. Espaciar
-            # los re-mints del MISMO slot por al menos BLOCK_PAUSE_S.
-            elapsed = time.monotonic() - slot.last_mint_ts
-            remaining = self._config.BLOCK_PAUSE_S - elapsed
-            if remaining > 0:
-                logger.info("Slot %d en cooldown; esperando %.1fs antes de re-mint", slot.index, remaining)
-                await asyncio.sleep(remaining)
-
         # Retry con backoff (A1). El proxy residencial falla ~12% de las veces, de
         # forma uniforme y desde el dia 1: sin reintento, cada uno de esos fallos le
         # cuesta una sincronizacion a una causa. Con fallos independientes, 12% baja
@@ -216,9 +303,8 @@ class SessionPool:
         # Cada vuelta pide un TOKEN NUEVO, o sea una IP nueva: el que falla es el
         # tunel de esa IP, asi que reintentar contra la misma no arregla nada.
         #
-        # El retry vive DESPUES del cooldown BLOCK_PAUSE_S de arriba y no lo
-        # re-dispara: ese cooldown es para un slot que re-mintea en loop, no para
-        # los reintentos de un mismo minteo.
+        # El cooldown de un fallo completo vive en la disposición del slot; los
+        # reintentos de este mismo minteo siguen dentro de un único ciclo.
         attempts = min(
             _MAX_NEW_STICKY_IPS_PER_MINT,
             max(1, self._config.MINT_MAX_RETRIES),
@@ -364,6 +450,8 @@ class SessionPool:
             self._anchor_slot_bundle_age(slot, persisted.saved_at)
             slot.cookie_expires_at = self._cookie_expiry(persisted)
             slot.last_verified_at = time.monotonic()
+
+        self._mark_slot_healthy(slot, reset_failures=True)
 
         if old_session is not None:
             self._retire_session(old_session, slot.index)
@@ -521,6 +609,7 @@ class SessionPool:
             if not replaced:
                 raise CookieStoreConcurrentUpdateError()
         except BaseException:
+            self.validation_failures += 1
             await self._close_candidate(candidate)
             raise
 
@@ -537,15 +626,19 @@ class SessionPool:
         self._anchor_slot_bundle_age(slot, bundle.saved_at)
         slot.cookie_expires_at = self._cookie_expiry(validated_bundle)
         slot.last_verified_at = time.monotonic()
+        self.validation_successes += 1
+        self.validations_avoided_mint += 1
+        self._mark_slot_healthy(slot, reset_failures=True)
         if old_session is not None:
             # CAS + swap already committed.  Cleanup of the retired adapter is
             # bounded background work, never a failed validation or new-IP cue.
             self._retire_session(old_session, slot.index)
 
     @staticmethod
-    def _validation_failure_allows_mint(exc: BaseException) -> bool:
+    def _validation_outcome(exc: BaseException) -> ValidationOutcome:
         if (
-            is_proxy_billing_error(exc)
+            not isinstance(exc, Exception)
+            or is_proxy_billing_error(exc)
             or isinstance(
                 exc,
                 (
@@ -556,10 +649,16 @@ class SessionPool:
                 ),
             )
         ):
-            return False
+            return "hard_stop"
+        if isinstance(exc, (BlockedPageError, RejectedDetailSessionError)):
+            return "rejected"
         if isinstance(exc, httpx.HTTPStatusError):
-            return exc.response.status_code in {401, 403}
-        return new_egress_may_help(exc)
+            return (
+                "rejected"
+                if exc.response.status_code in {401, 403}
+                else "inconclusive"
+            )
+        return "inconclusive"
 
     @staticmethod
     def _replacement_mint_reason(exc: BaseException) -> SessionReason:
@@ -589,7 +688,13 @@ class SessionPool:
         slot.session_cycle_id = cycle_id
         slot.session_cycle_reason = session_reason
         slot.session_cycle_age_seconds = age_seconds
-        await self._mint_slot(slot, max_attempts=1)
+        try:
+            await self._mint_slot(slot, max_attempts=1)
+        except BaseException as exc:
+            if isinstance(exc, Exception) and not self._is_cost_control_error(exc):
+                self._enter_cooldown(slot)
+            raise
+        self._mark_slot_healthy(slot, reset_failures=True)
         slot.minted_during_acquire = True
 
     def _reuse_traffic_budget_s(self) -> float:
@@ -629,6 +734,9 @@ class SessionPool:
         cycle_id, _ = self._begin_session_cycle(
             slot, age_seconds, session_reason,
         )
+        # Any failed validation must remain quarantined until its outcome is
+        # closed. This also preserves validation provenance through cooldown.
+        slot.disposition = "validate_before_reuse"
         try:
             await self._revalidate_bundle(
                 slot,
@@ -638,7 +746,11 @@ class SessionPool:
                 session_age_seconds=age_seconds,
             )
         except BaseException as exc:
-            if not self._validation_failure_allows_mint(exc):
+            outcome = self._validation_outcome(exc)
+            if outcome == "hard_stop":
+                raise
+            if outcome == "inconclusive":
+                self._enter_cooldown(slot)
                 raise
             await self._mint_once_for_acquisition(
                 slot,
@@ -682,6 +794,36 @@ class SessionPool:
         )
 
     async def _prepare_reuse_slot(self, slot: _Slot) -> None:
+        if slot.disposition == "validate_before_reuse":
+            bundle = self._store.load_slot(slot.index)
+            if (
+                bundle is None
+                or bundle.saved_at != slot.bundle_saved_at
+                or bundle.proxy_token != slot.token
+            ):
+                raise CookieStoreConcurrentUpdateError()
+            slot.minted_during_acquire = await self._revalidate_or_mint_once(
+                slot, bundle, session_reason="transport_rotation",
+            )
+            return
+
+        if slot.disposition == "replace_before_reuse":
+            age = (
+                self._slot_bundle_age(slot)
+                if slot.bundle_saved_at is not None
+                else None
+            )
+            cycle_id, age_seconds = self._begin_session_cycle(
+                slot, age, "session_rejected",
+            )
+            await self._mint_once_for_acquisition(
+                slot,
+                session_cycle_id=cycle_id,
+                session_reason="session_rejected",
+                session_age_seconds=age_seconds,
+            )
+            return
+
         if slot.session is None or slot.bundle_saved_at is None:
             slot.minted_during_acquire = await self._initialize_reuse_slot(slot)
             return
@@ -751,13 +893,19 @@ class SessionPool:
         vive en un solo lugar."""
         await self._sem.acquire()
         async with self._lock:
-            slot = next((s for s in self._slots if not s.busy), None)
+            now = self._monotonic_now()
+            slot = None
+            for candidate in self._slots:
+                if candidate.busy:
+                    continue
+                self._apply_expired_cooldown(candidate, now=now)
+                if candidate.disposition == "cooldown":
+                    continue
+                slot = candidate
+                break
             if slot is None:
-                # Invariante violada: el semáforo dio un permiso pero no hay
-                # slot libre. Convertir en un error claro (I1) en vez de un
-                # StopIteration desnudo. Devolver el permiso para no filtrarlo.
                 self._sem.release()
-                raise RuntimeError("borrow: semáforo dio permiso pero no hay slot libre")
+                raise PoolUnavailableError("mint_exhausted")
             slot.busy = True
             slot.minted_during_acquire = False
             slot.session_cycle_id = None
@@ -784,37 +932,67 @@ class SessionPool:
                     self._sem.release()
                 raise
         else:
+            if slot.disposition == "validate_before_reuse":
+                slot.disposition = "replace_before_reuse"
             needs_refresh = (
-                slot.session is None
+                slot.disposition == "replace_before_reuse"
+                or slot.session is None
                 or slot.session.age_seconds > self._config.SESSION_MAX_AGE_S
             )
             if needs_refresh:
                 try:
                     await self._refresh_slot(slot)
                 except Exception as exc:
-                    if is_proxy_billing_error(exc) or isinstance(
-                        exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
-                    ):
+                    if self._is_cost_control_error(exc):
                         await self._persist_cost_failure(exc)
                         slot.busy = False
                         self._sem.release()
                         raise
-                    # Legacy flag-off behavior intentionally returns the stale
-                    # session after a refresh failure.
+                    self._enter_cooldown(slot)
                     logger.exception(
-                        "Refresh de slot %d falló; usando la sesión existente",
+                        "Refresh de slot %d falló; slot en cooldown",
                         slot.index,
                     )
+                    slot.busy = False
+                    self._sem.release()
+                    raise
+                self._mark_slot_healthy(slot, reset_failures=True)
         return slot
 
-    async def _return_slot(self, slot: _Slot, healthy: bool, remint: bool = True) -> None:
+    @staticmethod
+    def _release_disposition(
+        healthy: bool | None,
+        disposition: ReleaseDisposition | None,
+    ) -> ReleaseDisposition:
+        if disposition is not None:
+            if disposition not in _SLOT_DISPOSITIONS:
+                raise ValueError("invalid slot disposition")
+            if healthy is not None:
+                legacy_disposition: ReleaseDisposition = (
+                    "healthy" if healthy else "replace_before_reuse"
+                )
+                if disposition != legacy_disposition:
+                    raise ValueError("contradictory release arguments")
+            return disposition
+        return "healthy" if healthy is not False else "replace_before_reuse"
+
+    async def _return_slot(
+        self,
+        slot: _Slot,
+        healthy: bool | None = None,
+        remint: bool = True,
+        *,
+        disposition: ReleaseDisposition | None = None,
+    ) -> None:
         """Primitiva de devolución: si `healthy=False`, re-mintea ESE slot (IP
         nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
         en uso por otras corrutinas. Base compartida por `release` y
         `release_familia_bundle`."""
         try:
+            release_disposition = self._release_disposition(healthy, disposition)
+            slot.disposition = release_disposition
             if (
-                not healthy
+                release_disposition == "replace_before_reuse"
                 and remint
                 and not (
                     self._reuse_validation_enabled
@@ -830,11 +1008,11 @@ class SessionPool:
                     else:
                         await self._refresh_slot(slot)
                 except Exception as exc:
-                    if is_proxy_billing_error(exc) or isinstance(
-                        exc, (ProxyBudgetExceededError, ProxyUsagePersistenceError),
-                    ):
+                    if self._is_cost_control_error(exc):
                         await self._persist_cost_failure(exc)
                         raise
+                    if slot.disposition != "cooldown":
+                        self._enter_cooldown(slot)
                     logger.exception("Re-mint reactivo de slot %d falló", slot.index)
         finally:
             slot.minted_during_acquire = False
@@ -854,7 +1032,12 @@ class SessionPool:
         return session
 
     async def release(
-        self, session: OJVSession, healthy: bool = True, remint: bool = True,
+        self,
+        session: OJVSession,
+        healthy: bool | None = None,
+        remint: bool = True,
+        *,
+        disposition: ReleaseDisposition | None = None,
     ) -> None:
         """Libera un slot tomado por `acquire`. El slot se resuelve por el
         registro explícito de checkouts (no por identidad escaneando `_slots`).
@@ -865,7 +1048,9 @@ class SessionPool:
         if slot is None:
             logger.warning("release() de una sesión no registrada; ignorada")
             return
-        await self._return_slot(slot, healthy, remint=remint)
+        await self._return_slot(
+            slot, healthy, remint=remint, disposition=disposition,
+        )
 
     async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
         """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
@@ -897,10 +1082,17 @@ class SessionPool:
         return bundle, slot
 
     async def release_familia_bundle(
-        self, slot: _Slot, healthy: bool = True, remint: bool = True,
+        self,
+        slot: _Slot,
+        healthy: bool | None = None,
+        remint: bool = True,
+        *,
+        disposition: ReleaseDisposition | None = None,
     ) -> None:
         """Libera un slot prestado a Familia. Misma semántica que release()."""
-        await self._return_slot(slot, healthy, remint=remint)
+        await self._return_slot(
+            slot, healthy, remint=remint, disposition=disposition,
+        )
 
     async def enforce_global_rate_limit(self):
         """En modo proxy: no-op (cada IP tiene su propio rate-limit per-adapter;

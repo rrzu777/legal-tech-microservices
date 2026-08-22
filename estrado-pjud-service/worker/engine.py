@@ -20,6 +20,7 @@ from app.document_metadata import (
     sanitize_pjud_case_external_payload,
     sanitize_pjud_movement_payload,
 )
+from app.errors import safe_error
 from app.failure_kind import (
     UpstreamChangedError,
     block_cause,
@@ -50,6 +51,7 @@ from worker.proxy_usage import (
     DEFAULT_PRICE_PER_GB_USD,
     ProxyUsageTracker,
 )
+from worker.session_pool import ReleaseDisposition
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -60,6 +62,48 @@ _PARSE_ALERT_COOLDOWN_S = 3600
 _MOVEMENT_PAGE_SIZE = 1_000
 _DOCUMENT_SOURCE_TIMEOUT_S = 2.0
 _MAX_LOOKUP_CANDIDATES = 100
+_BEGIN_SYNC_RUN_REPLAY_DELAYS_S = (0.1,)
+# Read/protocol failures can lose a committed response; write failures can occur
+# after partial transmission. Connect and pool-acquisition failures are pre-send
+# and deliberately excluded from the idempotent replay path.
+_AMBIGUOUS_BEGIN_SYNC_RUN_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
+_SYNC_RUN_ERROR_CODES = frozenset({
+    "worker_interrupted",
+    "sync_run_unavailable",
+    "invalid_identifier",
+    "unsupported_matter",
+    "case_not_found",
+    "parse_failed",
+    "pjud_timeout",
+    "upstream_changed",
+    "remote_protocol_disconnect",
+    "ojv_blocked",
+    "infra_unavailable",
+    "credential_unavailable",
+    "unknown_case_error",
+})
+_SYNC_RUN_EXACT_ERROR_TOKENS = {
+    "invalid identifier": "invalid_identifier",
+    "invalid_identity": "invalid_identifier",
+    "unsupported matter": "unsupported_matter",
+    "auth_type no soportado": "unsupported_matter",
+    "not found in ojv": "case_not_found",
+    "case not found in familia portal": "case_not_found",
+    "parse_failed": "parse_failed",
+    "no detail key available": "parse_failed",
+    "blocked by ojv": "ojv_blocked",
+    "detail blocked": "ojv_blocked",
+    "missing ojv_credential_id": "credential_unavailable",
+    "credential inactive or missing": "credential_unavailable",
+    "invalid credentials": "credential_unavailable",
+    "pool sin bundle f5": "infra_unavailable",
+}
 _LOOKUP_CANDIDATE_FIELDS = (
     "rol", "ruc", "tribunal", "caratulado", "fecha_ingreso",
     "tribunal_code", "corte", "corte_code", "libro", "libro_code",
@@ -68,6 +112,48 @@ _LOOKUP_CANDIDATE_FIELDS = (
 
 class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
+
+
+def _release_disposition_for_error(
+    error: BaseException,
+    *,
+    transport_revalidation_enabled: bool,
+) -> ReleaseDisposition:
+    if transport_revalidation_enabled and isinstance(
+        error, httpx.RemoteProtocolError,
+    ):
+        return "validate_before_reuse"
+    return "healthy" if slot_still_healthy(error) else "replace_before_reuse"
+
+
+def _sync_run_error_code(
+    error: BaseException | str | None,
+    *,
+    failure_kind: str | None = None,
+) -> str | None:
+    """Map worker outcomes to the database's closed scheduled-run taxonomy."""
+    if error is None:
+        return None
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "remote_protocol_disconnect"
+    if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+        return "pjud_timeout"
+    if isinstance(error, UpstreamChangedError):
+        return "upstream_changed"
+    if isinstance(error, InvalidCanonicalIdentityError):
+        return "invalid_identifier"
+
+    normalized = safe_error(error).strip().lower()
+    if normalized in _SYNC_RUN_ERROR_CODES:
+        return normalized
+    exact_code = _SYNC_RUN_EXACT_ERROR_TOKENS.get(normalized)
+    if exact_code is not None:
+        return exact_code
+    if failure_kind == "infra":
+        return "infra_unavailable"
+    if failure_kind == "ojv":
+        return "ojv_blocked"
+    return "unknown_case_error"
 
 MATTER_TO_COMPETENCIA = {
     "civil": "civil",
@@ -677,25 +763,76 @@ class SyncEngine:
             }).eq("id", case["id"])
         )
 
+    async def _begin_sync_run(
+        self,
+        case: dict,
+        run_id: str,
+        started_at: datetime,
+    ) -> str:
+        """Start one claim-bound run, replaying only an ambiguous transport."""
+        claim_token = case.get("sync_claim_token")
+        worker_id = getattr(self._config, "WORKER_ID", None)
+        if not all((
+            run_id,
+            case.get("id"),
+            case.get("law_firm_id"),
+            worker_id,
+            claim_token,
+        )):
+            raise RuntimeError("sync_run_identity_unavailable")
+
+        payload = {
+            "p_run_id": run_id,
+            "p_case_id": case["id"],
+            "p_law_firm_id": case["law_firm_id"],
+            "p_worker_id": worker_id,
+            "p_claim_token": claim_token,
+            "p_started_at": started_at.isoformat(),
+        }
+        attempts = len(_BEGIN_SYNC_RUN_REPLAY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._sb.rpc("begin_pjud_scheduled_sync_run", payload)
+                )
+            except _AMBIGUOUS_BEGIN_SYNC_RUN_ERRORS:
+                if attempt + 1 >= attempts:
+                    raise
+                logger.warning(
+                    "Ambiguous scheduled-run start transport; replaying exact RPC"
+                )
+                await asyncio.sleep(_BEGIN_SYNC_RUN_REPLAY_DELAYS_S[attempt])
+                continue
+
+            rows = response.data if isinstance(response.data, list) else []
+            if len(rows) != 1:
+                raise RuntimeError("sync_run_exact_row_unavailable")
+            row = rows[0]
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"id", "status", "error_code"}
+                or str(row.get("id")) != run_id
+                or row.get("status") != "running"
+                or row.get("error_code") is not None
+            ):
+                raise RuntimeError("sync_run_exact_row_mismatch")
+            return run_id
+
+        raise RuntimeError("sync_run_unavailable")
+
     async def sync_case(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
 
-        # Create sync run
         sync_run_id = str(uuid.uuid4())
         try:
-            await run_query(
-                self._sb.from_("case_sync_runs")
-                .insert({
-                    "id": sync_run_id,
-                    "law_firm_id": case["law_firm_id"],
-                    "case_id": case["id"],
-                    "status": "running",
-                    "trigger": "scheduled_sync",
-                    "started_at": started_at.isoformat(),
-                })
+            sync_run_id = await self._begin_sync_run(
+                case, sync_run_id, started_at,
             )
-        except Exception:
-            logger.exception("Failed to create sync_run")
+        except Exception as exc:
+            logger.error(
+                "Failed to begin claim-bound sync_run failure_type=%s",
+                type(exc).__name__,
+            )
             # A durable run is the attribution root for every paid operation.
             # Continuing with ``None`` would collapse all failed inserts onto
             # the same ``None:search`` idempotency key and can associate a
@@ -711,7 +848,7 @@ class SyncEngine:
             }
 
         session = None
-        session_healthy = True
+        release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
         try:
             # Legacy v1 needs the historical parsed form. Canonical v2 parses
@@ -816,7 +953,7 @@ class SyncEngine:
                     search_usage.error_kind = "ojv"
 
             if search_result["blocked"]:
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Blocked by OJV")
                 await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
@@ -888,7 +1025,7 @@ class SyncEngine:
                     detail_usage.error_kind = "ojv"
 
             if detail["blocked"]:
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 await self._finish_run(sync_run_id, started_at, "blocked", 0, "Detail blocked")
                 await self._handle_blocked(case["id"], "ojv")
                 self._metrics.record_error("infra")
@@ -898,7 +1035,7 @@ class SyncEngine:
                 # NO seguir al path de éxito: haría upsert vacío y sobrescribiría
                 # el external_payload bueno marcando "success". Corto-circuito
                 # sin penalizar la causa (no incrementa consecutive_sync_failures).
-                # session_healthy queda True a propósito: el contenido SÍ llegó
+                # La disposición queda healthy a propósito: el contenido SÍ llegó
                 # por esta IP (no es bloqueo ni caída de proxy), el problema es
                 # drift de parser/página; re-mintear el slot no ayudaría.
                 await self._finish_run(sync_run_id, started_at, "error", 0, "parse_failed")
@@ -998,7 +1135,7 @@ class SyncEngine:
             return {"success": True, "new_movements": new_count}
 
         except (asyncio.TimeoutError, httpx.TimeoutException) as e:
-            session_healthy = False
+            release_disposition = "replace_before_reuse"
             await self._finish_run(sync_run_id, started_at, "error", 0, "pjud_timeout")
             await self._handle_transient(case, "pjud_timeout", str(e))
             self._metrics.record_error("infra")
@@ -1009,7 +1146,6 @@ class SyncEngine:
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0, "status": "upstream_changed"}
         except (ProxyBudgetExceededError, ProxyUsagePersistenceError) as e:
-            session_healthy = True
             await self._finish_run(
                 sync_run_id, started_at, "blocked", 0, "infra_unavailable",
             )
@@ -1054,7 +1190,7 @@ class SyncEngine:
             # La app lo clasificaba bien desde la PR #55 (`pjudHttpError`); este
             # lado no, y los dos escriben sobre las mismas filas.
             if is_proxy_billing_error(e):
-                session_healthy = False
+                release_disposition = "replace_before_reuse"
                 remint_on_release = False
                 await self._finish_run(
                     sync_run_id, started_at, "blocked", 0, "infra_unavailable",
@@ -1082,22 +1218,40 @@ class SyncEngine:
             if kind == "case":
                 msg = str(e)
                 logger.exception("Error syncing case %s", case["case_number"])
-                await self._finish_run(sync_run_id, started_at, "error", 0, msg)
+                await self._finish_run(
+                    sync_run_id,
+                    started_at,
+                    "error",
+                    0,
+                    msg,
+                    error_code=_sync_run_error_code(e, failure_kind=kind),
+                )
                 await self._update_case_error(case, msg)
                 self._backoff.record_failure()
                 self._metrics.record_error()
                 return {"success": False, "new_movements": 0}
 
             # infra u ojv: transitorio. Se trata como bloqueo —re-mint del slot
-            # (session_healthy=False) SIN penalizar: sin `_update_case_error`,
+            # (`replace_before_reuse`) SIN penalizar: sin `_update_case_error`,
             # sin `consecutive_sync_failures++`—. El circuit breaker global vía
             # _handle_blocked/record_blocked da la protección sistémica.
             #
             # La excepción es la falta de token CSRF, donde re-mintear no puede
             # corregir nada y sale carísimo: ver `slot_still_healthy`.
-            session_healthy = slot_still_healthy(e)
+            mapped_disposition = _release_disposition_for_error(
+                e,
+                transport_revalidation_enabled=(
+                    getattr(
+                        self._config,
+                        "WORKER_TRANSPORT_REVALIDATION_ENABLED",
+                        False,
+                    )
+                    is True
+                ),
+            )
+            release_disposition = mapped_disposition
             msg = f"{kind}: {type(e).__name__}: {e}"
-            if session_healthy:
+            if release_disposition == "healthy":
                 # Tiene que hacer ruido. Sin el re-mint esto falla barato, y
                 # barato + `logger.warning` = invisible hasta que alguien mire.
                 # El watchdog cuenta tracebacks (3 en una hora dispara alerta),
@@ -1108,7 +1262,14 @@ class SyncEngine:
                 )
             else:
                 logger.warning("Fallo %s sincronizando causa %s: %s", kind, case["case_number"], msg)
-            await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+            await self._finish_run(
+                sync_run_id,
+                started_at,
+                "blocked",
+                0,
+                msg,
+                error_code=_sync_run_error_code(e, failure_kind=kind),
+            )
             await self._handle_blocked(case["id"], kind, msg)
             # "infra" fijo aunque `kind` pueda ser "ojv": el heartbeat del worker
             # tiene dos baldes, `errors_infra_today` y `errors_case_today`, y la
@@ -1121,9 +1282,15 @@ class SyncEngine:
         finally:
             if session:
                 if remint_on_release:
-                    await self._pool.release(session, healthy=session_healthy)
+                    await self._pool.release(
+                        session, disposition=release_disposition,
+                    )
                 else:
-                    await self._pool.release(session, healthy=False, remint=False)
+                    await self._pool.release(
+                        session,
+                        disposition=release_disposition,
+                        remint=False,
+                    )
 
     async def _call_app_internal(
         self, method: str, path: str, what: str
@@ -1211,13 +1378,15 @@ class SyncEngine:
         # la causa (Gap #6). El slot queda busy hasta release_familia_bundle.
         bundle, slot = await self._pool.acquire_familia_bundle()
         if bundle is None:
-            await self._pool.release_familia_bundle(slot, healthy=True)
+            await self._pool.release_familia_bundle(
+                slot, disposition="healthy",
+            )
             await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
             await self._handle_blocked(case["id"], "infra", "Pool sin bundle F5")
             self._metrics.record_error("infra")
             return {"success": False, "new_movements": 0}
 
-        session_healthy = True
+        release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
         try:
             try:
@@ -1265,7 +1434,18 @@ class SyncEngine:
                 httpx.TransportError,
                 httpx.HTTPStatusError,
             ) as e:
-                session_healthy = False
+                mapped_disposition = _release_disposition_for_error(
+                    e,
+                    transport_revalidation_enabled=(
+                        getattr(
+                            self._config,
+                            "WORKER_TRANSPORT_REVALIDATION_ENABLED",
+                            False,
+                        )
+                        is True
+                    ),
+                )
+                release_disposition = mapped_disposition
                 if is_proxy_billing_error(e):
                     remint_on_release = False
                     await self._finish_run(
@@ -1299,21 +1479,37 @@ class SyncEngine:
                 # `app.familia.auth` dentro del clasificador le arrastraria ese
                 # grafo entero a las rutas de search y detail, que no lo usan.
                 cause = "ojv" if isinstance(e, FamiliaBlockedError) else block_cause(e)
-                await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+                await self._finish_run(
+                    sync_run_id,
+                    started_at,
+                    "blocked",
+                    0,
+                    msg,
+                    error_code=_sync_run_error_code(e, failure_kind=cause),
+                )
                 await self._handle_blocked(case["id"], cause, msg)
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
         finally:
             if remint_on_release:
-                await self._pool.release_familia_bundle(slot, healthy=session_healthy)
+                await self._pool.release_familia_bundle(
+                    slot, disposition=release_disposition,
+                )
             else:
                 await self._pool.release_familia_bundle(
-                    slot, healthy=False, remint=False,
+                    slot, disposition=release_disposition, remint=False,
                 )
 
         casos, err = parse_familia_results(html)
         if err and err != "no_cases":
-            await self._finish_run(sync_run_id, started_at, "error", 0, f"Parse error: {err}")
+            await self._finish_run(
+                sync_run_id,
+                started_at,
+                "error",
+                0,
+                f"Parse error: {err}",
+                error_code="parse_failed",
+            )
             await self._update_case_error(case, "Error al interpretar respuesta OJV Familia")
             return {"success": False, "new_movements": 0}
 
@@ -1921,11 +2117,27 @@ class SyncEngine:
                 return movements
             start += _MOVEMENT_PAGE_SIZE
 
-    async def _finish_run(self, run_id, started_at, status, new_movements, error=None):
+    async def _finish_run(
+        self,
+        run_id,
+        started_at,
+        status,
+        new_movements,
+        error=None,
+        *,
+        error_code=None,
+    ):
         if not run_id:
             return
         now = datetime.now(TZ_SANTIAGO)
         duration_ms = int((now - started_at).total_seconds() * 1000)
+        error_message = safe_error(error)[:300] if error is not None else None
+        resolved_error_code = error_code or _sync_run_error_code(error)
+        if (
+            resolved_error_code is not None
+            and resolved_error_code not in _SYNC_RUN_ERROR_CODES
+        ):
+            resolved_error_code = "unknown_case_error"
         try:
             await run_query(
                 self._sb.from_("case_sync_runs").update({
@@ -1933,7 +2145,8 @@ class SyncEngine:
                     "finished_at": now.isoformat(),
                     "duration_ms": duration_ms,
                     "new_movements_count": new_movements,
-                    "error_message": error,
+                    "error_message": error_message,
+                    "error_code": resolved_error_code,
                 }).eq("id", run_id)
             )
         except Exception:

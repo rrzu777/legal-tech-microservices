@@ -8,6 +8,7 @@ from postgrest.exceptions import APIError
 
 from app.bandwidth import record_proxy_request, record_proxy_response
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.failure_kind import MintUnavailableError
 from worker.proxy_usage import ProxyUsageTracker
 from app.usage_context import usage_scope
 
@@ -24,6 +25,73 @@ def _supabase():
     chain.insert.return_value = chain
     chain.upsert.return_value = chain
     return sb
+
+
+@pytest.mark.asyncio
+async def test_successful_lifecycle_event_never_has_a_failure_code():
+    """A successful mint must not be relabelled as a lifecycle failure."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="mint",
+            transaction_key="mint-success",
+        ) as usage:
+            record_proxy_request(10)
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["status"] == "success"
+    assert payload["failure_code"] is None
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_does_not_accept_public_failure_code_injection():
+    """Callers cannot attach a failure code to a successful lifecycle event."""
+    tracker = ProxyUsageTracker(_supabase(), enabled=False)
+
+    with pytest.raises(TypeError, match="failure_code"):
+        async with tracker.track(
+            operation="mint",
+            failure_code="mint_navigation_failed",  # type: ignore[call-arg]
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_usage_tracker_maps_mint_exception_without_raw_detail():
+    """A typed mint failure must persist only its closed aggregate code."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with pytest.raises(MintUnavailableError):
+            async with tracker.track(
+                operation="mint",
+                transaction_key="mint-deadline-failure",
+            ):
+                record_proxy_request(10)
+                raise MintUnavailableError("deadline_exceeded")
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["failure_code"] == "mint_deadline_exceeded"
+    assert "deadline_exceeded" not in str({
+        key: value for key, value in payload.items() if key != "failure_code"
+    })
 
 
 @pytest.mark.asyncio
@@ -1179,6 +1247,32 @@ async def test_unmeasurable_response_consumes_conservative_reserved_floor():
     assert payload["measurement_status"] == "estimated_floor"
     finalize = sb.rpc.call_args_list[1]
     assert finalize.args[1]["p_release"] is False
+
+
+@pytest.mark.asyncio
+async def test_navigation_failure_without_cdp_evidence_retains_mint_floor():
+    """Removing the zero-byte floor would under-reserve an unmeasured failed mint."""
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True)
+
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with pytest.raises(MintUnavailableError):
+            async with tracker.track(operation="mint"):
+                record_proxy_request(0)
+                raise MintUnavailableError("navigation_failed")
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["bytes_down"] == 0
+    assert payload["estimated_bytes_floor"] == 10_000_000
+    assert payload["measurement_status"] == "estimated_floor"
+    assert payload["failure_code"] == "mint_navigation_failed"
 
 
 @pytest.mark.asyncio
