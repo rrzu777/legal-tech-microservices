@@ -7,22 +7,52 @@ set -uo pipefail
 ENV="${DIGEST_ENV:-/opt/legal-tech-microservices/estrado-pjud-service/.env}"
 set -a; . "$ENV"; set +a
 API="${SUPABASE_URL%/}/rest/v1"
-AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
 SINCE="${DIGEST_SINCE:-$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S)}"
 NOW="${DIGEST_NOW:-$(date -u +%Y-%m-%dT%H:%M:%S)}"
 DIGEST_DATE_UTC="${DIGEST_DATE_UTC:-$(date -u +%F)}"
 
+# Feed credentials through a private pipe-backed curl config. Putting either
+# header directly in argv makes the service-role key observable via ps/proc on
+# hosts without process isolation.
+curl_auth_config() {
+  printf 'header = "apikey: %s"\n' "$SUPABASE_SERVICE_KEY"
+  printf 'header = "Authorization: Bearer %s"\n' "$SUPABASE_SERVICE_KEY"
+}
+
 # count exacto vía HEAD (read-only). Un header ausente, wildcard o inválido no
 # permite inferir cero: se presenta como "sin datos".
 cnt() {
-  local cr
-  cr=$(curl -s -m 20 -I "$API/$1" "${AUTH[@]}" -H "Prefer: count=exact" -H "Range: 0-0" 2>/dev/null \
-        | tr -d '\r' | grep -iE '^content-range:[[:space:]]*0-0/[0-9]+$' \
-        | sed -E 's#^[^:]+:[[:space:]]*0-0/([0-9]+)$#\1#')
-  case "$cr" in
-    ''|*[^0-9]*) echo "sin datos" ;;
-    *) echo "$cr" ;;
-  esac
+  local cr start end total
+  cr=$(curl -s -m 20 -I "$API/$1" --config <(curl_auth_config) \
+        -H "Prefer: count=exact" -H "Range: 0-0" 2>/dev/null \
+        | tr -d '\r' \
+        | awk '{
+            colon = index($0, ":")
+            if (colon > 0 && tolower(substr($0, 1, colon - 1)) == "content-range") {
+              value = substr($0, colon + 1)
+              sub(/^[[:space:]]*/, "", value)
+              sub(/[[:space:]]*$/, "", value)
+              print value
+            }
+          }' \
+        | tail -1)
+  if [ "$cr" = "*/0" ]; then
+    echo 0
+  elif [[ "$cr" =~ ^([0-9]+)-([0-9]+)/([0-9]+)$ ]] \
+    && [ "${#BASH_REMATCH[1]}" -le 18 ] \
+    && [ "${#BASH_REMATCH[2]}" -le 18 ] \
+    && [ "${#BASH_REMATCH[3]}" -le 18 ]; then
+    start=$((10#${BASH_REMATCH[1]}))
+    end=$((10#${BASH_REMATCH[2]}))
+    total=$((10#${BASH_REMATCH[3]}))
+    if [ "$start" -le "$end" ] && [ "$total" -gt 0 ] && [ "$end" -lt "$total" ]; then
+      echo "$total"
+    else
+      echo "sin datos"
+    fi
+  else
+    echo "sin datos"
+  fi
 }
 
 FIRMS=$(cnt "law_firms?select=id")
@@ -48,7 +78,7 @@ heartbeat_summary() {
   local response body http
   response=$(curl -s -m 20 -w $'\n%{http_code}' \
     "$API/sync_worker_heartbeats?select=worker_id,status,last_heartbeat_at,cases_synced_today,errors_today,pool_size&order=last_heartbeat_at.desc&limit=1" \
-    "${AUTH[@]}" 2>/dev/null || true)
+    --config <(curl_auth_config) 2>/dev/null || true)
   http=${response##*$'\n'}
   body=${response%$'\n'*}
   [ "$http" = "200" ] || { echo "sin datos"; return; }

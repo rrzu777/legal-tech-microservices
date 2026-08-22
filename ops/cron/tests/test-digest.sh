@@ -31,6 +31,7 @@ printf 'SUPABASE_URL=http://example.invalid\nSUPABASE_SERVICE_KEY=fake-test-key\
 
 cat > "$TMP/bin/curl" <<'EOF'
 #!/bin/bash
+printf '%s\n' "$*" >> "${DIGEST_CURL_ARGV_CAPTURE:?}"
 if [[ " $* " == *" -I "* ]]; then
   case "$*" in
     *'law_firms?'*|*'users?'*|*'case_movements?'*|*'product_events?'*) count=0 ;;
@@ -47,10 +48,24 @@ if [[ " $* " == *" -I "* ]]; then
   esac
   if [ "${DIGEST_FAKE_PARTIAL:-0}" = 1 ] && [[ "$*" == *'law_firms?'* ]]; then
     printf 'HTTP/1.1 200 OK\r\n\r\n'
+  elif [ "${DIGEST_FAKE_POSTGREST_RANGES:-0}" = 1 ]; then
+    if [ "$count" -eq 0 ]; then
+      printf 'HTTP/1.1 200 OK\r\nContent-Range: */0\r\n\r\n'
+    else
+      printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-%s/%s\r\n\r\n' "$((count - 1))" "$count"
+    fi
   elif [ -n "${DIGEST_FAKE_CONTENT_RANGE:-}" ]; then
-    printf 'HTTP/1.1 200 OK\r\nContent-Range: %s\r\n\r\n' "$DIGEST_FAKE_CONTENT_RANGE"
+    if [ "${DIGEST_FAKE_NO_OWS:-0}" = 1 ]; then
+      printf 'HTTP/1.1 200 OK\r\nContent-Range:%s\r\n\r\n' "$DIGEST_FAKE_CONTENT_RANGE"
+    else
+      printf 'HTTP/1.1 200 OK\r\nContent-Range: %s\r\n\r\n' "$DIGEST_FAKE_CONTENT_RANGE"
+    fi
   elif [ "${DIGEST_FAKE_MISSING_RANGE:-0}" != 1 ]; then
-    printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$count"
+    if [ "$count" -eq 0 ]; then
+      printf 'HTTP/1.1 200 OK\r\nContent-Range: */0\r\n\r\n'
+    else
+      printf 'HTTP/1.1 200 OK\r\nContent-Range: 0-0/%s\r\n\r\n' "$count"
+    fi
   else
     printf 'HTTP/1.1 200 OK\r\n\r\n'
   fi
@@ -90,9 +105,11 @@ chmod +x "$TMP/bin/curl" "$TMP/bin/sudo" "$TMP/bin/hermes" "$TMP/bin/timeout"
 run() {
   : > "$TMP/prompt"
   : > "$TMP/send"
+  : > "$TMP/curl-argv"
   PATH="$TMP/bin:$PATH" HOME="$TMP/home" DIGEST_ENV="$TMP/digest.env" \
     DIGEST_SINCE=2026-08-09T12:00:00 DIGEST_NOW=2026-08-10T12:00:00 \
     DIGEST_DATE_UTC=2026-08-10 DIGEST_PROMPT_CAPTURE="$TMP/prompt" \
+    DIGEST_CURL_ARGV_CAPTURE="$TMP/curl-argv" \
     DIGEST_SEND_CAPTURE="$TMP/send" bash "$DIGEST"
 }
 
@@ -109,6 +126,34 @@ expect_contains 'explica que ventana y estado actual difieren' "$PROMPT" \
   'Las corridas de 24h y el estado actual de causas son métricas distintas.'
 expect_contains 'resume disponibilidad sin confundir cero con desconocido' "$PROMPT" \
   'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
+ARGV_CAPTURE=$(<"$TMP/curl-argv")
+expect_missing 'la service key no aparece en argv de curl' "$ARGV_CAPTURE" 'fake-test-key'
+
+echo '== digest: rangos exactos reales de PostgREST =='
+DIGEST_FAKE_POSTGREST_RANGES=1 run
+PROMPT=$(<"$TMP/prompt")
+expect_contains 'acepta rangos start-end/total y wildcard cero' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
+expect_contains 'conserva el total de corridas' "$PROMPT" \
+  'Corridas últimas 24h: 12 total | 9 success | 2 error | 1 blocked'
+DIGEST_FAKE_POSTGREST_RANGES=0
+
+echo '== digest: variantes válidas y relaciones inválidas =='
+DIGEST_FAKE_CONTENT_RANGE='0-78/79' DIGEST_FAKE_NO_OWS=1 run
+PROMPT=$(<"$TMP/prompt")
+expect_contains 'acepta muestra productiva sin OWS' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
+DIGEST_FAKE_NO_OWS=0
+DIGEST_FAKE_CONTENT_RANGE='0-32/33' run
+PROMPT=$(<"$TMP/prompt")
+expect_contains 'acepta segunda muestra productiva' "$PROMPT" \
+  'Disponibilidad de métricas agregadas: 14/14 lecturas disponibles'
+for invalid_range in '9-1/10' '0-78/10' '0-0/0'; do
+  DIGEST_FAKE_CONTENT_RANGE="$invalid_range" run
+  PROMPT=$(<"$TMP/prompt")
+  expect_contains "rechaza relación inválida $invalid_range" "$PROMPT" \
+    'Disponibilidad de métricas agregadas: 0/14 lecturas disponibles'
+done
 
 echo '== digest: Content-Range ausente no equivale a cero =='
 DIGEST_FAKE_MISSING_RANGE=1 run
