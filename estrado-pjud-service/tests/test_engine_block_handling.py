@@ -69,3 +69,27 @@ async def test_blocked_does_not_touch_the_pool():
     assert pool.method_calls == []
     engine._update_case_error.assert_not_awaited()
     engine._backoff.record_blocked.assert_called_once()
+
+
+def test_remote_protocol_uses_validation_only_behind_transport_flag():
+    import httpx
+
+    from worker.engine import _release_disposition_for_error
+
+    error = httpx.RemoteProtocolError("response lost after request")
+
+    assert _release_disposition_for_error(
+        error, transport_revalidation_enabled=True,
+    ) == "validate_before_reuse"
+    assert _release_disposition_for_error(
+        error, transport_revalidation_enabled=False,
+    ) == "replace_before_reuse"
+
+
+def test_known_rejection_still_requires_replacement_with_transport_flag():
+    from app.failure_kind import BlockedPageError
+    from worker.engine import _release_disposition_for_error
+
+    assert _release_disposition_for_error(
+        BlockedPageError("challenge"), transport_revalidation_enabled=True,
+    ) == "replace_before_reuse"

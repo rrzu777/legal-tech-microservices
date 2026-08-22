@@ -1088,8 +1088,8 @@ async def test_release_unhealthy_remints_only_that_slot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cooldown_spaces_reremints_by_block_pause(monkeypatch):
-    """Two quick re-mints of the same slot are spaced by >= BLOCK_PAUSE_S (G6)."""
+async def test_reactive_replacement_never_sleeps_through_block_pause(monkeypatch):
+    """Cooldown is a slot state after failure, never a wait holding a claim."""
     from worker import session_pool as sp
 
     _patch_pool_deps(monkeypatch, sp, patch_sleep=False)
@@ -1116,18 +1116,21 @@ async def test_cooldown_spaces_reremints_by_block_pause(monkeypatch):
     assert sleep_calls == []  # stagger sleep only applies between slots (N=1 here -> none)
 
     slot = pool._slots[0]
-    # Simulate only 5s elapsed since last mint -> re-mint should wait ~25s.
+    session = await pool.acquire()
+    prior_session = slot.session
+    # Simulate only 5s elapsed since last mint. Replacement remains eager, and
+    # only a failed replacement may place the slot in cooldown.
     fake_time["t"] += 5
-    await pool._refresh_slot(slot)
+    await pool.release(session, healthy=False)
 
-    assert len(sleep_calls) == 1
-    assert sleep_calls[0] == pytest.approx(25.0)
+    assert sleep_calls == []
+    assert slot.session is not prior_session
+    assert slot.disposition == "healthy"
 
 
 @pytest.mark.asyncio
-async def test_refresh_failure_during_acquire_is_non_fatal(monkeypatch):
-    """If _mint_slot raises during an acquire-triggered refresh, acquire still
-    returns the existing (stale) session instead of raising."""
+async def test_refresh_failure_during_acquire_quarantines_old_session(monkeypatch):
+    """A failed refresh preserves but never lends the existing stale session."""
     from worker import session_pool as sp
 
     call_count = {"n": 0}
@@ -1147,8 +1150,13 @@ async def test_refresh_failure_during_acquire_is_non_fatal(monkeypatch):
     pool._slots[0].session._age = config.SESSION_MAX_AGE_S + 1
 
     stale_session = pool._slots[0].session
-    result = await pool.acquire()
-    assert result is stale_session
+    with pytest.raises(RuntimeError, match="mint failed"):
+        await pool.acquire()
+
+    assert pool._slots[0].session is stale_session
+    assert pool._slots[0].disposition == "cooldown"
+    assert pool._slots[0].busy is False
+    assert pool._sem._value == 1
 
 
 @pytest.mark.asyncio

@@ -46,11 +46,25 @@ def _make_playwright_mock(*, cookies=None, user_agent="Mozilla/5.0 Test UA"):
     ]
 
     page = AsyncMock()
-    page.on = MagicMock()
+    page_callbacks = {}
+    page.on = MagicMock(
+        side_effect=lambda event, callback: page_callbacks.__setitem__(event, callback),
+    )
     page.evaluate = AsyncMock(return_value=user_agent)
+
+    cdp_callbacks = {}
+    cdp_session = AsyncMock()
+    cdp_session.on = MagicMock(
+        side_effect=lambda event, callback: cdp_callbacks.__setitem__(event, callback),
+    )
+    cdp_session.send = AsyncMock()
+    cdp_session.detach = AsyncMock()
+    page._callbacks = page_callbacks
+    page._cdp_callbacks = cdp_callbacks
 
     context = AsyncMock()
     context.new_page = AsyncMock(return_value=page)
+    context.new_cdp_session = AsyncMock(return_value=cdp_session)
     context.cookies = AsyncMock(return_value=pw_cookies)
 
     browser = AsyncMock()
@@ -248,10 +262,15 @@ async def test_mint_without_proxy_does_not_pass_proxy_kwarg():
 
 async def test_mint_attributes_chromium_transfer_sizes_to_active_operation():
     async_playwright_factory, _, page = _make_playwright_mock()
-    page.evaluate.side_effect = [
-        "Mozilla/5.0 Test UA",
-        [{"transferSize": 700}, {"transferSize": 500}],
-    ]
+
+    async def goto(*_args, **_kwargs):
+        request = MagicMock(post_data_buffer=None)
+        page._callbacks["request"](request)
+        page._callbacks["request"](request)
+        page._cdp_callbacks["Network.dataReceived"]({"encodedDataLength": 700})
+        page._cdp_callbacks["Network.dataReceived"]({"encodedDataLength": 500})
+
+    page.goto.side_effect = goto
 
     with patch("app.minter.async_playwright", async_playwright_factory):
         with capture_proxy_usage() as usage:

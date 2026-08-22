@@ -13,6 +13,11 @@ import httpx
 from postgrest.exceptions import APIError
 
 from app.bandwidth import ProxyUsageCapture, capture_proxy_usage
+from app.failure_kind import (
+    BlockedPageError,
+    MintUnavailableError,
+    RejectedDetailSessionError,
+)
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.usage_context import current_usage_scope
@@ -59,7 +64,27 @@ _SESSION_REASONS: frozenset[str] = frozenset({
 })
 _SESSION_REASONS_WITHOUT_AGE = frozenset({"startup", "missing_bundle"})
 _SESSION_OPERATIONS = frozenset({"health", "mint"})
-
+FailureCode = Literal[
+    "mint_navigation_failed",
+    "mint_deadline_exceeded",
+    "mint_browser_unavailable",
+    "session_rejected",
+    "remote_protocol_disconnect",
+    "unknown_infra",
+]
+def proxy_failure_code(error: BaseException) -> FailureCode:
+    """Map lifecycle exceptions without retaining any exception text."""
+    if isinstance(error, MintUnavailableError):
+        return {
+            "navigation_failed": "mint_navigation_failed",
+            "deadline_exceeded": "mint_deadline_exceeded",
+            "browser_unavailable": "mint_browser_unavailable",
+        }.get(error.code, "unknown_infra")
+    if isinstance(error, (BlockedPageError, RejectedDetailSessionError)):
+        return "session_rejected"
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "remote_protocol_disconnect"
+    return "unknown_infra"
 
 def _is_transient_telemetry_api_error(exc: APIError) -> bool:
     """Only database concurrency outcomes may safely reuse the same claim."""
@@ -472,6 +497,12 @@ class ProxyUsageTracker:
             status = "skipped"
             error_kind = None
 
+        failure_code = (
+            proxy_failure_code(error)
+            if error is not None and operation in _SESSION_OPERATIONS
+            else None
+        )
+
         event_reservation_id = reservation_id if has_provider_usage else None
         uses_estimated_floor = has_provider_usage and usage.bytes_down == 0
         payload = {
@@ -502,6 +533,7 @@ class ProxyUsageTracker:
             "documents_skipped": usage.documents_skipped,
             "status": status,
             "error_kind": error_kind,
+            "failure_code": failure_code,
             "provider": self._provider,
             "price_per_gb_usd": self._price_per_gb_usd,
         }

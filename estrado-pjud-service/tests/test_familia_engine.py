@@ -3,6 +3,7 @@ préstamo de bundle, y anti-apagón (block/timeout no penalizan)."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from app.cookie_store import CookieBundle
@@ -103,10 +104,11 @@ async def test_login_block_does_not_penalize_and_remints(monkeypatch):
     # "ojv": `FamiliaBlockedError` ES el portal cortandonos. Es el unico de los
     # cuatro tipos que atrapa ese `except` que de verdad culpa a OJV.
     engine._handle_blocked.assert_awaited_once_with("c1", "ojv", "F5")
+    assert engine._finish_run.await_args.kwargs["error_code"] == "ojv_blocked"
     engine._update_case_error.assert_not_awaited()  # NO penaliza
-    # release con healthy=False (re-mint del slot).
+    # Release requests replacement of the slot.
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is False
+    assert kwargs.get("disposition") == "replace_before_reuse"
 
 
 @pytest.mark.asyncio
@@ -134,11 +136,49 @@ async def test_session_error_no_le_echa_la_culpa_al_portal(monkeypatch):
 
     assert result["success"] is False
     engine._handle_blocked.assert_awaited_once_with("c1", "infra", "no se pudo abrir sesion")
+    assert engine._finish_run.await_args.kwargs["error_code"] == "infra_unavailable"
     # Y sigue sin penalizar y sigue re-minteando: la clasificacion cambia el
     # texto, no el manejo.
     engine._update_case_error.assert_not_awaited()
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is False
+    assert kwargs.get("disposition") == "replace_before_reuse"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("typed_error", "expected_code"), [
+    (
+        httpx.RemoteProtocolError("response lost after request"),
+        "remote_protocol_disconnect",
+    ),
+    (TimeoutError("Familia timed out"), "pjud_timeout"),
+])
+async def test_familia_specific_run_code_precedes_infra_fallback(
+    monkeypatch, typed_error, expected_code,
+):
+    import worker.engine as eng
+
+    engine = _make_engine()
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={
+            "rut": "1-9",
+            "password": "p",
+            "password_type": "clave_poder_judicial",
+        }
+    )
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(side_effect=typed_error)
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        eng, "FamiliaAuthSession", MagicMock(return_value=fake_session),
+    )
+
+    result = await engine._sync_familia_case(_CASE, None, MagicMock())
+
+    assert result["success"] is False
+    engine._handle_blocked.assert_awaited_once()
+    assert engine._handle_blocked.await_args.args[1] == "infra"
+    assert engine._finish_run.await_args.kwargs["error_code"] == expected_code
 
 
 @pytest.mark.asyncio
@@ -166,7 +206,10 @@ async def test_proxy_402_trips_persistent_control_without_remint(monkeypatch):
     engine._metrics.record_error.assert_called_once_with("infra")
     assert engine._finish_run.await_args.args[4] == "infra_unavailable"
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs == {"healthy": False, "remint": False}
+    assert kwargs == {
+        "disposition": "replace_before_reuse",
+        "remint": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -196,7 +239,8 @@ async def test_invalid_credentials_is_terminal_and_releases_healthy(monkeypatch)
     # una causa `suspended`, asi que su propio cableado no vuelve a pasar.
     engine._report_invalid_credential.assert_awaited_once_with("cred1")
     _, kwargs = engine._pool.release_familia_bundle.call_args
-    assert kwargs.get("healthy") is True  # credencial inválida NO es culpa de la IP
+    # An invalid credential is not the residential IP's fault.
+    assert kwargs.get("disposition") == "healthy"
 
 
 # NO hay un test "un bloqueo F5 NO reporta la credencial", aunque sea la

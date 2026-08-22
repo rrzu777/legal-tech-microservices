@@ -9,6 +9,7 @@ first cut (see docs/plans/2026-07-07-residential-proxy-pool.md, gap G5).
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -95,6 +96,17 @@ def record_proxy_response(bytes_down: int) -> None:
     capture = _ACTIVE_CAPTURE.get()
     if capture is not None:
         capture.bytes_down += max(0, bytes_down)
+
+
+def record_proxy_response_increment(encoded_data_length: object) -> None:
+    """Record one numeric transfer increment without retaining event metadata."""
+    if (
+        isinstance(encoded_data_length, bool)
+        or not isinstance(encoded_data_length, (int, float))
+        or not math.isfinite(encoded_data_length)
+    ):
+        return
+    record_proxy_response(int(encoded_data_length))
 
 
 def record_proxy_retry() -> None:

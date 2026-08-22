@@ -206,6 +206,18 @@ async def safe_get_next_batch(scheduler, metrics, backoff):
         return None
 
 
+async def safe_reconcile_stale_runs(scheduler, metrics, backoff) -> bool:
+    """Run bounded maintenance fail-closed before any traffic gate or claim."""
+    try:
+        await scheduler.reconcile_stale_runs()
+        return True
+    except Exception:
+        logger.exception("Failed to reconcile stale PJUD sync runs; traffic blocked")
+        metrics.record_error("infra")
+        backoff.record_failure()
+        return False
+
+
 async def scheduler_contract_ready(scheduler, metrics, backoff) -> bool:
     """Falla cerrado antes del primer mint si la migración/RPC no está lista."""
     try:
@@ -297,6 +309,15 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
+            if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+                metrics.set_status("backoff")
+                notify_status("sync-run reconciliation unavailable; traffic blocked")
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
+                continue
+
             # Never mint a paid-proxy session before the persistent control
             # allows traffic. Missing control/DB is intentionally fail-closed.
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
@@ -378,6 +399,15 @@ async def main():
         notify_status("running")
 
         while not shutdown_event.is_set():
+            if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+                metrics.set_status("backoff")
+                notify_status("sync-run reconciliation unavailable; traffic blocked")
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
+                continue
+
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
             if not snapshot.allowed:
                 metrics.set_status("paused")

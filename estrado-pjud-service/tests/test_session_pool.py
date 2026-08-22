@@ -653,13 +653,10 @@ def test_ojv_session_generation_id_is_random_and_can_be_injected():
 
 class TestWorkerSessionPoolAcquire:
     @pytest.mark.asyncio
-    async def test_acquire_returns_stale_session_when_refresh_fails(self):
-        """A mint/refresh failure during acquire() must NOT propagate — the
-        stale (expired-cookie) session should be returned instead. The F5
-        challenge it produces is detected downstream and routed through the
-        no-penalty blocked path (see engine._handle_blocked / detect_blocked),
-        which keeps the anti-outage invariant: mint failures never reach
-        _update_case_error / consecutive_sync_failures.
+    async def test_acquire_quarantines_stale_session_when_refresh_fails(self):
+        """A mint/refresh failure preserves but never lends the stale session.
+        The operational failure propagates without penalizing a case, while
+        cooldown prevents a paid probe loop.
 
         NOTE: as of the N-slot checkout pool (Task 5a), the worker pool is
         slot-based (`_slots`, `_refresh_slot`) rather than a flat `_pool` of
@@ -687,7 +684,11 @@ class TestWorkerSessionPoolAcquire:
         pool._slots = [slot]
         pool._refresh_slot = AsyncMock(side_effect=RuntimeError("mint failed"))
 
-        result = await pool.acquire()
+        with pytest.raises(RuntimeError, match="mint failed"):
+            await pool.acquire()
 
-        assert result is old  # stale session returned, NOT raised
-        await pool.release(result)  # must not raise; semaphore consistent
+        pool._refresh_slot.assert_awaited_once_with(slot)
+        assert slot.session is old
+        assert slot.disposition == "cooldown"
+        assert slot.busy is False
+        assert pool._sem._value == 1

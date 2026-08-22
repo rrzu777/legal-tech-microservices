@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
@@ -7,6 +8,7 @@ from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 logger = logging.getLogger(__name__)
 
 RELEASE_SCHEMA_CACHE_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+RECONCILE_INTERVAL_S = 15 * 60
 
 
 def _postgrest_error_code(error: Exception) -> str | None:
@@ -46,6 +48,33 @@ class Scheduler:
     def __init__(self, config: WorkerConfig, supabase):
         self._config = config
         self._sb = supabase
+        self._last_reconciliation_monotonic = float("-inf")
+
+    async def reconcile_stale_runs(self, *, force: bool = False) -> dict | None:
+        """Reconcile stale run rows without accepting a case or cutoff input."""
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._last_reconciliation_monotonic < RECONCILE_INTERVAL_S
+        ):
+            return None
+        response = await run_query(
+            self._sb.rpc("reconcile_stale_pjud_sync_runs", {})
+        )
+        rows = response.data if isinstance(response.data, list) else []
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError("sync_run_reconciliation_unavailable")
+        result = rows[0]
+        expected_fields = {"reconciled_count", "historical_unowned_count"}
+        if set(result) != expected_fields or any(
+            isinstance(result[field], bool)
+            or not isinstance(result[field], int)
+            or result[field] < 0
+            for field in expected_fields
+        ):
+            raise RuntimeError("sync_run_reconciliation_invalid")
+        self._last_reconciliation_monotonic = now
+        return result
 
     async def verify_claim_contract(self, now: datetime | None = None) -> None:
         """Verifica el RPC sin reclamar causas, antes de mintear el pool."""
