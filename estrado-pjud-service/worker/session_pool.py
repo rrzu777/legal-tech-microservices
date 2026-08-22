@@ -52,6 +52,10 @@ SlotDisposition = Literal[
     "cooldown",
 ]
 ReleaseDisposition = SlotDisposition
+RecoveryDisposition = Literal[
+    "validate_before_reuse",
+    "replace_before_reuse",
+]
 _SLOT_DISPOSITIONS: tuple[SlotDisposition, ...] = (
     "healthy",
     "validate_before_reuse",
@@ -84,6 +88,7 @@ class _Slot:
     session_cycle_reason: SessionReason | None = None
     session_cycle_age_seconds: int | None = None
     disposition: SlotDisposition = "healthy"
+    recovery_disposition: RecoveryDisposition | None = None
     next_probe_at: float = 0.0
     lifecycle_failures: int = 0
 
@@ -225,17 +230,6 @@ class SessionPool:
         # keeps partial config doubles and legacy callers on the flag-off path.
         return self._config.WORKER_SESSION_REUSE_VALIDATION_ENABLED is True
 
-    @property
-    def _transport_revalidation_enabled(self) -> bool:
-        return (
-            getattr(
-                self._config,
-                "WORKER_TRANSPORT_REVALIDATION_ENABLED",
-                False,
-            )
-            is True
-        )
-
     @staticmethod
     def _is_cost_control_error(exc: BaseException) -> bool:
         return is_proxy_billing_error(exc) or isinstance(
@@ -245,6 +239,7 @@ class SessionPool:
 
     def _mark_slot_healthy(self, slot: _Slot, *, reset_failures: bool) -> None:
         slot.disposition = "healthy"
+        slot.recovery_disposition = None
         slot.next_probe_at = 0.0
         if reset_failures:
             slot.lifecycle_failures = 0
@@ -256,6 +251,14 @@ class SessionPool:
         lifecycle_failure: bool = True,
         delay_s: float | None = None,
     ) -> None:
+        recovery_disposition: RecoveryDisposition = (
+            slot.disposition
+            if slot.disposition in {
+                "validate_before_reuse",
+                "replace_before_reuse",
+            }
+            else "replace_before_reuse"
+        )
         if lifecycle_failure:
             slot.lifecycle_failures += 1
         base = max(0.0, float(self._config.BLOCK_PAUSE_S))
@@ -266,6 +269,7 @@ class SessionPool:
             )
             delay_s = base * (2**exponent)
         slot.disposition = "cooldown"
+        slot.recovery_disposition = recovery_disposition
         slot.next_probe_at = self._monotonic_now() + max(0.0, delay_s)
 
     # -- Minteo por-slot ------------------------------------------------
@@ -871,15 +875,10 @@ class SessionPool:
                     if now < candidate.next_probe_at:
                         continue
                     candidate.disposition = (
-                        "validate_before_reuse"
-                        if (
-                            self._transport_revalidation_enabled
-                            and self._reuse_validation_enabled
-                            and candidate.session is not None
-                            and candidate.bundle_saved_at is not None
-                        )
-                        else "replace_before_reuse"
+                        candidate.recovery_disposition
+                        or "replace_before_reuse"
                     )
+                    candidate.recovery_disposition = None
                 slot = candidate
                 break
             if slot is None:
@@ -961,9 +960,9 @@ class SessionPool:
         nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
         en uso por otras corrutinas. Base compartida por `release` y
         `release_familia_bundle`."""
-        release_disposition = self._release_disposition(healthy, disposition)
-        slot.disposition = release_disposition
         try:
+            release_disposition = self._release_disposition(healthy, disposition)
+            slot.disposition = release_disposition
             if (
                 release_disposition == "replace_before_reuse"
                 and remint

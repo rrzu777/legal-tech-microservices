@@ -1036,3 +1036,123 @@ async def test_cost_control_failure_hard_stops_without_cooldown(monkeypatch):
     assert slot.lifecycle_failures == 0
     assert slot.busy is False
     assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_cooldown_expires_back_to_replacement(monkeypatch):
+    """A failed required replacement cannot downgrade to generic validation."""
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monotonic_now = 100.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    pool = _reuse_pool()
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+    pool._monotonic_now = lambda: monotonic_now
+    pool._store = _ReuseStore(_bundle(now - 60))
+    old = _ReusableSession()
+    replacement = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        busy=True,
+        bundle_saved_at=now - 60,
+    )
+    pool._slots = [slot]
+    pool._checkout[old] = slot
+    pool._sem = asyncio.Semaphore(0)
+    mint_attempts = 0
+
+    async def fail_then_replace(target, *, max_attempts=None):
+        nonlocal mint_attempts
+        assert max_attempts == 1
+        mint_attempts += 1
+        if mint_attempts == 1:
+            raise httpx.ConnectError("replacement unavailable")
+        target.session = replacement
+        target.bundle_saved_at = now
+
+    pool._mint_slot = fail_then_replace
+    pool._revalidate_bundle = AsyncMock()
+
+    await pool.release(old, disposition="replace_before_reuse")
+
+    assert pool.slot_state_counts["cooldown"] == 1
+    monotonic_now = slot.next_probe_at + 0.001
+
+    acquired = await pool.acquire()
+
+    assert acquired is replacement
+    assert mint_attempts == 2
+    pool._revalidate_bundle.assert_not_awaited()
+    assert pool.slot_state_counts["healthy"] == 1
+    await pool.release(acquired)
+
+
+@pytest.mark.asyncio
+async def test_invalid_release_disposition_frees_checkout_capacity():
+    """Runtime validation errors cannot strand a removed checkout as busy."""
+    from worker import session_pool as sp
+
+    pool = _make_pool()
+    pool._pool_size = 1
+    pool._sem = asyncio.Semaphore(0)
+    session = _ReusableSession()
+    slot = sp._Slot(index=0, session=session, busy=True)
+    pool._slots = [slot]
+    pool._checkout[session] = slot
+
+    with pytest.raises(ValueError, match="invalid slot disposition"):
+        await pool.release(session, disposition="invalid")  # type: ignore[arg-type]
+
+    assert session not in pool._checkout
+    assert slot.busy is False
+    assert pool._sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_validation_cooldown_restores_validation_intent(monkeypatch):
+    """Recovery intent is captured at failure time, not recomputed from flags."""
+    from worker import session_pool as sp
+
+    now = 10_000.0
+    monotonic_now = 100.0
+    monkeypatch.setattr(sp.time, "time", lambda: now)
+    pool = _reuse_pool()
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = True
+    pool._monotonic_now = lambda: monotonic_now
+    pool._store = _ReuseStore(_bundle(now - 60))
+    old = _ReusableSession()
+    slot = sp._Slot(
+        index=0,
+        token="sticky",
+        proxy_url="http://old-proxy",
+        session=old,
+        bundle_saved_at=now - 60,
+        disposition="validate_before_reuse",
+    )
+    pool._slots = [slot]
+    pool._revalidate_bundle = AsyncMock(
+        side_effect=httpx.RemoteProtocolError("health response lost"),
+    )
+    pool._mint_slot = AsyncMock(
+        side_effect=httpx.ConnectError("replacement unavailable"),
+    )
+
+    with pytest.raises(httpx.ConnectError, match="replacement unavailable"):
+        await pool.acquire()
+
+    assert slot.disposition == "cooldown"
+    pool._config.WORKER_TRANSPORT_REVALIDATION_ENABLED = False
+    monotonic_now = slot.next_probe_at + 0.001
+    pool._revalidate_bundle = AsyncMock()
+    pool._mint_slot = AsyncMock()
+
+    acquired = await pool.acquire()
+
+    assert acquired is old
+    pool._revalidate_bundle.assert_awaited_once()
+    pool._mint_slot.assert_not_awaited()
+    await pool.release(acquired)
