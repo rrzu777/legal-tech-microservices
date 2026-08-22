@@ -603,7 +603,7 @@ replace_fstab_without_managed_block() {
 
 cleanup_current_apply() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
-  local cleanup_failed=0 configuration_safe=1 swapoff_required=0
+  local swapoff_required=0
 
   if [ "$apply_activation_unknown" -eq 1 ]; then
     return 1
@@ -633,7 +633,7 @@ cleanup_current_apply() {
     if "$rm_bin" "$current_temp"; then
       current_temp=''
     else
-      cleanup_failed=1
+      return 1
     fi
   fi
 
@@ -642,8 +642,7 @@ cleanup_current_apply() {
       apply_promoted_fstab=0
       apply_created_backup=0
     else
-      cleanup_failed=1
-      configuration_safe=0
+      return 1
     fi
   elif [ "$apply_created_backup" -eq 1 ]; then
     if validate_backup_metadata "$backup_path" && \
@@ -651,8 +650,7 @@ cleanup_current_apply() {
        "$rm_bin" "$backup_path"; then
       apply_created_backup=0
     else
-      cleanup_failed=1
-      configuration_safe=0
+      return 1
     fi
   fi
 
@@ -660,36 +658,33 @@ cleanup_current_apply() {
     if "$rm_bin" "$sysctl_file"; then
       apply_created_sysctl=0
     else
-      cleanup_failed=1
+      return 1
     fi
   fi
 
   if [ "$apply_created_swap_file" -eq 1 ] && \
-     [ "$apply_activated_swap" -eq 0 ] && [ "$apply_activation_unknown" -eq 0 ] && \
-     [ "$configuration_safe" -eq 1 ]; then
+     [ "$apply_activated_swap" -eq 0 ] && [ "$apply_activation_unknown" -eq 0 ]; then
     if inspect_swap_file 0; then
       if [ "$swap_file_exists" -eq 0 ] || "$rm_bin" "$swap_file"; then
         apply_created_swap_file=0
       else
-        cleanup_failed=1
+        return 1
       fi
     else
-      cleanup_failed=1
+      return 1
     fi
   fi
 
-
-  if [ "$apply_created_swappiness_metadata" -eq 1 ] && [ "$cleanup_failed" -eq 0 ] \
-    && [ "$configuration_safe" -eq 1 ]; then
+  if [ "$apply_created_swappiness_metadata" -eq 1 ]; then
     if validate_swappiness_metadata_file "$swappiness_metadata_file" \
       && "$rm_bin" "$swappiness_metadata_file"; then
       apply_created_swappiness_metadata=0
     else
-      cleanup_failed=1
+      return 1
     fi
   fi
 
-  [ "$cleanup_failed" -eq 0 ]
+  return 0
 }
 
 abort_current_apply() {

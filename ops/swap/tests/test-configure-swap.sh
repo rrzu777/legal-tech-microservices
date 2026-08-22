@@ -79,7 +79,7 @@ setup() {
   unset DF_FAIL FALLOCATE_FAIL CHMOD_FAIL MKSWAP_FAIL SWAPON_FAIL SWAPOFF_FAIL
   unset SWAPON_FAIL_STATE SWAPOFF_KEEP_ACTIVE SYSCTL_FAIL FREE_FAIL
   unset SYSCTL_RESTORE_FAIL SYSCTL_VERIFY_FAIL FREE_MALFORMED FREE_FAIL_AFTER_OUTPUT
-  unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL STAT_FAIL RM_FAIL RM_FAIL_PATH
+  unset CP_FAIL MV_FAIL MV_FAIL_ON_CALL MV_FAIL_SOURCE STAT_FAIL RM_FAIL RM_FAIL_PATH
   unset STAT_OVERRIDE_PATH STAT_OVERRIDE_MODE STAT_OVERRIDE_LINKS
   unset STAT_OVERRIDE_UID STAT_OVERRIDE_GID
   unset FLOCK_FAIL_AFTER_OUTPUT READLINK_FAIL_AFTER_OUTPUT
@@ -188,6 +188,7 @@ exec /bin/cp "$@"'
   write_stub mv '
 printf "mv %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 [ "${SWAP_TEST_MV_FAIL:-0}" != 1 ] || exit 8
+[ -z "${SWAP_TEST_MV_FAIL_SOURCE:-}" ] || [ "${1:-}" != "$SWAP_TEST_MV_FAIL_SOURCE" ] || exit 8
 count=$(cat "$SWAP_TEST_MV_COUNT_FILE") || exit 8
 case "$count" in ""|*[!0-9]*) exit 8;; esac
 count=$((count + 1))
@@ -295,6 +296,7 @@ run_swap() {
     SWAP_TEST_FREE_FAIL_AFTER_OUTPUT="${FREE_FAIL_AFTER_OUTPUT:-0}" SWAP_TEST_CP_FAIL="${CP_FAIL:-0}" \
     SWAP_TEST_MV_FAIL="${MV_FAIL:-0}" \
     SWAP_TEST_MV_FAIL_ON_CALL="${MV_FAIL_ON_CALL:-0}" \
+    SWAP_TEST_MV_FAIL_SOURCE="${MV_FAIL_SOURCE:-}" \
     SWAP_TEST_STAT_FAIL="${STAT_FAIL:-0}" \
     SWAP_TEST_STAT_OVERRIDE_PATH="${STAT_OVERRIDE_PATH:-}" \
     SWAP_TEST_STAT_OVERRIDE_MODE="${STAT_OVERRIDE_MODE:-}" \
@@ -710,6 +712,67 @@ fi
 
 if [ -z "${SWAP_FOCUS:-}" ]; then
   run_apply_compensation_gate_regressions
+fi
+
+run_apply_compensation_retry_regressions() {
+  local original_fstab
+  echo '== failed apply compensation stops at the first cleanup failure and remains retryable'
+
+  setup apply-compensation-fstab-retry
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  original_fstab="$TMP/apply-compensation-fstab-retry.fstab.before"
+  /bin/cp "$FSTAB_FILE" "$original_fstab"
+  SWAPON_FAIL_STATE=active
+  MV_FAIL_SOURCE="$FSTAB_FILE.legaltech-swap.bak"
+  run_swap apply
+  expect_eq 'failed fstab restoration keeps apply failed' "$RC" 1
+  expect_eq 'failed fstab restoration leaves target inactive' \
+    "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+  expect_contains 'failed fstab restoration retains managed block' \
+    "$(cat "$FSTAB_FILE")" '# BEGIN LEGALTECH MANAGED SWAP'
+  if [ -e "$SYSCTL_FILE" ]; then ok 'failed fstab restoration retains later sysctl'; else bad 'failed fstab restoration retains later sysctl'; fi
+  if [ -e "$SWAP_FILE" ]; then ok 'failed fstab restoration retains later swapfile'; else bad 'failed fstab restoration retains later swapfile'; fi
+  if [ -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'failed fstab restoration retains retry metadata'; else bad 'failed fstab restoration retains retry metadata'; fi
+  expect_eq 'failed fstab restoration does not remove later sysctl' \
+    "$(count_log "rm $SYSCTL_FILE")" 0
+  expect_eq 'failed fstab restoration does not remove later swapfile' \
+    "$(count_log "rm $SWAP_FILE")" 0
+  expect_eq 'failed fstab restoration does not remove retry metadata' \
+    "$(count_log "rm $SWAPPINESS_METADATA_FILE")" 0
+  unset SWAPON_FAIL_STATE MV_FAIL_SOURCE
+  assert_retry_converges_clean 'failed apply fstab restoration' "$original_fstab"
+
+  setup apply-compensation-sysctl-retry
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  original_fstab="$TMP/apply-compensation-sysctl-retry.fstab.before"
+  /bin/cp "$FSTAB_FILE" "$original_fstab"
+  SWAPON_FAIL_STATE=active
+  RM_FAIL_PATH=$SYSCTL_FILE
+  run_swap apply
+  expect_eq 'failed apply sysctl removal stays failed' "$RC" 1
+  expect_file_eq 'failed apply sysctl removal already restores fstab byte-identically' \
+    "$original_fstab" "$FSTAB_FILE"
+  if [ -e "$SYSCTL_FILE" ]; then ok 'failed apply sysctl removal retains validated sysctl'; else bad 'failed apply sysctl removal retains validated sysctl'; fi
+  if [ -e "$SWAP_FILE" ]; then ok 'failed apply sysctl removal retains later swapfile'; else bad 'failed apply sysctl removal retains later swapfile'; fi
+  if [ -e "$SWAPPINESS_METADATA_FILE" ]; then ok 'failed apply sysctl removal retains retry metadata'; else bad 'failed apply sysctl removal retains retry metadata'; fi
+  expect_eq 'failed apply sysctl removal does not remove later swapfile' \
+    "$(count_log "rm $SWAP_FILE")" 0
+  expect_eq 'failed apply sysctl removal does not remove retry metadata' \
+    "$(count_log "rm $SWAPPINESS_METADATA_FILE")" 0
+  unset SWAPON_FAIL_STATE RM_FAIL_PATH
+  assert_retry_converges_clean 'failed apply sysctl removal' "$original_fstab"
+}
+
+if [ "${SWAP_FOCUS:-}" = apply-compensation-retry ]; then
+  run_apply_compensation_retry_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_apply_compensation_retry_regressions
 fi
 
 run_swappiness_metadata_regressions() {

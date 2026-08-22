@@ -786,6 +786,21 @@ if [ "$1" = preflight ]; then
   if [ -e "$RG_TEST_STATE/swap-applied" ]; then printf '%s\n' managed; else printf '%s\n' clean; fi
   exit 0
 fi
+if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-apply-compensation-fail" ]; then
+  rm -f "$RG_TEST_STATE/swap-applied"
+  : > "$RG_TEST_STATE/swap-deactivated"
+  : > "$RG_TEST_STATE/swap-partial-swapfile"
+  : > "$RG_TEST_STATE/swap-partial-metadata"
+  case "$(cat "$RG_TEST_STATE/swap-apply-compensation-fail")" in
+    fstab)
+      : > "$RG_TEST_STATE/swap-partial-fstab"
+      : > "$RG_TEST_STATE/swap-partial-sysctl"
+      ;;
+    sysctl) : > "$RG_TEST_STATE/swap-partial-sysctl" ;;
+    *) exit 97 ;;
+  esac
+  exit 1
+fi
 if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-apply-fail" ]; then exit 1; fi
 if [ "$1" = apply ]; then : > "$RG_TEST_STATE/swap-applied"; fi
 if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/create-swap-metadata" ]; then
@@ -798,6 +813,7 @@ if [ "$1" = verify ]; then
   [ -e "$RG_TEST_STATE/swap-applied" ] || exit 1
 fi
 if [ "$1" = rollback ]; then
+  if [ -e "$RG_TEST_STATE/swap-apply-compensation-fail" ]; then exit 1; fi
   if [ -e "$RG_TEST_STATE/swap-rollback-post-deactivate-fail" ]; then
     rm -f "$RG_TEST_STATE/swap-applied"
     : > "$RG_TEST_STATE/swap-deactivated"
@@ -806,6 +822,10 @@ if [ "$1" = rollback ]; then
   [ ! -e "$RG_TEST_STATE/swap-rollback-fail" ] || exit 1
   rm -f "$RG_TEST_STATE/swap-applied"
   rm -f "$RG_TEST_STATE/swap-deactivated"
+  rm -f "$RG_TEST_STATE/swap-partial-fstab"
+  rm -f "$RG_TEST_STATE/swap-partial-sysctl"
+  rm -f "$RG_TEST_STATE/swap-partial-swapfile"
+  rm -f "$RG_TEST_STATE/swap-partial-metadata"
   rm -f "$RG_SWAPPINESS_METADATA_FILE"
 fi
 exit 0
@@ -1197,6 +1217,66 @@ run_incomplete_rollback_retry_regression() {
   expect_eq 'external unvalidated backup is rejected' "$RC" 1
   expect_missing 'external unvalidated path is never reflected' "$OUT" "$invalid_path"
   expect_missing 'external unvalidated path leaks no sentinel' "$OUT" "$SECRET_SENTINEL"
+}
+
+run_apply_compensation_retry_regressions() {
+  local scenario failed_output backup_path retry_path expected_fstab
+  echo '== failed swap apply compensation remains diagnosable and retryable through the orchestrator'
+  for scenario in fstab sysctl; do
+    setup
+    printf '%s\n' "$scenario" > "$STATE/swap-apply-compensation-fail"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    failed_output=$OUT
+    backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+
+    expect_eq "$scenario compensation failure keeps resource apply failed" "$RC" 1
+    if [ -e "$STATE/swap-deactivated" ]; then
+      ok "$scenario compensation failure leaves the exact swap target inactive"
+    else
+      bad "$scenario compensation failure leaves the exact swap target inactive"
+    fi
+    case "$scenario" in
+      fstab) expected_fstab=present ;;
+      sysctl) expected_fstab=absent ;;
+    esac
+    if { [ "$expected_fstab" = present ] && [ -e "$STATE/swap-partial-fstab" ]; } \
+      || { [ "$expected_fstab" = absent ] && [ ! -e "$STATE/swap-partial-fstab" ]; }; then
+      ok "$scenario compensation preserves the expected fstab phase"
+    else
+      bad "$scenario compensation preserves the expected fstab phase"
+    fi
+    if [ -e "$STATE/swap-partial-sysctl" ] \
+      && [ -e "$STATE/swap-partial-swapfile" ] \
+      && [ -e "$STATE/swap-partial-metadata" ]; then
+      ok "$scenario compensation does not advance past its failed cleanup boundary"
+    else
+      bad "$scenario compensation does not advance past its failed cleanup boundary"
+    fi
+    expect_contains "$scenario automatic rollback emits the fixed incomplete diagnostic" \
+      "$failed_output" 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: '
+    expect_contains "$scenario diagnostic includes the exact validated backup" \
+      "$failed_output" "$backup_path"
+    expect_missing "$scenario diagnostic exposes no service credential" \
+      "$failed_output" "$SECRET_SENTINEL"
+    retry_path=$(printf '%s\n' "$failed_output" \
+      | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+    expect_eq "$scenario diagnostic yields one exact BACKUP_DIR" "$retry_path" "$backup_path"
+
+    rm -f "$STATE/swap-apply-compensation-fail"
+    run_guard rollback --backup-dir "$retry_path"
+    expect_eq "$scenario exact BACKUP_DIR retry converges" "$RC" 0
+    expect_contains "$scenario retry confirms the same validated backup" \
+      "$OUT" "ROLLBACK OK: $backup_path"
+    if [ ! -e "$STATE/swap-deactivated" ] \
+      && [ ! -e "$STATE/swap-partial-fstab" ] \
+      && [ ! -e "$STATE/swap-partial-sysctl" ] \
+      && [ ! -e "$STATE/swap-partial-swapfile" ] \
+      && [ ! -e "$STATE/swap-partial-metadata" ]; then
+      ok "$scenario exact BACKUP_DIR retry removes the remaining validated swap state"
+    else
+      bad "$scenario exact BACKUP_DIR retry removes the remaining validated swap state"
+    fi
+  done
 }
 
 run_api_enablement_regressions() {
@@ -1782,11 +1862,20 @@ if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-retry-diagnostic ]; then
   exit
 fi
 
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = swap-apply-compensation-retry ]; then
+  run_apply_compensation_retry_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
 run_swappiness_namespace_regressions
 run_incomplete_rollback_retry_regression
+run_apply_compensation_retry_regressions
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions
