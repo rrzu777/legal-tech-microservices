@@ -48,7 +48,7 @@ class Scheduler:
     def __init__(self, config: WorkerConfig, supabase):
         self._config = config
         self._sb = supabase
-        self._last_reconciliation_monotonic = time.monotonic()
+        self._last_reconciliation_monotonic = float("-inf")
 
     async def reconcile_stale_runs(self, *, force: bool = False) -> dict | None:
         """Reconcile stale run rows without accepting a case or cutoff input."""
@@ -79,7 +79,6 @@ class Scheduler:
     async def verify_claim_contract(self, now: datetime | None = None) -> None:
         """Verifica el RPC sin reclamar causas, antes de mintear el pool."""
         now = now or datetime.now(TZ_SANTIAGO)
-        await self.reconcile_stale_runs(force=True)
         await run_query(self._sb.rpc("claim_pjud_sync_cases", {
             "p_worker_id": self._config.WORKER_ID,
             "p_limit": 0,
@@ -88,7 +87,6 @@ class Scheduler:
 
     async def get_next_batch(self, now: datetime | None = None) -> list[dict]:
         now = now or datetime.now(TZ_SANTIAGO)
-        await self.reconcile_stale_runs()
         validation_once = self._config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
         process_outside_office_hours = (
             self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True

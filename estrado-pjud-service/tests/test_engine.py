@@ -217,6 +217,57 @@ class TestSyncEngine:
         sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport_error", [
+        httpx.ConnectError("connect failed"),
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.PoolTimeout("pool timed out"),
+    ])
+    async def test_begin_sync_run_does_not_replay_pre_send_transport_failure(
+        self, transport_error,
+    ):
+        """Connection and pool acquisition failures cannot hide a committed RPC."""
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(side_effect=transport_error),
+        ), patch("worker.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(type(transport_error)):
+                await engine._begin_sync_run(
+                    _make_case(), "run-uuid-1", datetime(2026, 8, 22, 10, 30),
+                )
+
+        assert mock_sb.rpc.call_count == 1
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ambiguous_error", [
+        httpx.ReadError("read failed after send"),
+        httpx.ReadTimeout("read timed out after send"),
+        httpx.WriteError("write completion unknown"),
+        httpx.WriteTimeout("write completion unknown"),
+    ])
+    async def test_begin_sync_run_replays_read_or_write_ambiguity(
+        self, ambiguous_error,
+    ):
+        engine, _pool, mock_sb, _notifier, _metrics, _backoff = _make_engine()
+        response = MagicMock(data=[{
+            "id": "run-uuid-1", "status": "running", "error_code": None,
+        }])
+
+        with patch(
+            "worker.engine.run_query",
+            new=AsyncMock(side_effect=[ambiguous_error, response]),
+        ), patch("worker.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            assert await engine._begin_sync_run(
+                _make_case(), "run-uuid-1", datetime(2026, 8, 22, 10, 30),
+            ) == "run-uuid-1"
+
+        assert mock_sb.rpc.call_count == 2
+        assert mock_sb.rpc.call_args_list[0] == mock_sb.rpc.call_args_list[1]
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_sync_run_mismatch_stops_before_pool_rate_limit_or_usage(self):
         """A non-exact RPC row cannot authorize any provider-attributed work."""
         engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
@@ -604,6 +655,7 @@ class TestSyncEngine:
         case = _make_case()
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_finish_run", new_callable=AsyncMock) as mock_finish, \
              patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
             mock_search.side_effect = httpx.ConnectError("boom")
             result = await engine.sync_case(case)
@@ -612,6 +664,7 @@ class TestSyncEngine:
         mock_backoff.record_blocked.assert_called_once()
         mock_metrics.record_error.assert_called_once()
         mock_update_error.assert_not_called()
+        assert mock_finish.await_args.kwargs["error_code"] == "infra_unavailable"
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
 
     @pytest.mark.asyncio
@@ -761,6 +814,7 @@ class TestSyncEngine:
         mock_session = mock_pool.acquire.return_value
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_finish_run", new_callable=AsyncMock) as mock_finish, \
              patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error, \
              patch.object(engine, "_handle_blocked", new_callable=AsyncMock) as mock_blocked:
             mock_search.side_effect = http_status_error(503)
@@ -771,6 +825,7 @@ class TestSyncEngine:
         mock_pool.release.assert_awaited_once_with(mock_session, healthy=False)
         # Y con la culpa donde corresponde: el 503 salió del servidor de ellos.
         assert mock_blocked.await_args[0][1] == "ojv"
+        assert mock_finish.await_args.kwargs["error_code"] == "ojv_blocked"
 
     @pytest.mark.asyncio
     async def test_sync_404_de_ojv_si_es_de_la_causa(self):
@@ -783,6 +838,7 @@ class TestSyncEngine:
         engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff = _make_engine()
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
+             patch.object(engine, "_finish_run", new_callable=AsyncMock) as mock_finish, \
              patch.object(engine, "_update_case_error", new_callable=AsyncMock) as mock_update_error:
             mock_search.side_effect = http_status_error(404)
             result = await engine.sync_case(_make_case())
@@ -790,6 +846,7 @@ class TestSyncEngine:
         assert result["success"] is False
         mock_update_error.assert_called_once()
         mock_backoff.record_failure.assert_called_once()
+        assert mock_finish.await_args.kwargs["error_code"] == "unknown_case_error"
 
     @pytest.mark.asyncio
     async def test_sync_cuerpo_vacio_es_infra_y_no_bloqueo_de_ojv(self):

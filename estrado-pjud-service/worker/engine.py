@@ -62,6 +62,16 @@ _MOVEMENT_PAGE_SIZE = 1_000
 _DOCUMENT_SOURCE_TIMEOUT_S = 2.0
 _MAX_LOOKUP_CANDIDATES = 100
 _BEGIN_SYNC_RUN_REPLAY_DELAYS_S = (0.1,)
+# Read/protocol failures can lose a committed response; write failures can occur
+# after partial transmission. Connect and pool-acquisition failures are pre-send
+# and deliberately excluded from the idempotent replay path.
+_AMBIGUOUS_BEGIN_SYNC_RUN_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
 _SYNC_RUN_ERROR_CODES = frozenset({
     "worker_interrupted",
     "sync_run_unavailable",
@@ -87,10 +97,18 @@ class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
 
 
-def _sync_run_error_code(error: BaseException | str | None) -> str | None:
+def _sync_run_error_code(
+    error: BaseException | str | None,
+    *,
+    failure_kind: str | None = None,
+) -> str | None:
     """Map worker outcomes to the database's closed scheduled-run taxonomy."""
     if error is None:
         return None
+    if failure_kind == "infra":
+        return "infra_unavailable"
+    if failure_kind == "ojv":
+        return "ojv_blocked"
     if isinstance(error, httpx.RemoteProtocolError):
         return "remote_protocol_disconnect"
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
@@ -766,7 +784,7 @@ class SyncEngine:
                 response = await run_query(
                     self._sb.rpc("begin_pjud_scheduled_sync_run", payload)
                 )
-            except (httpx.TransportError, asyncio.TimeoutError):
+            except _AMBIGUOUS_BEGIN_SYNC_RUN_ERRORS:
                 if attempt + 1 >= attempts:
                     raise
                 logger.warning(
@@ -1190,7 +1208,14 @@ class SyncEngine:
             if kind == "case":
                 msg = str(e)
                 logger.exception("Error syncing case %s", case["case_number"])
-                await self._finish_run(sync_run_id, started_at, "error", 0, msg)
+                await self._finish_run(
+                    sync_run_id,
+                    started_at,
+                    "error",
+                    0,
+                    msg,
+                    error_code=_sync_run_error_code(e, failure_kind=kind),
+                )
                 await self._update_case_error(case, msg)
                 self._backoff.record_failure()
                 self._metrics.record_error()
@@ -1216,7 +1241,14 @@ class SyncEngine:
                 )
             else:
                 logger.warning("Fallo %s sincronizando causa %s: %s", kind, case["case_number"], msg)
-            await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+            await self._finish_run(
+                sync_run_id,
+                started_at,
+                "blocked",
+                0,
+                msg,
+                error_code=_sync_run_error_code(e, failure_kind=kind),
+            )
             await self._handle_blocked(case["id"], kind, msg)
             # "infra" fijo aunque `kind` pueda ser "ojv": el heartbeat del worker
             # tiene dos baldes, `errors_infra_today` y `errors_case_today`, y la
@@ -1407,7 +1439,14 @@ class SyncEngine:
                 # `app.familia.auth` dentro del clasificador le arrastraria ese
                 # grafo entero a las rutas de search y detail, que no lo usan.
                 cause = "ojv" if isinstance(e, FamiliaBlockedError) else block_cause(e)
-                await self._finish_run(sync_run_id, started_at, "blocked", 0, msg)
+                await self._finish_run(
+                    sync_run_id,
+                    started_at,
+                    "blocked",
+                    0,
+                    msg,
+                    error_code=_sync_run_error_code(e, failure_kind=cause),
+                )
                 await self._handle_blocked(case["id"], cause, msg)
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
@@ -2029,13 +2068,27 @@ class SyncEngine:
                 return movements
             start += _MOVEMENT_PAGE_SIZE
 
-    async def _finish_run(self, run_id, started_at, status, new_movements, error=None):
+    async def _finish_run(
+        self,
+        run_id,
+        started_at,
+        status,
+        new_movements,
+        error=None,
+        *,
+        error_code=None,
+    ):
         if not run_id:
             return
         now = datetime.now(TZ_SANTIAGO)
         duration_ms = int((now - started_at).total_seconds() * 1000)
         error_message = safe_error(error)[:300] if error is not None else None
-        error_code = _sync_run_error_code(error)
+        resolved_error_code = error_code or _sync_run_error_code(error)
+        if (
+            resolved_error_code is not None
+            and resolved_error_code not in _SYNC_RUN_ERROR_CODES
+        ):
+            resolved_error_code = "unknown_case_error"
         try:
             await run_query(
                 self._sb.from_("case_sync_runs").update({
@@ -2044,7 +2097,7 @@ class SyncEngine:
                     "duration_ms": duration_ms,
                     "new_movements_count": new_movements,
                     "error_message": error_message,
-                    "error_code": error_code,
+                    "error_code": resolved_error_code,
                 }).eq("id", run_id)
             )
         except Exception:

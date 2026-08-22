@@ -103,6 +103,7 @@ async def test_login_block_does_not_penalize_and_remints(monkeypatch):
     # "ojv": `FamiliaBlockedError` ES el portal cortandonos. Es el unico de los
     # cuatro tipos que atrapa ese `except` que de verdad culpa a OJV.
     engine._handle_blocked.assert_awaited_once_with("c1", "ojv", "F5")
+    assert engine._finish_run.await_args.kwargs["error_code"] == "ojv_blocked"
     engine._update_case_error.assert_not_awaited()  # NO penaliza
     # release con healthy=False (re-mint del slot).
     _, kwargs = engine._pool.release_familia_bundle.call_args
@@ -134,6 +135,7 @@ async def test_session_error_no_le_echa_la_culpa_al_portal(monkeypatch):
 
     assert result["success"] is False
     engine._handle_blocked.assert_awaited_once_with("c1", "infra", "no se pudo abrir sesion")
+    assert engine._finish_run.await_args.kwargs["error_code"] == "infra_unavailable"
     # Y sigue sin penalizar y sigue re-minteando: la clasificacion cambia el
     # texto, no el manejo.
     engine._update_case_error.assert_not_awaited()
