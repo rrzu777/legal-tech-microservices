@@ -739,8 +739,14 @@ if [ "$1" = verify ]; then
   [ -e "$RG_TEST_STATE/swap-applied" ] || exit 1
 fi
 if [ "$1" = rollback ]; then
+  if [ -e "$RG_TEST_STATE/swap-rollback-post-deactivate-fail" ]; then
+    rm -f "$RG_TEST_STATE/swap-applied"
+    : > "$RG_TEST_STATE/swap-deactivated"
+    exit 1
+  fi
   [ ! -e "$RG_TEST_STATE/swap-rollback-fail" ] || exit 1
   rm -f "$RG_TEST_STATE/swap-applied"
+  rm -f "$RG_TEST_STATE/swap-deactivated"
   rm -f "$RG_SWAPPINESS_METADATA_FILE"
 fi
 exit 0
@@ -1071,6 +1077,52 @@ run_swappiness_namespace_regressions() {
   expect_eq 'failed swap rollback leaves apply failed' "$RC" 1
   if [ -f "$SWAPPINESS_METADATA_FILE" ]; then ok 'failed swap rollback retains retry metadata'; else bad 'failed swap rollback retains retry metadata'; fi
   expect_contains 'failed metadata rollback is loud' "$OUT" 'ROLLBACK INCOMPLETO'
+}
+
+run_incomplete_rollback_retry_regression() {
+  local failed_output backup_path retry_path invalid_path
+  echo '== incomplete automatic rollback reports only its validated retry backup'
+  setup
+  : > "$STATE/create-swap-metadata"
+  : > "$STATE/postflight-fail"
+  : > "$STATE/swap-rollback-post-deactivate-fail"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  failed_output=$OUT
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+
+  expect_eq 'post-deactivation rollback failure keeps apply failed' "$RC" 1
+  if [ -e "$STATE/swap-deactivated" ] && [ ! -e "$STATE/swap-applied" ]; then
+    ok 'failed rollback leaves the exact swap target deactivated'
+  else
+    bad 'failed rollback leaves the exact swap target deactivated'
+  fi
+  expect_contains 'incomplete rollback emits fixed retry diagnostic' "$failed_output" \
+    'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: '
+  expect_contains 'retry diagnostic includes the exact validated backup' \
+    "$failed_output" "$backup_path"
+  expect_missing 'retry diagnostic exposes no service credential' \
+    "$failed_output" "$SECRET_SENTINEL"
+  retry_path=$(printf '%s\n' "$failed_output" \
+    | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+  expect_eq 'retry diagnostic yields exactly one validated backup path' \
+    "$retry_path" "$backup_path"
+
+  rm -f "$STATE/swap-rollback-post-deactivate-fail"
+  run_guard rollback --backup-dir "$retry_path"
+  expect_eq 'retry command from the diagnostic converges' "$RC" 0
+  expect_contains 'retry command confirms the same backup' "$OUT" \
+    "ROLLBACK OK: $backup_path"
+  if [ ! -e "$STATE/swap-deactivated" ] && [ ! -e "$SWAPPINESS_METADATA_FILE" ]; then
+    ok 'retry command removes the remaining validated swap artifacts'
+  else
+    bad 'retry command removes the remaining validated swap artifacts'
+  fi
+
+  invalid_path="$FAKE/external-$SECRET_SENTINEL"
+  run_guard rollback --backup-dir "$invalid_path"
+  expect_eq 'external unvalidated backup is rejected' "$RC" 1
+  expect_missing 'external unvalidated path is never reflected' "$OUT" "$invalid_path"
+  expect_missing 'external unvalidated path leaks no sentinel' "$OUT" "$SECRET_SENTINEL"
 }
 
 run_api_enablement_regressions() {
@@ -1485,10 +1537,19 @@ if [ "${RESOURCE_GUARDS_FOCUS:-}" = swappiness-namespace ]; then
   exit
 fi
 
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-retry-diagnostic ]; then
+  run_incomplete_rollback_retry_regression
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
 run_swappiness_namespace_regressions
+run_incomplete_rollback_retry_regression
 run_api_enablement_regressions
 run_worker_fence_regressions
 run_runtime_cgroup_regressions

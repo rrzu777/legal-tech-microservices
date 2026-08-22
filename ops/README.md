@@ -147,9 +147,13 @@ observan. Los workloads continuos capturados activos deben estar exactamente en:
   final sea su unit exacta.
 
 Las units capturadas inactivas deben seguir inactivas, con PID cero y sin cgroup
-live. Cualquier identidad distinta hace fallar el apply y dispara su rollback.
-`monitor.py --dry-run` es sólo diagnóstico no mutante: exit cero por sí solo no
-prueba postflight ni salud.
+live. Cualquier identidad distinta dentro de `apply` hace fallar la transacción
+y dispara su rollback. En cambio, el subcomando standalone `postflight` deriva
+las expectativas de actividad del estado live que observa en ese momento: es un
+diagnóstico sin captura transaccional y no prueba que se haya preservado el
+estado capturado por un `apply`. No agregar persistencia para convertirlo en
+autoridad de rollout. `monitor.py --dry-run` también es sólo diagnóstico no
+mutante: exit cero por sí solo no prueba postflight ni salud.
 
 ### 4. Rollback
 
@@ -163,7 +167,9 @@ sudo ./ops/resource-guards.sh rollback --backup-dir "$BACKUP_DIR"
 `/var/backups/legaltech-resource-guards/YYYYMMDDTHHMMSSZ` directo, root-owned y
 con manifiesto válido. Restaura exclusivamente los paths del manifiesto y los
 estados capturados de las units. Si el gate de RAM impide retirar swap, informa
-`ROLLBACK INCOMPLETO` y no hace borrado amplio.
+`ROLLBACK INCOMPLETO`, imprime el `BACKUP_DIR` exacto que ya validó y no hace
+borrado amplio. No usar una ruta reconstruida, copiada de otro rollout o
+proporcionada por un tercero.
 
 El rollback de swap es reanudable. Si `swapoff` ya tuvo éxito y una restauración
 o eliminación posterior falla, conservar todos los artefactos y volver a

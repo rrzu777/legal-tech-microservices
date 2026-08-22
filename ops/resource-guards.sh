@@ -1240,7 +1240,8 @@ do_rollback() {
   restore_unit_states || rollback_rc=1
   restore_hermes_unit_states || rollback_rc=1
   if [ "$rollback_rc" -ne 0 ]; then
-    printf '%s\n' 'ROLLBACK INCOMPLETO: intervención manual requerida; no se hizo borrado amplio.' >&2
+    printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
+      "$backup_dir" >&2
     return 1
   fi
   printf '%s\n' "ROLLBACK OK: $backup_dir"
