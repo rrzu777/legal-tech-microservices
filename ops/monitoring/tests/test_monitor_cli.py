@@ -14,6 +14,7 @@ from ops.monitoring.resource_metrics import (
     HostSnapshot,
     ResourceSnapshot,
     UnitSnapshot,
+    collect_resource_snapshot,
 )
 
 
@@ -200,13 +201,59 @@ def test_dry_run_returns_candidates_without_network_or_state_mutation(tmp_path):
 
 def test_dry_run_wrong_cgroup_is_sanitized_and_suppresses_heartbeat(tmp_path):
     output = io.StringIO()
-    wrong_path = "/system.slice/estrado-pjud.service"
-    collected = sample()
-    collected.units["estrado-pjud.service"] = UnitSnapshot(
-        **{
-            **collected.units["estrado-pjud.service"].__dict__,
-            "control_group": wrong_path,
-        }
+    wrong_path = "/system.slice/hermes-gateway.service"
+
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 1
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    properties = {
+        "LoadState": "loaded",
+        "UnitFileState": "enabled",
+        "ActiveState": "active",
+        "SubState": "running",
+        "Result": "success",
+        "MemoryCurrent": "10",
+        "MemoryPeak": "10",
+        "MemoryHigh": "100",
+        "MemoryMax": "200",
+        "TasksCurrent": "1",
+        "TasksMax": "10",
+        "CPUUsageNSec": "1",
+        "NRestarts": "0",
+    }
+
+    def run_command(command, timeout):
+        unit_name = command[4] if command[1] == "--user" else command[2]
+        control_group = {
+            "legaltech.slice": "/legaltech.slice",
+            "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+            "estrado-pjud-worker.service": "/legaltech.slice/estrado-pjud-worker.service",
+            "user-4242.slice": "/user.slice/user-4242.slice",
+            "hermes-gateway.service": wrong_path,
+            "hermes-dashboard.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-dashboard.service"
+            ),
+        }.get(unit_name, f"/system.slice/{unit_name}")
+        return "\n".join(
+            f"{key}={value}"
+            for key, value in {**properties, "ControlGroup": control_group}.items()
+        )
+
+    collected = collect_resource_snapshot(
+        hermes_user_slice="user-4242.slice",
+        read_text=lambda path: (
+            "MemTotal: 100 kB\nMemAvailable: 50 kB\n"
+            "SwapTotal: 100 kB\nSwapFree: 100 kB\n"
+        ),
+        statvfs=lambda path: FakeStatvfs(),
+        run_command=run_command,
+        loadavg=lambda: (0.0, 0.0, 0.0),
+        now=lambda: "2026-08-19T12:00:00Z",
     )
 
     result = main(
@@ -230,7 +277,7 @@ def test_dry_run_wrong_cgroup_is_sanitized_and_suppresses_heartbeat(tmp_path):
     serialized = json.dumps(rendered)
     assert result == 0
     assert any(
-        event["key"] == "unit.inactive:estrado-pjud.service"
+        event["key"] == "unit.operational:hermes-gateway.service"
         for event in rendered["events"]
     )
     assert all(event["key"] != "healthy-heartbeat" for event in rendered["events"])

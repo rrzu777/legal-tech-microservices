@@ -11,6 +11,7 @@ import csv
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
@@ -45,6 +46,10 @@ BASE_UNITS = (
     "legaltech-resource-tracker.service",
     "legaltech-monitor.timer",
     "legaltech-resource-tracker.timer",
+)
+HERMES_USER_UNITS = (
+    "hermes-gateway.service",
+    "hermes-dashboard.service",
 )
 COLLECTION_UNAVAILABLE_MESSAGE = "Required host resource metrics are unavailable"
 
@@ -282,6 +287,8 @@ def collect_resource_snapshot(
 ) -> ResourceSnapshot:
     """Collect host and unit aggregates without letting one unit hide the host."""
     try:
+        if re.fullmatch(r"user-[0-9]+\.slice", hermes_user_slice) is None:
+            raise ValueError("Hermes user slice is invalid")
         meminfo = parse_meminfo(read_text("/proc/meminfo"))
         required_meminfo = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")
         if any(key not in meminfo for key in required_meminfo):
@@ -330,6 +337,14 @@ def collect_resource_snapshot(
         unit_name: _collect_unit(unit_name, run_command)
         for unit_name in (*BASE_UNITS, hermes_user_slice)
     }
+    units.update(
+        {
+            unit_name: _collect_unit(
+                unit_name, run_command, hermes_user_manager=True
+            )
+            for unit_name in HERMES_USER_UNITS
+        }
+    )
     return ResourceSnapshot(
         schema_version=SCHEMA_VERSION,
         timestamp_utc=now(),
@@ -339,12 +354,34 @@ def collect_resource_snapshot(
     )
 
 
-def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
-    command = ["systemctl", "show", unit_name, "--no-pager"] + [
+def _collect_unit(
+    unit_name: str,
+    run_command: RunCommand,
+    *,
+    hermes_user_manager: bool = False,
+) -> UnitSnapshot:
+    command = ["systemctl"]
+    if hermes_user_manager:
+        command += ["--user", "--machine=hermes@.host"]
+    command += ["show", unit_name, "--no-pager"] + [
         f"--property={property_name}" for property_name in SYSTEMD_PROPERTIES
     ]
     try:
-        values = parse_systemctl_show(run_command(command, SYSTEMD_TIMEOUT_SECONDS))
+        output = run_command(command, SYSTEMD_TIMEOUT_SECONDS)
+        values = _parse_exact_unit_properties(output)
+        numeric_values = {
+            name: _strict_optional_int(values[name])
+            for name in (
+                "MemoryCurrent",
+                "MemoryPeak",
+                "MemoryHigh",
+                "MemoryMax",
+                "TasksCurrent",
+                "TasksMax",
+                "CPUUsageNSec",
+                "NRestarts",
+            )
+        }
     except Exception:
         return UnitSnapshot(
             name=unit_name,
@@ -368,14 +405,14 @@ def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
         name=unit_name,
         active_state=values.get("ActiveState", "unknown"),
         sub_state=values.get("SubState", "unknown"),
-        memory_current_bytes=_optional_int(values.get("MemoryCurrent")),
-        memory_peak_bytes=_optional_int(values.get("MemoryPeak")),
-        memory_high_bytes=_optional_int(values.get("MemoryHigh")),
-        memory_max_bytes=_optional_int(values.get("MemoryMax")),
-        tasks_current=_optional_int(values.get("TasksCurrent")),
-        tasks_max=_optional_int(values.get("TasksMax")),
-        cpu_usage_ns=_optional_int(values.get("CPUUsageNSec")),
-        n_restarts=_optional_int(values.get("NRestarts")),
+        memory_current_bytes=numeric_values["MemoryCurrent"],
+        memory_peak_bytes=numeric_values["MemoryPeak"],
+        memory_high_bytes=numeric_values["MemoryHigh"],
+        memory_max_bytes=numeric_values["MemoryMax"],
+        tasks_current=numeric_values["TasksCurrent"],
+        tasks_max=numeric_values["TasksMax"],
+        cpu_usage_ns=numeric_values["CPUUsageNSec"],
+        n_restarts=numeric_values["NRestarts"],
         load_state=values.get("LoadState", "unknown") or "unknown",
         unit_file_state=values.get("UnitFileState", "unknown") or "unknown",
         result=values.get("Result", "unknown") or "unknown",
@@ -383,11 +420,41 @@ def _collect_unit(unit_name: str, run_command: RunCommand) -> UnitSnapshot:
     )
 
 
-def _optional_int(value: str | None) -> int | None:
-    if value is None or value.strip() in {"", "max", "infinity", "[not set]"}:
+def _parse_exact_unit_properties(text: str) -> dict[str, str]:
+    if not isinstance(text, str) or "\r" in text or "\x00" in text:
+        raise ValueError("invalid systemctl output")
+    values: dict[str, str] = {}
+    allowed = set(SYSTEMD_PROPERTIES)
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or key not in allowed
+            or key in values
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in line
+            )
+        ):
+            raise ValueError("invalid systemctl output")
+        values[key] = value
+    if set(values) != allowed:
+        raise ValueError("invalid systemctl output")
+    for key in ("LoadState", "UnitFileState", "ActiveState", "SubState", "Result"):
+        if re.fullmatch(r"[A-Za-z0-9_.@:-]*", values[key]) is None:
+            raise ValueError("invalid systemctl output")
+    control_group = values["ControlGroup"]
+    if control_group and (
+        re.fullmatch(r"/[A-Za-z0-9_.@:/-]+", control_group) is None
+        or "//" in control_group
+    ):
+        raise ValueError("invalid systemctl output")
+    return values
+
+
+def _strict_optional_int(value: str) -> int | None:
+    if value in {"", "max", "infinity", "[not set]"}:
         return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed >= 0 else None
+    if re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError("invalid numeric systemctl property")
+    return int(value)

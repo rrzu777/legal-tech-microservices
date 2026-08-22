@@ -1,5 +1,6 @@
 import csv
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from ops.monitoring.resource_metrics import (
     parse_systemctl_show,
     percent_used,
 )
+from ops.monitoring.alert_policy import advance_state, evaluate_rules
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -74,7 +76,7 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
 
     def run_command(command, timeout):
         calls.append((command, timeout))
-        unit_name = command[2]
+        unit_name = command[4] if command[1] == "--user" else command[2]
         control_groups = {
             "legaltech.slice": "/legaltech.slice",
             "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
@@ -90,6 +92,14 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
                 "/system.slice/legaltech-resource-tracker.timer"
             ),
             "user-4242.slice": "/user.slice/user-4242.slice",
+            "hermes-gateway.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-gateway.service"
+            ),
+            "hermes-dashboard.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-dashboard.service"
+            ),
         }
         return (FIXTURES / "systemctl-show.txt").read_text().replace(
             "/system.slice/legaltech.slice", control_groups[unit_name]
@@ -125,8 +135,10 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
         "legaltech-monitor.timer",
         "legaltech-resource-tracker.timer",
         "user-4242.slice",
+        "hermes-gateway.service",
+        "hermes-dashboard.service",
     }
-    assert len(calls) == 8
+    assert len(calls) == 10
     assert all(timeout == 5.0 for _, timeout in calls)
     assert all("--property=ControlGroup" in command for command, _ in calls)
     assert all("--property=LoadState" in command for command, _ in calls)
@@ -136,6 +148,170 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
     assert snapshot.units["user-4242.slice"].control_group == (
         "/user.slice/user-4242.slice"
     )
+    hermes_commands = [command for command, _ in calls if command[1] == "--user"]
+    assert [command[:5] for command in hermes_commands] == [
+        [
+            "systemctl",
+            "--user",
+            "--machine=hermes@.host",
+            "show",
+            "hermes-gateway.service",
+        ],
+        [
+            "systemctl",
+            "--user",
+            "--machine=hermes@.host",
+            "show",
+            "hermes-dashboard.service",
+        ],
+    ]
+
+
+def test_collector_wrong_hermes_cgroup_reaches_policy_and_suppresses_heartbeat():
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 1
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    wrong_path = "/system.slice/hermes-gateway.service"
+
+    def run_command(command, timeout):
+        unit_name = command[4] if command[1] == "--user" else command[2]
+        expected = {
+            "legaltech.slice": "/legaltech.slice",
+            "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+            "estrado-pjud-worker.service": "/legaltech.slice/estrado-pjud-worker.service",
+            "user-4242.slice": "/user.slice/user-4242.slice",
+            "hermes-gateway.service": wrong_path,
+            "hermes-dashboard.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-dashboard.service"
+            ),
+        }.get(unit_name, f"/system.slice/{unit_name}")
+        return (FIXTURES / "systemctl-show.txt").read_text().replace(
+            "/system.slice/legaltech.slice", expected
+        )
+
+    snapshot = collect_resource_snapshot(
+        hermes_user_slice="user-4242.slice",
+        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        statvfs=lambda path: FakeStatvfs(),
+        run_command=run_command,
+        loadavg=lambda: (0.0, 0.0, 0.0),
+        now=lambda: "2026-08-19T12:00:00Z",
+    )
+    events, _ = advance_state(
+        evaluate_rules(snapshot, {}),
+        {},
+        datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert any(
+        event.key == "unit.operational:hermes-gateway.service"
+        for event in events
+    )
+    assert all(event.key != "healthy-heartbeat" for event in events)
+    assert wrong_path not in json.dumps([event.__dict__ for event in events])
+
+
+@pytest.mark.parametrize("failure_mode", ["producer", "duplicate-property"])
+def test_hermes_user_manager_failure_is_sanitized_and_fails_closed(failure_mode):
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 1
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    secret = "user-manager-secret-detail"
+
+    def run_command(command, timeout):
+        unit_name = command[4] if command[1] == "--user" else command[2]
+        output = (FIXTURES / "systemctl-show.txt").read_text()
+        if unit_name == "hermes-gateway.service":
+            if failure_mode == "producer":
+                raise RuntimeError(secret)
+            output += "ActiveState=active\n"
+        return output
+
+    snapshot = collect_resource_snapshot(
+        hermes_user_slice="user-4242.slice",
+        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        statvfs=lambda path: FakeStatvfs(),
+        run_command=run_command,
+        loadavg=lambda: (0.0, 0.0, 0.0),
+        now=lambda: "2026-08-19T12:00:00Z",
+    )
+    failed = snapshot.units["hermes-gateway.service"]
+    events, _ = advance_state(
+        evaluate_rules(snapshot, {}),
+        {},
+        datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert failed.diagnostic == "systemctl show failed"
+    assert secret not in repr(failed)
+    assert any(
+        event.key == "unit.operational:hermes-gateway.service"
+        for event in events
+    )
+    assert all(event.key != "healthy-heartbeat" for event in events)
+
+
+def test_collected_disabled_inactive_hermes_service_needs_no_live_cgroup():
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 1
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    def run_command(command, timeout):
+        unit_name = command[4] if command[1] == "--user" else command[2]
+        control_group = {
+            "legaltech.slice": "/legaltech.slice",
+            "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+            "estrado-pjud-worker.service": "/legaltech.slice/estrado-pjud-worker.service",
+            "user-4242.slice": "/user.slice/user-4242.slice",
+            "hermes-gateway.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-gateway.service"
+            ),
+        }.get(unit_name, f"/system.slice/{unit_name}")
+        output = (FIXTURES / "systemctl-show.txt").read_text().replace(
+            "/system.slice/legaltech.slice", control_group
+        )
+        if unit_name == "hermes-dashboard.service":
+            output = (
+                output.replace("UnitFileState=enabled", "UnitFileState=disabled")
+                .replace("ActiveState=active", "ActiveState=inactive")
+                .replace("SubState=running", "SubState=dead")
+                .replace(
+                    "ControlGroup=/system.slice/hermes-dashboard.service",
+                    "ControlGroup=",
+                )
+            )
+        return output
+
+    snapshot = collect_resource_snapshot(
+        hermes_user_slice="user-4242.slice",
+        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        statvfs=lambda path: FakeStatvfs(),
+        run_command=run_command,
+        loadavg=lambda: (0.0, 0.0, 0.0),
+        now=lambda: "2026-08-19T12:00:00Z",
+    )
+    events, _ = advance_state(
+        evaluate_rules(snapshot, {}),
+        {},
+        datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert snapshot.units["hermes-dashboard.service"].active_state == "inactive"
+    assert snapshot.units["hermes-dashboard.service"].control_group is None
+    assert [event.key for event in events] == ["healthy-heartbeat"]
 
 
 def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_error():
