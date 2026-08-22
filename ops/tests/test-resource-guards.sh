@@ -782,7 +782,7 @@ run_guard() {
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
     RG_TEST_RAM_BYTES="${TEST_RAM_BYTES:-7516192768}" \
     RG_WORKER_FENCE_POLL_DELAY_SECONDS=0 \
-    RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS=0 \
+    RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS="${TEST_HEARTBEAT_POLL_DELAY_OVERRIDE-0}" \
     RG_TEST_MUTATE="${TEST_MUTATE:-none}" \
     bash "$SCRIPT" "$@" 2>&1)
   RC=$?
@@ -1110,16 +1110,20 @@ configure_worker_precondition_scenario() {
 }
 
 run_worker_post_start_wait_regressions() {
+  local poll
+  local -a heartbeat_sequence=(safe)
   echo '== post-start wait spans a real heartbeat interval and accepts subsecond-new idle state'
   setup
   configure_active_worker
-  printf '%s\n' safe starting-new starting-new starting-new starting-new starting-new safe-new \
-    > "$STATE/heartbeat-sequence"
+  for ((poll = 0; poll < 13; poll++)); do heartbeat_sequence+=(starting-new); done
+  heartbeat_sequence+=(safe-new)
+  printf '%s\n' "${heartbeat_sequence[@]}" > "$STATE/heartbeat-sequence"
   printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
-  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
-  expect_eq 'delayed idle heartbeat after five starting polls succeeds' "$RC" 0
-  expect_exact_count 'delayed idle heartbeat polls five times without real test sleep' 'sleep 0' 5
-  expect_count 'heartbeat wait never sleeps the production delay in tests' 'sleep 5' 0
+  TEST_HEARTBEAT_POLL_DELAY_OVERRIDE='' TEST_MUTATE=dropin \
+    run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'delayed idle heartbeat after thirteen starting polls succeeds' "$RC" 0
+  expect_exact_count 'delayed idle heartbeat exercises thirteen production-delay polls' 'sleep 5' 13
+  expect_count 'production-delay coverage performs no zero-delay heartbeat polls' 'sleep 0' 0
 
   setup
   configure_active_worker
