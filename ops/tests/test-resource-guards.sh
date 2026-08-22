@@ -488,7 +488,11 @@ if [ -n "$config" ]; then
   [ ! -f "$heartbeat_calls_file" ] || heartbeat_calls=$(cat "$heartbeat_calls_file")
   heartbeat_calls=$((heartbeat_calls + 1))
   printf '%s\n' "$heartbeat_calls" > "$heartbeat_calls_file"
-  if [ "$heartbeat_calls" -eq 1 ]; then
+  if [ -s "$RG_TEST_STATE/heartbeat-sequence" ]; then
+    heartbeat_state=$(sed -n '1p' "$RG_TEST_STATE/heartbeat-sequence")
+    sed '1d' "$RG_TEST_STATE/heartbeat-sequence" > "$RG_TEST_STATE/heartbeat-sequence.next"
+    mv "$RG_TEST_STATE/heartbeat-sequence.next" "$RG_TEST_STATE/heartbeat-sequence"
+  elif [ "$heartbeat_calls" -eq 1 ]; then
     heartbeat_state=$(cat "$RG_TEST_STATE/heartbeat-pre")
   else
     heartbeat_state=$(cat "$RG_TEST_STATE/heartbeat-post")
@@ -497,6 +501,9 @@ if [ -n "$config" ]; then
     safe) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
     safe-historical-mint) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":7}}]' > "$output" ;;
     safe-new) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:02:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    safe-subsecond) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00.100000Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    safe-new-subsecond) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00.900000Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    starting-new) printf '[{"status":"starting","last_heartbeat_at":"2026-08-22T00:01:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
     wrong-worker)
       case "$url" in
         *'worker_id=eq.worker-1'*) printf '[]' > "$output" ;;
@@ -545,9 +552,19 @@ case "$*" in
     [ ! -e "$RG_TEST_STATE/date-hour-fail-after-output" ]
     ;;
   *'@'*'+%Y-%m-%dT%H:%M:%SZ') echo 2026-08-21T20:03:00Z ;;
+  *'2026-08-22T00:00:00Z'*'+%s%N') echo 1787356800000000000 ;;
   *'2026-08-22T00:00:00Z'*'+%s') echo 1787356800 ;;
+  *'2026-08-22T00:00:00.100000Z'*'+%s%N') echo 1787356800100000000 ;;
+  *'2026-08-22T00:00:00.900000Z'*'+%s%N') echo 1787356800900000000 ;;
+  *'2026-08-22T00:00:00.100000Z'*'+%s') echo 1787356800 ;;
+  *'2026-08-22T00:00:00.900000Z'*'+%s') echo 1787356800 ;;
+  *'2026-08-22T00:02:00Z'*'+%s%N') echo 1787356920000000000 ;;
   *'2026-08-22T00:02:00Z'*'+%s') echo 1787356920 ;;
+  *'2026-08-22T00:01:00Z'*'+%s%N') echo 1787356860000000000 ;;
+  *'2026-08-22T00:01:00Z'*'+%s') echo 1787356860 ;;
+  *'2026-08-21T23:50:00Z'*'+%s%N') echo 1787356200000000000 ;;
   *'2026-08-21T23:50:00Z'*'+%s') echo 1787356200 ;;
+  *'2026-08-22T00:04:00Z'*'+%s%N') echo 1787357040000000000 ;;
   *'2026-08-22T00:04:00Z'*'+%s') echo 1787357040 ;;
   *) exit 1 ;;
 esac
@@ -765,6 +782,7 @@ run_guard() {
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
     RG_TEST_RAM_BYTES="${TEST_RAM_BYTES:-7516192768}" \
     RG_WORKER_FENCE_POLL_DELAY_SECONDS=0 \
+    RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS=0 \
     RG_TEST_MUTATE="${TEST_MUTATE:-none}" \
     bash "$SCRIPT" "$@" 2>&1)
   RC=$?
@@ -1091,6 +1109,27 @@ configure_worker_precondition_scenario() {
   esac
 }
 
+run_worker_post_start_wait_regressions() {
+  echo '== post-start wait spans a real heartbeat interval and accepts subsecond-new idle state'
+  setup
+  configure_active_worker
+  printf '%s\n' safe starting-new starting-new starting-new starting-new starting-new safe-new \
+    > "$STATE/heartbeat-sequence"
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'delayed idle heartbeat after five starting polls succeeds' "$RC" 0
+  expect_exact_count 'delayed idle heartbeat polls five times without real test sleep' 'sleep 0' 5
+  expect_count 'heartbeat wait never sleeps the production delay in tests' 'sleep 5' 0
+
+  setup
+  configure_active_worker
+  printf '%s\n' safe-subsecond > "$STATE/heartbeat-pre"
+  printf '%s\n' safe-new-subsecond > "$STATE/heartbeat-post"
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'strictly newer idle heartbeat in the same second succeeds' "$RC" 0
+}
+
 run_worker_fence_regressions() {
   local scenario rollback_count backup_path
   local -a unsafe_scenarios=(
@@ -1128,6 +1167,8 @@ run_worker_fence_regressions() {
   printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
   TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'historical pre-stop mint attempts remain safe' "$RC" 0
+
+  run_worker_post_start_wait_regressions
 
   echo '== changed active worker follows the stop-drain-start transaction exactly'
   setup
@@ -1213,11 +1254,23 @@ run_worker_fence_regressions() {
     rollback_count=$(printf '%s\n' "$OUT" | grep -Ec 'ROLLBACK (OK|INCOMPLETO)' || true)
     expect_eq "$scenario triggers exactly one rollback result" "$rollback_count" 1
     expect_count "$scenario rollback never restarts worker" 'systemctl restart estrado-pjud-worker.service' 0
+    if [ "$scenario" = missing-new-heartbeat ]; then
+      expect_exact_count 'missing heartbeat uses the bounded 75-second wait budget' 'sleep 0' 15
+      expect_count 'missing heartbeat never sleeps the production delay in tests' 'sleep 5' 0
+    fi
     for forbidden in '/api/v1/sync' '/proxy' '/session/mint' '/retry'; do
       expect_missing "$scenario emits no $forbidden action" "$(cat "$EVENTS")" "$forbidden"
     done
   done
 }
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-heartbeat-wait ]; then
+  run_worker_post_start_wait_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-fence ]; then
   run_worker_fence_regressions

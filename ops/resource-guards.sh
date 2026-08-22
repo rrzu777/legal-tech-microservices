@@ -10,7 +10,7 @@ readonly MIN_RAM_BYTES=6442450944
 readonly ACTIVE_LEASE_SECONDS=14400
 readonly HEARTBEAT_MAX_AGE_SECONDS=300
 readonly WORKER_DRAIN_ATTEMPTS=5
-readonly WORKER_HEARTBEAT_ATTEMPTS=5
+readonly WORKER_POST_START_HEARTBEAT_ATTEMPTS=16
 readonly WORKER_CGROUP=/legaltech.slice/estrado-pjud-worker.service
 
 usage() {
@@ -39,6 +39,7 @@ readonly -a OVERRIDE_NAMES=(
   RG_FIND_BIN RG_CP_BIN RG_RM_BIN RG_MKDIR_BIN RG_CHMOD_BIN RG_CHOWN_BIN
   RG_MKTEMP_BIN RG_JQ_BIN RG_PROVISION_BIN RG_SWAP_BIN RG_PYTHON_BIN
   RG_TEST_ROOT_UID RG_TEST_ROOT_GID RG_WORKER_FENCE_POLL_DELAY_SECONDS
+  RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS
 )
 
 test_mode=${RG_TEST_MODE:-0}
@@ -100,6 +101,7 @@ python_bin=${RG_PYTHON_BIN:-/usr/bin/python3}
 root_uid=${RG_TEST_ROOT_UID:-0}
 root_gid=${RG_TEST_ROOT_GID:-0}
 worker_fence_poll_delay_seconds=${RG_WORKER_FENCE_POLL_DELAY_SECONDS:-1}
+worker_heartbeat_poll_delay_seconds=${RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS:-5}
 
 for absolute_value in \
   "$repo_dir" "$systemd_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
@@ -116,6 +118,8 @@ is_uint "$root_uid" || usage
 is_uint "$root_gid" || usage
 is_uint "$worker_fence_poll_delay_seconds" || usage
 [ "$worker_fence_poll_delay_seconds" -le 30 ] || usage
+is_uint "$worker_heartbeat_poll_delay_seconds" || usage
+[ "$worker_heartbeat_poll_delay_seconds" -le 30 ] || usage
 
 if [ "$test_mode" != 1 ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
   fail 'must run as root' || exit "$EXIT_ERROR"
@@ -245,8 +249,8 @@ validate_managed_source() {
 worker_id=''
 worker_id_encoded=''
 worker_proxy_mode=0
-worker_last_heartbeat_epoch=''
-worker_pre_stop_heartbeat_epoch=''
+worker_last_heartbeat_order=''
+worker_pre_stop_heartbeat_order=''
 worker_restore_allowed=1
 
 load_worker_fence_config() {
@@ -367,10 +371,10 @@ maintenance_window_is_open() {
     || { [ "$hour" -ge 0 ] && [ "$hour" -le 3 ]; }
 }
 
-worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-epoch
-  local require_zero_mint=${1:-0} minimum_epoch=${2:-}
+worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-order
+  local require_zero_mint=${1:-0} minimum_order=${2:-}
   local config="$temp_dir/heartbeat.curl" body="$temp_dir/heartbeat.body"
-  local http timestamp now_epoch heartbeat_epoch age
+  local http timestamp now_epoch heartbeat_epoch heartbeat_order age
   write_curl_config "$config" \
     "${SUPABASE_URL%/}/rest/v1/sync_worker_heartbeats?worker_id=eq.${worker_id_encoded}&select=status,last_heartbeat_at,metadata" \
     "$body" || return 1
@@ -396,14 +400,15 @@ worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-epoch
   ' "$body" 2>"$null_file"); then return 1; fi
   now_epoch=$(LC_ALL=C "$date_bin" -u +%s 2>"$null_file") || return 1
   heartbeat_epoch=$(LC_ALL=C "$date_bin" -u -d "$timestamp" +%s 2>"$null_file") || return 1
-  is_uint "$now_epoch" && is_uint "$heartbeat_epoch" || return 1
+  heartbeat_order=$(LC_ALL=C "$date_bin" -u -d "$timestamp" +%s%N 2>"$null_file") || return 1
+  is_uint "$now_epoch" && is_uint "$heartbeat_epoch" && is_uint "$heartbeat_order" || return 1
   [ "$now_epoch" -ge "$heartbeat_epoch" ] || return 1
   age=$((now_epoch - heartbeat_epoch))
   [ "$age" -le "$HEARTBEAT_MAX_AGE_SECONDS" ] || return 1
-  if [ -n "$minimum_epoch" ]; then
-    is_uint "$minimum_epoch" && [ "$heartbeat_epoch" -gt "$minimum_epoch" ] || return 1
+  if [ -n "$minimum_order" ]; then
+    is_uint "$minimum_order" && [ "$heartbeat_order" -gt "$minimum_order" ] || return 1
   fi
-  worker_last_heartbeat_epoch=$heartbeat_epoch
+  worker_last_heartbeat_order=$heartbeat_order
 }
 
 active_claim_count() {
@@ -1220,14 +1225,14 @@ stop_worker_for_change() {
 verify_started_worker_is_idle() {
   local attempt count
   worker_runtime_is_active || return 1
-  for ((attempt = 1; attempt <= WORKER_HEARTBEAT_ATTEMPTS; attempt++)); do
-    if worker_heartbeat_is_idle 1 "$worker_pre_stop_heartbeat_epoch"; then
+  for ((attempt = 1; attempt <= WORKER_POST_START_HEARTBEAT_ATTEMPTS; attempt++)); do
+    if worker_heartbeat_is_idle 1 "$worker_pre_stop_heartbeat_order"; then
       count=$(active_claim_count) || return 1
       [ "$count" = 0 ]
       return
     fi
-    [ "$attempt" -lt "$WORKER_HEARTBEAT_ATTEMPTS" ] || return 1
-    "$sleep_bin" "$worker_fence_poll_delay_seconds" >"$null_file" 2>&1 || return 1
+    [ "$attempt" -lt "$WORKER_POST_START_HEARTBEAT_ATTEMPTS" ] || return 1
+    "$sleep_bin" "$worker_heartbeat_poll_delay_seconds" >"$null_file" 2>&1 || return 1
   done
   return 1
 }
@@ -1305,7 +1310,7 @@ run_apply_steps() {
     load_worker_fence_config || return 1
     maintenance_window_is_open || return 1
     worker_heartbeat_is_idle 0 || return 1
-    worker_pre_stop_heartbeat_epoch=$worker_last_heartbeat_epoch
+    worker_pre_stop_heartbeat_order=$worker_last_heartbeat_order
     worker_count=$(active_claim_count) || return 1
     [ "$worker_count" = 0 ] || return 1
   fi
