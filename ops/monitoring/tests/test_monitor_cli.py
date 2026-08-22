@@ -74,6 +74,20 @@ def sample(api_active="active"):
                 "user-4242.slice",
                 control_group="/user.slice/user-4242.slice",
             ),
+            "hermes-gateway.service": unit(
+                "hermes-gateway.service",
+                control_group=(
+                    "/user.slice/user-4242.slice/user@4242.service/"
+                    "app.slice/hermes-gateway.service"
+                ),
+            ),
+            "hermes-dashboard.service": unit(
+                "hermes-dashboard.service",
+                control_group=(
+                    "/user.slice/user-4242.slice/user@4242.service/"
+                    "app.slice/hermes-dashboard.service"
+                ),
+            ),
         },
         hermes_user_slice="user-4242.slice",
     )
@@ -182,6 +196,45 @@ def test_dry_run_returns_candidates_without_network_or_state_mutation(tmp_path):
     assert rendered["dry_run"] is True
     assert rendered["events"][0]["key"] == "unit.inactive:estrado-pjud.service"
     assert list(tmp_path.iterdir()) == []
+
+
+def test_dry_run_wrong_cgroup_is_sanitized_and_suppresses_heartbeat(tmp_path):
+    output = io.StringIO()
+    wrong_path = "/system.slice/estrado-pjud.service"
+    collected = sample()
+    collected.units["estrado-pjud.service"] = UnitSnapshot(
+        **{
+            **collected.units["estrado-pjud.service"].__dict__,
+            "control_group": wrong_path,
+        }
+    )
+
+    result = main(
+        ["--dry-run", "--state-dir", str(tmp_path)],
+        environ={},
+        collect=lambda **kwargs: collected,
+        clock=fixed_clock,
+        state_loader=lambda path: new_state(),
+        state_writer=lambda *args: (_ for _ in ()).throw(
+            AssertionError("dry-run mutated state")
+        ),
+        transport_factory=lambda *args: (_ for _ in ()).throw(
+            AssertionError("dry-run constructed transport")
+        ),
+        slice_resolver=lambda: "user-4242.slice",
+        stdout=output,
+        stderr=io.StringIO(),
+    )
+
+    rendered = json.loads(output.getvalue())
+    serialized = json.dumps(rendered)
+    assert result == 0
+    assert any(
+        event["key"] == "unit.inactive:estrado-pjud.service"
+        for event in rendered["events"]
+    )
+    assert all(event["key"] != "healthy-heartbeat" for event in rendered["events"])
+    assert wrong_path not in serialized
 
 
 def test_collection_unavailable_becomes_stable_immediate_alert_without_heartbeat(

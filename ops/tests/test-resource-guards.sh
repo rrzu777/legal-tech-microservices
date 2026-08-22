@@ -116,8 +116,16 @@ setup() {
 
   printf '%s\n' enabled > "$STATE/unit-estrado-pjud.service-enabled"
   printf '%s\n' active > "$STATE/unit-estrado-pjud.service-active"
+  printf '%s\n' loaded > "$STATE/unit-estrado-pjud.service-load"
+  printf '%s\n' 4200 > "$STATE/unit-estrado-pjud.service-main-pid"
+  printf '%s\n' /legaltech.slice/estrado-pjud.service \
+    > "$STATE/unit-estrado-pjud.service-control-group"
+  printf '%s\n' loaded > "$STATE/unit-legaltech.slice-load"
+  printf '%s\n' active > "$STATE/unit-legaltech.slice-active"
+  printf '%s\n' /legaltech.slice > "$STATE/unit-legaltech.slice-control-group"
   printf '%s\n' disabled > "$STATE/unit-estrado-pjud-worker.service-enabled"
   printf '%s\n' inactive > "$STATE/unit-estrado-pjud-worker.service-active"
+  printf '%s\n' loaded > "$STATE/unit-estrado-pjud-worker.service-load"
   printf '%s\n' 0 > "$STATE/unit-estrado-pjud-worker.service-main-pid"
   : > "$STATE/unit-estrado-pjud-worker.service-control-group"
   printf '%s\n' legaltech.slice > "$STATE/unit-estrado-pjud-worker.service-slice"
@@ -137,7 +145,15 @@ setup() {
   for unit in hermes-gateway.service hermes-dashboard.service; do
     printf '%s\n' enabled > "$STATE/user-unit-$unit-enabled"
     printf '%s\n' active > "$STATE/user-unit-$unit-active"
+    printf '%s\n' loaded > "$STATE/user-unit-$unit-load"
+    case "$unit" in hermes-gateway.service) pid=4301 ;; *) pid=4302 ;; esac
+    printf '%s\n' "$pid" > "$STATE/user-unit-$unit-main-pid"
+    printf '/user.slice/user-1002.slice/user@1002.service/app.slice/%s\n' "$unit" \
+      > "$STATE/user-unit-$unit-control-group"
   done
+  printf '%s\n' loaded > "$STATE/unit-user-1002.slice-load"
+  printf '%s\n' active > "$STATE/unit-user-1002.slice-active"
+  printf '%s\n' /user.slice/user-1002.slice > "$STATE/unit-user-1002.slice-control-group"
 
   if [ -d "$TMP/stub-bin" ]; then
     cp -R "$TMP/stub-bin/." "$BIN/"
@@ -205,6 +221,42 @@ state_file() { printf '%s/unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
 user_state_file() { printf '%s/user-unit-%s-%s' "$RG_TEST_STATE" "$1" "$2"; }
 if [ "${1:-}" = --user ]; then
   command=${3:-}; unit=${4:-}
+  if [ "$command" = show ]; then
+    properties=()
+    for arg in "$@"; do case "$arg" in --property=*) properties+=("${arg#--property=}") ;; esac; done
+    for property in "${properties[@]}"; do
+      if [ -e "$RG_TEST_STATE/property-omit" ] \
+        && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-omit")" ]; then
+        continue
+      fi
+      if [ -e "$RG_TEST_STATE/property-bad" ] \
+        && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-bad")" ]; then
+        value=$(cat "$RG_TEST_STATE/property-bad-value" 2>/dev/null || printf drifted)
+      else
+        case "$property" in
+          LoadState) value=$(cat "$(user_state_file "$unit" load)") || exit 1 ;;
+          ActiveState) value=$(cat "$(user_state_file "$unit" active)") || exit 1 ;;
+          MainPID)
+            if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=0
+            else value=$(cat "$(user_state_file "$unit" main-pid)") || exit 1; fi ;;
+          ControlGroup)
+            if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=
+            else value=$(cat "$(user_state_file "$unit" control-group)") || exit 1; fi ;;
+          *) exit 1 ;;
+        esac
+      fi
+      printf '%s=%s\n' "$property" "$value"
+      if [ -e "$RG_TEST_STATE/property-duplicate" ] \
+        && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-duplicate")" ]; then
+        printf '%s=%s\n' "$property" "$value"
+      fi
+    done
+    if [ -e "$RG_TEST_STATE/property-extra" ] \
+      && [ "$unit" = "$(cat "$RG_TEST_STATE/property-extra")" ]; then
+      printf '%s\n' 'Unexpected=loaded'
+    fi
+    exit 0
+  fi
   if [ "$command" = list-unit-files ]; then
     for candidate in hermes-gateway.service hermes-dashboard.service; do
       value=$(cat "$(user_state_file "$candidate" enabled)") || exit 1
@@ -274,6 +326,20 @@ if [ "${1:-}" = show ]; then
     fi
   fi
   case "$unit:$1" in
+    legaltech.slice:LoadState|legaltech.slice:ActiveState|legaltech.slice:ControlGroup|user-1002.slice:LoadState|user-1002.slice:ActiveState|user-1002.slice:ControlGroup|estrado-pjud.service:LoadState|estrado-pjud.service:ActiveState|estrado-pjud.service:MainPID|estrado-pjud.service:ControlGroup) {
+      case "$1" in
+        LoadState) suffix=load ;;
+        ActiveState) suffix=active ;;
+        MainPID) suffix=main-pid ;;
+        ControlGroup) suffix=control-group ;;
+      esac
+      if [ "$unit" = estrado-pjud.service ] \
+        && [ "$(cat "$RG_TEST_STATE/unit-$unit-active")" = inactive ]; then
+        case "$1" in MainPID) printf '%s\n' 0 ;; ControlGroup) printf '\n' ;; *) cat "$RG_TEST_STATE/unit-$unit-$suffix" ;; esac
+      else
+        cat "$RG_TEST_STATE/unit-$unit-$suffix"
+      fi
+    } ;;
     legaltech.slice:CPUWeight) echo 1000 ;;
     legaltech.slice:MemoryLow) echo 3221225472 ;;
     legaltech.slice:MemoryHigh) echo 6442450944 ;;
@@ -296,6 +362,7 @@ if [ "${1:-}" = show ]; then
     user-1002.slice:TasksMax) echo 1024 ;;
     user-1002.slice:CPUWeight) echo 200 ;;
     estrado-pjud-worker.service:Slice|legaltech-monitor.service:Slice|legaltech-resource-tracker.service:Slice) cat "$RG_TEST_STATE/unit-$unit-slice" ;;
+    estrado-pjud-worker.service:LoadState) cat "$RG_TEST_STATE/unit-$unit-load" ;;
     estrado-pjud-worker.service:MainPID|legaltech-monitor.service:MainPID|legaltech-resource-tracker.service:MainPID) cat "$RG_TEST_STATE/unit-$unit-main-pid" ;;
     estrado-pjud-worker.service:ControlGroup|legaltech-monitor.service:ControlGroup|legaltech-resource-tracker.service:ControlGroup) cat "$RG_TEST_STATE/unit-$unit-control-group" ;;
     estrado-pjud-worker.service:ActiveState|legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
@@ -331,7 +398,22 @@ if [ "${1:-}" = show ]; then
     *) exit 1 ;;
   esac; }
   if [ "$value_mode" -eq 1 ]; then property_value "$property"; else
-    for property in "${properties[@]}"; do printf '%s=%s\n' "$property" "$(property_value "$property")"; done
+    for property in "${properties[@]}"; do
+      if [ -e "$RG_TEST_STATE/property-omit" ] \
+        && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-omit")" ]; then
+        continue
+      fi
+      value=$(property_value "$property") || exit 1
+      printf '%s=%s\n' "$property" "$value"
+      if [ -e "$RG_TEST_STATE/property-duplicate" ] \
+        && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-duplicate")" ]; then
+        printf '%s=%s\n' "$property" "$value"
+      fi
+    done
+    if [ -e "$RG_TEST_STATE/property-extra" ] \
+      && [ "$unit" = "$(cat "$RG_TEST_STATE/property-extra")" ]; then
+      printf '%s\n' 'Unexpected=loaded'
+    fi
   fi
   exit 0
 fi
@@ -1268,8 +1350,87 @@ run_worker_fence_regressions() {
   done
 }
 
+run_runtime_cgroup_regressions() {
+  local scenario key value mutate rollback_count
+  echo '== exact runtime cgroups fail closed and roll back once'
+  for scenario in legaltech-slice api worker hermes-slice hermes-gateway hermes-dashboard; do
+    setup
+    mutate=api
+    case "$scenario" in
+      legaltech-slice)
+        key=legaltech.slice:ControlGroup value=/system.slice/legaltech.slice ;;
+      api)
+        key=estrado-pjud.service:ControlGroup value=/system.slice/estrado-pjud.service ;;
+      worker)
+        configure_active_worker
+        : > "$STATE/worker-wrong-start-cgroup"
+        key='' value=''
+        mutate=dropin ;;
+      hermes-slice)
+        key=user-1002.slice:ControlGroup value=/user.slice/user-9999.slice ;;
+      hermes-gateway)
+        key=hermes-gateway.service:ControlGroup
+        value=/user.slice/user-1002.slice/user@1002.service/app.slice/wrong.service
+        mutate=hermes ;;
+      hermes-dashboard)
+        key=hermes-dashboard.service:ControlGroup value=/system.slice/hermes-dashboard.service
+        mutate=hermes ;;
+    esac
+    if [ -n "$key" ]; then
+      printf '%s\n' "$key" > "$STATE/property-bad"
+      printf '%s\n' "$value" > "$STATE/property-bad-value"
+    fi
+    TEST_MUTATE=$mutate run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario wrong valid cgroup refuses apply" "$RC" 1
+    rollback_count=$(grep -c -x -F 'swap rollback' "$EVENTS" 2>/dev/null || true)
+    expect_eq "$scenario mismatch triggers one rollback" "$rollback_count" 1
+  done
+
+  echo '== runtime parser rejects missing duplicate malformed and extra properties'
+  for scenario in missing-active duplicate-pid malformed-pid missing-cgroup extra-property; do
+    setup
+    case "$scenario" in
+      missing-active) printf '%s\n' legaltech.slice:ActiveState > "$STATE/property-omit" ;;
+      duplicate-pid) printf '%s\n' estrado-pjud.service:MainPID > "$STATE/property-duplicate" ;;
+      malformed-pid)
+        printf '%s\n' estrado-pjud.service:MainPID > "$STATE/property-bad"
+        printf '%s\n' '42x' > "$STATE/property-bad-value" ;;
+      missing-cgroup) printf '%s\n' user-1002.slice:ControlGroup > "$STATE/property-omit" ;;
+      extra-property) printf '%s\n' legaltech.slice > "$STATE/property-extra" ;;
+    esac
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario refuses apply" "$RC" 1
+    expect_exact_count "$scenario triggers one rollback" 'swap rollback' 1
+  done
+
+  echo '== exact active runtime passes and captured inactivity needs no live cgroup'
+  setup
+  configure_active_worker
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'all exact active cgroups pass' "$RC" 0
+
+  setup
+  printf '%s\n' inactive > "$STATE/user-unit-hermes-dashboard.service-active"
+  printf '%s\n' 0 > "$STATE/user-unit-hermes-dashboard.service-main-pid"
+  : > "$STATE/user-unit-hermes-dashboard.service-control-group"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'captured inactive worker and Hermes unit need no cgroup' "$RC" 0
+  expect_count 'captured inactive worker state is runtime-probed once' \
+    'systemctl show estrado-pjud-worker.service --property=LoadState' 1
+  expect_count 'captured inactive Hermes state is runtime-probed once' \
+    'systemctl --user --machine=hermes@.host show hermes-dashboard.service --property=LoadState' 1
+}
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-heartbeat-wait ]; then
   run_worker_post_start_wait_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = runtime-cgroups ]; then
+  run_runtime_cgroup_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
@@ -1330,6 +1491,7 @@ run_absent_timer_regressions
 run_swappiness_namespace_regressions
 run_api_enablement_regressions
 run_worker_fence_regressions
+run_runtime_cgroup_regressions
 
 echo '== explicit test guard rejects a partial override set'
 setup

@@ -855,6 +855,92 @@ show_contract() { # unit property expected [property expected ...]
   done
 }
 
+show_runtime_contract() { # scope unit expected-active exact|hermes-prefix expected-cgroup
+  local scope=$1 unit=$2 expected_active=$3 match_mode=$4 expected_cgroup=$5
+  local output line key value load_state='' active_state='' main_pid='' control_group=''
+  local load_count=0 active_count=0 pid_count=0 control_count=0 line_count=0
+  local -a arguments=(--property=LoadState --property=ActiveState)
+  case "$match_mode" in
+    exact-slice) ;;
+    exact-service|hermes-service) arguments+=(--property=MainPID) ;;
+    *) return 1 ;;
+  esac
+  arguments+=(--property=ControlGroup)
+  output=$(scoped_systemctl "$scope" show "$unit" "${arguments[@]}" 2>"$null_file") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_count=$((line_count + 1))
+    case "$line" in *$'\r'*|*$'\t'*|*' '*) return 1 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    [ "$key" != "$line" ] || return 1
+    case "$value" in *$'\n'*|*$'\r'*|*$'\t'*) return 1 ;; esac
+    case "$key" in
+      LoadState) load_count=$((load_count + 1)); load_state=$value ;;
+      ActiveState) active_count=$((active_count + 1)); active_state=$value ;;
+      MainPID) pid_count=$((pid_count + 1)); main_pid=$value ;;
+      ControlGroup) control_count=$((control_count + 1)); control_group=$value ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [ "$load_count" -eq 1 ] && [ "$active_count" -eq 1 ] \
+    && [ "$control_count" -eq 1 ] || return 1
+  case "$match_mode" in
+    exact-slice) [ "$pid_count" -eq 0 ] && [ "$line_count" -eq 3 ] || return 1 ;;
+    *) [ "$pid_count" -eq 1 ] && [ "$line_count" -eq 4 ] || return 1 ;;
+  esac
+  [ "$load_state" = loaded ] && [ "$active_state" = "$expected_active" ] || return 1
+  case "$expected_active:$match_mode" in
+    inactive:exact-service|inactive:hermes-service)
+      [ "$main_pid" = 0 ] && [ -z "$control_group" ] || return 1
+      ;;
+    active:exact-slice)
+      [ "$control_group" = "$expected_cgroup" ] || return 1
+      ;;
+    active:exact-service)
+      is_uint "$main_pid" && [ "$main_pid" -gt 0 ] \
+        && [ "$control_group" = "$expected_cgroup" ] || return 1
+      ;;
+    active:hermes-service)
+      is_uint "$main_pid" && [ "$main_pid" -gt 0 ] || return 1
+      [[ "$control_group" =~ ^/[A-Za-z0-9_.@:/-]+$ ]] || return 1
+      case "$control_group" in *'//'*) return 1 ;; esac
+      case "$control_group" in
+        "$expected_cgroup"/*/"$unit") ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_expected_activity() { # scope unit tracked-index
+  local scope=$1 unit=$2 index=$3
+  if [ "${#desired_active_states[@]}" -eq "${#tracked_units[@]}" ]; then
+    printf '%s\n' "${desired_active_states[$index]}"
+  else
+    read_unit_state "$scope" is-active "$unit"
+  fi
+}
+
+verify_runtime_postflight() { # Hermes uid
+  local uid=$1 expected unit index
+  show_runtime_contract system legaltech.slice active exact-slice /legaltech.slice || return 1
+  expected=$(runtime_expected_activity system estrado-pjud.service 0) || return 1
+  show_runtime_contract system estrado-pjud.service "$expected" exact-service \
+    /legaltech.slice/estrado-pjud.service || return 1
+  expected=$(runtime_expected_activity system estrado-pjud-worker.service 1) || return 1
+  show_runtime_contract system estrado-pjud-worker.service "$expected" exact-service \
+    "$WORKER_CGROUP" || return 1
+  show_runtime_contract system "user-$uid.slice" active exact-slice \
+    "/user.slice/user-$uid.slice" || return 1
+  for ((index = system_unit_count; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    expected=$(runtime_expected_activity user "$unit" "$index") || return 1
+    show_runtime_contract user "$unit" "$expected" hermes-service \
+      "/user.slice/user-$uid.slice" || return 1
+  done
+}
+
 run_postflight() {
   local uid timer target enabled active
   uid=$(validate_hermes_inventory) || { fail 'postflight Hermes inventory is unknown'; return 1; }
@@ -862,6 +948,7 @@ run_postflight() {
   show_contract estrado-pjud.service Slice legaltech.slice MemoryHigh 3221225472 MemoryMax 4294967296 CPUQuotaPerSecUSec 2s CPUWeight 500 TasksMax 512 || return 1
   show_contract estrado-pjud-worker.service PartOf legaltech.slice Slice legaltech.slice MemoryHigh 2147483648 MemoryMax 3221225472 CPUQuotaPerSecUSec 2s CPUWeight 800 TasksMax 512 || return 1
   show_contract "user-$uid.slice" MemoryHigh 2147483648 MemoryMax 2621440000 TasksMax 1024 CPUWeight 200 || return 1
+  verify_runtime_postflight "$uid" || return 1
   show_contract legaltech-monitor.service \
     Type oneshot User root PartOf '' \
     EnvironmentFiles '/etc/legaltech-monitoring.env (ignore_errors=yes)' \
@@ -1356,6 +1443,8 @@ run_apply_steps() {
     if [ "${desired_active_states[0]}" = active ]; then
       [ "$(read_unit_state system is-active estrado-pjud.service)" = active ] || return 1
       "$systemctl_bin" restart estrado-pjud.service >"$null_file" 2>&1 || return 1
+      show_runtime_contract system estrado-pjud.service active exact-service \
+        /legaltech.slice/estrado-pjud.service || return 1
     else
       [ "$(read_unit_state system is-active estrado-pjud.service)" = inactive ] || return 1
     fi
@@ -1368,6 +1457,8 @@ run_apply_steps() {
       if [ "${desired_active_states[$hermes_index]}" = active ]; then
         [ "$hermes_activity" = active ] || return 1
         scoped_systemctl user restart "$hermes_unit" >"$null_file" 2>&1 || return 1
+        show_runtime_contract user "$hermes_unit" active hermes-service \
+          "/user.slice/user-$uid.slice" || return 1
       else
         [ "$hermes_activity" = inactive ] || return 1
       fi
@@ -1377,6 +1468,8 @@ run_apply_steps() {
     if [ "${desired_active_states[1]}" = active ]; then
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
       "$systemctl_bin" start estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
+      show_runtime_contract system estrado-pjud-worker.service active exact-service \
+        "$WORKER_CGROUP" || return 1
       verify_started_worker_is_idle || return 1
     else
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1

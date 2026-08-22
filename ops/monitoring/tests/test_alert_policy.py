@@ -120,6 +120,20 @@ def snapshot(
                 "user-4242.slice",
                 control_group="/user.slice/user-4242.slice",
             ),
+            "hermes-gateway.service": unit(
+                "hermes-gateway.service",
+                control_group=(
+                    "/user.slice/user-4242.slice/user@4242.service/"
+                    "app.slice/hermes-gateway.service"
+                ),
+            ),
+            "hermes-dashboard.service": unit(
+                "hermes-dashboard.service",
+                control_group=(
+                    "/user.slice/user-4242.slice/user@4242.service/"
+                    "app.slice/hermes-dashboard.service"
+                ),
+            ),
         },
         hermes_user_slice="user-4242.slice",
     )
@@ -422,6 +436,61 @@ def test_invalid_required_continuous_unit_cgroup_is_immediate_and_blocks_heartbe
     assert all(event.key != "healthy-heartbeat" for event in events)
 
 
+@pytest.mark.parametrize(
+    ("unit_name", "rule_key", "wrong_control_group"),
+    [
+        (
+            "legaltech.slice",
+            "unit.operational:legaltech.slice",
+            "/system.slice/legaltech.slice",
+        ),
+        (
+            "estrado-pjud.service",
+            "unit.inactive:estrado-pjud.service",
+            "/system.slice/estrado-pjud.service",
+        ),
+        (
+            "estrado-pjud-worker.service",
+            "unit.inactive:estrado-pjud-worker.service",
+            "/system.slice/estrado-pjud-worker.service",
+        ),
+        (
+            "user-4242.slice",
+            "unit.operational:user-4242.slice",
+            "/user.slice/user-9999.slice",
+        ),
+        (
+            "hermes-gateway.service",
+            "unit.operational:hermes-gateway.service",
+            "/user.slice/user-4242.slice/user@4242.service/app.slice/wrong.service",
+        ),
+        (
+            "hermes-dashboard.service",
+            "unit.operational:hermes-dashboard.service",
+            "/system.slice/hermes-dashboard.service",
+        ),
+    ],
+)
+def test_wrong_valid_cgroup_raises_sanitized_alert_and_blocks_heartbeat(
+    unit_name, rule_key, wrong_control_group
+):
+    sample = snapshot()
+    sample.units[unit_name] = replace(
+        sample.units[unit_name], control_group=wrong_control_group
+    )
+
+    rule = rules_by_key(sample)[rule_key]
+    events, _ = evaluate(sample, {}, datetime(2026, 8, 19, 12, 0, tzinfo=UTC))
+
+    assert rule.active is True
+    assert rule.persist_for_seconds == 0
+    assert wrong_control_group not in rule.message
+    assert wrong_control_group != rule.value
+    assert any(event.key == rule_key for event in events)
+    assert all(wrong_control_group not in event.message for event in events)
+    assert all(event.key != "healthy-heartbeat" for event in events)
+
+
 def test_disabled_inactive_worker_does_not_require_a_cgroup_for_healthy_heartbeat():
     sample = snapshot(worker_active="inactive")
     sample.units["estrado-pjud-worker.service"] = replace(
@@ -457,4 +526,18 @@ def test_timers_and_inactive_successful_oneshots_need_no_cgroup_for_heartbeat():
         for result in results
         if result.key.startswith("unit.operational:")
     )
+    assert [event.key for event in events] == ["healthy-heartbeat"]
+
+
+def test_inactive_hermes_service_needs_no_cgroup_for_healthy_heartbeat():
+    sample = snapshot()
+    sample.units["hermes-dashboard.service"] = replace(
+        sample.units["hermes-dashboard.service"],
+        active_state="inactive",
+        unit_file_state="disabled",
+        control_group=None,
+    )
+
+    events, _ = evaluate(sample, {}, datetime(2026, 8, 19, 12, 0, tzinfo=UTC))
+
     assert [event.key for event in events] == ["healthy-heartbeat"]

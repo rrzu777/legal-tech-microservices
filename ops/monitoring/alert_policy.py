@@ -57,11 +57,23 @@ def evaluate_rules(
     previous_rules = (state or {}).get("rules", {})
     results: list[RuleResult] = [collection_unavailable_rule(active=False)]
 
+    hermes_user_slice = snapshot.hermes_user_slice or next(
+        (
+            name
+            for name in sorted(snapshot.units)
+            if re.fullmatch(r"user-[0-9]+\.slice", name)
+        ),
+        "hermes-user.slice",
+    )
+
     for unit_name in CRITICAL_UNITS:
         unit = snapshot.units.get(unit_name)
         expected = unit_name == "estrado-pjud.service" or _worker_is_expected(unit)
         inactive = expected and not _continuous_unit_is_available(
-            unit, require_control_group=True
+            unit,
+            unit_name=unit_name,
+            hermes_user_slice=hermes_user_slice,
+            require_control_group=True,
         )
         results.append(
             RuleResult(
@@ -80,14 +92,6 @@ def evaluate_rules(
         ("legaltech-monitor.timer", True, False),
         ("legaltech-resource-tracker.timer", True, False),
     )
-    hermes_user_slice = snapshot.hermes_user_slice or next(
-        (
-            name
-            for name in sorted(snapshot.units)
-            if re.fullmatch(r"user-[0-9]+\.slice", name)
-        ),
-        "hermes-user.slice",
-    )
     required_continuous_units += ((hermes_user_slice, False, True),)
     for (
         unit_name,
@@ -96,11 +100,27 @@ def evaluate_rules(
     ) in required_continuous_units:
         unit = snapshot.units.get(unit_name)
         unavailable = not _continuous_unit_is_available(
-            unit, require_control_group=control_group_required
+            unit,
+            unit_name=unit_name,
+            hermes_user_slice=hermes_user_slice,
+            require_control_group=control_group_required,
         ) or (
             enabled_required
             and unit is not None
             and unit.unit_file_state not in {"enabled", "enabled-runtime"}
+        )
+        results.append(_operational_unit_rule(unit_name, unavailable))
+
+    for unit_name in ("hermes-gateway.service", "hermes-dashboard.service"):
+        unit = snapshot.units.get(unit_name)
+        if unit is None:
+            continue
+        expected = _worker_is_expected(unit)
+        unavailable = expected and not _continuous_unit_is_available(
+            unit,
+            unit_name=unit_name,
+            hermes_user_slice=hermes_user_slice,
+            require_control_group=True,
         )
         results.append(_operational_unit_rule(unit_name, unavailable))
 
@@ -286,7 +306,11 @@ def _worker_is_expected(unit: Any) -> bool:
 
 
 def _continuous_unit_is_available(
-    unit: Any, *, require_control_group: bool = False
+    unit: Any,
+    *,
+    unit_name: str = "",
+    hermes_user_slice: str = "",
+    require_control_group: bool = False,
 ) -> bool:
     return (
         unit is not None
@@ -295,21 +319,51 @@ def _continuous_unit_is_available(
         and unit.active_state == "active"
         and (
             not require_control_group
-            or _control_group_is_valid(unit.control_group)
+            or _control_group_matches(
+                unit_name, unit.control_group, hermes_user_slice
+            )
         )
     )
 
 
-def _control_group_is_valid(control_group: Any) -> bool:
-    return (
-        isinstance(control_group, str)
-        and bool(control_group.strip())
-        and control_group.startswith("/")
-        and not any(
-            ord(character) < 32 or ord(character) == 127
+def _control_group_matches(
+    unit_name: str, control_group: Any, hermes_user_slice: str
+) -> bool:
+    if (
+        not isinstance(control_group, str)
+        or not control_group
+        or control_group != control_group.strip()
+        or not control_group.startswith("/")
+        or re.fullmatch(r"/[A-Za-z0-9_.@:/-]+", control_group) is None
+        or "//" in control_group
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
             for character in control_group
         )
-    )
+    ):
+        return False
+    exact_paths = {
+        "legaltech.slice": "/legaltech.slice",
+        "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+        "estrado-pjud-worker.service": (
+            "/legaltech.slice/estrado-pjud-worker.service"
+        ),
+    }
+    if unit_name in exact_paths:
+        return control_group == exact_paths[unit_name]
+    if re.fullmatch(r"user-[0-9]+\.slice", hermes_user_slice) is None:
+        return False
+    if unit_name == hermes_user_slice:
+        return control_group == f"/user.slice/{hermes_user_slice}"
+    if unit_name in {"hermes-gateway.service", "hermes-dashboard.service"}:
+        prefix = f"/user.slice/{hermes_user_slice}/"
+        return (
+            control_group.startswith(prefix)
+            and control_group.rsplit("/", 1)[-1] == unit_name
+        )
+    return False
 
 
 def _operational_unit_rule(unit_name: str, unavailable: bool) -> RuleResult:
