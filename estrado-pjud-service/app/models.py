@@ -132,7 +132,13 @@ def _validate_v2_search_contract(
 
 class SearchRequest(BaseModel):
     contract_version: Literal[1, 2] = 1
-    case_type: str
+    case_type: str = Field(
+        description=(
+            "Case identifier type. Canonical values are rol, rit, and ruc. "
+            "For cobranza, use rit; the temporary deprecated rol alias is accepted "
+            "and normalized to rit. Cobranza does not accept ruc."
+        ),
+    )
     case_number: str  # "X-NNNN-YYYY"
     competencia: COMPETENCIA_TYPE
     corte: int | None = None
@@ -144,6 +150,12 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_corte(self):
+        if self.competencia == "cobranza":
+            if self.case_type == "rol":
+                self.case_type = "rit"
+            elif self.case_type == "ruc":
+                raise ValueError("cobranza requires rit; rol is accepted as a deprecated alias")
+
         if self.contract_version == 2:
             return self._validate_v2()
 
@@ -194,6 +206,13 @@ class SearchResponse(BaseModel):
     matches: list[CandidateMatch]
     blocked: bool
     error: str | None
+    case_type: str | None = Field(
+        default=None,
+        description=(
+            "Normalized request case identifier type. Cobranza responses emit rit; "
+            "deprecated rol is accepted only as an input alias."
+        ),
+    )
     libro_used: str | None = None
     # Additive v2 rollout fields.  The legacy quartet above keeps its exact
     # semantics until JurisTrack has switched to the canonical contract.

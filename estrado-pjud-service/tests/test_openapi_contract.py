@@ -79,3 +79,17 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
             f"{schema} perdió campos que la app lee: {missing} — si es intencional, "
             "actualizar el espejo en la app (tests/unit/pjud-contract.test.ts)"
         )
+
+
+def test_cobranza_documents_canonical_rit_and_legacy_rol_alias():
+    spec = json.loads(OUT.read_text())
+    schemas = spec["components"]["schemas"]
+
+    request_case_type = schemas["SearchRequest"]["properties"]["case_type"]
+    assert "rit" in request_case_type["description"].lower()
+    assert "rol" in request_case_type["description"].lower()
+    assert "cobranza" in request_case_type["description"].lower()
+
+    response_case_type = schemas["SearchResponse"]["properties"]["case_type"]
+    assert "rit" in response_case_type["description"].lower()
+    assert "rol" in response_case_type["description"].lower()

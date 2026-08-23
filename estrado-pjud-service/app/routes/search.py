@@ -149,6 +149,11 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
     healthy = True
     try:
         api_metrics.record_request("search")
+        logger.info(
+            "PJUD search requested competencia=%s case_type=%s",
+            req.competencia,
+            req.case_type,
+        )
 
         parsed = parse_search_identifier(req.case_type, req.case_number)
         comp_path = competencia_path(req.competencia)
@@ -186,6 +191,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
+                case_type=req.case_type,
                 libro_used=None,
                 status="pjud_blocked",
             )
@@ -196,7 +202,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             if req.contract_version == 2:
                 return SearchResponse(
                     found=False, match_count=0, matches=[], blocked=False,
-                    error="PJUD search response could not be parsed", libro_used=None,
+                    error="PJUD search response could not be parsed", case_type=req.case_type,
+                    libro_used=None,
                     status="upstream_changed",
                 )
             raise
@@ -205,7 +212,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if req.contract_version == 2 and not matches and not is_definitive_not_found(html):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=False,
-                error="PJUD search response could not be parsed", libro_used=None,
+                error="PJUD search response could not be parsed", case_type=req.case_type,
+                libro_used=None,
                 status="upstream_changed",
             )
 
@@ -261,13 +269,16 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 logger.warning("Loaded PJUD catalog could not resolve search identity")
                 return SearchResponse(
                     found=False, match_count=0, matches=[], blocked=False,
-                    error="PJUD search identity could not be resolved", libro_used=None,
+                    error="PJUD search identity could not be resolved", case_type=req.case_type,
+                    libro_used=None,
                     status="upstream_changed",
                 )
 
         api_metrics.record_success("search")
 
-        return build_search_response(matches, req, libro_used=libro_used)
+        response = build_search_response(matches, req, libro_used=libro_used)
+        response.case_type = req.case_type
+        return response
 
     except Exception as e:
         logger.exception("Search failed")
@@ -276,7 +287,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if req.contract_version == 2 and isinstance(e, httpx.TimeoutException):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=False,
-                error="PJUD request timed out", libro_used=None,
+                error="PJUD request timed out", case_type=req.case_type, libro_used=None,
                 status="pjud_timeout",
             )
         kind = await classify_and_alert(e, request, "search")
@@ -290,6 +301,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=kind == "ojv",
             error=safe_error(e),
+            case_type=req.case_type,
             libro_used=None,
             status="pjud_blocked" if kind == "ojv" else "not_found",
         )

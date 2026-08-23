@@ -891,6 +891,7 @@
             "type": "string"
           },
           "case_type": {
+            "description": "Case identifier type. Canonical values are rol, rit, and ruc. For cobranza, use rit; the temporary deprecated rol alias is accepted and normalized to rit. Cobranza does not accept ruc.",
             "title": "Case Type",
             "type": "string"
           },
@@ -985,6 +986,18 @@
           "blocked": {
             "title": "Blocked",
             "type": "boolean"
+          },
+          "case_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Normalized request case identifier type. Cobranza responses emit rit; deprecated rol is accepted only as an input alias.",
+            "title": "Case Type"
           },
           "error": {
             "anyOf": [

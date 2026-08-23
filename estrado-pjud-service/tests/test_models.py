@@ -266,6 +266,41 @@ class TestCanonicalSearchRequestV2:
         )
         assert req.case_type == "legacy-cause-type"
 
+    @pytest.mark.parametrize(("competencia", "case_type", "expected_case_type"), [
+        ("cobranza", "rit", "rit"),
+        ("cobranza", "rol", "rit"),
+        ("civil", "rol", "rol"),
+        ("laboral", "rit", "rit"),
+        ("penal", "ruc", "ruc"),
+    ])
+    def test_cobranza_uses_rit_without_rewriting_other_competencias(
+        self, competencia, case_type, expected_case_type,
+    ):
+        """Changing this normalization must not rewrite non-Cobranza requests."""
+        request = SearchRequest(
+            competencia=competencia,
+            case_type=case_type,
+            case_number="C-1234-2025",
+        )
+
+        assert request.case_type == expected_case_type
+        assert request.model_dump()["case_type"] == expected_case_type
+
+    @pytest.mark.parametrize("contract_version, extra", [
+        (1, {}),
+        (2, {"corte": 90, "tribunal": 321, "libro": "C"}),
+    ])
+    def test_cobranza_rejects_ruc_for_each_contract_version(self, contract_version, extra):
+        """Cobranza never has an RUC search path, unlike Penal."""
+        with pytest.raises(ValidationError, match="cobranza requires rit"):
+            SearchRequest(
+                contract_version=contract_version,
+                competencia="cobranza",
+                case_type="ruc",
+                case_number="2400012345-6",
+                **extra,
+            )
+
     def test_v2_rejects_legacy_case_type_values(self):
         with pytest.raises(ValidationError):
             SearchRequest(
