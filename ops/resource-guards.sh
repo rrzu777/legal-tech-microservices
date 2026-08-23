@@ -243,6 +243,19 @@ def inject(name):
 
 directories = []
 try:
+    backup_root = os.path.dirname(root)
+    namespace_parent = os.path.dirname(backup_root)
+    for directory, exact_mode in ((root, 0o700), (backup_root, 0o700)):
+        metadata = os.lstat(directory)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid
+                or metadata.st_gid != gid or (metadata.st_mode & 0o7777) != exact_mode):
+            raise OSError("unsafe durable backup directory")
+    namespace_metadata = os.lstat(namespace_parent)
+    namespace_mode = namespace_metadata.st_mode & 0o7777
+    if (not stat.S_ISDIR(namespace_metadata.st_mode) or namespace_metadata.st_uid != uid
+            or namespace_metadata.st_gid != gid or (namespace_mode & 0o700) != 0o700
+            or (namespace_mode & 0o022) != 0):
+        raise OSError("unsafe durable backup namespace parent")
     for current, names, files in os.walk(root, topdown=True, followlinks=False):
         current_stat = os.lstat(current)
         if not stat.S_ISDIR(current_stat.st_mode) or current_stat.st_uid != uid or current_stat.st_gid != gid:
@@ -278,10 +291,16 @@ try:
             inject("after-tree-dir-fsync")
         finally:
             os.close(fd)
-    parent = os.path.dirname(root)
-    fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    fd = os.open(backup_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
+    finally:
+        os.close(fd)
+    fd = os.open(namespace_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        inject("before-root-parent-fsync")
+        os.fsync(fd)
+        inject("after-root-parent-fsync")
     finally:
         os.close(fd)
 except BaseException:
@@ -1030,8 +1049,20 @@ durable_rewrite_existing_metadata() { # path
 }
 
 durable_sync_backup_tree() {
-  local output
+  local output namespace_parent fields mode uid gid links permissions
   safe_existing_path "$backup_dir" && validate_root_path "$backup_dir" 700 || return 1
+  safe_existing_path "$backup_root" && validate_root_path "$backup_root" 700 || return 1
+  namespace_parent=${backup_root%/*}
+  [ -n "$namespace_parent" ] || namespace_parent=/
+  [ -d "$namespace_parent" ] && [ ! -L "$namespace_parent" ] || return 1
+  path_has_symlink_component "$namespace_parent" && return 1
+  fields=$(stat_fields "$namespace_parent") || return 1
+  IFS='|' read -r mode uid gid links <<< "$fields"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] && is_uint "$links" || return 1
+  [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] || return 1
+  permissions=$((8#$mode))
+  [ $((permissions & 8#0700)) -eq $((8#0700)) ] \
+    && [ $((permissions & 8#0022)) -eq 0 ] || return 1
   if ! output=$("$python_bin" -c "$durable_backup_syncer" \
       --resource-guards-fsync-tree "$backup_dir" "$root_uid" "$root_gid" "$test_mode" \
       2>"$null_file"); then

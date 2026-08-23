@@ -709,6 +709,8 @@ uid=$(/usr/bin/stat -f '%u' "$path")
 gid=$(/usr/bin/stat -f '%g' "$path")
 links=$(/usr/bin/stat -f '%l' "$path")
 if [ -e "$RG_TEST_STATE/credential-wrong-gid" ] && [ "$path" = "$RG_CREDENTIAL_FILE" ]; then gid=$((gid + 1)); fi
+if [ -e "$RG_TEST_STATE/backup-parent-wrong-gid" ] \
+  && [ "$path" = "${RG_BACKUP_ROOT%/*}" ]; then gid=$((gid + 1)); fi
 printf '%s|%s|%s|%s\n' "$mode" "$uid" "$gid" "$links"
 EOF
   write_stub sha256 <<'EOF'
@@ -966,7 +968,7 @@ run_guard() {
     RG_TEST_ROOT_UID="$TEST_UID" RG_TEST_ROOT_GID="$TEST_GID" \
     RG_REPO_DIR="$FAKE/repo" RG_SYSTEMD_DIR="$FAKE/systemd" RG_TMP_ROOT="$CASE_DIR/tmp" RG_DISK_PATH="$FAKE" RG_NULL_FILE="$CASE_DIR/null" \
     RG_CREDENTIAL_FILE="$FAKE/repo/estrado-pjud-service/.env" \
-    RG_BACKUP_ROOT="$FAKE/backups" RG_MONITORING_DIR="$FAKE/monitoring" \
+    RG_BACKUP_ROOT="${TEST_BACKUP_ROOT_OVERRIDE:-$FAKE/backups}" RG_MONITORING_DIR="$FAKE/monitoring" \
     RG_MONITOR_ENV_FILE="$FAKE/monitoring.env" RG_FSTAB_FILE="$FAKE/etc/fstab" \
     RG_SYSCTL_FILE="$FAKE/etc/sysctl.d/60-legaltech-swap.conf" \
     RG_SWAPPINESS_METADATA_FILE="$SWAPPINESS_METADATA_FILE" \
@@ -1843,6 +1845,44 @@ run_durable_metadata_regressions() {
     expect_eq "$boundary backup durability failure refuses apply" "$RC" 1
     expect_count "$boundary backup failure performs no provision" provision 0
     expect_count "$boundary backup failure performs no swap apply" 'swap apply' 0
+  done
+
+  echo '== first rollout durably publishes a newly-created backup root entry'
+  for boundary in before-root-parent-fsync after-root-parent-fsync \
+    crash-before-root-parent-fsync crash-after-root-parent-fsync; do
+    setup
+    rm -rf "$FAKE/backups"
+    printf '%s\n' backup-tree > "$STATE/durable-fail-target"
+    printf '%s\n' 1 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary backup-root publication failure refuses apply" "$RC" 1
+    expect_count "$boundary backup-root failure performs no provision" provision 0
+    expect_count "$boundary backup-root failure performs no swap apply" 'swap apply' 0
+    expect_count "$boundary backup-root failure performs no systemd stop" 'systemctl stop' 0
+    expect_count "$boundary backup-root failure performs no systemd start" 'systemctl start' 0
+    expect_count "$boundary backup-root failure performs no systemd restart" 'systemctl restart' 0
+    expect_count "$boundary backup-root failure performs no daemon reload" 'systemctl daemon-reload' 0
+  done
+
+  echo '== backup namespace parent identity and mode are strict'
+  for scenario in writable wrong-group symlink-component; do
+    setup
+    case "$scenario" in
+      writable) chmod 0777 "$FAKE" ;;
+      wrong-group) : > "$STATE/backup-parent-wrong-gid" ;;
+      symlink-component)
+        mkdir -p "$CASE_DIR/backup-namespace/backups"
+        chmod 0700 "$CASE_DIR/backup-namespace/backups"
+        ln -s "$CASE_DIR/backup-namespace" "$CASE_DIR/backup-link"
+        TEST_BACKUP_ROOT_OVERRIDE="$CASE_DIR/backup-link/backups"
+        ;;
+    esac
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario backup namespace parent refuses apply" "$RC" 1
+    expect_count "$scenario backup namespace performs no provision" provision 0
+    expect_count "$scenario backup namespace performs no swap apply" 'swap apply' 0
+    unset TEST_BACKUP_ROOT_OVERRIDE
   done
 
   echo '== abrupt writer exits retain no authority to begin protected effects'
