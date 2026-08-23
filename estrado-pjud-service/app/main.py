@@ -2,7 +2,9 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -20,6 +22,20 @@ from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import ProxyUsageTracker
+
+
+async def _redacted_request_validation_handler(
+    _request: Request,
+    _error: RequestValidationError,
+) -> JSONResponse:
+    """Never reflect request bodies from private credential boundaries."""
+    return JSONResponse(status_code=422, content={
+        "detail": [{
+            "type": "request_validation",
+            "loc": ["body"],
+            "msg": "Invalid request",
+        }],
+    })
 
 
 @asynccontextmanager
@@ -124,6 +140,7 @@ def create_app() -> FastAPI:
         ProxyBudgetExceededError, proxy_cost_control_exception_handler,
     )
     app.add_exception_handler(httpx.ProxyError, proxy_cost_control_exception_handler)
+    app.add_exception_handler(RequestValidationError, _redacted_request_validation_handler)
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

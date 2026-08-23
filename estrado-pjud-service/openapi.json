@@ -879,6 +879,235 @@
         "title": "Movement",
         "type": "object"
       },
+      "PrivateCauseResolution": {
+        "additionalProperties": false,
+        "properties": {
+          "case_number": {
+            "title": "Case Number",
+            "type": "string"
+          },
+          "case_type": {
+            "const": "rit",
+            "default": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "detail": {
+            "$ref": "#/components/schemas/SanitizedCaseDetail"
+          },
+          "matter": {
+            "const": "familia",
+            "default": "familia",
+            "title": "Matter",
+            "type": "string"
+          },
+          "movements": {
+            "items": {
+              "$ref": "#/components/schemas/SanitizedMovement"
+            },
+            "title": "Movements",
+            "type": "array"
+          },
+          "tribunal_code": {
+            "exclusiveMinimum": 0.0,
+            "title": "Tribunal Code",
+            "type": "integer"
+          },
+          "tribunal_label": {
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_number",
+          "tribunal_code",
+          "tribunal_label",
+          "detail",
+          "movements"
+        ],
+        "title": "PrivateCauseResolution",
+        "type": "object"
+      },
+      "PrivateCauseResolutionRequest": {
+        "additionalProperties": false,
+        "description": "Closed request boundary for one explicitly selected Familia candidate.",
+        "properties": {
+          "auth_type": {
+            "const": "clave_pj",
+            "default": "clave_pj",
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "case_number": {
+            "maxLength": 128,
+            "pattern": "^[A-Z]+-[0-9]+-[0-9]{4}$",
+            "title": "Case Number",
+            "type": "string"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "rut": {
+            "title": "Rut",
+            "type": "string"
+          },
+          "tribunal_code": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal Code"
+          },
+          "tribunal_label": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rut",
+          "password",
+          "case_number",
+          "tribunal_label"
+        ],
+        "title": "PrivateCauseResolutionRequest",
+        "type": "object"
+      },
+      "PrivateCauseResolutionResult": {
+        "additionalProperties": false,
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "private_not_found",
+                  "private_ambiguous",
+                  "private_identifier_mismatch",
+                  "private_tribunal_mismatch",
+                  "private_evidence_incomplete",
+                  "credential_invalid",
+                  "session_expired",
+                  "waf",
+                  "timeout",
+                  "upstream_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrivateCauseResolution"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "PrivateCauseResolutionResult",
+        "type": "object"
+      },
+      "SanitizedCaseDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "caption": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Caption",
+            "type": "string"
+          },
+          "filed_at": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filed At"
+          },
+          "status": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "required": [
+          "caption",
+          "status"
+        ],
+        "title": "SanitizedCaseDetail",
+        "type": "object"
+      },
+      "SanitizedMovement": {
+        "additionalProperties": false,
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "kind": {
+            "const": "status",
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "title": "SanitizedMovement",
+        "type": "object"
+      },
       "SearchRequest": {
         "properties": {
           "allow_broad": {
@@ -1162,6 +1391,52 @@
         "summary": "Case Detail",
         "tags": [
           "detail"
+        ]
+      }
+    },
+    "/api/v1/familia/resolve-private": {
+      "post": {
+        "operationId": "familia_resolve_private_api_v1_familia_resolve_private_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivateCauseResolutionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateCauseResolutionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Familia Resolve Private",
+        "tags": [
+          "familia"
         ]
       }
     },

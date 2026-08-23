@@ -3,15 +3,24 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.auth import verify_api_key
 from app.config import get_settings
 from app.errors import safe_error
 from app.failure_kind import classify_exception
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
-from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
-from app.familia.parser import parse_familia_results
+from app.familia.models import (
+    FamiliaSyncRequest,
+    FamiliaSyncResponse,
+    PrivateCauseResolutionRequest,
+    PrivateCauseResolutionResult,
+)
+from app.familia.parser import (
+    PrivateResolutionError,
+    parse_familia_results,
+    resolve_private_familia_html,
+)
 from app.ojv.errors import OjvSessionError
 from app.metrics import api_metrics
 from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
@@ -25,6 +34,77 @@ router = APIRouter(prefix="/api/v1/familia", tags=["familia"])
 
 # Familia sync is expensive: login + N queries at 2.5s each. Limit to 2/min per key.
 _SYNC_TIMEOUT_S = 60
+
+
+def _private_failure(code: str) -> PrivateCauseResolutionResult:
+    return PrivateCauseResolutionResult(ok=False, resolution=None, error_code=code)
+
+
+async def _run_private_resolution(
+    req: PrivateCauseResolutionRequest,
+    rate_s: float,
+    bundle,
+    catalog_service,
+) -> PrivateCauseResolutionResult:
+    async with FamiliaAuthSession(
+        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
+    ) as session:
+        try:
+            await session.login(req.rut, req.password, req.auth_type)
+            prefix, number, year = req.case_number.split("-", 2)
+            if not prefix or not number.isdigit() or not year.isdigit():
+                return _private_failure("private_identifier_mismatch")
+            html = await session.search_familia(rut=req.rut, rit=number, year=year)
+
+            def resolve_tribunal(label: str) -> int | None:
+                identity = catalog_service.resolve_loaded_tribunal("familia", label)
+                return identity.tribunal_code if identity is not None else None
+
+            resolution = resolve_private_familia_html(
+                html,
+                expected_case_number=req.case_number,
+                expected_tribunal_code=req.tribunal_code,
+                expected_tribunal_label=req.tribunal_label,
+                resolve_tribunal=resolve_tribunal,
+            )
+            html = ""
+            return PrivateCauseResolutionResult(ok=True, resolution=resolution)
+        except PrivateResolutionError as error:
+            return _private_failure(str(error))
+        except OjvSessionError as error:
+            return _private_failure(error.code.value)
+        except Exception:
+            logger.warning("familia_private_resolution: unexpected upstream failure")
+            return _private_failure("upstream_changed")
+
+
+@router.post("/resolve-private", response_model=PrivateCauseResolutionResult)
+@limiter.limit("2/minute")
+async def familia_resolve_private(
+    request: Request,
+    req: PrivateCauseResolutionRequest,
+    _api_key: str = verify_api_key,
+) -> PrivateCauseResolutionResult:
+    settings = get_settings()
+    if not settings.private_familia_enabled:
+        raise HTTPException(status_code=404, detail="private_familia_disabled")
+    bundle = await familia_bundle_or_alert(request.app.state.session_pool, request)
+    api_metrics.record_request("familia")
+    try:
+        async with asyncio.timeout(_SYNC_TIMEOUT_S):
+            result = await _run_private_resolution(
+                req,
+                settings.RATE_LIMIT_MS / 1000.0,
+                bundle,
+                request.app.state.catalog_service,
+            )
+    except TimeoutError:
+        result = _private_failure("timeout")
+    if result.ok:
+        api_metrics.record_success("familia")
+    else:
+        api_metrics.record_error("familia")
+    return result
 
 
 @router.post("/sync", response_model=FamiliaSyncResponse)

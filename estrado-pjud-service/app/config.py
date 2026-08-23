@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     SESSION_POOL_SIZE: int = 2
     SESSION_MAX_AGE_S: int = 1200
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
+    ENABLE_PJUD_PRIVATE_FAMILIA: str = "false"
+
+    @property
+    def private_familia_enabled(self) -> bool:
+        return self.ENABLE_PJUD_PRIVATE_FAMILIA == "true"
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""
