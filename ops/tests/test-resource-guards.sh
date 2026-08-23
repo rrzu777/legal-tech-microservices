@@ -856,6 +856,42 @@ if [ -e "$RG_TEST_STATE/corrupt-live-state" ]; then
 fi
 EOF
   write_stub python <<'EOF'
+if [ "${1:-}" = -c ] && [ "${3:-}" = --resource-guards-atomic-write ]; then
+  target=${4:-}
+  target_name=${target##*/}
+  calls_file="$RG_TEST_STATE/durable-calls-$target_name"
+  calls=0
+  [ ! -f "$calls_file" ] || calls=$(cat "$calls_file")
+  calls=$((calls + 1))
+  printf '%s\n' "$calls" > "$calls_file"
+  printf 'durable-write %s call=%s\n' "$target_name" "$calls" >> "$RG_TEST_STATE/events"
+  if [ -f "$RG_TEST_STATE/durable-fail-boundary" ] \
+    && [ "$(cat "$RG_TEST_STATE/durable-fail-target")" = "$target_name" ] \
+    && [ "$(cat "$RG_TEST_STATE/durable-fail-call")" = "$calls" ]; then
+    export RG_DURABLE_TEST_BOUNDARY
+    RG_DURABLE_TEST_BOUNDARY=$(cat "$RG_TEST_STATE/durable-fail-boundary")
+  fi
+  writer_output=$(/usr/bin/python3 "$@")
+  writer_rc=$?
+  if [ -e "$RG_TEST_STATE/durable-bad-output" ]; then
+    printf '%s\n' WRONG
+    exit 0
+  fi
+  printf '%s\n' "$writer_output"
+  if [ -e "$RG_TEST_STATE/durable-fail-after-output" ]; then exit 7; fi
+  exit "$writer_rc"
+fi
+if [ "${1:-}" = -c ] && [ "${3:-}" = --resource-guards-fsync-tree ]; then
+  printf '%s\n' 'durable-sync backup-tree call=1' >> "$RG_TEST_STATE/events"
+  if [ -f "$RG_TEST_STATE/durable-fail-boundary" ] \
+    && [ "$(cat "$RG_TEST_STATE/durable-fail-target")" = backup-tree ] \
+    && [ "$(cat "$RG_TEST_STATE/durable-fail-call")" = 1 ]; then
+    export RG_DURABLE_TEST_BOUNDARY
+    RG_DURABLE_TEST_BOUNDARY=$(cat "$RG_TEST_STATE/durable-fail-boundary")
+  fi
+  /usr/bin/python3 "$@"
+  exit $?
+fi
 printf 'python %s\n' "$*" >> "$RG_TEST_STATE/events"
 case "$*" in
   *resource-tracker.py*) [ ! -e "$RG_TEST_STATE/tracker-fail" ] || exit 1 ;;
@@ -1774,6 +1810,106 @@ run_runtime_cgroup_regressions() {
     'systemctl --user --machine=hermes@.host show hermes-dashboard.service --property=LoadState' 1
 }
 
+run_durable_metadata_regressions() {
+  local boundary backup_path
+
+  echo '== initial transaction metadata must be durably committed before mutation'
+  for boundary in before-file-fsync after-file-fsync before-rename after-rename before-dir-fsync after-dir-fsync; do
+    setup
+    printf '%s\n' expected-sha > "$STATE/durable-fail-target"
+    printf '%s\n' 1 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary initial metadata failure refuses apply" "$RC" 1
+    expect_count "$boundary performs no provision" provision 0
+    expect_count "$boundary performs no swap apply" 'swap apply' 0
+  done
+
+  for scenario in bad-output fail-after-output; do
+    setup
+    : > "$STATE/durable-$scenario"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario durable producer refuses apply" "$RC" 1
+    expect_count "$scenario durable producer performs no provision" provision 0
+    expect_count "$scenario durable producer performs no swap apply" 'swap apply' 0
+  done
+
+  for boundary in before-tree-file-fsync after-tree-file-fsync before-tree-dir-fsync after-tree-dir-fsync; do
+    setup
+    printf '%s\n' backup-tree > "$STATE/durable-fail-target"
+    printf '%s\n' 1 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary backup durability failure refuses apply" "$RC" 1
+    expect_count "$boundary backup failure performs no provision" provision 0
+    expect_count "$boundary backup failure performs no swap apply" 'swap apply' 0
+  done
+
+  echo '== abrupt writer exits retain no authority to begin protected effects'
+  for boundary in crash-after-file-fsync crash-after-rename crash-after-dir-fsync; do
+    setup
+    configure_active_worker
+    printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+    printf '%s\n' changes > "$STATE/durable-fail-target"
+    printf '%s\n' 2 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary worker marker crash refuses apply" "$RC" 1
+    expect_exact_count "$boundary performs no worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$boundary performs no provision" provision 0
+    expect_eq "$boundary safely consumes exact stale metadata temporaries" \
+      "$(find "$FAKE/backups" -name '.changes.*' -print | wc -l | tr -d ' ')" 0
+  done
+
+  echo '== durable worker-stop marker precedes the protected stop'
+  for boundary in before-file-fsync after-file-fsync before-rename after-rename before-dir-fsync after-dir-fsync; do
+    setup
+    configure_active_worker
+    printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+    printf '%s\n' changes > "$STATE/durable-fail-target"
+    printf '%s\n' 2 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary worker marker failure refuses apply" "$RC" 1
+    expect_exact_count "$boundary performs no worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$boundary performs no provision" provision 0
+  done
+
+  echo '== attempted swap marker is confirmed durable before swap apply'
+  for boundary in before-file-fsync after-file-fsync before-rename after-rename before-dir-fsync after-dir-fsync; do
+    setup
+    printf '%s\n' swap-state > "$STATE/durable-fail-target"
+    printf '%s\n' 2 > "$STATE/durable-fail-call"
+    printf '%s\n' "$boundary" > "$STATE/durable-fail-boundary"
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$boundary attempted marker failure refuses apply" "$RC" 1
+    expect_count "$boundary never starts swap apply" 'swap apply' 0
+  done
+
+  echo '== stale and malformed swap ownership metadata never reports false rollback success'
+  setup
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'fixture apply creates exact owned swap state' "$RC" 0
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  printf '%s\n' not-attempted > "$backup_path/swap-state"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'stale not-attempted marker with owned swap fails closed' "$RC" 1
+  expect_missing 'stale marker never declares rollback success' "$OUT" 'ROLLBACK OK'
+  expect_count 'stale marker is not guessed into destructive swap rollback' 'swap rollback' 0
+  expect_eq 'stale marker leaves owned swap evidence for operator recovery' \
+    "$(test -e "$STATE/swap-applied"; echo $?)" 0
+
+  printf '%s' attempt > "$backup_path/swap-state"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'truncated swap marker fails closed' "$RC" 1
+  expect_missing 'truncated marker never declares rollback success' "$OUT" 'ROLLBACK OK'
+  expect_count 'truncated marker performs no swap rollback' 'swap rollback' 0
+}
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-heartbeat-wait ]; then
   run_worker_post_start_wait_regressions
   echo
@@ -1800,6 +1936,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = runtime-cgroups ]; then
   run_runtime_cgroup_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = durable-metadata ]; then
+  run_durable_metadata_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]

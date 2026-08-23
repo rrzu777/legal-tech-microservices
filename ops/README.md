@@ -129,6 +129,13 @@ una unit habilitada. Si el worker cambió y estaba activo, el orden es fail-clos
 6. cgroup exacto, heartbeat estrictamente más nuevo `idle_off_hours` con
    `mint_attempts=0`, claims finales cero y postflight.
 
+El backup y sus marcadores críticos se confirman en disco antes de autorizar
+cada efecto protegido: archivo temporal root-only en el mismo directorio,
+`fsync` del archivo, reemplazo atómico y `fsync` del directorio. El árbol de
+backup completo también se sincroniza antes de comenzar mutaciones. Si cualquiera
+de esas fronteras falla, el rollout se detiene sin iniciar el efecto que dependía
+del marcador.
+
 La identidad previa no se presupone en `legaltech.slice`: el backup captura en
 una sola lectura el PID, `Slice` efectiva y cgroup exacto de la unit instalada.
 Por eso una primera migración válida desde
@@ -195,6 +202,14 @@ resuelta la causa:
 ```bash
 sudo ./ops/resource-guards.sh rollback --backup-dir "$BACKUP_DIR"
 ```
+
+Un `swap-state` truncado, desconocido o `not-attempted` que contradiga evidencia
+live de swap administrado no se corrige por inferencia: el rollback falla cerrado
+antes de restaurar o borrar artefactos y nunca imprime `ROLLBACK OK`. Conservar el
+`BACKUP_DIR`, verificar el target y los artefactos exactos con el runbook de swap,
+y corregir la metadata sólo mediante un procedimiento de recovery revisado; no
+ejecutar `swapoff`, editar el marcador ni borrar archivos manualmente durante el
+incidente.
 
 El segundo intento valida el estado parcial producido por la transacción y
 continúa sin repetir `swapoff`. No editar ni borrar manualmente fstab, backup,

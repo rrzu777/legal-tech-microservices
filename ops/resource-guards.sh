@@ -108,6 +108,186 @@ root_gid=${RG_TEST_ROOT_GID:-0}
 worker_fence_poll_delay_seconds=${RG_WORKER_FENCE_POLL_DELAY_SECONDS:-1}
 worker_heartbeat_poll_delay_seconds=${RG_WORKER_HEARTBEAT_POLL_DELAY_SECONDS:-5}
 
+readonly durable_metadata_writer='import os
+import stat
+import sys
+import tempfile
+
+OK = "DURABLE_WRITE_OK"
+
+def inject(name, enabled):
+    if not enabled:
+        return
+    boundary = os.environ.get("RG_DURABLE_TEST_BOUNDARY")
+    if boundary == "crash-" + name:
+        os._exit(91)
+    if boundary == name:
+        raise OSError("injected durable metadata boundary")
+
+def write_all(fd, payload):
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError("short durable metadata write")
+        offset += written
+
+if len(sys.argv) != 7 or sys.argv[1] != "--resource-guards-atomic-write":
+    raise SystemExit(2)
+
+target, uid_text, gid_text, mode_text, test_text = sys.argv[2:]
+if not target.startswith("/") or "/" not in target[1:]:
+    raise SystemExit(2)
+if not uid_text.isdecimal() or not gid_text.isdecimal() or mode_text != "600":
+    raise SystemExit(2)
+if test_text not in ("0", "1"):
+    raise SystemExit(2)
+
+parent = os.path.dirname(target)
+name = os.path.basename(target)
+if not name or name in (".", ".."):
+    raise SystemExit(2)
+payload = sys.stdin.buffer.read(1048577)
+if len(payload) > 1048576:
+    raise SystemExit(1)
+
+fd = -1
+dir_fd = -1
+temporary = ""
+renamed = False
+try:
+    prefix = "." + name + "."
+    for candidate in os.scandir(parent):
+        if not candidate.name.startswith(prefix):
+            continue
+        metadata = candidate.stat(follow_symlinks=False)
+        if (not candidate.is_file(follow_symlinks=False) or metadata.st_nlink != 1
+                or metadata.st_uid != int(uid_text) or metadata.st_gid != int(gid_text)
+                or (metadata.st_mode & 0o7777) != 0o600):
+            raise OSError("unsafe stale durable metadata temporary")
+        os.unlink(candidate.path)
+    fd, temporary = tempfile.mkstemp(prefix="." + name + ".", dir=parent)
+    os.fchmod(fd, 0o600)
+    os.fchown(fd, int(uid_text), int(gid_text))
+    write_all(fd, payload)
+    inject("before-file-fsync", test_text == "1")
+    os.fsync(fd)
+    inject("after-file-fsync", test_text == "1")
+    os.close(fd)
+    fd = -1
+    inject("before-rename", test_text == "1")
+    os.replace(temporary, target)
+    renamed = True
+    inject("after-rename", test_text == "1")
+    dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    inject("before-dir-fsync", test_text == "1")
+    os.fsync(dir_fd)
+    inject("after-dir-fsync", test_text == "1")
+    metadata = os.lstat(target)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or metadata.st_uid != int(uid_text) or metadata.st_gid != int(gid_text)
+            or (metadata.st_mode & 0o7777) != 0o600):
+        raise OSError("durable metadata identity changed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    verify_fd = os.open(target, flags)
+    try:
+        chunks = []
+        remaining = len(payload) + 1
+        while remaining > 0:
+            chunk = os.read(verify_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if b"".join(chunks) != payload:
+            raise OSError("durable metadata content changed")
+    finally:
+        os.close(verify_fd)
+except BaseException:
+    raise SystemExit(1)
+finally:
+    if fd >= 0:
+        try: os.close(fd)
+        except OSError: pass
+    if dir_fd >= 0:
+        try: os.close(dir_fd)
+        except OSError: pass
+    if temporary and not renamed:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
+        except OSError: pass
+
+sys.stdout.write(OK + "\n")'
+
+readonly durable_backup_syncer='import os
+import stat
+import sys
+
+if len(sys.argv) != 6 or sys.argv[1] != "--resource-guards-fsync-tree":
+    raise SystemExit(2)
+root, uid_text, gid_text, test_text = sys.argv[2:]
+if not root.startswith("/") or not uid_text.isdecimal() or not gid_text.isdecimal():
+    raise SystemExit(2)
+if test_text not in ("0", "1"):
+    raise SystemExit(2)
+uid, gid = int(uid_text), int(gid_text)
+
+def inject(name):
+    if test_text != "1":
+        return
+    boundary = os.environ.get("RG_DURABLE_TEST_BOUNDARY")
+    if boundary == "crash-" + name:
+        os._exit(91)
+    if boundary == name:
+        raise OSError("injected durable backup boundary")
+
+directories = []
+try:
+    for current, names, files in os.walk(root, topdown=True, followlinks=False):
+        current_stat = os.lstat(current)
+        if not stat.S_ISDIR(current_stat.st_mode) or current_stat.st_uid != uid or current_stat.st_gid != gid:
+            raise OSError("unsafe durable backup directory")
+        directories.append(current)
+        for name in names:
+            entry = os.path.join(current, name)
+            entry_stat = os.lstat(entry)
+            if not stat.S_ISDIR(entry_stat.st_mode) or entry_stat.st_uid != uid or entry_stat.st_gid != gid:
+                raise OSError("unsafe durable backup subtree")
+        for name in files:
+            entry = os.path.join(current, name)
+            entry_stat = os.lstat(entry)
+            if (not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1
+                    or entry_stat.st_uid != uid or entry_stat.st_gid != gid):
+                raise OSError("unsafe durable backup file")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(entry, flags)
+            try:
+                opened = os.fstat(fd)
+                if opened.st_dev != entry_stat.st_dev or opened.st_ino != entry_stat.st_ino:
+                    raise OSError("durable backup file identity changed")
+                inject("before-tree-file-fsync")
+                os.fsync(fd)
+                inject("after-tree-file-fsync")
+            finally:
+                os.close(fd)
+    for directory in reversed(directories):
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            inject("before-tree-dir-fsync")
+            os.fsync(fd)
+            inject("after-tree-dir-fsync")
+        finally:
+            os.close(fd)
+    parent = os.path.dirname(root)
+    fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+except BaseException:
+    raise SystemExit(1)
+sys.stdout.write("DURABLE_SYNC_OK\n")'
+
 for absolute_value in \
   "$repo_dir" "$systemd_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
   "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" \
@@ -819,6 +999,47 @@ validate_root_path() { # path mode
   [ "$mode" = "$expected_mode" ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ]
 }
 
+durable_replace_metadata() { # path exact-content
+  local target=$1 content=$2 output parent=${1%/*}
+  case "$target" in "$backup_dir"/*) ;; *) return 1 ;; esac
+  [ "$parent" = "$backup_dir" ] || return 1
+  [ -d "$parent" ] && [ ! -L "$parent" ] && validate_root_path "$parent" 700 || return 1
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] && validate_root_path "$target" 600 || return 1
+  fi
+  if ! output=$(printf '%s' "$content" | "$python_bin" -c "$durable_metadata_writer" \
+      --resource-guards-atomic-write "$target" "$root_uid" "$root_gid" 600 "$test_mode" \
+      2>"$null_file"); then
+    # A killed writer cannot run its finally block. One best-effort replacement
+    # under the same host lock safely consumes an exact stale temporary, but the
+    # original persistence failure still aborts the protected operation.
+    printf '%s' "$content" | "$python_bin" -c "$durable_metadata_writer" \
+      --resource-guards-atomic-write "$target" "$root_uid" "$root_gid" 600 "$test_mode" \
+      >"$null_file" 2>&1 || true
+    return 1
+  fi
+  [ "$output" = DURABLE_WRITE_OK ] || return 1
+  [ -f "$target" ] && [ ! -L "$target" ] && validate_root_path "$target" 600 || return 1
+}
+
+durable_rewrite_existing_metadata() { # path
+  local content
+  [ -f "$1" ] && [ ! -L "$1" ] && validate_root_path "$1" 600 || return 1
+  content=$(<"$1")
+  durable_replace_metadata "$1" "$content"$'\n'
+}
+
+durable_sync_backup_tree() {
+  local output
+  safe_existing_path "$backup_dir" && validate_root_path "$backup_dir" 700 || return 1
+  if ! output=$("$python_bin" -c "$durable_backup_syncer" \
+      --resource-guards-fsync-tree "$backup_dir" "$root_uid" "$root_gid" "$test_mode" \
+      2>"$null_file"); then
+    return 1
+  fi
+  [ "$output" = DURABLE_SYNC_OK ] || return 1
+}
+
 create_backup() {
   local uid=$1 timestamp path index=0 rel fields mode owner group links existed
   path_has_symlink_component "$backup_root" && return 1
@@ -880,6 +1101,18 @@ create_backup() {
   "$chown_bin" "$root_uid:$root_gid" "$backup_dir/expected-sha" "$backup_dir/changes" "$backup_dir/swap-state" \
     "$backup_dir/unit-states.tsv" "$backup_dir/worker-runtime.tsv" \
     "$backup_dir/monitor-runtime.tsv" || return 1
+  durable_rewrite_existing_metadata "$manifest" || return 1
+  durable_rewrite_existing_metadata "$backup_dir/expected-sha" || return 1
+  durable_replace_metadata "$backup_dir/changes" '' || return 1
+  durable_rewrite_existing_metadata "$backup_dir/unit-states.tsv" || return 1
+  durable_rewrite_existing_metadata "$backup_dir/worker-runtime.tsv" || return 1
+  durable_rewrite_existing_metadata "$backup_dir/monitor-runtime.tsv" || return 1
+  if [ "${swap_initial_state:-unknown}" = managed ]; then
+    durable_replace_metadata "$backup_dir/swap-state" $'preexisting\n' || return 1
+  else
+    durable_replace_metadata "$backup_dir/swap-state" $'not-attempted\n' || return 1
+  fi
+  durable_sync_backup_tree || return 1
   printf '%s\n' "$backup_dir"
 }
 
@@ -900,7 +1133,24 @@ digest_path() {
   fi
 }
 
-record_change() { printf '%s\n' "$1" >> "$backup_dir/changes"; }
+record_change() {
+  local existing content change=$1
+  load_and_validate_changes || return 1
+  case "$change" in
+    api) [ "$changed_api" -eq 0 ] || return 1 ;;
+    worker) [ "$changed_worker" -eq 0 ] || return 1 ;;
+    worker-stop) [ "$worker_stopped" -eq 0 ] || return 1 ;;
+    hermes) [ "$changed_hermes" -eq 0 ] || return 1 ;;
+    monitor) [ "$changed_monitor" -eq 0 ] || return 1 ;;
+    tracker) [ "$changed_tracker" -eq 0 ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  existing=$(<"$backup_dir/changes")
+  if [ -n "$existing" ]; then content="$existing"$'\n'; else content=''; fi
+  content+="$change"$'\n'
+  durable_replace_metadata "$backup_dir/changes" "$content" || return 1
+  load_and_validate_changes
+}
 
 show_contract() { # unit property expected [property expected ...]
   local unit=$1 output property expected line key value count index
@@ -1297,8 +1547,16 @@ run_swap_mutator() { # apply|rollback
   LEGALTECH_RESOURCE_LOCK_FD="$resource_lock_fd" "$swap_bin" "$1"
 }
 
+inspect_swap_state() {
+  local output
+  is_uint "$resource_lock_fd" || return 1
+  output=$(LEGALTECH_RESOURCE_LOCK_FD="$resource_lock_fd" "$swap_bin" preflight \
+    2>"$null_file") || return 1
+  case "$output" in clean|managed) printf '%s\n' "$output" ;; *) return 1 ;; esac
+}
+
 do_rollback() {
-  local uid rollback_rc=0 swap_rc=0 swap_state
+  local uid rollback_rc=0 swap_rc=0 swap_state observed_swap_state
   backup_dir=$1
   uid=$(validate_hermes_inventory) || { fail 'rollback cannot validate Hermes inventory'; return 1; }
   build_managed_paths "$uid"
@@ -1320,7 +1578,18 @@ do_rollback() {
     attempted)
       if ! run_swap_mutator rollback >"$null_file" 2>&1; then swap_rc=1; rollback_rc=1; fi
       ;;
-    not-attempted|preexisting) ;;
+    not-attempted)
+      observed_swap_state=$(inspect_swap_state) \
+        || { fail 'rollback swap ownership state is unsafe or unknown'; return 1; }
+      [ "$observed_swap_state" = clean ] \
+        || { fail 'rollback swap marker conflicts with owned live state'; return 1; }
+      ;;
+    preexisting)
+      observed_swap_state=$(inspect_swap_state) \
+        || { fail 'rollback preexisting swap state is unsafe or unknown'; return 1; }
+      [ "$observed_swap_state" = managed ] \
+        || { fail 'rollback preexisting swap state changed unexpectedly'; return 1; }
+      ;;
     *) fail 'rollback swap metadata is invalid'; return 1 ;;
   esac
   restore_manifest "$swap_rc" || rollback_rc=1
@@ -1411,6 +1680,7 @@ stop_worker_for_change() {
     && worker_runtime_has_exact_identity "$active" "$old_pid" \
       "$old_control_group" "$effective_slice" || return 1
   record_change worker-stop || return 1
+  mutation_started=1
   "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
   [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
   worker_runtime_is_stopped "$old_pid" "$effective_slice"
@@ -1508,13 +1778,13 @@ run_apply_steps() {
     worker_count=$(active_claim_count) || return 1
     [ "$worker_count" = 0 ] || return 1
   fi
-  mutation_started=1
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     stop_worker_for_change || return 1
     wait_for_zero_claims || return 1
   fi
   if [ "$monitor_will_change" -eq 1 ]; then record_change monitor || return 1; fi
   if [ "$tracker_will_change" -eq 1 ]; then record_change tracker || return 1; fi
+  mutation_started=1
   stop_legacy_monitor_if_changed "$monitor_will_change" 0 2 || return 1
   stop_legacy_monitor_if_changed "$tracker_will_change" 1 3 || return 1
   PROV_ENABLE_PJUD_WORKER=0 PROV_SKIP_CADDY=1 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
@@ -1539,7 +1809,7 @@ run_apply_steps() {
   [ "$provision_rc" -eq 0 ] || return 1
   restore_enabled_state system estrado-pjud.service "${desired_enabled_states[0]}" || return 1
   if [ "${swap_initial_state:-unknown}" = clean ]; then
-    printf '%s\n' attempted > "$backup_dir/swap-state" || return 1
+    durable_replace_metadata "$backup_dir/swap-state" $'attempted\n' || return 1
   fi
   run_swap_mutator apply >"$null_file" 2>&1 || return 1
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
