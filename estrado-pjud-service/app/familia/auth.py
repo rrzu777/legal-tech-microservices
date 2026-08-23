@@ -6,9 +6,11 @@ import asyncio
 import logging
 import time
 from collections.abc import Mapping, Sequence
+from urllib.parse import urlencode
 
 import httpx
 from bs4 import BeautifulSoup
+from pydantic import SecretStr
 
 from app.adapters.http_adapter import _USER_AGENT
 from app.bandwidth import estimate_request_bytes, record_proxy_request, record_proxy_response
@@ -43,20 +45,25 @@ _FAMILIA_HEADERS = {
 }
 
 
-def _decode(resp: httpx.Response) -> str:
+def decode_ojv_html(resp: httpx.Response) -> str:
+    """Decode the two encodings observed on authenticated OJV HTML pages."""
     try:
         return resp.content.decode("utf-8")
     except UnicodeDecodeError:
-        text = resp.content.decode("latin-1")
-        try:
-            return text.encode("latin-1").decode("utf-8", errors="replace")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return text
+        return resp.content.decode("latin-1")
+
+
+# Private compatibility name retained for existing Familia call sites.
+_decode = decode_ojv_html
 
 
 def _rut_parts(rut: str) -> tuple[str, str]:
     """Return (digits_only_8, dv) from any RUT format."""
-    clean = rut.replace(".", "").replace("-", "").strip()
+    normalized = rut.replace(".", "").strip().upper()
+    if "-" in normalized:
+        body, dv = normalized.rsplit("-", 1)
+        return body[:8], dv[:1]
+    clean = normalized.replace("-", "")
     if len(clean) >= 9:
         return clean[:-1][:8], clean[-1]
     return clean[:8], ""
@@ -90,8 +97,8 @@ def _detect_session_error(url: str) -> bool:
     return any(k in low for k in ["login", "error", "claveunica.gob.cl", "ojv.pjud.cl"])
 
 
-class FamiliaAuthSession:
-    """Short-lived authenticated OJV session for a single Familia sync."""
+class OjvSession:
+    """Short-lived authenticated OJV session shared by authenticated flows."""
 
     def __init__(
         self,
@@ -99,9 +106,12 @@ class FamiliaAuthSession:
         cookies: Sequence[CookieRecord] | Mapping[str, str] | None = None,
         user_agent: str | None = None,
         rate_limit_s: float = 2.5,
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._rate_s = rate_limit_s
         self._last: float = 0.0
+        self._authenticated_rut: SecretStr | None = None
+        self._authenticated_dv: SecretStr | None = None
         cookie_records = cookies or ()
         if isinstance(cookie_records, Mapping):
             domain, secure = legacy_cookie_scope(_OJV_BASE)
@@ -110,6 +120,7 @@ class FamiliaAuthSession:
             )
         self._client = httpx.AsyncClient(
             proxy=proxy_url,
+            transport=transport,
             cookies=cookie_jar_from_records(cookie_records),
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
@@ -137,6 +148,17 @@ class FamiliaAuthSession:
         if elapsed < self._rate_s:
             await asyncio.sleep(self._rate_s - elapsed)
         self._last = time.monotonic()
+
+    async def post_form(
+        self,
+        url: str,
+        data: Sequence[tuple[str, str]],
+        *,
+        headers: Mapping[str, str],
+    ) -> httpx.Response:
+        """Rate-limit and submit one form with this session's live cookie jar."""
+        await self._wait()
+        return await self._post(url, content=urlencode(data), headers=headers)
 
     async def _login_clave_pj(self, rut: str, password: str) -> None:
         rut_digits, _ = _rut_parts(rut)
@@ -240,6 +262,8 @@ class FamiliaAuthSession:
         logger.info("Clave Única session established via %s", final_url[:60])
 
     async def login(self, rut: str, password: str, auth_type: str) -> None:
+        self._authenticated_rut = None
+        self._authenticated_dv = None
         if auth_type == "clave_pj":
             await self._login_clave_pj(rut, password)
         elif auth_type == "clave_unica":
@@ -248,6 +272,38 @@ class FamiliaAuthSession:
             raise ValueError("Clave Única no soportada; usá Clave Poder Judicial")
         else:
             raise ValueError(f"Unknown auth_type: {auth_type!r}")
+        self._remember_authenticated_rut(rut)
+
+    def _remember_authenticated_rut(self, rut: str) -> None:
+        rut_digits, dv = _rut_parts(rut)
+        if not rut_digits.isdigit() or not dv or (not dv.isdigit() and dv != "K"):
+            return
+        self._authenticated_rut = SecretStr(rut_digits)
+        self._authenticated_dv = SecretStr(dv)
+
+    def authenticated_form_identity(self) -> tuple[str, str]:
+        """Return the in-memory identity required by authenticated OJV forms."""
+        if self._authenticated_rut is None or self._authenticated_dv is None:
+            raise SessionError("authenticated identity unavailable")
+        return (
+            self._authenticated_rut.get_secret_value(),
+            self._authenticated_dv.get_secret_value(),
+        )
+
+    async def close(self) -> None:
+        self._authenticated_rut = None
+        self._authenticated_dv = None
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "OjvSession":
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        await self.close()
+
+
+class FamiliaAuthSession(OjvSession):
+    """Backward-compatible Familia session surface."""
 
     async def search_familia(self, rut: str, rit: str = "", year: str = "") -> str:
         rut_digits, dv = _rut_parts(rut)
@@ -265,10 +321,9 @@ class FamiliaAuthSession:
             "apePatMisCauFam":        "",
             "apeMatMisCauFam":        "",
         }
-        await self._wait()
-        resp = await self._post(
+        resp = await self.post_form(
             _FAMILIA_SEARCH,
-            data=form_data,
+            list(form_data.items()),
             headers={**_FAMILIA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
@@ -276,15 +331,6 @@ class FamiliaAuthSession:
         if detect_blocked(html):
             raise FamiliaBlockedError("Familia search: challenge F5")
         return html
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-    async def __aenter__(self) -> "FamiliaAuthSession":
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        await self.close()
 
 
 class InvalidCredentialsError(Exception):
