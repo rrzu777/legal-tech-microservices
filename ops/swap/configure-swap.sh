@@ -379,6 +379,92 @@ read_live_swappiness() {
   printf '%s\n' "$output"
 }
 
+durable_sync_path() { # sync-file|sync-dir path
+  local operation=$1 path=$2 expected output
+  case "$operation" in
+    sync-file)
+      [ -f "$path" ] && [ ! -L "$path" ] || return 1
+      expected=file-fsynced
+      ;;
+    sync-dir)
+      [ -d "$path" ] && [ ! -L "$path" ] \
+        && ! path_has_symlink_component "$path" || return 1
+      expected=directory-fsynced
+      ;;
+    *) return 1 ;;
+  esac
+  output=$("$python_bin" - "$operation" "$path" "$root_uid" "$root_gid" <<'PY'
+import os
+import stat
+import sys
+
+operation, path, uid_text, gid_text = sys.argv[1:]
+uid, gid = int(uid_text), int(gid_text)
+if operation == "sync-file":
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    expected_kind = stat.S_ISREG
+    token = "file-fsynced"
+elif operation == "sync-dir":
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    expected_kind = stat.S_ISDIR
+    token = "directory-fsynced"
+else:
+    raise RuntimeError("invalid sync operation")
+fd = os.open(path, flags)
+try:
+    metadata = os.fstat(fd)
+    if not expected_kind(metadata.st_mode) or metadata.st_uid != uid or metadata.st_gid != gid:
+        raise RuntimeError("unsafe sync target")
+    if operation == "sync-file" and metadata.st_nlink != 1:
+        raise RuntimeError("unsafe sync target identity")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+print(token)
+PY
+  ) || return 1
+  [ "$output" = "$expected" ]
+}
+
+sync_regular_file() { durable_sync_path sync-file "$1"; }
+
+sync_containing_directory() {
+  local parent=${1%/*}
+  [ -n "$parent" ] || parent=/
+  durable_sync_path sync-dir "$parent"
+}
+
+validate_managed_sysctl_path() { # path
+  local path=$1 metadata kind mode size links uid gid extra content=''
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$path") || return 1
+  kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
+  IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
+  [ "$kind" = 'regular file' ] && [ "$mode" = 600 ] && is_uint "$size" \
+    && [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] \
+    && [ -z "$extra" ] || return 1
+  if IFS= read -r -d '' content < "$path"; then :; else [ "$?" -eq 1 ] || return 1; fi
+  [ "$content" = $'vm.swappiness=10\n' ]
+}
+
+create_managed_sysctl() {
+  local temp="${sysctl_file}.tmp.$$"
+  [ ! -e "$sysctl_file" ] && [ ! -L "$sysctl_file" ] \
+    && [ ! -e "$temp" ] && [ ! -L "$temp" ] || return 1
+  current_temp=$temp
+  ( set -o noclobber; umask 077; printf '%s\n' 'vm.swappiness=10' > "$temp" ) \
+    2>/dev/null || return 1
+  "$chmod_bin" 0600 "$temp" || return 1
+  validate_managed_sysctl_path "$temp" || return 1
+  sync_regular_file "$temp" || return 1
+  "$mv_bin" "$temp" "$sysctl_file" || return 1
+  current_temp=''
+  test_crash_after sysctl-file
+  sync_containing_directory "$sysctl_file" || return 1
+  inspect_sysctl_file || return 1
+  [ "$sysctl_state" = managed ]
+}
+
 durable_replace_phase_metadata() { # original-swappiness phase
   local value=$1 phase=$2 payload parent
   valid_swappiness "$value" || return 1
@@ -748,12 +834,14 @@ replace_fstab_with_managed_block() {
   "$cp_bin" -p -n "$fstab_file" "$backup_temp" || return 1
   validate_backup_metadata "$backup_temp" || return 1
   backup_matches_clean_fstab "$backup_temp" || return 1
+  sync_regular_file "$backup_temp" || return 1
   "$mv_bin" -n "$backup_temp" "$backup_path" || return 1
   [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
   current_temp=''
+  test_crash_after fstab-backup
+  sync_containing_directory "$backup_path" || return 1
   validate_backup_metadata "$backup_path" || return 1
   backup_matches_clean_fstab "$backup_path" || return 1
-  test_crash_after fstab-backup
 
   current_temp="${fstab_file}.legaltech-swap.tmp.$$"
   [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
@@ -766,9 +854,11 @@ replace_fstab_with_managed_block() {
       "$BEGIN_MARKER" "$swap_file" "$END_MARKER"
   } >> "$current_temp" || return 1
 
+  sync_regular_file "$current_temp" || return 1
   "$mv_bin" "$current_temp" "$fstab_file" || return 1
   current_temp=''
   test_crash_after fstab-managed
+  sync_containing_directory "$fstab_file" || return 1
 }
 
 replace_fstab_without_managed_block() {
@@ -835,11 +925,13 @@ apply_swap() {
   [ "$swap_file_exists" -eq 1 ] || { abort_current_apply; return 1; }
   "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
   inspect_swap_file || { abort_current_apply; return 1; }
+  sync_regular_file "$swap_file" || { abort_current_apply; return 1; }
   durable_replace_phase_metadata "$original_swappiness" mkswap \
     || { abort_current_apply; return 1; }
   test_crash_after mkswap-phase
   "$mkswap_bin" "$swap_file" || { abort_current_apply; return 1; }
   test_crash_after mkswap
+  sync_regular_file "$swap_file" || { abort_current_apply; return 1; }
   durable_replace_phase_metadata "$original_swappiness" fstab \
     || { abort_current_apply; return 1; }
   test_crash_after fstab-phase
@@ -847,10 +939,7 @@ apply_swap() {
   durable_replace_phase_metadata "$original_swappiness" sysctl \
     || { abort_current_apply; return 1; }
   test_crash_after sysctl-phase
-  printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
-  "$chmod_bin" 0600 "$sysctl_file" || { abort_current_apply; return 1; }
-  inspect_sysctl_file || { abort_current_apply; return 1; }
-  test_crash_after sysctl-file
+  create_managed_sysctl || { abort_current_apply; return 1; }
   durable_replace_phase_metadata "$original_swappiness" swappiness \
     || { abort_current_apply; return 1; }
   test_crash_after swappiness-phase
@@ -901,7 +990,24 @@ rollback_swap() {
   local state live restore_phase backup_path="${fstab_file}.legaltech-swap.bak"
   inspect_rollback_state >/dev/null || return 1
   state=$rollback_state
-  [ "$state" != clean ] || return 0
+  if [ "$state" = clean ]; then
+    sync_containing_directory "$swappiness_metadata_file" || return 1
+    return 0
+  fi
+
+  case "$apply_phase" in
+    rollback-fstab)
+      if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ]; then
+        sync_containing_directory "$fstab_file" || return 1
+      fi
+      ;;
+    rollback-sysctl)
+      [ "$sysctl_state" != absent ] || sync_containing_directory "$sysctl_file" || return 1
+      ;;
+    rollback-swapfile)
+      [ "$swap_file_exists" -ne 0 ] || sync_containing_directory "$swap_file" || return 1
+      ;;
+  esac
 
   if [ "$active_target_count" -eq 1 ]; then
     read_memory_safety || return 1
@@ -936,6 +1042,7 @@ rollback_swap() {
       "$rm_bin" "$backup_path" || return 1
     fi
     test_crash_after rollback-fstab
+    sync_containing_directory "$fstab_file" || return 1
     inspect_rollback_state >/dev/null || return 1
   fi
   if [ "$sysctl_state" = managed ]; then
@@ -943,6 +1050,7 @@ rollback_swap() {
     test_crash_after rollback-sysctl-phase
     "$rm_bin" "$sysctl_file" || return 1
     test_crash_after rollback-sysctl
+    sync_containing_directory "$sysctl_file" || return 1
     inspect_rollback_state >/dev/null || return 1
   fi
   if [ "$swap_file_exists" -eq 1 ]; then
@@ -950,6 +1058,7 @@ rollback_swap() {
     test_crash_after rollback-swapfile-phase
     "$rm_bin" "$swap_file" || return 1
     test_crash_after rollback-swapfile
+    sync_containing_directory "$swap_file" || return 1
     inspect_rollback_state >/dev/null || return 1
   fi
   [ "$swappiness_metadata_state" = managed ] || return 1
@@ -957,6 +1066,7 @@ rollback_swap() {
   test_crash_after rollback-metadata-phase
   "$rm_bin" "$swappiness_metadata_file" || return 1
   test_crash_after rollback-metadata
+  sync_containing_directory "$swappiness_metadata_file" || return 1
   inspect_rollback_state >/dev/null || return 1
   [ "$rollback_state" = clean ]
 }
