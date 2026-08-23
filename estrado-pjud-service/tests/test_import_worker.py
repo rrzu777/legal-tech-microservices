@@ -5,10 +5,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from pydantic import SecretStr
 
 from app.familia.auth import InvalidCredentialsError
 from app.my_causes.models import ImportCandidate
 from app.my_causes.client import DiscoveryResult
+from app.ojv.errors import (
+    OjvTimeoutError,
+    OjvUpstreamChangedError,
+    OjvWafError,
+    SessionExpiredError,
+)
+from app.proxy_billing import ProxyBillingExhaustedError
 from worker.import_jobs import ImportDiscoveryWorker
 
 
@@ -121,7 +129,12 @@ async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
     assert await worker.process_next() is True
 
     credential.assert_awaited_once_with(JOB["credential_id"], JOB["law_firm_id"])
-    session.login.assert_awaited_once_with("11111111-1", "secret-value", "clave_pj")
+    login_args = session.login.await_args.args
+    assert login_args[2] == "clave_pj"
+    assert isinstance(login_args[0], SecretStr)
+    assert isinstance(login_args[1], SecretStr)
+    assert login_args[0].get_secret_value() == "11111111-1"
+    assert login_args[1].get_secret_value() == "secret-value"
     discover.assert_awaited_once()
     assert sb.calls[0] == (
         "claim_pjud_import_job",
@@ -210,6 +223,58 @@ async def test_invalid_login_is_terminal_and_never_calls_listing_discovery():
     discover.assert_not_awaited()
     final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"][0]
     assert final["p_summary"]["error_code"] == "credential_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "error_code", "expected_sessions", "expected_disposition"),
+    [
+        (SessionExpiredError(), "session_expired", 2, "replace_before_reuse"),
+        (OjvWafError(), "ojv_blocked", 1, "replace_before_reuse"),
+        (OjvTimeoutError(), "pjud_timeout", 1, "replace_before_reuse"),
+        (OjvUpstreamChangedError(), "upstream_changed", 1, "healthy"),
+    ],
+)
+async def test_login_uses_closed_taxonomy_and_only_expired_session_retries(
+    error, error_code, expected_sessions, expected_disposition
+):
+    session = FakeSession(login_error=error)
+    worker, sb, _pool, discover, _credential, session_factory, _ = make_worker(
+        session=session
+    )
+
+    assert await worker.process_next() is True
+
+    discover.assert_not_awaited()
+    assert session_factory.call_count == expected_sessions
+    assert _pool.release_familia_bundle.await_count == expected_sessions
+    assert all(
+        release.kwargs["disposition"] == expected_disposition
+        for release in _pool.release_familia_bundle.await_args_list
+    )
+    final = [
+        payload
+        for name, payload in sb.calls
+        if name == "finalize_pjud_import_discovery"
+    ][0]
+    assert final["p_summary"]["error_code"] == error_code
+
+
+@pytest.mark.asyncio
+async def test_safe_proxy_billing_signal_never_remints_or_finalizes_claim():
+    session = FakeSession(login_error=ProxyBillingExhaustedError())
+    worker, sb, pool, discover, *_ = make_worker(session=session)
+
+    with pytest.raises(ProxyBillingExhaustedError):
+        await worker.process_next()
+
+    discover.assert_not_awaited()
+    pool.release_familia_bundle.assert_awaited_once_with(
+        pool.slot,
+        disposition="replace_before_reuse",
+        remint=False,
+    )
+    assert not any(name == "finalize_pjud_import_discovery" for name, _ in sb.calls)
 
 
 @pytest.mark.asyncio
@@ -483,6 +548,22 @@ async def test_main_loop_import_poll_contains_failure_without_crashing_paid_sync
     metrics.record_error.assert_called_once_with("infra")
     assert "secret" not in caplog.text
     assert "C-10-2026" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_main_loop_import_billing_signal_trips_global_cost_controls():
+    from worker.__main__ import safe_process_import_job
+
+    engine = SimpleNamespace(
+        process_import_job=AsyncMock(side_effect=ProxyBillingExhaustedError()),
+        _proxy_control=SimpleNamespace(trip_billing_exhausted=AsyncMock()),
+        _backoff=SimpleNamespace(open_permanently=MagicMock()),
+    )
+    metrics = SimpleNamespace(record_error=MagicMock())
+
+    assert await safe_process_import_job(engine, metrics) is False
+    engine._proxy_control.trip_billing_exhausted.assert_awaited_once()
+    engine._backoff.open_permanently.assert_called_once_with("billing_exhausted")
 
 
 @pytest.mark.asyncio

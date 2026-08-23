@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, date
 
 import httpx
+from pydantic import SecretStr
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
@@ -28,8 +29,9 @@ from app.failure_kind import (
     reject_empty_body,
     slot_still_healthy,
 )
-from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
 from app.familia.parser import parse_familia_results
+from app.ojv.errors import OjvSessionError
 from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
 from app.models import CandidateMatch, SearchRequest
 from app.parsers.anexo_parser import parse_anexo_list
@@ -37,7 +39,7 @@ from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
-from app.proxy_billing import is_proxy_billing_error
+from app.proxy_billing import ProxyBillingExhaustedError, is_proxy_billing_error
 from app.proxy_cost import (
     ProxyBudgetExceededError,
     ProxyUsagePersistenceError,
@@ -124,6 +126,10 @@ def _release_disposition_for_error(
     *,
     transport_revalidation_enabled: bool,
 ) -> ReleaseDisposition:
+    if isinstance(error, OjvSessionError) and error.code.value == "upstream_changed":
+        # Markup drift is independent of residential egress. A paid remint
+        # cannot repair it and would only retry a terminal contract failure.
+        return "healthy"
     if transport_revalidation_enabled and isinstance(
         error, httpx.RemoteProtocolError,
     ):
@@ -139,6 +145,14 @@ def _sync_run_error_code(
     """Map worker outcomes to the database's closed scheduled-run taxonomy."""
     if error is None:
         return None
+    if isinstance(error, OjvSessionError):
+        return {
+            "upstream_changed": "upstream_changed",
+            "timeout": "pjud_timeout",
+            "waf": "ojv_blocked",
+            "session_expired": "infra_unavailable",
+            "credential_invalid": "credential_unavailable",
+        }[error.code.value]
     if isinstance(error, httpx.RemoteProtocolError):
         return "remote_protocol_disconnect"
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
@@ -1453,7 +1467,11 @@ class SyncEngine:
                             bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
                         ) as session:
                             try:
-                                await session.login(cred["rut"], cred["password"], auth_type)
+                                await session.login(
+                                    SecretStr(cred["rut"]),
+                                    SecretStr(cred["password"]),
+                                    auth_type,
+                                )
                             except InvalidCredentialsError:
                                 # Credencial inválida = terminal (no reintenta en loop);
                                 # la IP está sana, se libera healthy=True.
@@ -1466,7 +1484,7 @@ class SyncEngine:
                                 return {"success": False, "new_movements": 0}
 
                             html = await session.search_familia(
-                                rut=cred["rut"],
+                                rut=SecretStr(cred["rut"]),
                                 rit=str(parsed["numero"]),
                                 year=str(parsed["anno"]),
                             )
@@ -1480,7 +1498,8 @@ class SyncEngine:
             # terminaba penalizando la causa.
             except (
                 FamiliaBlockedError,
-                SessionError,
+                OjvSessionError,
+                ProxyBillingExhaustedError,
                 TimeoutError,
                 httpx.TransportError,
                 httpx.HTTPStatusError,

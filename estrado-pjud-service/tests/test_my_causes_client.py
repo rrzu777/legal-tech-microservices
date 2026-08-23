@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from app.familia.auth import OjvSession
 from app.my_causes.client import DiscoveryResult, discover_my_causes
@@ -41,7 +42,7 @@ def session_factory():
             cookies={"OJVID": "session-secret"},
             transport=httpx.MockTransport(handler),
         )
-        session._remember_authenticated_rut("11111111-1")
+        session._remember_authenticated_rut(SecretStr("11111111-1"))
         sessions.append(session)
         return session
 
@@ -451,10 +452,12 @@ async def test_login_redirect_mid_run_classifies_session_expired(session_factory
 
 async def test_timeout_has_one_bounded_retry_and_terminal_status(session_factory) -> None:
     calls = 0
+    bodies: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
+        bodies.append(request.content.decode())
         raise httpx.ReadTimeout("synthetic timeout", request=request)
 
     session = session_factory(handler)
@@ -463,6 +466,9 @@ async def test_timeout_has_one_bounded_retry_and_terminal_status(session_factory
 
     assert result.status == "timeout"
     assert calls == 2
+    assert bodies[0] == bodies[1]
+    assert "rutMisCauCiv=11111111" in bodies[0]
+    assert "estadoCausaMisCauCiv%5B%5D=1" in bodies[0]
     assert result.page_count == 0
 
 

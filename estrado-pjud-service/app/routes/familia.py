@@ -9,9 +9,10 @@ from app.auth import verify_api_key
 from app.config import get_settings
 from app.errors import safe_error
 from app.failure_kind import classify_exception
-from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
 from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
 from app.familia.parser import parse_familia_results
+from app.ojv.errors import OjvSessionError
 from app.metrics import api_metrics
 from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
 from app.proxy_billing import is_proxy_billing_error
@@ -120,7 +121,7 @@ async def _run_sync(
                 error_code="invalid_credentials",
                 error="Las credenciales proporcionadas no son válidas",
             )
-        except SessionError as e:
+        except OjvSessionError as e:
             logger.warning("familia_sync: session error: %s", safe_error(e))
             return FamiliaSyncResponse(
                 ok=False, casos=[],
@@ -159,6 +160,17 @@ async def _run_sync(
                     # Un bloqueo F5 aborta el batch: no seguir martillando la
                     # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
                     return _blocked()
+                except OjvSessionError as e:
+                    logger.warning(
+                        "familia_sync: authenticated session failure code=%s",
+                        e.code.value,
+                    )
+                    return FamiliaSyncResponse(
+                        ok=False,
+                        casos=[],
+                        error_code="session_error",
+                        error="No se pudo consultar la causa en OJV",
+                    )
                 except Exception as e:
                     billing = await _proxy_billing_response(e, proxy_control)
                     if billing:
@@ -197,6 +209,17 @@ async def _run_sync(
             html = await session.search_familia(rut=req.rut)
         except FamiliaBlockedError:
             return _blocked()
+        except OjvSessionError as e:
+            logger.warning(
+                "familia_sync: authenticated session failure code=%s",
+                e.code.value,
+            )
+            return FamiliaSyncResponse(
+                ok=False,
+                casos=[],
+                error_code="session_error",
+                error="No se pudo consultar OJV",
+            )
         except Exception as e:
             billing = await _proxy_billing_response(e, proxy_control)
             if billing:

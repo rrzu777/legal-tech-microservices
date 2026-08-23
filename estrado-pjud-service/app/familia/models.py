@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, WithJsonSchema, field_validator
 
 #: ⚠️ CONTRATO CROSS-REPO. Quien lo consume es `classifyFamiliaFailure`
 #: (`apps/web/src/lib/pjud/sync-error-patch.ts`, repo LegalTech), que traduce
@@ -14,6 +14,10 @@ from pydantic import BaseModel, Field, field_validator
 FamiliaErrorCode = Literal["invalid_credentials", "session_error", "no_cases", "parse_error", "blocked"]
 
 _MAX_CASES = 10
+RedactedRequestString = Annotated[
+    SecretStr,
+    WithJsonSchema({"type": "string"}),
+]
 
 
 class FamiliaCaseFilter(BaseModel):
@@ -22,15 +26,15 @@ class FamiliaCaseFilter(BaseModel):
 
 
 class FamiliaSyncRequest(BaseModel):
-    rut: str              # "12345678-9" or "12345678"
-    password: str
+    rut: RedactedRequestString        # "12345678-9" or "12345678"
+    password: RedactedRequestString
     auth_type: Literal["clave_pj", "clave_unica"] = "clave_pj"
     cases: Annotated[list[FamiliaCaseFilter], Field(max_length=_MAX_CASES)] = []
 
     @field_validator("rut")
     @classmethod
-    def _clean_rut(cls, v: str) -> str:
-        return v.strip()
+    def _clean_rut(cls, v: SecretStr) -> SecretStr:
+        return SecretStr(v.get_secret_value().strip())
 
 
 class FamiliaCaso(BaseModel):

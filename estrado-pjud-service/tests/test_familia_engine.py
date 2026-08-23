@@ -8,6 +8,7 @@ import pytest
 
 from app.cookie_store import CookieBundle
 from app.familia.auth import FamiliaBlockedError, InvalidCredentialsError, SessionError
+from app.ojv.errors import OjvUpstreamChangedError
 from app.familia.models import FamiliaCaso
 
 from tests.helpers import find_update_payload
@@ -113,7 +114,9 @@ async def test_login_block_does_not_penalize_and_remints(monkeypatch):
     assert result["success"] is False
     # "ojv": `FamiliaBlockedError` ES el portal cortandonos. Es el unico de los
     # cuatro tipos que atrapa ese `except` que de verdad culpa a OJV.
-    engine._handle_blocked.assert_awaited_once_with("c1", "ojv", "F5")
+    engine._handle_blocked.assert_awaited_once_with(
+        "c1", "ojv", "OJV request blocked"
+    )
     assert engine._finish_run.await_args.kwargs["error_code"] == "ojv_blocked"
     engine._update_case_error.assert_not_awaited()  # NO penaliza
     # Release requests replacement of the slot.
@@ -145,13 +148,41 @@ async def test_session_error_no_le_echa_la_culpa_al_portal(monkeypatch):
     result = await engine._sync_familia_case(_CASE, None, MagicMock())
 
     assert result["success"] is False
-    engine._handle_blocked.assert_awaited_once_with("c1", "infra", "no se pudo abrir sesion")
+    engine._handle_blocked.assert_awaited_once_with(
+        "c1", "infra", "OJV session unavailable"
+    )
     assert engine._finish_run.await_args.kwargs["error_code"] == "infra_unavailable"
     # Y sigue sin penalizar y sigue re-minteando: la clasificacion cambia el
     # texto, no el manejo.
     engine._update_case_error.assert_not_awaited()
     _, kwargs = engine._pool.release_familia_bundle.call_args
     assert kwargs.get("disposition") == "replace_before_reuse"
+
+
+@pytest.mark.asyncio
+async def test_upstream_change_keeps_slot_and_closed_run_taxonomy(monkeypatch):
+    import worker.engine as eng
+
+    engine = _make_engine()
+    engine._get_decrypted_credential = AsyncMock(
+        return_value={
+            "rut": "1-9",
+            "password": "p",
+            "password_type": "clave_poder_judicial",
+        }
+    )
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(side_effect=OjvUpstreamChangedError())
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(eng, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    result = await engine._sync_familia_case(_CASE, None, MagicMock())
+
+    assert result["success"] is False
+    assert engine._finish_run.await_args.kwargs["error_code"] == "upstream_changed"
+    _, kwargs = engine._pool.release_familia_bundle.call_args
+    assert kwargs.get("disposition") == "healthy"
 
 
 @pytest.mark.asyncio

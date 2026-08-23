@@ -12,16 +12,15 @@ import json
 import logging
 import unicodedata
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, UUID4
+from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
 
-from app.familia.auth import (
-    FamiliaAuthSession,
-    InvalidCredentialsError,
-)
-from app.my_causes.client import DiscoveryResult, discover_my_causes
+from app.familia.auth import FamiliaAuthSession
+from app.my_causes.client import DiscoveryResult, DiscoveryStatus, discover_my_causes
 from app.my_causes.models import ImportCandidate, Matter
+from app.ojv.errors import OjvSessionError
+from app.proxy_billing import ProxyBillingExhaustedError
 from worker.config import run_query
 
 
@@ -269,11 +268,17 @@ class ImportDiscoveryWorker:
             ) as session:
                 try:
                     await session.login(
-                        credential["rut"], credential["password"], "clave_pj",
+                        SecretStr(credential["rut"]),
+                        SecretStr(credential["password"]),
+                        "clave_pj",
                     )
-                except InvalidCredentialsError:
+                except OjvSessionError as error:
+                    if error.code.value in {"session_expired", "waf", "timeout"}:
+                        disposition = "replace_before_reuse"
                     return DiscoveryResult(
-                        candidates=[], page_count=0, status="credential_invalid",
+                        candidates=[],
+                        page_count=0,
+                        status=cast(DiscoveryStatus, error.code.value),
                     )
                 return await self._discover(
                     session,
@@ -284,6 +289,10 @@ class ImportDiscoveryWorker:
             # The borrowed F5 bundle is read-only and the authenticated client
             # is ephemeral. Shutdown must not trigger a paid reactive remint.
             disposition = "healthy"
+            remint = False
+            raise
+        except ProxyBillingExhaustedError:
+            disposition = "replace_before_reuse"
             remint = False
             raise
         except BaseException:

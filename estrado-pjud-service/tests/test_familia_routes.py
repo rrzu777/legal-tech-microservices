@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from app.cookie_store import CookieBundle
 from app.failure_kind import PoolUnavailableError
 from app.familia.models import FamiliaSyncRequest
+from app.ojv.errors import OjvTimeoutError, OjvUpstreamChangedError, SessionExpiredError
 from app.pool_guard import PUBLIC_POOL_UNAVAILABLE_DETAIL
 
 
@@ -191,6 +192,43 @@ async def test_un_fallo_de_red_en_el_rit_no_se_disfraza_de_causa_inexistente(mon
 
     assert resp.ok is False
     assert resp.error_code == "session_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_error",
+    [
+        pytest.param(SessionExpiredError(), id="expired"),
+        pytest.param(OjvTimeoutError(), id="timeout"),
+        pytest.param(OjvUpstreamChangedError(), id="upstream-changed"),
+    ],
+)
+async def test_common_session_failure_does_not_become_a_missing_familia_case(
+    monkeypatch, session_error
+):
+    from app.familia.models import FamiliaCaseFilter
+    from app.routes import familia as mod
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(side_effect=session_error)
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    response = await mod._run_sync(
+        FamiliaSyncRequest(
+            rut="11111111-1",
+            password="p",
+            auth_type="clave_pj",
+            cases=[FamiliaCaseFilter(rit="100", year="2024")],
+        ),
+        rate_s=0.0,
+        bundle=_bundle(),
+    )
+
+    assert response.ok is False
+    assert response.error_code == "session_error"
 
 
 @pytest.mark.asyncio

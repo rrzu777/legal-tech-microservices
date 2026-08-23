@@ -20,7 +20,8 @@ from bs4 import BeautifulSoup
 
 from pydantic import BaseModel, ConfigDict
 
-from app.familia.auth import OjvSession, SessionError, decode_ojv_html
+from app.ojv.errors import OjvTimeoutError, SessionError
+from app.ojv.session import OjvSession, decode_ojv_html
 from app.my_causes.models import ImportCandidate, Matter
 from app.my_causes.parser import UpstreamChangedError, parse_my_causes_page
 from app.parsers.search_parser import detect_blocked
@@ -238,7 +239,7 @@ async def _post_with_bounded_retry(
                 return response
             if detect_blocked(response.text):
                 return response
-        except (httpx.TimeoutException, httpx.TransportError):
+        except (OjvTimeoutError, httpx.TimeoutException, httpx.TransportError):
             pass
         if attempt + 1 == _TRANSIENT_ATTEMPTS:
             return None

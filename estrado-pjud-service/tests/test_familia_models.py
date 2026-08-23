@@ -14,6 +14,23 @@ def test_default_auth_type_is_clave_pj():
     assert req.auth_type == "clave_pj"
 
 
+def test_secret_wrappers_preserve_the_existing_request_json_schema():
+    properties = FamiliaSyncRequest.model_json_schema()["properties"]
+
+    assert properties["rut"] == {"title": "Rut", "type": "string"}
+    assert properties["password"] == {"title": "Password", "type": "string"}
+
+
+def test_request_repr_and_dump_redact_rut_and_password():
+    request = FamiliaSyncRequest(
+        rut="11.111.111-1", password="synthetic-password"
+    )
+
+    rendered = f"{request!r} {request.model_dump()!r}"
+    assert "11.111.111-1" not in rendered
+    assert "synthetic-password" not in rendered
+
+
 def test_el_conjunto_de_error_code_esta_fijado():
     """⚠️ Contrato cross-repo: si esto falla, `classifyFamiliaFailure` en el repo
     de la app (`apps/web/src/lib/pjud/sync-error-patch.ts`) tiene que aprender el

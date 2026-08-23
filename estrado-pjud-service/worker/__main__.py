@@ -216,6 +216,13 @@ async def safe_process_import_job(engine, metrics) -> bool:
             type(exc).__name__,
         )
         metrics.record_error("infra")
+        if is_proxy_billing_error(exc):
+            proxy_control = getattr(engine, "_proxy_control", None)
+            if proxy_control is not None:
+                await proxy_control.trip_billing_exhausted()
+            backoff = getattr(engine, "_backoff", None)
+            if backoff is not None:
+                backoff.open_permanently("billing_exhausted")
         return False
 
 
