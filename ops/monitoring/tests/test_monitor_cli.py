@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -168,6 +170,89 @@ def test_failed_delivery_preserves_retry_state_and_sanitized_error(tmp_path):
     assert "chat-from-env" not in json.dumps(writes)
     assert "payload-secret" not in json.dumps(writes)
     assert stderr.getvalue() == "Telegram delivery failed\n"
+
+
+def test_initial_directory_sync_failure_prevents_delivery_and_success_output(
+    tmp_path, monkeypatch
+):
+    sent = []
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    secret = "initial-dir-sync-secret"
+    real_fsync = os.fsync
+
+    def failing_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(secret)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "ops.monitoring.resource_metrics.os.fsync", failing_directory_fsync
+    )
+
+    result = main(
+        ["--once", "--state-dir", str(tmp_path)],
+        environ={
+            "LEGALTECH_TELEGRAM_BOT_TOKEN": "token-from-env",
+            "LEGALTECH_TELEGRAM_CHAT_ID": "chat-from-env",
+        },
+        collect=lambda **kwargs: sample(api_active="inactive"),
+        clock=fixed_clock,
+        transport_factory=lambda token, chat_id: FakeTransport(sent),
+        slice_resolver=lambda: "user-4242.slice",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert sent == []
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == "Monitoring state write failed\n"
+    assert secret not in stderr.getvalue()
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_delivery_directory_sync_failure_does_not_confirm_cooldown_or_success(
+    tmp_path, monkeypatch
+):
+    sent = []
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    real_fsync = os.fsync
+    directory_syncs = 0
+
+    def fail_second_directory_fsync(descriptor):
+        nonlocal directory_syncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs += 1
+            if directory_syncs == 2:
+                raise OSError("post-delivery-dir-sync-secret")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "ops.monitoring.resource_metrics.os.fsync", fail_second_directory_fsync
+    )
+
+    result = main(
+        ["--once", "--state-dir", str(tmp_path)],
+        environ={
+            "LEGALTECH_TELEGRAM_BOT_TOKEN": "token-from-env",
+            "LEGALTECH_TELEGRAM_CHAT_ID": "chat-from-env",
+        },
+        collect=lambda **kwargs: sample(api_active="inactive"),
+        clock=fixed_clock,
+        transport_factory=lambda token, chat_id: FakeTransport(sent),
+        slice_resolver=lambda: "user-4242.slice",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert len(sent) == 1
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == "Monitoring state write failed\n"
+    assert "post-delivery-dir-sync-secret" not in stderr.getvalue()
+    assert list(tmp_path.glob(".state.json.*")) == []
 
 
 def test_dry_run_returns_candidates_without_network_or_state_mutation(tmp_path):

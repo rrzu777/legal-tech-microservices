@@ -12,8 +12,9 @@ import json
 import math
 import os
 import re
+import secrets
+import stat
 import subprocess
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,24 +157,117 @@ def percent_used(total: int, available: int) -> float:
 
 
 def atomic_write_json(path: Path, value: dict[str, object]) -> None:
-    """Atomically replace a JSON file using a same-directory temporary file."""
+    """Durably replace private JSON state without following a parent symlink."""
     path = Path(path)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        text=True,
-    )
-    temporary_path = Path(temporary_name)
+    directory_descriptor = _open_private_directory(path.parent)
+    temporary_name: str | None = None
     try:
+        descriptor, temporary_name = _create_private_temporary_file(
+            directory_descriptor, path.name
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(value, handle, sort_keys=True, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
+            temporary_identity = _regular_file_identity(os.fstat(handle.fileno()))
+
+        _require_same_directory(path.parent, directory_descriptor)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        target_identity = _regular_file_identity(
+            os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
+        )
+        if target_identity != temporary_identity:
+            raise OSError("Atomic JSON state write failed")
+        _require_same_directory(path.parent, directory_descriptor)
+        os.fsync(directory_descriptor)
+        _require_same_directory(path.parent, directory_descriptor)
+    except BaseException as error:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise OSError("Atomic JSON state write failed") from None
+    finally:
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass
+
+
+def _open_private_directory(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        _require_private_directory(os.fstat(descriptor))
+        _require_same_directory(path, descriptor)
+        return descriptor
+    except Exception:
+        if "descriptor" in locals():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise OSError("Atomic JSON state write failed") from None
+
+
+def _require_same_directory(path: Path, descriptor: int) -> None:
+    opened = _require_private_directory(os.fstat(descriptor))
+    named = _require_private_directory(os.stat(path, follow_symlinks=False))
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise OSError("Atomic JSON state write failed")
+
+
+def _require_private_directory(metadata: os.stat_result) -> os.stat_result:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise OSError("Atomic JSON state write failed")
+    return metadata
+
+
+def _create_private_temporary_file(
+    directory_descriptor: int, target_name: str
+) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(16):
+        temporary_name = f".{target_name}.{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            return descriptor, temporary_name
+        except FileExistsError:
+            continue
+    raise OSError("Atomic JSON state write failed")
+
+
+def _regular_file_identity(metadata: os.stat_result) -> tuple[int, int]:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise OSError("Atomic JSON state write failed")
+    return metadata.st_dev, metadata.st_ino
 
 
 CSV_COLUMNS = (

@@ -1,5 +1,9 @@
 import csv
 import json
+import os
+import stat
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -419,6 +423,162 @@ def test_atomic_write_json_replaces_value_without_leaving_a_temporary_file(tmp_p
     atomic_write_json(target, {"schema_version": 1, "active": False})
 
     assert json.loads(target.read_text()) == {"schema_version": 1, "active": False}
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_atomic_write_json_fsyncs_the_parent_directory_after_replacement(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "state.json"
+    synced_kinds = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor):
+        synced_kinds.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("ops.monitoring.resource_metrics.os.fsync", recording_fsync)
+
+    atomic_write_json(target, {"schema_version": 1, "active": True})
+
+    assert synced_kinds == [stat.S_IFREG, stat.S_IFDIR]
+    assert json.loads(target.read_text()) == {"schema_version": 1, "active": True}
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_atomic_write_json_reports_directory_fsync_failure_without_leaking_details(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "state.json"
+    target.write_text('{"previous":true}\n')
+    secret = "directory-fsync-secret"
+    real_fsync = os.fsync
+
+    def failing_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(secret)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "ops.monitoring.resource_metrics.os.fsync", failing_directory_fsync
+    )
+
+    with pytest.raises(OSError) as raised:
+        atomic_write_json(target, {"schema_version": 1, "active": True})
+
+    assert str(raised.value) == "Atomic JSON state write failed"
+    assert secret not in str(raised.value)
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_atomic_write_json_cleans_temp_and_preserves_old_state_before_replace(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "state.json"
+    target.write_text('{"previous":true}\n')
+    secret = "temporary-write-secret"
+
+    def fail_json_write(*args, **kwargs):
+        raise OSError(secret)
+
+    monkeypatch.setattr("ops.monitoring.resource_metrics.json.dump", fail_json_write)
+
+    with pytest.raises(OSError) as raised:
+        atomic_write_json(target, {"schema_version": 1, "active": True})
+
+    assert str(raised.value) == "Atomic JSON state write failed"
+    assert secret not in str(raised.value)
+    assert json.loads(target.read_text()) == {"previous": True}
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_atomic_write_json_rejects_a_symlinked_parent_without_touching_target(tmp_path):
+    real_directory = tmp_path / "real-state"
+    real_directory.mkdir(mode=0o700)
+    linked_directory = tmp_path / "linked-state"
+    linked_directory.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(OSError) as raised:
+        atomic_write_json(linked_directory / "state.json", {"schema_version": 1})
+
+    assert str(raised.value) == "Atomic JSON state write failed"
+    assert list(real_directory.iterdir()) == []
+
+
+def test_atomic_write_json_rejects_a_directory_writable_by_other_users(tmp_path):
+    unsafe_directory = tmp_path / "unsafe-state"
+    unsafe_directory.mkdir()
+    unsafe_directory.chmod(0o770)
+
+    with pytest.raises(OSError) as raised:
+        atomic_write_json(unsafe_directory / "state.json", {"schema_version": 1})
+
+    assert str(raised.value) == "Atomic JSON state write failed"
+    assert list(unsafe_directory.iterdir()) == []
+
+
+def test_atomic_write_json_commits_private_single_link_state(tmp_path):
+    target = tmp_path / "state.json"
+
+    atomic_write_json(target, {"schema_version": 1})
+
+    metadata = target.stat(follow_symlinks=False)
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert metadata.st_uid == os.geteuid()
+    assert metadata.st_nlink == 1
+
+
+@pytest.mark.parametrize(
+    ("crash_timing", "expected_status"),
+    [("before", 91), ("after", 92)],
+)
+def test_atomic_write_json_crash_at_directory_sync_never_reports_success_or_leaves_temp(
+    tmp_path, crash_timing, expected_status
+):
+    target = tmp_path / "state.json"
+    script = """
+import os
+import stat
+from pathlib import Path
+from ops.monitoring import resource_metrics
+
+target = Path(os.environ["MONITOR_STATE_PATH"])
+timing = os.environ["MONITOR_CRASH_TIMING"]
+real_fsync = os.fsync
+
+def crash_at_directory_sync(descriptor):
+    if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        if timing == "before":
+            os._exit(91)
+        real_fsync(descriptor)
+        os._exit(92)
+    real_fsync(descriptor)
+
+resource_metrics.os.fsync = crash_at_directory_sync
+resource_metrics.atomic_write_json(target, {"schema_version": 1, "active": True})
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "MONITOR_STATE_PATH": str(target),
+            "MONITOR_CRASH_TIMING": crash_timing,
+            "PYTHONPATH": str(Path(__file__).parents[3]),
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[3],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == expected_status
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert json.loads(target.read_text()) == {"schema_version": 1, "active": True}
     assert list(tmp_path.glob(".state.json.*")) == []
 
 
