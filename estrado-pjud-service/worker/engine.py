@@ -1293,7 +1293,7 @@ class SyncEngine:
                     )
 
     async def _call_app_internal(
-        self, method: str, path: str, what: str
+        self, method: str, path: str, what: str, *, law_firm_id: str | None = None
     ) -> httpx.Response | None:
         """Una request a la API interna de la app, o `None` si no salio.
 
@@ -1308,9 +1308,12 @@ class SyncEngine:
             logger.error("VERCEL_APP_URL or INTERNAL_CREDENTIALS_API_KEY not configured")
             return None
         try:
+            headers = {"Authorization": f"Bearer {key}"}
+            if law_firm_id is not None:
+                headers["X-Law-Firm-Id"] = law_firm_id
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.request(
-                    method, f"{url}{path}", headers={"Authorization": f"Bearer {key}"}
+                    method, f"{url}{path}", headers=headers
                 )
             if resp.status_code != 200:
                 logger.warning("%s returned %d (%s)", what, resp.status_code, path)
@@ -1319,10 +1322,15 @@ class SyncEngine:
             logger.exception("%s failed (%s)", what, path)
             return None
 
-    async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
+    async def _get_decrypted_credential(
+        self, credential_id: str, law_firm_id: str
+    ) -> dict | None:
         """Fetch decrypted credential from Vercel internal endpoint."""
         resp = await self._call_app_internal(
-            "GET", f"/api/internal/credentials/{credential_id}/decrypt", "Decrypt endpoint"
+            "GET",
+            f"/api/internal/credentials/{credential_id}/decrypt",
+            "Decrypt endpoint",
+            law_firm_id=law_firm_id,
         )
         return resp.json() if resp is not None and resp.status_code == 200 else None
 
@@ -1353,7 +1361,9 @@ class SyncEngine:
             await self._terminal_error(case["id"], "Causa Familia sin credencial OJV configurada")
             return {"success": False, "new_movements": 0}
 
-        cred = await self._get_decrypted_credential(credential_id)
+        cred = await self._get_decrypted_credential(
+            credential_id, case["law_firm_id"]
+        )
         if not cred:
             await self._finish_run(sync_run_id, started_at, "error", 0, "Credential inactive or missing")
             await self._terminal_error(case["id"], "Credencial OJV inactiva o no encontrada")

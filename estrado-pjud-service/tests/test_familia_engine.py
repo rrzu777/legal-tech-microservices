@@ -53,6 +53,16 @@ _CASE = {
 
 
 @pytest.mark.asyncio
+async def test_familia_scopes_credential_fetch_to_case_tenant():
+    engine = _make_engine()
+    engine._get_decrypted_credential = AsyncMock(return_value=None)
+
+    await engine._sync_familia_case(_CASE, None, MagicMock())
+
+    engine._get_decrypted_credential.assert_awaited_once_with("cred1", "lf1")
+
+
+@pytest.mark.asyncio
 async def test_terminal_error_suspends_instead_of_user_pausing():
     engine = _make_engine(stub_terminal_error=False)
 
@@ -382,6 +392,25 @@ class TestReportInvalidCredential:
         args, kwargs = instance.request.call_args
         assert args == ("POST", "https://app.test/api/internal/credentials/cred1/invalidate")
         assert kwargs["headers"]["Authorization"] == "Bearer k"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_envia_el_tenant_autoritativo_sin_otros_metadatos(self):
+        engine = self._engine()
+        with patch("worker.engine.httpx.AsyncClient") as mock_client:
+            instance = mock_client.return_value
+            response = MagicMock(status_code=200)
+            response.json.return_value = {"password_type": "clave_poder_judicial"}
+            instance.request = AsyncMock(return_value=response)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+
+            await engine._get_decrypted_credential("cred1", "lf1")
+
+        _args, kwargs = instance.request.call_args
+        assert kwargs["headers"] == {
+            "Authorization": "Bearer k",
+            "X-Law-Firm-Id": "lf1",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
