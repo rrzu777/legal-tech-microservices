@@ -83,7 +83,18 @@ setup() {
   unset STAT_OVERRIDE_PATH STAT_OVERRIDE_MODE STAT_OVERRIDE_LINKS
   unset STAT_OVERRIDE_UID STAT_OVERRIDE_GID
   unset FLOCK_FAIL_AFTER_OUTPUT READLINK_FAIL_AFTER_OUTPUT
+  unset CRASH_AFTER
   unset HANDOFF_FD
+  unset PHASE_WRITE_FAIL
+
+  write_stub phase-python '
+payload=${5:-}
+phase=$(printf "%s" "$payload" | sed -n "s/^phase=//p")
+printf "phase-write %s\n" "$phase" >> "$SWAP_TEST_CALL_LOG"
+[ -z "${SWAP_TEST_PHASE_WRITE_FAIL:-}" ] \
+  || [ "$phase" != "$SWAP_TEST_PHASE_WRITE_FAIL" ] \
+  || exit 8
+exec "$SWAP_TEST_PYTHON" "$@"'
 
   write_stub df '
 printf "df %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
@@ -161,7 +172,10 @@ case "${1:-}" in
       printf "%s\n" "$current"
     fi
     ;;
-  -p) [ -f "${2:-}" ] || exit 9; printf "10\n" > "$SWAP_TEST_SWAPPINESS_STATE" ;;
+  -p)
+    [ -f "${2:-}" ] || exit 9
+    printf "10\n" > "$SWAP_TEST_SWAPPINESS_STATE"
+    ;;
   -w)
     case "${2:-}" in vm.swappiness=*) value=${2#vm.swappiness=} ;; *) exit 9 ;; esac
     [ "${SWAP_TEST_SYSCTL_RESTORE_FAIL:-0}" != 1 ] || exit 8
@@ -237,6 +251,13 @@ case "${1:-}" in
       && [ -e "/dev/fd/$LEGALTECH_RESOURCE_LOCK_FD" ]; then
       exit 0
     fi
+    if [ -d "$SWAP_TEST_STATE/resource-lock-held" ]; then
+      stale_owner=$(cat "$SWAP_TEST_STATE/resource-lock-held/owner" 2>/dev/null || true)
+      case "$stale_owner" in ""|*[!0-9]*) ;; *)
+        kill -0 "$stale_owner" 2>/dev/null || rm -rf "$SWAP_TEST_STATE/resource-lock-held"
+        ;;
+      esac
+    fi
     if mkdir "$SWAP_TEST_STATE/resource-lock-held" 2>/dev/null; then
       printf "%s\n" "$PPID" > "$SWAP_TEST_STATE/resource-lock-held/owner"
       exit 0
@@ -274,9 +295,11 @@ run_swap() {
     SWAP_FREE_BIN="$BIN_DIR/free" SWAP_CP_BIN="$BIN_DIR/cp" \
     SWAP_MV_BIN="$BIN_DIR/mv" SWAP_STAT_BIN="$BIN_DIR/stat" \
     SWAP_RM_BIN="$BIN_DIR/rm" SWAP_FLOCK_BIN="$BIN_DIR/flock" \
-    SWAP_READLINK_BIN="$BIN_DIR/readlink" SWAP_LOCK_FILE="$LOCK_FILE" \
+    SWAP_READLINK_BIN="$BIN_DIR/readlink" SWAP_PYTHON_BIN="$BIN_DIR/phase-python" \
+    SWAP_LOCK_FILE="$LOCK_FILE" \
     SWAP_FD_ROOT="$ROOT/fd" SWAP_TEST_FD_ROOT="$ROOT/fd" \
     SWAP_TEST_STATE="$STATE_DIR" SWAP_TEST_CALL_LOG="$CALL_LOG" \
+    SWAP_TEST_FSTAB="$FSTAB_FILE" SWAP_TEST_CRASH_AFTER="${CRASH_AFTER:-}" \
     SWAP_TEST_PROC_SWAPS="$PROC_SWAPS_FILE" \
     SWAP_TEST_MV_COUNT_FILE="$MV_COUNT_FILE" \
     SWAP_TEST_SWAPPINESS_STATE="$SWAPPINESS_STATE" \
@@ -284,6 +307,7 @@ run_swap() {
     SWAP_TEST_FREE_BYTES="$FREE_BYTES" SWAP_TEST_AVAILABLE_RAM="$AVAILABLE_RAM" \
     SWAP_TEST_SWAP_USED="$SWAP_USED" SWAP_TEST_TARGET_USED_KIB="$TARGET_USED_KIB" \
     SWAP_TEST_PYTHON="$(command -v python3)" \
+    SWAP_TEST_PHASE_WRITE_FAIL="${PHASE_WRITE_FAIL:-}" \
     SWAP_TEST_DF_FAIL="${DF_FAIL:-0}" SWAP_TEST_FALLOCATE_FAIL="${FALLOCATE_FAIL:-0}" \
     SWAP_TEST_CHMOD_FAIL="${CHMOD_FAIL:-0}" SWAP_TEST_MKSWAP_FAIL="${MKSWAP_FAIL:-0}" \
     SWAP_TEST_SWAPON_FAIL="${SWAPON_FAIL:-0}" SWAP_TEST_SWAPOFF_FAIL="${SWAPOFF_FAIL:-0}" \
@@ -327,8 +351,16 @@ append_managed_block() {
 managed_fstab() {
   save_fstab_backup
   append_managed_block
-  printf '%s\n' 10 > "$SWAPPINESS_METADATA_FILE"
+  printf 'version=1\noriginal_swappiness=10\nphase=complete\n' > "$SWAPPINESS_METADATA_FILE"
   /bin/chmod 600 "$SWAPPINESS_METADATA_FILE"
+}
+
+metadata_original() {
+  sed -n 's/^original_swappiness=//p' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true
+}
+
+metadata_phase() {
+  sed -n 's/^phase=//p' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true
 }
 
 write_managed_sysctl() {
@@ -358,6 +390,19 @@ managed_artifact_count() {
     if [ -e "$path" ] || [ -L "$path" ]; then count=$((count + 1)); fi
   done
   printf '%s\n' "$count"
+}
+
+simulate_literal_reboot() {
+  printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$PROC_SWAPS_FILE"
+  if grep -qxF "$SWAP_FILE none swap sw 0 0" "$FSTAB_FILE" \
+    && [ -f "$SWAP_FILE" ]; then
+    printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+  fi
+  if [ -f "$SYSCTL_FILE" ] \
+    && [ "$(cat "$SYSCTL_FILE")" = 'vm.swappiness=10' ]; then
+    printf '%s\n' 10 > "$SWAPPINESS_STATE"
+  fi
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
 }
 
 assert_retry_converges_clean() {
@@ -775,6 +820,259 @@ if [ -z "${SWAP_FOCUS:-}" ]; then
   run_apply_compensation_retry_regressions
 fi
 
+run_apply_crash_recovery_regressions() {
+  local boundary original_fstab before_mutations expected_phase expected_artifacts expected_active
+  local expected_live safe_stale stale_temp
+  local -a boundaries=(
+    metadata-only swapfile-allocated mkswap-phase mkswap fstab-phase
+    fstab-backup fstab-managed sysctl-phase sysctl-file swappiness-phase
+    live-swappiness swapon-phase swapon complete
+  )
+  echo '== every exact apply crash prefix rolls back to the byte-identical clean state'
+  for boundary in "${boundaries[@]}"; do
+    setup "apply-crash-$boundary"
+    printf '%s\n' 60 > "$SWAPPINESS_STATE"
+    original_fstab="$TMP/apply-crash-$boundary.fstab.before"
+    /bin/cp "$FSTAB_FILE" "$original_fstab"
+    CRASH_AFTER=$boundary run_swap apply
+    if [ "$RC" -ne 0 ]; then ok "$boundary abrupt apply is nonzero"; else bad "$boundary abrupt apply is nonzero"; fi
+    unset CRASH_AFTER
+    case "$boundary" in
+      metadata-only) expected_phase=swapfile; expected_artifacts=1; expected_active=0 ;;
+      swapfile-allocated) expected_phase=swapfile; expected_artifacts=2; expected_active=0 ;;
+      mkswap-phase|mkswap) expected_phase=mkswap; expected_artifacts=2; expected_active=0 ;;
+      fstab-phase) expected_phase=fstab; expected_artifacts=2; expected_active=0 ;;
+      fstab-backup|fstab-managed) expected_phase=fstab; expected_artifacts=3; expected_active=0 ;;
+      sysctl-phase) expected_phase=sysctl; expected_artifacts=3; expected_active=0 ;;
+      sysctl-file) expected_phase=sysctl; expected_artifacts=4; expected_active=0 ;;
+      swappiness-phase) expected_phase=swappiness; expected_artifacts=4; expected_active=0 ;;
+      live-swappiness) expected_phase=swappiness; expected_artifacts=4; expected_active=0 ;;
+      swapon-phase) expected_phase=swapon; expected_artifacts=4; expected_active=0 ;;
+      swapon) expected_phase=swapon; expected_artifacts=4; expected_active=1 ;;
+      complete) expected_phase=complete; expected_artifacts=4; expected_active=1 ;;
+    esac
+    expect_eq "$boundary crash retains exact durable phase" \
+      "$(metadata_phase)" "$expected_phase"
+    expect_eq "$boundary crash retains exact phase artifact prefix" \
+      "$(managed_artifact_count)" "$expected_artifacts"
+    expect_eq "$boundary crash retains exact target activity" \
+      "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" \
+      "$expected_active"
+    # A real flock is released by the kernel when the killed owner exits. The
+    # directory-backed test double needs the equivalent explicit reap.
+    /bin/rm -rf "$STATE_DIR/resource-lock-held"
+    [ ! -d "$STATE_DIR/resource-lock-held" ] || printf 'DEBUG lock dir survived reap: %s\n' "$STATE_DIR"
+    run_swap rollback
+    expect_eq "$boundary rollback converges" "$RC" 0
+    expect_file_eq "$boundary restores fstab bytes" "$original_fstab" "$FSTAB_FILE"
+    expect_eq "$boundary restores live swappiness" "$(cat "$SWAPPINESS_STATE")" 60
+    expect_eq "$boundary leaves target inactive" \
+      "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 0
+    expect_eq "$boundary removes all transaction artifacts" "$(managed_artifact_count)" 0
+  done
+
+  echo '== literal boot replay is accepted only after its authorizing artifacts are durable'
+  for boundary in fstab-managed sysctl-phase sysctl-file swappiness-phase live-swappiness; do
+    setup "apply-reboot-$boundary"
+    printf '%s\n' 60 > "$SWAPPINESS_STATE"
+    original_fstab="$TMP/apply-reboot-$boundary.fstab.before"
+    /bin/cp "$FSTAB_FILE" "$original_fstab"
+    CRASH_AFTER=$boundary run_swap apply
+    unset CRASH_AFTER
+    simulate_literal_reboot
+    case "$boundary" in
+      fstab-managed) expected_phase=fstab; expected_live=60 ;;
+      sysctl-phase) expected_phase=sysctl; expected_live=60 ;;
+      sysctl-file) expected_phase=sysctl; expected_live=10 ;;
+      swappiness-phase|live-swappiness) expected_phase=swappiness; expected_live=10 ;;
+    esac
+    expect_eq "$boundary reboot retains exact phase" "$(metadata_phase)" "$expected_phase"
+    expect_eq "$boundary reboot deterministically reactivates target" \
+      "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
+    expect_eq "$boundary reboot has exact owned live swappiness" \
+      "$(cat "$SWAPPINESS_STATE")" "$expected_live"
+    run_swap rollback
+    expect_eq "$boundary reboot rollback converges" "$RC" 0
+    expect_file_eq "$boundary reboot restores fstab bytes" "$original_fstab" "$FSTAB_FILE"
+    expect_eq "$boundary reboot restores live swappiness" "$(cat "$SWAPPINESS_STATE")" 60
+    expect_eq "$boundary reboot removes all artifacts" "$(managed_artifact_count)" 0
+  done
+
+  setup apply-reboot-before-fstab-durable
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=fstab-backup run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  printf '%s file 4194300 0 -2\n' "$SWAP_FILE" >> "$PROC_SWAPS_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'active target before managed fstab durability is rejected' "$RC" 1
+  expect_eq 'unauthorized pre-fstab activation causes zero mutation' \
+    "$(mutation_count)" "$before_mutations"
+
+  echo '== rollback phases survive deterministic boot replay and re-run the RAM gate'
+  for boundary in \
+    rollback-swappiness-phase rollback-live-swappiness \
+    rollback-swapoff-phase rollback-swapoff \
+    rollback-fstab-phase rollback-fstab \
+    rollback-sysctl-phase rollback-sysctl \
+    rollback-swapfile-phase rollback-swapfile \
+    rollback-metadata-phase rollback-metadata
+  do
+    prepare_retryable_managed_state "rollback-reboot-$boundary"
+    original_fstab="$TMP/rollback-reboot-$boundary.fstab.before"
+    : > "$CALL_LOG"
+    CRASH_AFTER=$boundary run_swap rollback
+    if [ "$RC" -ne 0 ]; then ok "$boundary abrupt rollback is nonzero"; else bad "$boundary abrupt rollback is nonzero"; fi
+    unset CRASH_AFTER
+    simulate_literal_reboot
+    case "$boundary" in
+      rollback-swappiness-phase|rollback-live-swappiness)
+        expected_phase=rollback-swappiness; expected_active=1 ;;
+      rollback-swapoff-phase|rollback-swapoff)
+        expected_phase=rollback-swapoff; expected_active=1 ;;
+      rollback-fstab-phase) expected_phase=rollback-fstab; expected_active=1 ;;
+      rollback-fstab) expected_phase=rollback-fstab; expected_active=0 ;;
+      rollback-sysctl-phase|rollback-sysctl)
+        expected_phase=rollback-sysctl; expected_active=0 ;;
+      rollback-swapfile-phase|rollback-swapfile)
+        expected_phase=rollback-swapfile; expected_active=0 ;;
+      rollback-metadata-phase)
+        expected_phase=rollback-metadata; expected_active=0 ;;
+      rollback-metadata) expected_phase=''; expected_active=0 ;;
+    esac
+    expect_eq "$boundary reboot retains exact rollback phase" \
+      "$(metadata_phase)" "$expected_phase"
+    expect_eq "$boundary reboot retains deterministic target activity" \
+      "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" \
+      "$expected_active"
+    : > "$CALL_LOG"
+    run_swap rollback
+    expect_eq "$boundary reboot retry converges" "$RC" 0
+    if [ "$expected_active" -eq 1 ]; then
+      expect_eq "$boundary reboot retry re-runs RAM gate" "$(count_log 'free -b')" 1
+      expect_eq "$boundary reboot retry re-runs exact swapoff" "$(count_log 'swapoff ')" 1
+    fi
+    expect_file_eq "$boundary reboot retry restores fstab" "$original_fstab" "$FSTAB_FILE"
+    expect_eq "$boundary reboot retry restores swappiness" "$(cat "$SWAPPINESS_STATE")" 60
+    expect_eq "$boundary reboot retry removes all artifacts" "$(managed_artifact_count)" 0
+  done
+
+  echo '== corrupt or phase-mismatched apply metadata never authorizes cleanup'
+  setup apply-crash-corrupt-phase
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=metadata-only run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  printf '%s' 'version=1' > "$SWAPPINESS_METADATA_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'truncated apply phase is rejected' "$RC" 1
+  expect_eq 'truncated apply phase causes zero mutation' "$(mutation_count)" "$before_mutations"
+
+  setup apply-crash-mismatched-phase
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=metadata-only run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  printf 'version=1\noriginal_swappiness=60\nphase=swapon\n' > "$SWAPPINESS_METADATA_FILE"
+  /bin/chmod 600 "$SWAPPINESS_METADATA_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'phase tuple mismatch is rejected' "$RC" 1
+  expect_eq 'phase tuple mismatch causes zero mutation' "$(mutation_count)" "$before_mutations"
+
+  echo '== a later durable transition consumes only exact safe stale writer temporaries'
+  setup apply-crash-safe-stale-temp
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=metadata-only run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  stale_temp="${SWAPPINESS_METADATA_FILE%/*}/.${SWAPPINESS_METADATA_FILE##*/}.12345.0123456789abcdef"
+  printf '%s\n' stale > "$stale_temp"
+  /bin/chmod 600 "$stale_temp"
+  run_swap rollback
+  expect_eq 'safe stale writer temporary permits retry' "$RC" 0
+  if [ ! -e "$stale_temp" ]; then ok 'safe stale writer temporary is consumed'; else bad 'safe stale writer temporary is consumed'; fi
+
+  setup apply-crash-unsafe-stale-temp
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=metadata-only run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  safe_stale="${SWAPPINESS_METADATA_FILE%/*}/.${SWAPPINESS_METADATA_FILE##*/}.12345.0123456789abcdef"
+  printf '%s\n' stale > "$safe_stale"
+  /bin/chmod 600 "$safe_stale"
+  stale_temp="${SWAPPINESS_METADATA_FILE%/*}/.${SWAPPINESS_METADATA_FILE##*/}.12346.fedcba9876543210"
+  /bin/ln -s "$FSTAB_FILE" "$stale_temp"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'unsafe stale writer temporary fails closed' "$RC" 1
+  expect_eq 'unsafe stale writer temporary authorizes no host mutation' \
+    "$(mutation_count)" "$before_mutations"
+  if [ -e "$safe_stale" ] && [ -L "$stale_temp" ] && [ -e "$SWAPPINESS_METADATA_FILE" ]; then
+    ok 'unsafe stale writer evidence remains intact'
+  else
+    bad 'unsafe stale writer evidence remains intact'
+  fi
+}
+
+if [ "${SWAP_FOCUS:-}" = apply-crash-recovery ]; then
+  run_apply_crash_recovery_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_apply_crash_recovery_regressions
+fi
+
+run_phase_durability_gate_regressions() {
+  local phase forbidden
+  echo '== each durable phase must commit before its protected next side effect'
+  for phase in swapfile mkswap fstab sysctl swappiness swapon complete; do
+    setup "phase-write-$phase"
+    printf '%s\n' 60 > "$SWAPPINESS_STATE"
+    PHASE_WRITE_FAIL=$phase run_swap apply
+    expect_eq "$phase phase persistence failure refuses apply" "$RC" 1
+    case "$phase" in
+      swapfile) forbidden='fallocate ' ;;
+      mkswap) forbidden='mkswap ' ;;
+      fstab) forbidden="cp -p -n $FSTAB_FILE" ;;
+      sysctl) forbidden='sysctl -p ' ;;
+      swappiness) forbidden='sysctl -p ' ;;
+      swapon) forbidden='swapon ' ;;
+      complete) forbidden='' ;;
+    esac
+    if [ -n "$forbidden" ]; then
+      expect_eq "$phase phase failure blocks its protected effect" \
+        "$(count_log "$forbidden")" 0
+    else
+      expect_eq 'final phase failure never reports success' \
+        "$(printf '%s\n' "$OUT" | grep -cF 'OK: swap operation completed' || true)" 0
+    fi
+    unset PHASE_WRITE_FAIL
+    run_swap rollback
+    expect_eq "$phase phase failure retry converges clean" "$RC" 0
+    expect_eq "$phase phase failure leaves no transaction artifacts" \
+      "$(managed_artifact_count)" 0
+  done
+}
+
+if [ "${SWAP_FOCUS:-}" = phase-durability ]; then
+  run_phase_durability_gate_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_phase_durability_gate_regressions
+fi
+
 run_swappiness_metadata_regressions() {
   local mutations_before metadata_uid metadata_gid
   echo '== live swappiness is captured once and restored through retryable metadata'
@@ -784,7 +1082,8 @@ run_swappiness_metadata_regressions() {
   expect_eq 'apply from swappiness 60 succeeds' "$RC" 0
   if [ -f "$SWAPPINESS_METADATA_FILE" ]; then ok 'apply creates swappiness metadata'; else bad 'apply creates swappiness metadata'; fi
   expect_eq 'metadata stores exact previous value 60' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+    "$(metadata_original)" 60
+  expect_eq 'successful apply commits the exact final phase' "$(metadata_phase)" complete
   expect_eq 'metadata mode is 0600' "$(file_mode "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 600
   metadata_uid=$(/usr/bin/stat -f '%u' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
   metadata_gid=$(/usr/bin/stat -f '%g' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
@@ -793,7 +1092,7 @@ run_swappiness_metadata_regressions() {
   run_swap apply
   expect_eq 'idempotent managed apply succeeds' "$RC" 0
   expect_eq 'idempotent apply never replaces original swappiness' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+    "$(metadata_original)" 60
   run_swap rollback
   expect_eq 'rollback to swappiness 60 succeeds' "$RC" 0
   expect_eq 'rollback restores live swappiness 60' "$(cat "$SWAPPINESS_STATE")" 60
@@ -803,7 +1102,7 @@ run_swappiness_metadata_regressions() {
   printf '%s\n' 0 > "$SWAPPINESS_STATE"
   run_swap apply
   expect_eq 'apply captures swappiness zero' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 0
+    "$(metadata_original)" 0
   run_swap rollback
   expect_eq 'rollback to swappiness zero succeeds' "$RC" 0
   expect_eq 'rollback restores live swappiness zero' "$(cat "$SWAPPINESS_STATE")" 0
@@ -846,7 +1145,7 @@ run_swappiness_metadata_regressions() {
   expect_eq 'failed live restoration keeps rollback failed' "$RC" 1
   expect_eq 'failed live restoration happens before swapoff' "$(count_log 'swapoff ')" 0
   expect_eq 'failed live restoration retains original metadata' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+    "$(metadata_original)" 60
   expect_eq 'failed live restoration keeps active target retryable' \
     "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
   unset SYSCTL_RESTORE_FAIL
@@ -862,7 +1161,7 @@ run_swappiness_metadata_regressions() {
   run_swap rollback
   expect_eq 'failed restoration verification keeps rollback failed' "$RC" 1
   expect_eq 'failed restoration verification retains metadata' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+    "$(metadata_original)" 60
   unset SYSCTL_VERIFY_FAIL
   run_swap rollback
   expect_eq 'retry after verification failure succeeds' "$RC" 0
@@ -878,7 +1177,7 @@ run_swappiness_metadata_regressions() {
   expect_eq 'failed apply restoration retains active target for retry' \
     "$(grep -cF -- "$SWAP_FILE " "$PROC_SWAPS_FILE" 2>/dev/null || true)" 1
   expect_eq 'failed apply restoration retains original metadata' \
-    "$(cat "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 60
+    "$(metadata_original)" 60
   unset SWAPON_FAIL_STATE SYSCTL_RESTORE_FAIL
   run_swap rollback
   expect_eq 'rollback retries apply compensation restoration safely' "$RC" 0
@@ -943,9 +1242,9 @@ expect_eq "entry exacta una vez" "$(grep -cFx "$SWAP_FILE none swap sw 0 0" "$FS
 expect_eq "marker END una vez" "$(grep -cFx '# END LEGALTECH MANAGED SWAP' "$FSTAB_FILE")" "1"
 expect_eq "sysctl administrado exacto" "$(cat "$SYSCTL_FILE")" "vm.swappiness=10"
 expect_file_eq "backup conserva fstab original" "$TMP/fstab.before" "$FSTAB_FILE.legaltech-swap.bak"
-MUTATIONS=$(grep -E '^(fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p)' "$CALL_LOG" | cut -d' ' -f1 | tr '\n' ' ')
+MUTATIONS=$(grep -E '^(phase-write|fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p)' "$CALL_LOG" | cut -d' ' -f1 | tr '\n' ' ')
 expect_eq "metadata y estructura durable preceden activación" "$MUTATIONS" \
-  "chmod mv fallocate chmod mkswap cp mv cp mv sysctl swapon "
+  "phase-write fallocate chmod phase-write mkswap phase-write cp mv cp mv phase-write chmod phase-write sysctl phase-write swapon phase-write "
 
 echo "== apply repetido es idempotente"
 cp "$FSTAB_FILE" "$TMP/fstab.applied"

@@ -18,7 +18,7 @@ fail() {
 }
 
 usage() {
-  printf '%s\n' 'usage: configure-swap.sh {preflight|apply|verify|rollback}' >&2
+  printf '%s\n' 'usage: configure-swap.sh {preflight|rollback-preflight|apply|verify|rollback}' >&2
   exit "$EXIT_USAGE"
 }
 
@@ -32,7 +32,7 @@ is_uint() {
 command_name=${1:-}
 [ "$#" -eq 1 ] || usage
 case "$command_name" in
-  preflight|apply|verify|rollback) ;;
+  preflight|rollback-preflight|apply|verify|rollback) ;;
   *) usage ;;
 esac
 
@@ -44,7 +44,8 @@ for variable_name in \
   SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
   SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
   SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN \
-  SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_LOCK_FILE SWAP_FD_ROOT
+  SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_PYTHON_BIN SWAP_LOCK_FILE SWAP_FD_ROOT \
+  SWAP_TEST_CRASH_AFTER
 do
   if [ "${!variable_name+x}" = x ]; then
     override_present=1
@@ -63,7 +64,8 @@ if [ "$test_mode" = 1 ]; then
     SWAP_DF_BIN SWAP_FALLOCATE_BIN SWAP_DD_BIN SWAP_CHMOD_BIN \
     SWAP_MKSWAP_BIN SWAP_SWAPON_BIN SWAP_SWAPOFF_BIN SWAP_SYSCTL_BIN \
     SWAP_FREE_BIN SWAP_CP_BIN SWAP_MV_BIN SWAP_STAT_BIN SWAP_RM_BIN \
-    SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_LOCK_FILE SWAP_FD_ROOT
+    SWAP_FLOCK_BIN SWAP_READLINK_BIN SWAP_PYTHON_BIN SWAP_LOCK_FILE SWAP_FD_ROOT \
+    SWAP_TEST_CRASH_AFTER
   do
     [ "${!variable_name+x}" = x ] || usage
   done
@@ -92,6 +94,7 @@ stat_bin=${SWAP_STAT_BIN:-/usr/bin/stat}
 rm_bin=${SWAP_RM_BIN:-/usr/bin/rm}
 flock_bin=${SWAP_FLOCK_BIN:-/usr/bin/flock}
 readlink_bin=${SWAP_READLINK_BIN:-/usr/bin/readlink}
+python_bin=${SWAP_PYTHON_BIN:-/usr/bin/python3}
 lock_file=${SWAP_LOCK_FILE:-/run/lock/legaltech-resource-guards.lock}
 fd_root=${SWAP_FD_ROOT:-/proc/self/fd}
 
@@ -100,7 +103,7 @@ for absolute_value in \
   "$df_bin" "$fallocate_bin" "$dd_bin" "$chmod_bin" "$mkswap_bin" \
   "$swapon_bin" "$swapoff_bin" "$sysctl_bin" "$free_bin" "$cp_bin" \
   "$mv_bin" "$stat_bin" "$rm_bin" \
-  "$flock_bin" "$readlink_bin" "$lock_file" "$fd_root"
+  "$flock_bin" "$readlink_bin" "$python_bin" "$lock_file" "$fd_root"
 do
   case "$absolute_value" in
     /*) ;;
@@ -119,18 +122,11 @@ swap_file_exists=0
 sysctl_state=absent
 swappiness_metadata_state=absent
 previous_swappiness=''
+apply_phase=''
 rollback_state=invalid
 current_temp=''
 mutation_lock_fd=''
 mutation_lock_owned=0
-apply_created_swap_file=0
-apply_activated_swap=0
-apply_activation_unknown=0
-apply_created_backup=0
-apply_promoted_fstab=0
-apply_created_sysctl=0
-apply_created_swappiness_metadata=0
-apply_swappiness_may_have_changed=0
 
 cleanup_temp() {
   if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
@@ -143,6 +139,12 @@ cleanup_temp() {
   fi
 }
 trap cleanup_temp EXIT
+
+test_crash_after() {
+  [ "$test_mode" = 1 ] || return 0
+  [ "${SWAP_TEST_CRASH_AFTER:-}" = "$1" ] || return 0
+  kill -KILL "$$"
+}
 
 path_has_symlink_component() {
   local current=$1 parent
@@ -322,7 +324,8 @@ valid_swappiness() {
 }
 
 validate_swappiness_metadata_file() {
-  local path=$1 metadata kind mode size links uid gid extra content raw
+  local path=$1 metadata kind mode size links uid gid extra content
+  local version_line original_line phase_line rest original phase
   metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$path") || return 1
   kind=''; mode=''; size=''; links=''; uid=''; gid=''; extra=''
   IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
@@ -330,14 +333,35 @@ validate_swappiness_metadata_file() {
     && [ "$links" = 1 ] && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] \
     && [ -z "$extra" ] || return 1
   read_text_file "$path" content || return 1
-  case "$content" in *$'\n') raw=${content%$'\n'} ;; *) return 1 ;; esac
-  [ "$content" = "$raw"$'\n' ] && valid_swappiness "$raw" || return 1
-  previous_swappiness=$raw
+  case "$content" in *$'\n') ;; *) return 1 ;; esac
+  rest=${content#*$'\n'}
+  [ "$rest" != "$content" ] || return 1
+  version_line=${content%%$'\n'*}
+  original_line=${rest%%$'\n'*}
+  rest=${rest#*$'\n'}
+  [ "$rest" != "$original_line" ] || return 1
+  phase_line=${rest%%$'\n'*}
+  [ "$rest" = "$phase_line"$'\n' ] || return 1
+  [ "$version_line" = version=1 ] || return 1
+  case "$original_line" in original_swappiness=*) original=${original_line#*=} ;; *) return 1 ;; esac
+  case "$phase_line" in phase=*) phase=${phase_line#*=} ;; *) return 1 ;; esac
+  valid_swappiness "$original" || return 1
+  case "$phase" in
+    swapfile|mkswap|fstab|sysctl|swappiness|swapon|complete|\
+    rollback-swappiness|rollback-swapoff|rollback-fstab|rollback-sysctl|\
+    rollback-swapfile|rollback-metadata) ;;
+    *) return 1 ;;
+  esac
+  [ "$content" = "version=1"$'\n'"original_swappiness=$original"$'\n'"phase=$phase"$'\n' ] \
+    || return 1
+  previous_swappiness=$original
+  apply_phase=$phase
 }
 
 inspect_swappiness_metadata() {
   swappiness_metadata_state=absent
   previous_swappiness=''
+  apply_phase=''
   if [ ! -e "$swappiness_metadata_file" ] && [ ! -L "$swappiness_metadata_file" ]; then
     return 0
   fi
@@ -355,22 +379,100 @@ read_live_swappiness() {
   printf '%s\n' "$output"
 }
 
+durable_replace_phase_metadata() { # original-swappiness phase
+  local value=$1 phase=$2 payload parent
+  valid_swappiness "$value" || return 1
+  case "$phase" in
+    swapfile|mkswap|fstab|sysctl|swappiness|swapon|complete|\
+    rollback-swappiness|rollback-swapoff|rollback-fstab|rollback-sysctl|\
+    rollback-swapfile|rollback-metadata) ;;
+    *) return 1 ;;
+  esac
+  parent=${swappiness_metadata_file%/*}
+  [ -d "$parent" ] && [ ! -L "$parent" ] && ! path_has_symlink_component "$parent" || return 1
+  payload="version=1"$'\n'"original_swappiness=$value"$'\n'"phase=$phase"$'\n'
+  "$python_bin" - "$swappiness_metadata_file" "$root_uid" "$root_gid" "$payload" <<'PY'
+import os
+import re
+import secrets
+import stat
+import sys
+
+path, uid_text, gid_text, payload = sys.argv[1:]
+uid, gid = int(uid_text), int(gid_text)
+parent, name = os.path.split(path)
+dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+dir_fd = os.open(parent, dir_flags)
+temp_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
+temp_fd = None
+try:
+    try:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        current = None
+    if current is not None:
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise RuntimeError("unsafe destination")
+        if stat.S_IMODE(current.st_mode) != 0o600 or current.st_uid != uid or current.st_gid != gid:
+            raise RuntimeError("unsafe destination metadata")
+    stale_prefix = f".{name}."
+    stale_pattern = re.compile(re.escape(stale_prefix) + r"[1-9][0-9]*\.[0-9a-f]{16}")
+    stale_candidates = []
+    for candidate in os.listdir(dir_fd):
+        if not candidate.startswith(stale_prefix):
+            continue
+        if stale_pattern.fullmatch(candidate) is None:
+            raise RuntimeError("unsafe stale metadata temporary name")
+        stale = os.stat(candidate, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISREG(stale.st_mode) or stat.S_IMODE(stale.st_mode) != 0o600:
+            raise RuntimeError("unsafe stale metadata temporary")
+        if stale.st_nlink != 1 or stale.st_uid != uid or stale.st_gid != gid:
+            raise RuntimeError("unsafe stale metadata temporary identity")
+        stale_candidates.append(candidate)
+    for candidate in stale_candidates:
+        os.unlink(candidate, dir_fd=dir_fd)
+    if stale_candidates:
+        os.fsync(dir_fd)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    temp_fd = os.open(temp_name, flags, 0o600, dir_fd=dir_fd)
+    os.fchmod(temp_fd, 0o600)
+    if os.fstat(temp_fd).st_uid != uid or os.fstat(temp_fd).st_gid != gid:
+        os.fchown(temp_fd, uid, gid)
+    data = payload.encode("ascii")
+    written = 0
+    while written < len(data):
+        count = os.write(temp_fd, data[written:])
+        if count <= 0:
+            raise RuntimeError("short write")
+        written += count
+    os.fsync(temp_fd)
+    os.close(temp_fd)
+    temp_fd = None
+    os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
+    final = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISREG(final.st_mode) or stat.S_IMODE(final.st_mode) != 0o600:
+        raise RuntimeError("invalid final metadata")
+    if final.st_nlink != 1 or final.st_uid != uid or final.st_gid != gid:
+        raise RuntimeError("invalid final identity")
+finally:
+    if temp_fd is not None:
+        os.close(temp_fd)
+    try:
+        os.unlink(temp_name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    os.close(dir_fd)
+PY
+  inspect_swappiness_metadata || return 1
+  [ "$swappiness_metadata_state" = managed ] \
+    && [ "$previous_swappiness" = "$value" ] && [ "$apply_phase" = "$phase" ]
+}
+
 create_swappiness_metadata() {
   local value=$1
-  valid_swappiness "$value" || return 1
   [ ! -e "$swappiness_metadata_file" ] && [ ! -L "$swappiness_metadata_file" ] || return 1
-  current_temp="${swappiness_metadata_file}.tmp.$$"
-  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
-  umask 077
-  printf '%s\n' "$value" > "$current_temp" || return 1
-  "$chmod_bin" 0600 "$current_temp" || return 1
-  validate_swappiness_metadata_file "$current_temp" || return 1
-  "$mv_bin" -n "$current_temp" "$swappiness_metadata_file" || return 1
-  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
-  current_temp=''
-  apply_created_swappiness_metadata=1
-  inspect_swappiness_metadata || return 1
-  [ "$swappiness_metadata_state" = managed ] && [ "$previous_swappiness" = "$value" ]
+  durable_replace_phase_metadata "$value" swapfile || return 1
 }
 
 restore_live_swappiness() {
@@ -433,15 +535,23 @@ inspect_fstab_backup() {
   local backup_path="${fstab_file}.legaltech-swap.bak"
   backup_state=absent
   if [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ]; then
-    [ "$fstab_state" = absent ]
+    [ "$fstab_state" = absent ] || [ "$fstab_state" = managed ]
     return
   fi
-  [ "$fstab_state" = managed ] || return 1
   [ -f "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
   validate_backup_metadata "$backup_path" || return 1
   [ "$backup_mode" = "$fstab_mode" ] || return 1
-  backup_reconstructs_managed_fstab "$backup_path" || return 1
-  backup_state=managed
+  case "$fstab_state" in
+    absent)
+      backup_matches_clean_fstab "$backup_path" || return 1
+      backup_state=clean-copy
+      ;;
+    managed)
+      backup_reconstructs_managed_fstab "$backup_path" || return 1
+      backup_state=managed
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 inspect_managed_state() {
@@ -462,7 +572,7 @@ inspect_managed_state() {
   if [ "$fstab_state" = managed ] && [ "$backup_state" = managed ] && \
      [ "$swap_file_exists" -eq 1 ] && \
      [ "$active_target_count" -eq 1 ] && [ "$sysctl_state" = managed ] \
-     && [ "$swappiness_metadata_state" = managed ]; then
+     && [ "$swappiness_metadata_state" = managed ] && [ "$apply_phase" = complete ]; then
     printf '%s\n' managed
     return 0
   fi
@@ -470,7 +580,7 @@ inspect_managed_state() {
 }
 
 inspect_rollback_state() {
-  local live_swappiness
+  local live_swappiness tuple
   rollback_state=invalid
   inspect_fstab || return 1
   inspect_fstab_backup || return 1
@@ -486,40 +596,113 @@ inspect_rollback_state() {
     printf '%s\n' "$rollback_state"
     return 0
   fi
-
-  if [ "$fstab_state" = managed ] && [ "$backup_state" = managed ] && \
-     [ "$swap_file_exists" -eq 1 ] && [ "$sysctl_state" = managed ] && \
-     [ "$swappiness_metadata_state" = managed ]; then
-    if [ "$active_target_count" -eq 1 ]; then
+  [ "$swappiness_metadata_state" = managed ] || return 1
+  live_swappiness=$(read_live_swappiness) || return 1
+  tuple="$fstab_state:$backup_state:$swap_file_exists:$active_target_count:$sysctl_state:$live_swappiness"
+  case "$apply_phase" in
+    swapfile)
+      case "$tuple" in
+        absent:absent:0:0:absent:"$previous_swappiness"|\
+        absent:absent:1:0:absent:"$previous_swappiness") rollback_state=apply-swapfile ;;
+        *) return 1 ;;
+      esac
+      ;;
+    mkswap)
+      [ "$tuple" = "absent:absent:1:0:absent:$previous_swappiness" ] || return 1
+      rollback_state=apply-mkswap
+      ;;
+    fstab)
+      case "$tuple" in
+        absent:absent:1:0:absent:"$previous_swappiness"|\
+        absent:clean-copy:1:0:absent:"$previous_swappiness"|\
+        managed:managed:1:0:absent:"$previous_swappiness"|\
+        managed:managed:1:1:absent:"$previous_swappiness") rollback_state=apply-fstab ;;
+        *) return 1 ;;
+      esac
+      ;;
+    sysctl)
+      case "$tuple" in
+        managed:managed:1:0:absent:"$previous_swappiness"|\
+        managed:managed:1:1:absent:"$previous_swappiness"|\
+        managed:managed:1:0:managed:"$previous_swappiness"|\
+        managed:managed:1:1:managed:10) rollback_state=apply-sysctl ;;
+        *) return 1 ;;
+      esac
+      ;;
+    swappiness)
+      case "$tuple" in
+        managed:managed:1:0:managed:"$previous_swappiness"|\
+        managed:managed:1:0:managed:10|\
+        managed:managed:1:1:managed:10) rollback_state=apply-swappiness ;;
+        *) return 1 ;;
+      esac
+      ;;
+    swapon)
+      case "$tuple" in
+        managed:managed:1:0:managed:10|managed:managed:1:1:managed:10) \
+          rollback_state=apply-swapon ;;
+        *) return 1 ;;
+      esac
+      ;;
+    complete)
+      [ "$tuple" = managed:managed:1:1:managed:10 ] || return 1
       rollback_state=managed-active
-      printf '%s\n' "$rollback_state"
-      return 0
-    fi
-    if [ "$active_target_count" -eq 0 ]; then
-      live_swappiness=$(read_live_swappiness) || return 1
-      [ "$live_swappiness" = "$previous_swappiness" ] || return 1
-      rollback_state=managed-deactivated
-      printf '%s\n' "$rollback_state"
-      return 0
-    fi
-    return 1
-  fi
-
-  if [ "$fstab_state" = absent ] && [ "$backup_state" = absent ] && \
-     [ "$active_target_count" -eq 0 ] && \
-     [ "$swappiness_metadata_state" = managed ]; then
-    case "$sysctl_state:$swap_file_exists" in
-      managed:1|absent:1|absent:0) ;;
-      *) return 1 ;;
-    esac
-    live_swappiness=$(read_live_swappiness) || return 1
-    [ "$live_swappiness" = "$previous_swappiness" ] || return 1
-    rollback_state=fstab-restored
-    printf '%s\n' "$rollback_state"
-    return 0
-  fi
-
-  return 1
+      ;;
+    rollback-swappiness)
+      case "$tuple" in
+        managed:managed:1:1:managed:10|\
+        managed:managed:1:1:managed:"$previous_swappiness"|\
+        managed:managed:1:0:managed:10|\
+        managed:managed:1:0:managed:"$previous_swappiness") rollback_state=rollback-swappiness ;;
+        *) return 1 ;;
+      esac
+      ;;
+    rollback-swapoff)
+      case "$tuple" in
+        managed:managed:1:1:absent:"$previous_swappiness"|\
+        managed:managed:1:0:absent:"$previous_swappiness"|\
+        managed:managed:1:1:managed:10|\
+        managed:managed:1:1:managed:"$previous_swappiness"|\
+        managed:managed:1:0:managed:"$previous_swappiness") rollback_state=rollback-swapoff ;;
+        *) return 1 ;;
+      esac
+      ;;
+    rollback-fstab)
+      case "$tuple" in
+        managed:managed:1:1:absent:"$previous_swappiness"|\
+        managed:managed:1:0:absent:"$previous_swappiness"|\
+        managed:managed:1:1:managed:10|\
+        managed:managed:1:1:managed:"$previous_swappiness"|\
+        managed:managed:1:0:managed:"$previous_swappiness"|\
+        absent:clean-copy:1:0:absent:"$previous_swappiness"|\
+        absent:absent:1:0:managed:10|\
+        absent:absent:1:0:managed:"$previous_swappiness"|\
+        absent:absent:1:0:absent:"$previous_swappiness") rollback_state=rollback-fstab ;;
+        *) return 1 ;;
+      esac
+      ;;
+    rollback-sysctl)
+      case "$tuple" in
+        absent:absent:1:0:managed:10|\
+        absent:absent:1:0:managed:"$previous_swappiness"|\
+        absent:absent:1:0:absent:"$previous_swappiness") rollback_state=rollback-sysctl ;;
+        *) return 1 ;;
+      esac
+      ;;
+    rollback-swapfile)
+      case "$tuple" in
+        absent:absent:1:0:absent:"$previous_swappiness"|\
+        absent:absent:0:0:absent:"$previous_swappiness") rollback_state=rollback-swapfile ;;
+        *) return 1 ;;
+      esac
+      ;;
+    rollback-metadata)
+      [ "$tuple" = "absent:absent:0:0:absent:$previous_swappiness" ] || return 1
+      rollback_state=rollback-metadata
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$rollback_state"
 }
 
 check_free_disk() {
@@ -568,9 +751,9 @@ replace_fstab_with_managed_block() {
   "$mv_bin" -n "$backup_temp" "$backup_path" || return 1
   [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
   current_temp=''
-  apply_created_backup=1
   validate_backup_metadata "$backup_path" || return 1
   backup_matches_clean_fstab "$backup_path" || return 1
+  test_crash_after fstab-backup
 
   current_temp="${fstab_file}.legaltech-swap.tmp.$$"
   [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
@@ -585,7 +768,7 @@ replace_fstab_with_managed_block() {
 
   "$mv_bin" "$current_temp" "$fstab_file" || return 1
   current_temp=''
-  apply_promoted_fstab=1
+  test_crash_after fstab-managed
 }
 
 replace_fstab_without_managed_block() {
@@ -602,33 +785,6 @@ replace_fstab_without_managed_block() {
 }
 
 cleanup_current_apply() {
-  local backup_path="${fstab_file}.legaltech-swap.bak"
-  local swapoff_required=0
-
-  if [ "$apply_activation_unknown" -eq 1 ]; then
-    return 1
-  elif [ "$apply_activated_swap" -eq 1 ]; then
-    read_memory_safety || return 1
-    swapoff_required=1
-  fi
-
-  if [ "$apply_swappiness_may_have_changed" -eq 1 ]; then
-    if restore_live_swappiness; then
-      apply_swappiness_may_have_changed=0
-    else
-      return 1
-    fi
-  fi
-
-  if [ "$swapoff_required" -eq 1 ]; then
-    if "$swapoff_bin" "$swap_file" && inspect_active_swaps && \
-       [ "$active_target_count" -eq 0 ]; then
-      apply_activated_swap=0
-    else
-      return 1
-    fi
-  fi
-
   if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
     if "$rm_bin" "$current_temp"; then
       current_temp=''
@@ -637,54 +793,7 @@ cleanup_current_apply() {
     fi
   fi
 
-  if [ "$apply_promoted_fstab" -eq 1 ]; then
-    if replace_fstab_without_managed_block; then
-      apply_promoted_fstab=0
-      apply_created_backup=0
-    else
-      return 1
-    fi
-  elif [ "$apply_created_backup" -eq 1 ]; then
-    if validate_backup_metadata "$backup_path" && \
-       backup_matches_clean_fstab "$backup_path" && \
-       "$rm_bin" "$backup_path"; then
-      apply_created_backup=0
-    else
-      return 1
-    fi
-  fi
-
-  if [ "$apply_created_sysctl" -eq 1 ]; then
-    if "$rm_bin" "$sysctl_file"; then
-      apply_created_sysctl=0
-    else
-      return 1
-    fi
-  fi
-
-  if [ "$apply_created_swap_file" -eq 1 ] && \
-     [ "$apply_activated_swap" -eq 0 ] && [ "$apply_activation_unknown" -eq 0 ]; then
-    if inspect_swap_file 0; then
-      if [ "$swap_file_exists" -eq 0 ] || "$rm_bin" "$swap_file"; then
-        apply_created_swap_file=0
-      else
-        return 1
-      fi
-    else
-      return 1
-    fi
-  fi
-
-  if [ "$apply_created_swappiness_metadata" -eq 1 ]; then
-    if validate_swappiness_metadata_file "$swappiness_metadata_file" \
-      && "$rm_bin" "$swappiness_metadata_file"; then
-      apply_created_swappiness_metadata=0
-    else
-      return 1
-    fi
-  fi
-
-  return 0
+  rollback_swap
 }
 
 abort_current_apply() {
@@ -702,14 +811,6 @@ verify_managed() {
 
 apply_swap() {
   local state original_swappiness
-  apply_created_swap_file=0
-  apply_activated_swap=0
-  apply_activation_unknown=0
-  apply_created_backup=0
-  apply_promoted_fstab=0
-  apply_created_sysctl=0
-  apply_created_swappiness_metadata=0
-  apply_swappiness_may_have_changed=0
   check_free_disk || return 1
   state=$(inspect_managed_state) || return 1
   if [ "$state" = managed ]; then
@@ -719,38 +820,59 @@ apply_swap() {
   [ "$state" = clean ] || return 1
 
   original_swappiness=$(read_live_swappiness) || return 1
+  umask 077
   create_swappiness_metadata "$original_swappiness" || { abort_current_apply; return 1; }
+  test_crash_after metadata-only
 
-  apply_created_swap_file=1
   if ! "$fallocate_bin" -l "$SWAP_BYTES" "$swap_file"; then
     if ! "$dd_bin" if=/dev/zero "of=$swap_file" bs=1M count=4096 conv=fsync status=none; then
       abort_current_apply
       return 1
     fi
   fi
+  test_crash_after swapfile-allocated
   inspect_swap_file 0 || { abort_current_apply; return 1; }
   [ "$swap_file_exists" -eq 1 ] || { abort_current_apply; return 1; }
   "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
   inspect_swap_file || { abort_current_apply; return 1; }
+  durable_replace_phase_metadata "$original_swappiness" mkswap \
+    || { abort_current_apply; return 1; }
+  test_crash_after mkswap-phase
   "$mkswap_bin" "$swap_file" || { abort_current_apply; return 1; }
+  test_crash_after mkswap
+  durable_replace_phase_metadata "$original_swappiness" fstab \
+    || { abort_current_apply; return 1; }
+  test_crash_after fstab-phase
   replace_fstab_with_managed_block || { abort_current_apply; return 1; }
-  apply_created_sysctl=1
+  durable_replace_phase_metadata "$original_swappiness" sysctl \
+    || { abort_current_apply; return 1; }
+  test_crash_after sysctl-phase
   printf '%s\n' 'vm.swappiness=10' > "$sysctl_file" || { abort_current_apply; return 1; }
-  apply_swappiness_may_have_changed=1
+  "$chmod_bin" 0600 "$sysctl_file" || { abort_current_apply; return 1; }
+  inspect_sysctl_file || { abort_current_apply; return 1; }
+  test_crash_after sysctl-file
+  durable_replace_phase_metadata "$original_swappiness" swappiness \
+    || { abort_current_apply; return 1; }
+  test_crash_after swappiness-phase
   "$sysctl_bin" -p "$sysctl_file" >/dev/null || { abort_current_apply; return 1; }
-  if "$swapon_bin" "$swap_file"; then
-    apply_activated_swap=1
-  else
+  [ "$(read_live_swappiness)" = 10 ] || { abort_current_apply; return 1; }
+  test_crash_after live-swappiness
+  durable_replace_phase_metadata "$original_swappiness" swapon \
+    || { abort_current_apply; return 1; }
+  test_crash_after swapon-phase
+  if ! "$swapon_bin" "$swap_file"; then
     if inspect_active_swaps; then
-      if [ "$active_target_count" -eq 1 ]; then
-        apply_activated_swap=1
-      fi
-    else
-      apply_activation_unknown=1
+      [ "$active_target_count" -le 1 ] || return 1
     fi
     abort_current_apply
     return 1
   fi
+  test_crash_after swapon
+  inspect_rollback_state >/dev/null || { abort_current_apply; return 1; }
+  [ "$rollback_state" = apply-swapon ] || { abort_current_apply; return 1; }
+  durable_replace_phase_metadata "$original_swappiness" complete \
+    || { abort_current_apply; return 1; }
+  test_crash_after complete
   verify_managed || { abort_current_apply; return 1; }
 }
 
@@ -776,41 +898,65 @@ read_memory_safety() {
 }
 
 rollback_swap() {
-  local state
+  local state live restore_phase backup_path="${fstab_file}.legaltech-swap.bak"
   inspect_rollback_state >/dev/null || return 1
   state=$rollback_state
-  case "$state" in
-    clean) return 0 ;;
-    managed-active)
-      read_memory_safety || return 1
-      restore_live_swappiness || return 1
-      "$swapoff_bin" "$swap_file" || return 1
-      inspect_rollback_state >/dev/null || return 1
-      [ "$rollback_state" = managed-deactivated ] || return 1
-      ;;
-    managed-deactivated|fstab-restored) ;;
-    *) return 1 ;;
-  esac
+  [ "$state" != clean ] || return 0
 
-  if [ "$rollback_state" = managed-deactivated ]; then
-    replace_fstab_without_managed_block || return 1
+  if [ "$active_target_count" -eq 1 ]; then
+    read_memory_safety || return 1
+  fi
+  live=$(read_live_swappiness) || return 1
+  if [ "$live" != "$previous_swappiness" ]; then
+    restore_phase=rollback-swappiness
+    case "$apply_phase" in rollback-*) restore_phase=$apply_phase ;; esac
+    durable_replace_phase_metadata "$previous_swappiness" "$restore_phase" || return 1
+    test_crash_after rollback-swappiness-phase
+    restore_live_swappiness || return 1
+    test_crash_after rollback-live-swappiness
     inspect_rollback_state >/dev/null || return 1
-    [ "$rollback_state" = fstab-restored ] || return 1
+  fi
+  if [ "$active_target_count" -eq 1 ]; then
+    durable_replace_phase_metadata "$previous_swappiness" rollback-swapoff || return 1
+    test_crash_after rollback-swapoff-phase
+    "$swapoff_bin" "$swap_file" || return 1
+    test_crash_after rollback-swapoff
+    inspect_rollback_state >/dev/null || return 1
+    [ "$active_target_count" -eq 0 ] || return 1
   fi
 
-  [ "$rollback_state" = fstab-restored ] || return 1
-  if [ "$sysctl_state" = managed ]; then
-    "$rm_bin" "$sysctl_file" || return 1
+  if [ "$fstab_state" = managed ] || [ "$backup_state" = clean-copy ]; then
+    durable_replace_phase_metadata "$previous_swappiness" rollback-fstab || return 1
+    test_crash_after rollback-fstab-phase
+    if [ "$fstab_state" = managed ]; then
+      replace_fstab_without_managed_block || return 1
+    else
+      validate_backup_metadata "$backup_path" || return 1
+      backup_matches_clean_fstab "$backup_path" || return 1
+      "$rm_bin" "$backup_path" || return 1
+    fi
+    test_crash_after rollback-fstab
     inspect_rollback_state >/dev/null || return 1
-    [ "$rollback_state" = fstab-restored ] || return 1
+  fi
+  if [ "$sysctl_state" = managed ]; then
+    durable_replace_phase_metadata "$previous_swappiness" rollback-sysctl || return 1
+    test_crash_after rollback-sysctl-phase
+    "$rm_bin" "$sysctl_file" || return 1
+    test_crash_after rollback-sysctl
+    inspect_rollback_state >/dev/null || return 1
   fi
   if [ "$swap_file_exists" -eq 1 ]; then
+    durable_replace_phase_metadata "$previous_swappiness" rollback-swapfile || return 1
+    test_crash_after rollback-swapfile-phase
     "$rm_bin" "$swap_file" || return 1
+    test_crash_after rollback-swapfile
     inspect_rollback_state >/dev/null || return 1
-    [ "$rollback_state" = fstab-restored ] || return 1
   fi
   [ "$swappiness_metadata_state" = managed ] || return 1
+  durable_replace_phase_metadata "$previous_swappiness" rollback-metadata || return 1
+  test_crash_after rollback-metadata-phase
   "$rm_bin" "$swappiness_metadata_file" || return 1
+  test_crash_after rollback-metadata
   inspect_rollback_state >/dev/null || return 1
   [ "$rollback_state" = clean ]
 }
@@ -821,6 +967,7 @@ esac
 
 case "$command_name" in
   preflight) preflight_state || fail; exit 0 ;;
+  rollback-preflight) inspect_rollback_state || fail; exit 0 ;;
   apply) apply_swap || fail ;;
   verify) verify_managed || fail ;;
   rollback) rollback_swap || fail ;;

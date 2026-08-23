@@ -1598,8 +1598,48 @@ inspect_swap_state() {
   case "$output" in clean|managed) printf '%s\n' "$output" ;; *) return 1 ;; esac
 }
 
+inspect_swap_rollback_state() {
+  local output
+  is_uint "$resource_lock_fd" || return 1
+  output=$(LEGALTECH_RESOURCE_LOCK_FD="$resource_lock_fd" "$swap_bin" rollback-preflight \
+    2>"$null_file") || return 1
+  case "$output" in
+    clean|apply-swapfile|apply-mkswap|apply-fstab|apply-sysctl|apply-swappiness|\
+    apply-swapon|managed-active|rollback-swappiness|rollback-swapoff|\
+    rollback-fstab|rollback-sysctl|rollback-swapfile|rollback-metadata)
+      printf '%s\n' "$output"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_swap_rollback_authority() {
+  local marker observed
+  marker=$(<"$backup_dir/swap-state")
+  case "$marker" in
+    attempted)
+      observed=$(inspect_swap_rollback_state) \
+        || { fail 'rollback swap ownership state is unsafe or unknown'; return 1; }
+      ;;
+    not-attempted)
+      observed=$(inspect_swap_state) \
+        || { fail 'rollback swap ownership state is unsafe or unknown'; return 1; }
+      [ "$observed" = clean ] \
+        || { fail 'rollback swap marker conflicts with owned live state'; return 1; }
+      ;;
+    preexisting)
+      observed=$(inspect_swap_state) \
+        || { fail 'rollback preexisting swap state is unsafe or unknown'; return 1; }
+      [ "$observed" = managed ] \
+        || { fail 'rollback preexisting swap state changed unexpectedly'; return 1; }
+      ;;
+    *) fail 'rollback swap metadata is invalid'; return 1 ;;
+  esac
+  swap_state=$marker
+}
+
 do_rollback() {
-  local uid rollback_rc=0 swap_rc=0 swap_state observed_swap_state
+  local uid rollback_rc=0 swap_rc=0 swap_state
   backup_dir=$1
   uid=$(validate_hermes_inventory) || { fail 'rollback cannot validate Hermes inventory'; return 1; }
   build_managed_paths "$uid"
@@ -1609,6 +1649,7 @@ do_rollback() {
   load_and_validate_unit_states || { fail 'rollback live-unit metadata is invalid'; return 1; }
   load_and_validate_worker_runtime || { fail 'rollback worker runtime metadata is invalid'; return 1; }
   load_and_validate_monitor_runtime || { fail 'rollback monitor runtime metadata is invalid'; return 1; }
+  validate_swap_rollback_authority || return 1
   worker_restore_allowed=1
   if [ "${desired_active_states[1]}" = active ] \
     && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
@@ -1616,24 +1657,12 @@ do_rollback() {
     rollback_rc=1
     worker_restore_allowed=0
   fi
-  swap_state=$(<"$backup_dir/swap-state")
   case "$swap_state" in
     attempted)
       if ! run_swap_mutator rollback >"$null_file" 2>&1; then swap_rc=1; rollback_rc=1; fi
       ;;
-    not-attempted)
-      observed_swap_state=$(inspect_swap_state) \
-        || { fail 'rollback swap ownership state is unsafe or unknown'; return 1; }
-      [ "$observed_swap_state" = clean ] \
-        || { fail 'rollback swap marker conflicts with owned live state'; return 1; }
-      ;;
-    preexisting)
-      observed_swap_state=$(inspect_swap_state) \
-        || { fail 'rollback preexisting swap state is unsafe or unknown'; return 1; }
-      [ "$observed_swap_state" = managed ] \
-        || { fail 'rollback preexisting swap state changed unexpectedly'; return 1; }
-      ;;
-    *) fail 'rollback swap metadata is invalid'; return 1 ;;
+    not-attempted|preexisting) ;;
+    *) return 1 ;;
   esac
   restore_manifest "$swap_rc" || rollback_rc=1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1

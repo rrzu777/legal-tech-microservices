@@ -788,6 +788,28 @@ if [ "$1" = preflight ]; then
   if [ -e "$RG_TEST_STATE/swap-applied" ]; then printf '%s\n' managed; else printf '%s\n' clean; fi
   exit 0
 fi
+if [ "$1" = rollback-preflight ]; then
+  [ ! -e "$RG_TEST_STATE/swap-rollback-preflight-fail" ] || exit 1
+  if [ -e "$RG_TEST_STATE/swap-crash-state" ]; then
+    cat "$RG_TEST_STATE/swap-crash-state"
+  elif [ -e "$RG_TEST_STATE/swap-applied" ]; then
+    printf '%s\n' managed-active
+  elif [ -e "$RG_TEST_STATE/swap-partial-fstab" ]; then
+    printf '%s\n' rollback-fstab
+  elif [ -e "$RG_TEST_STATE/swap-partial-sysctl" ]; then
+    printf '%s\n' rollback-sysctl
+  elif [ -e "$RG_TEST_STATE/swap-partial-swapfile" ]; then
+    printf '%s\n' rollback-swapfile
+  elif [ -e "$RG_TEST_STATE/swap-partial-metadata" ]; then
+    printf '%s\n' rollback-metadata
+  else
+    printf '%s\n' clean
+  fi
+  exit 0
+fi
+if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-crash-state" ]; then
+  exit 1
+fi
 if [ "$1" = apply ] && [ -e "$RG_TEST_STATE/swap-apply-compensation-fail" ]; then
   rm -f "$RG_TEST_STATE/swap-applied"
   : > "$RG_TEST_STATE/swap-deactivated"
@@ -815,6 +837,11 @@ if [ "$1" = verify ]; then
   [ -e "$RG_TEST_STATE/swap-applied" ] || exit 1
 fi
 if [ "$1" = rollback ]; then
+  if [ -e "$RG_TEST_STATE/swap-crash-state" ] \
+    && [ -e "$RG_TEST_STATE/swap-crash-rollback-fail-once" ]; then
+    rm -f "$RG_TEST_STATE/swap-crash-rollback-fail-once"
+    exit 1
+  fi
   if [ -e "$RG_TEST_STATE/swap-apply-compensation-fail" ]; then exit 1; fi
   if [ -e "$RG_TEST_STATE/swap-rollback-post-deactivate-fail" ]; then
     rm -f "$RG_TEST_STATE/swap-applied"
@@ -828,6 +855,7 @@ if [ "$1" = rollback ]; then
   rm -f "$RG_TEST_STATE/swap-partial-sysctl"
   rm -f "$RG_TEST_STATE/swap-partial-swapfile"
   rm -f "$RG_TEST_STATE/swap-partial-metadata"
+  rm -f "$RG_TEST_STATE/swap-crash-state"
   rm -f "$RG_SWAPPINESS_METADATA_FILE"
 fi
 exit 0
@@ -2014,6 +2042,91 @@ run_durable_metadata_regressions() {
   expect_count 'truncated marker performs no swap rollback' 'swap rollback' 0
 }
 
+run_rollback_precheck_regressions() {
+  local scenario backup_path
+  echo '== rollback proves swap ownership before quiescing a changed active worker'
+  for scenario in stale truncated conflicting; do
+    setup
+    configure_active_worker
+    printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario fixture apply succeeds" "$RC" 0
+    backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+    case "$scenario" in
+      stale) printf '%s\n' not-attempted > "$backup_path/swap-state" ;;
+      truncated) printf '%s' attempt > "$backup_path/swap-state" ;;
+      conflicting)
+        printf '%s\n' preexisting > "$backup_path/swap-state"
+        rm -f "$STATE/swap-applied"
+        ;;
+    esac
+    : > "$EVENTS"
+    run_guard rollback --backup-dir "$backup_path"
+    expect_eq "$scenario marker refuses rollback" "$RC" 1
+    expect_count "$scenario marker performs no worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$scenario marker performs no worker start" \
+      'systemctl start estrado-pjud-worker.service' 0
+    expect_count "$scenario marker performs no worker restart" \
+      'systemctl restart estrado-pjud-worker.service' 0
+    expect_count "$scenario marker performs no provision" provision 0
+    expect_count "$scenario marker performs no swap rollback" 'swap rollback' 0
+    expect_count "$scenario marker performs no manifest reload" \
+      'systemctl daemon-reload' 0
+    expect_eq "$scenario marker leaves worker active" \
+      "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+  done
+}
+
+run_orchestrated_swap_crash_regression() {
+  local backup_path retry_path
+  echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
+  setup
+  printf '%s\n' apply-fstab > "$STATE/swap-crash-state"
+  : > "$STATE/swap-crash-rollback-fail-once"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'inner crash keeps outer apply failed' "$RC" 1
+  expect_exact_count 'outer attempted marker delegates automatic swap rollback once' \
+    'swap rollback' 1
+  expect_contains 'failed automatic crash recovery reports exact retry authority' \
+    "$OUT" 'ROLLBACK INCOMPLETO'
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  retry_path=$(printf '%s\n' "$OUT" \
+    | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+  expect_eq 'crash recovery diagnostic returns the same backup directory' \
+    "$retry_path" "$backup_path"
+  expect_eq 'outer transaction retains durable attempted authority' \
+    "$(cat "$backup_path/swap-state")" attempted
+
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$retry_path"
+  expect_eq 'same backup directory retry converges after inner crash' "$RC" 0
+  expect_exact_count 'same backup retry delegates swap rollback once' 'swap rollback' 1
+  expect_contains 'same backup retry confirms exact authority' \
+    "$OUT" "ROLLBACK OK: $backup_path"
+  if [ ! -e "$STATE/swap-crash-state" ]; then
+    ok 'same backup retry removes the exact inner crash state'
+  else
+    bad 'same backup retry removes the exact inner crash state'
+  fi
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = swap-crash-recovery ]; then
+  run_orchestrated_swap_crash_regression
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-precheck ]; then
+  run_rollback_precheck_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = worker-heartbeat-wait ]; then
   run_worker_post_start_wait_regressions
   echo
@@ -2124,6 +2237,8 @@ run_absent_timer_regressions
 run_swappiness_namespace_regressions
 run_incomplete_rollback_retry_regression
 run_apply_compensation_retry_regressions
+run_orchestrated_swap_crash_regression
+run_rollback_precheck_regressions
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions
@@ -2447,7 +2562,7 @@ run_mutation_failure() {
     postflight-health) : > "$STATE/health-after-first" ;;
   esac
   TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
-  rollback_count=$(grep -c -F 'swap rollback' "$EVENTS" 2>/dev/null || true)
+  rollback_count=$(grep -c -x -F 'swap rollback' "$EVENTS" 2>/dev/null || true)
   printf '%s|%s|%s\n' "$scenario" "$RC" "$rollback_count"
 }
 mutation_scenarios=(swap-apply swap-verify daemon api-restart hermes-restart timers tracker monitor postflight-property postflight-health)
@@ -2569,7 +2684,7 @@ before_api=$(cat "$FAKE/systemd/estrado-pjud.service")
 before_credential=$(cat "$FAKE/repo/estrado-pjud-service/.env")
 TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'postflight failure exits nonzero' "$RC" 1
-expect_count 'automatic rollback delegates swap once' 'swap rollback' 1
+expect_exact_count 'automatic rollback delegates swap once' 'swap rollback' 1
 expect_last_before 'rollback delegates swap before reloading restored units' 'swap rollback' 'systemctl daemon-reload'
 expect_last_before 'rollback daemon reload precedes affected API restart' 'systemctl daemon-reload' 'systemctl restart estrado-pjud.service'
 expect_count 'affected API restarts once on apply and once on rollback' 'systemctl restart estrado-pjud.service' 2
@@ -2693,7 +2808,7 @@ setup
 : > "$STATE/mutate-outside"
 TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
 expect_eq 'unsafe swap rollback leaves apply failed' "$RC" 1
-expect_count 'unsafe swap rollback attempted exactly once' 'swap rollback' 1
+expect_exact_count 'unsafe swap rollback attempted exactly once' 'swap rollback' 1
 expect_contains 'unsafe rollback is diagnosed without secret material' "$OUT" 'ROLLBACK INCOMPLETO'
 expect_eq 'unlisted path remains untouched on rollback failure' "$(cat "$FAKE/outside")" 'outside changed'
 
