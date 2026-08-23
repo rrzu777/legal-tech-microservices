@@ -552,7 +552,7 @@ async def test_safe_logs_exclude_credentials_identifiers_captions_and_cookie(
 
     assert result.status == "ok"
     log_text = caplog.text
-    assert "matter=civil" in log_text
+    assert "matter=" not in log_text
     assert "page=1" in log_text
     assert "count=2" in log_text
     for secret in (
@@ -562,6 +562,7 @@ async def test_safe_logs_exclude_credentials_identifiers_captions_and_cookie(
         "C-1234-2024",
         "EMPRESA E",
         "PERSONA F",
+        "civil",
     ):
         assert secret not in log_text
 

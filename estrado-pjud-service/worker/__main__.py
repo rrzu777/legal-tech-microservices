@@ -440,7 +440,11 @@ async def main():
         session_capacity = (
             config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
         )
-        if session_capacity >= 2 and not validation_once:
+        if (
+            config.ENABLE_PJUD_MY_CAUSES_IMPORT
+            and session_capacity >= 2
+            and not validation_once
+        ):
             import_task = asyncio.create_task(
                 run_import_discovery_loop(
                     engine,
@@ -461,7 +465,8 @@ async def main():
             )
         else:
             logger.warning(
-                "Import discovery loop disabled (session_capacity=%d validation_once=%s)",
+                "Import discovery loop disabled (enabled=%s session_capacity=%d validation_once=%s)",
+                config.ENABLE_PJUD_MY_CAUSES_IMPORT,
                 session_capacity,
                 validation_once,
             )

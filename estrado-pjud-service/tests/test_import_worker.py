@@ -486,6 +486,19 @@ async def test_main_loop_import_poll_contains_failure_without_crashing_paid_sync
 
 
 @pytest.mark.asyncio
+async def test_import_completion_log_is_aggregate_only(caplog):
+    caplog.set_level("INFO", logger="worker.import_jobs")
+    worker, *_ = make_worker()
+    await worker.process_next()
+
+    assert JOB["job_id"] not in caplog.text
+    assert JOB["law_firm_id"] not in caplog.text
+    assert "status=ok" in caplog.text
+    assert "pages=1" in caplog.text
+    assert "count=1" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_import_poll_loop_is_independent_and_shutdown_cancels_inflight_work():
     from worker.__main__ import run_import_discovery_loop
 
@@ -518,6 +531,12 @@ def test_import_budget_reserves_at_least_one_session_for_public_sync():
 
     assert public_sync_concurrency(3, imports_enabled=True) == 2
     assert public_sync_concurrency(2, imports_enabled=True) == 1
+
+
+def test_import_budget_is_not_reserved_while_import_flag_is_disabled():
+    from worker.__main__ import public_sync_concurrency
+
+    assert public_sync_concurrency(3, imports_enabled=False) == 3
     assert public_sync_concurrency(1, imports_enabled=False) == 1
 
 

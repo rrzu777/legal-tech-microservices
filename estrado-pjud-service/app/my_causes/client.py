@@ -330,8 +330,7 @@ async def discover_my_causes(
                     collected.append(candidate)
 
             logger.info(
-                "my_causes page matter=%s page=%d count=%d",
-                matter,
+                "my_causes page=%d count=%d",
                 current_page,
                 len(parsed),
             )

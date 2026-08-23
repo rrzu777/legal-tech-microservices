@@ -175,6 +175,7 @@ class ImportDiscoveryWorker:
         concurrency: int = 1,
         lease_seconds: int = 120,
         renewal_interval_seconds: float | None = None,
+        enabled: bool = True,
     ):
         if concurrency < 1:
             raise ValueError("import_concurrency_must_be_positive")
@@ -193,6 +194,7 @@ class ImportDiscoveryWorker:
             if renewal_interval_seconds is not None
             else max(5.0, lease_seconds / 3)
         )
+        self._enabled = enabled
 
     async def _rpc(self, name: str, payload: dict[str, Any]) -> Any:
         response = await run_query(self._sb.rpc(name, payload))
@@ -301,6 +303,8 @@ class ImportDiscoveryWorker:
         return await self._discover_once(job, credential)
 
     async def process_next(self) -> bool:
+        if not self._enabled:
+            return False
         async with self._semaphore:
             job = await self._claim()
             if job is None:
@@ -351,8 +355,7 @@ class ImportDiscoveryWorker:
             },
         )
         logger.info(
-            "my_causes job=%s status=%s pages=%d count=%d",
-            job.job_id,
+            "my_causes status=%s pages=%d count=%d",
             result.status,
             result.page_count,
             len(candidates),
