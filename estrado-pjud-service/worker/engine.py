@@ -45,6 +45,7 @@ from app.proxy_cost import (
 )
 from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
+from worker.import_jobs import ImportDiscoveryWorker
 from worker.sync_messages import BlockCause, blocked_error_message
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import (
@@ -112,6 +113,10 @@ _LOOKUP_CANDIDATE_FIELDS = (
 
 class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
+
+
+class ImportCredentialInfrastructureError(RuntimeError):
+    """The app credential boundary is temporarily unavailable."""
 
 
 def _release_disposition_for_error(
@@ -640,6 +645,13 @@ class SyncEngine:
             pool, proxy_usage=self._proxy_usage,
         )
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
+        self._import_worker = ImportDiscoveryWorker(
+            supabase=supabase,
+            pool=pool,
+            worker_id=getattr(config, "WORKER_ID", "worker-1"),
+            fetch_credential=self._get_import_credential,
+            concurrency=1,
+        )
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
             self._r2 = R2Client(
@@ -648,6 +660,10 @@ class SyncEngine:
                 endpoint=config.R2_ENDPOINT,
                 bucket=config.R2_BUCKET,
             )
+
+    async def process_import_job(self) -> bool:
+        """Poll one discovery job outside the paid public batch semaphore."""
+        return await self._import_worker.process_next()
 
     async def _enrich_candidates(
         self, matches: list[dict], request: SearchRequest
@@ -1333,6 +1349,30 @@ class SyncEngine:
             law_firm_id=law_firm_id,
         )
         return resp.json() if resp is not None and resp.status_code == 200 else None
+
+    async def _get_import_credential(
+        self, credential_id: str, law_firm_id: str,
+    ) -> dict | None:
+        """Keep terminal credential absence distinct from internal outages."""
+        resp = await self._call_app_internal(
+            "GET",
+            f"/api/internal/credentials/{credential_id}/decrypt",
+            "Import decrypt endpoint",
+            law_firm_id=law_firm_id,
+        )
+        if resp is None or resp.status_code in {401, 403, 408, 429} or resp.status_code >= 500:
+            raise ImportCredentialInfrastructureError("import_credential_boundary_unavailable")
+        if resp.status_code in {404, 410, 422}:
+            return None
+        if resp.status_code != 200:
+            raise ImportCredentialInfrastructureError("import_credential_boundary_unexpected")
+        data = resp.json()
+        if not isinstance(data, dict) or any(
+            not isinstance(data.get(field), str) or not data[field]
+            for field in ("rut", "password", "password_type")
+        ) or data["password_type"] != "clave_poder_judicial":
+            raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
+        return data
 
     async def _report_invalid_credential(self, credential_id: str) -> None:
         """Tell the app that OJV rejected this credential.

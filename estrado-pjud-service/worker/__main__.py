@@ -206,6 +206,44 @@ async def safe_get_next_batch(scheduler, metrics, backoff):
         return None
 
 
+async def safe_process_import_job(engine, metrics) -> bool:
+    """Poll one discovery job without coupling failures to public case sync."""
+    try:
+        return await engine.process_import_job()
+    except Exception as exc:
+        logger.error(
+            "Failed to process PJUD import discovery job (error_class=%s)",
+            type(exc).__name__,
+        )
+        metrics.record_error("infra")
+        return False
+
+
+async def run_import_discovery_loop(
+    engine,
+    metrics,
+    shutdown_event: asyncio.Event,
+    *,
+    poll_interval: float = 5.0,
+    traffic_allowed=lambda: True,
+) -> None:
+    """Independent one-at-a-time discovery loop with structured cancellation."""
+    while not shutdown_event.is_set():
+        if traffic_allowed():
+            processed = await safe_process_import_job(engine, metrics)
+            if processed:
+                continue
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+def public_sync_concurrency(session_capacity: int, *, imports_enabled: bool) -> int:
+    """Reserve one pool session for imports without ever starving public sync."""
+    return max(1, session_capacity - (1 if imports_enabled else 0))
+
+
 async def safe_reconcile_stale_runs(scheduler, metrics, backoff) -> bool:
     """Run bounded maintenance fail-closed before any traffic gate or claim."""
     try:
@@ -305,6 +343,7 @@ async def main():
     notify_ready()
     notify_status("starting")
     bandwidth_alert_state = BandwidthAlertState()
+    import_task: asyncio.Task | None = None
 
     try:
         initialized = False
@@ -398,6 +437,35 @@ async def main():
         metrics.set_status("running")
         notify_status("running")
 
+        session_capacity = (
+            config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+        )
+        if session_capacity >= 2 and not validation_once:
+            import_task = asyncio.create_task(
+                run_import_discovery_loop(
+                    engine,
+                    metrics,
+                    shutdown_event,
+                    traffic_allowed=(
+                        lambda: not backoff.is_open
+                        and is_processing_allowed(
+                            process_outside_office_hours=process_outside_office_hours,
+                        )
+                    ),
+                ),
+                name="pjud-import-discovery",
+            )
+            logger.info(
+                "Import discovery loop enabled with one reserved budget; public capacity=%d",
+                session_capacity - 1,
+            )
+        else:
+            logger.warning(
+                "Import discovery loop disabled (session_capacity=%d validation_once=%s)",
+                session_capacity,
+                validation_once,
+            )
+
         while not shutdown_event.is_set():
             if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
@@ -476,7 +544,13 @@ async def main():
 
             case_ids = [c["id"] for c in batch]
 
-            concurrency = config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            session_capacity = (
+                config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            )
+            concurrency = public_sync_concurrency(
+                session_capacity,
+                imports_enabled=import_task is not None,
+            )
             await process_batch(
                 batch,
                 engine,
@@ -501,6 +575,10 @@ async def main():
     finally:
         notify_stopping()
         logger.info("Shutting down...")
+        shutdown_event.set()
+        if import_task is not None:
+            import_task.cancel()
+            await asyncio.gather(import_task, return_exceptions=True)
         await metrics.stop()
         await pool.close_all()
         logger.info("Worker stopped")
