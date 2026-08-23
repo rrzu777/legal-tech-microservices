@@ -857,6 +857,10 @@ if [ -e "$RG_TEST_STATE/corrupt-live-state" ]; then
   done
 fi
 EOF
+  write_stub mkdir <<'EOF'
+printf 'mkdir %s\n' "$*" >> "$RG_TEST_STATE/events"
+/bin/mkdir "$@"
+EOF
   write_stub python <<'EOF'
 if [ "${1:-}" = -c ] && [ "${3:-}" = --resource-guards-atomic-write ]; then
   target=${4:-}
@@ -984,7 +988,7 @@ run_guard() {
     RG_TEST_FD_ROOT="$FAKE/fd" \
     RG_SLEEP_BIN="$BIN/sleep" \
     RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN="$BIN/find" RG_CP_BIN="$BIN/cp" \
-    RG_RM_BIN=/bin/rm RG_MKDIR_BIN=/bin/mkdir RG_CHMOD_BIN="$BIN/chmod" \
+    RG_RM_BIN=/bin/rm RG_MKDIR_BIN="$BIN/mkdir" RG_CHMOD_BIN="$BIN/chmod" \
     RG_CHOWN_BIN=/usr/sbin/chown RG_MKTEMP_BIN=/usr/bin/mktemp RG_JQ_BIN="$BIN/jq" \
     RG_PROVISION_BIN="$BIN/provision" RG_SWAP_BIN="$BIN/swap" RG_PYTHON_BIN="$BIN/python" \
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
@@ -1866,22 +1870,37 @@ run_durable_metadata_regressions() {
   done
 
   echo '== backup namespace parent identity and mode are strict'
-  for scenario in writable wrong-group symlink-component; do
+  for scenario in writable wrong-group missing-parent symlink-component; do
     setup
+    backup_artifact_root="$FAKE/backups"
     case "$scenario" in
       writable) chmod 0777 "$FAKE" ;;
       wrong-group) : > "$STATE/backup-parent-wrong-gid" ;;
+      missing-parent)
+        TEST_BACKUP_ROOT_OVERRIDE="$CASE_DIR/missing-parent/backups"
+        backup_artifact_root=$TEST_BACKUP_ROOT_OVERRIDE
+        ;;
       symlink-component)
         mkdir -p "$CASE_DIR/backup-namespace/backups"
         chmod 0700 "$CASE_DIR/backup-namespace/backups"
         ln -s "$CASE_DIR/backup-namespace" "$CASE_DIR/backup-link"
         TEST_BACKUP_ROOT_OVERRIDE="$CASE_DIR/backup-link/backups"
+        backup_artifact_root=$TEST_BACKUP_ROOT_OVERRIDE
         ;;
     esac
     TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
     expect_eq "$scenario backup namespace parent refuses apply" "$RC" 1
+    expect_count "$scenario backup namespace performs no recursive backup mkdir" 'mkdir -p --' 0
+    expect_count "$scenario backup namespace performs no backup leaf mkdir" 'mkdir --' 0
+    expect_count "$scenario backup namespace copies no protected backup" backup-copy 0
+    expect_eq "$scenario backup namespace creates no backup artifact" \
+      "$(find "$backup_artifact_root" -mindepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" 0
     expect_count "$scenario backup namespace performs no provision" provision 0
     expect_count "$scenario backup namespace performs no swap apply" 'swap apply' 0
+    expect_count "$scenario backup namespace performs no systemd stop" 'systemctl stop' 0
+    expect_count "$scenario backup namespace performs no systemd start" 'systemctl start' 0
+    expect_count "$scenario backup namespace performs no systemd restart" 'systemctl restart' 0
+    expect_count "$scenario backup namespace performs no daemon reload" 'systemctl daemon-reload' 0
     unset TEST_BACKUP_ROOT_OVERRIDE
   done
 

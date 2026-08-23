@@ -1048,10 +1048,8 @@ durable_rewrite_existing_metadata() { # path
   durable_replace_metadata "$1" "$content"$'\n'
 }
 
-durable_sync_backup_tree() {
-  local output namespace_parent fields mode uid gid links permissions
-  safe_existing_path "$backup_dir" && validate_root_path "$backup_dir" 700 || return 1
-  safe_existing_path "$backup_root" && validate_root_path "$backup_root" 700 || return 1
+validate_backup_namespace_parent() {
+  local namespace_parent fields mode uid gid links permissions
   namespace_parent=${backup_root%/*}
   [ -n "$namespace_parent" ] || namespace_parent=/
   [ -d "$namespace_parent" ] && [ ! -L "$namespace_parent" ] || return 1
@@ -1062,7 +1060,14 @@ durable_sync_backup_tree() {
   [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] || return 1
   permissions=$((8#$mode))
   [ $((permissions & 8#0700)) -eq $((8#0700)) ] \
-    && [ $((permissions & 8#0022)) -eq 0 ] || return 1
+    && [ $((permissions & 8#0022)) -eq 0 ]
+}
+
+durable_sync_backup_tree() {
+  local output
+  safe_existing_path "$backup_dir" && validate_root_path "$backup_dir" 700 || return 1
+  safe_existing_path "$backup_root" && validate_root_path "$backup_root" 700 || return 1
+  validate_backup_namespace_parent || return 1
   if ! output=$("$python_bin" -c "$durable_backup_syncer" \
       --resource-guards-fsync-tree "$backup_dir" "$root_uid" "$root_gid" "$test_mode" \
       2>"$null_file"); then
@@ -1073,9 +1078,16 @@ durable_sync_backup_tree() {
 
 create_backup() {
   local uid=$1 timestamp path index=0 rel fields mode owner group links existed
+  # The existing namespace parent is a trusted-root boundary: root ownership,
+  # no group/other write, and a symlink-free path prevent an unprivileged actor
+  # from replacing it between this gate and leaf creation. The host lock excludes
+  # concurrent resource-guard writers; a malicious root process is out of scope.
+  validate_backup_namespace_parent || return 1
   path_has_symlink_component "$backup_root" && return 1
   if [ ! -e "$backup_root" ]; then
-    "$mkdir_bin" -p -- "$backup_root" || return 1
+    [ ! -L "$backup_root" ] || return 1
+    "$mkdir_bin" -- "$backup_root" || return 1
+    validate_backup_namespace_parent || return 1
     "$chmod_bin" 0700 "$backup_root" || return 1
     "$chown_bin" "$root_uid:$root_gid" "$backup_root" || return 1
   else
