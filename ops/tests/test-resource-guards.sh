@@ -859,7 +859,24 @@ fi
 EOF
   write_stub mkdir <<'EOF'
 printf 'mkdir %s\n' "$*" >> "$RG_TEST_STATE/events"
-/bin/mkdir "$@"
+/bin/mkdir "$@" || exit 1
+if [ -e "$RG_TEST_STATE/audit-mkdir-mode" ]; then
+  unsafe=0
+  for path in "$@"; do
+    case "$path" in --|-*) continue ;; esac
+    [ -d "$path" ] || continue
+    mode=$(/usr/bin/stat -f '%Lp' "$path") || exit 1
+    printf 'mkdir-mode %s %s\n' "$path" "$mode" >> "$RG_TEST_STATE/events"
+    permissions=$((8#$mode))
+    if [ $((permissions & 8#0077)) -ne 0 ]; then
+      printf 'mkdir-unsafe %s %s\n' "$path" "$mode" >> "$RG_TEST_STATE/events"
+      : > "$path/attacker-entry"
+      printf 'attacker-entry %s\n' "$path" >> "$RG_TEST_STATE/events"
+      unsafe=1
+    fi
+  done
+  [ "$unsafe" -eq 0 ] || exit 91
+fi
 EOF
   write_stub python <<'EOF'
 if [ "${1:-}" = -c ] && [ "${3:-}" = --resource-guards-atomic-write ]; then
@@ -1902,6 +1919,34 @@ run_durable_metadata_regressions() {
     expect_count "$scenario backup namespace performs no systemd restart" 'systemctl restart' 0
     expect_count "$scenario backup namespace performs no daemon reload" 'systemctl daemon-reload' 0
     unset TEST_BACKUP_ROOT_OVERRIDE
+  done
+
+  echo '== backup directories are private at creation under a hostile inherited umask'
+  for scenario in first-root existing-root; do
+    setup
+    : > "$STATE/audit-mkdir-mode"
+    if [ "$scenario" = first-root ]; then
+      rm -rf "$FAKE/backups"
+      expected_private_mkdirs=3
+    else
+      expected_private_mkdirs=2
+    fi
+    previous_umask=$(umask)
+    umask 000
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    umask "$previous_umask"
+    expect_eq "$scenario hostile umask apply succeeds" "$RC" 0
+    expect_count "$scenario exposes no backup directory at mkdir return" mkdir-unsafe 0
+    expect_count "$scenario admits no attacker entry during mkdir window" attacker-entry 0
+    expect_count "$scenario creates every new backup directory as 0700" ' 700' "$expected_private_mkdirs"
+    unsafe_count=$(grep -c -F mkdir-unsafe "$EVENTS" 2>/dev/null || true)
+    backup_copy_count=$(grep -c -F backup-copy "$EVENTS" 2>/dev/null || true)
+    protected_effect_count=$(grep -E -c '^(provision|swap apply|systemctl (stop|start|restart|daemon-reload))' "$EVENTS" 2>/dev/null || true)
+    if [ "$unsafe_count" -eq 0 ] || { [ "$backup_copy_count" -eq 0 ] && [ "$protected_effect_count" -eq 0 ]; }; then
+      ok "$scenario unsafe mkdir cannot reach secret copy or protected effect"
+    else
+      bad "$scenario unsafe mkdir reached copy/effect (copies=$backup_copy_count effects=$protected_effect_count)"
+    fi
   done
 
   echo '== abrupt writer exits retain no authority to begin protected effects'

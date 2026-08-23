@@ -552,6 +552,7 @@ load_worker_fence_config() {
   [ -n "$worker_id_encoded" ] && [[ "$worker_id_encoded" != *$'\n'* ]] || return 1
   unset proxy_url
 
+  umask 077
   if [ -z "$temp_dir" ]; then
     temp_dir=$("$mktemp_bin" -d "$tmp_root/legaltech-resource-guards.XXXXXX") || return 1
     "$chmod_bin" 0700 "$temp_dir" || return 1
@@ -559,7 +560,6 @@ load_worker_fence_config() {
     validate_root_path "$temp_dir" 700 || return 1
   fi
   curl_header_file="$temp_dir/supabase.headers"
-  umask 077
   {
     printf 'apikey: %s\n' "$SUPABASE_SERVICE_KEY"
     printf 'Authorization: Bearer %s\n' "$SUPABASE_SERVICE_KEY"
@@ -1078,6 +1078,7 @@ durable_sync_backup_tree() {
 
 create_backup() {
   local uid=$1 timestamp path index=0 rel fields mode owner group links existed
+  umask 077
   # The existing namespace parent is a trusted-root boundary: root ownership,
   # no group/other write, and a symlink-free path prevent an unprivileged actor
   # from replacing it between this gate and leaf creation. The host lock excludes
@@ -1103,7 +1104,6 @@ create_backup() {
   "$chown_bin" "$root_uid:$root_gid" "$backup_dir" "$backup_dir/entries" || return 1
   validate_root_path "$backup_dir" 700 && validate_root_path "$backup_dir/entries" 700 || return 1
   manifest="$backup_dir/manifest.tsv"
-  umask 077
   : > "$manifest" || return 1
   for path in "${managed_paths[@]}"; do
     index=$((index + 1))
