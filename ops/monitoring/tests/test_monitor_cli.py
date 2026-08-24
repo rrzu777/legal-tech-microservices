@@ -4,6 +4,7 @@ import os
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,7 +46,9 @@ def sample(api_active="active"):
     return ResourceSnapshot(
         schema_version=1,
         timestamp_utc="2026-08-19T12:00:00Z",
-        host=HostSnapshot(100, 50, 100, 0, 0.1, 100, 10, 100, 10),
+        host=HostSnapshot(
+            100, 50, 100, 0, 0.1, 100, 10, 100, 10, managed_swap_status="healthy"
+        ),
         units={
             "legaltech.slice": unit(
                 "legaltech.slice", control_group="/legaltech.slice"
@@ -94,6 +97,51 @@ def sample(api_active="active"):
         },
         hermes_user_slice="user-4242.slice",
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "expects_alert"),
+    [
+        ("missing", True),
+        ("undersized", True),
+        ("wrong-target", True),
+        ("invalid", True),
+        ("healthy", False),
+    ],
+)
+def test_dry_run_managed_swap_contract_controls_alert_and_heartbeat(
+    tmp_path, status, expects_alert
+):
+    output = io.StringIO()
+    collected = sample()
+    collected = replace(
+        collected,
+        host=replace(collected.host, managed_swap_status=status),
+    )
+
+    result = main(
+        ["--dry-run", "--state-dir", str(tmp_path)],
+        environ={},
+        collect=lambda **kwargs: collected,
+        clock=fixed_clock,
+        state_loader=lambda path: new_state(),
+        state_writer=lambda *args: (_ for _ in ()).throw(
+            AssertionError("dry-run mutated state")
+        ),
+        transport_factory=lambda *args: (_ for _ in ()).throw(
+            AssertionError("dry-run constructed transport")
+        ),
+        slice_resolver=lambda: "user-4242.slice",
+        stdout=output,
+        stderr=io.StringIO(),
+    )
+
+    rendered = json.loads(output.getvalue())
+    event_keys = [event["key"] for event in rendered["events"]]
+    assert result == 0
+    assert ("host.swap.managed" in event_keys) is expects_alert
+    assert ("healthy-heartbeat" in event_keys) is not expects_alert
+    assert all("/swap" not in event["message"] for event in rendered["events"])
 
 
 class FakeTransport:
@@ -332,8 +380,13 @@ def test_dry_run_wrong_cgroup_is_sanitized_and_suppresses_heartbeat(tmp_path):
     collected = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
         read_text=lambda path: (
-            "MemTotal: 100 kB\nMemAvailable: 50 kB\n"
-            "SwapTotal: 100 kB\nSwapFree: 100 kB\n"
+            "Filename\tType\tSize\tUsed\tPriority\n"
+            "/swapfile\tfile\t100\t0\t-2\n"
+            if path == "/proc/swaps"
+            else (
+                "MemTotal: 100 kB\nMemAvailable: 50 kB\n"
+                "SwapTotal: 100 kB\nSwapFree: 100 kB\n"
+            )
         ),
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,

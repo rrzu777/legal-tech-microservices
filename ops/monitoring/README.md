@@ -36,6 +36,13 @@ memoria total/disponible, swap, load de un minuto, uso de disco/inodos y, por
 unit, estado, memoria, tasks, CPU y número de restarts. El CSV rota diariamente,
 con 14 archivos retenidos y compresión.
 
+La salud de swap exige exactamente el target administrado `/swapfile` y la
+capacidad utilizable que Linux reporta para el archivo configurado de 4 GiB
+(mínimo `4194300 KiB`). Target ausente, capacidad menor, otra identidad o
+`/proc/swaps` malformado activan una alerta inmediata y suprimen el heartbeat
+saludable. Los eventos sólo incluyen el estado agregado y nunca reflejan paths
+observados arbitrarios.
+
 Nunca requieren ni deben recibir contenido de causas, cookies, telemetría o
 payloads de proxy, datos de sesión ni datos de usuario. No agregar esos datos al
 CSV, estado de alertas, journald o mensajes Telegram.

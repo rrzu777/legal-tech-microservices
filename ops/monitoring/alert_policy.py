@@ -173,6 +173,29 @@ def evaluate_rules(
         )
     )
 
+    swap_status_messages = {
+        "healthy": "Managed swap target is healthy",
+        "missing": "Managed swap target is missing",
+        "undersized": "Managed swap capacity is below 4 GiB",
+        "wrong-target": "Managed swap identity is invalid",
+    }
+    managed_swap_status = host.managed_swap_status
+    if managed_swap_status not in swap_status_messages:
+        managed_swap_status = "invalid"
+    results.append(
+        RuleResult(
+            key="host.swap.managed",
+            severity="critical",
+            active=managed_swap_status != "healthy",
+            persist_for_seconds=0,
+            cooldown_seconds=DEFAULT_COOLDOWN_SECONDS,
+            message=swap_status_messages.get(
+                managed_swap_status, "Managed swap state is invalid"
+            ),
+            value=managed_swap_status,
+        )
+    )
+
     swap_percent = _percent(host.swap_used_bytes, host.swap_total_bytes)
     if host.swap_total_bytes > 0 and swap_percent > 50:
         swap_severity, swap_duration, swap_message = (

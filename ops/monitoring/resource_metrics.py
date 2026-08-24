@@ -23,6 +23,9 @@ from typing import Callable, Protocol, Sequence
 
 SCHEMA_VERSION = 1
 SYSTEMD_TIMEOUT_SECONDS = 5.0
+MANAGED_SWAP_TARGET = "/swapfile"
+# mkswap reserves one 4 KiB page from the configured 4 GiB file.
+MANAGED_SWAP_MIN_SIZE_KIB = 4_194_300
 SYSTEMD_PROPERTIES = (
     "LoadState",
     "UnitFileState",
@@ -73,6 +76,7 @@ class HostSnapshot:
     root_bytes_used: int
     root_inodes_total: int
     root_inodes_used: int
+    managed_swap_status: str = "invalid"
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,56 @@ def parse_meminfo(text: str) -> dict[str, int]:
             value *= 1024
         values[key] = value
     return values
+
+
+def managed_swap_status(proc_swaps: str, swap_total_bytes: int) -> str:
+    """Classify only the fixed managed swap contract without exposing paths."""
+    lines = proc_swaps.splitlines()
+    if not lines or lines[0].split() != [
+        "Filename",
+        "Type",
+        "Size",
+        "Used",
+        "Priority",
+    ]:
+        raise ValueError("invalid proc swaps header")
+
+    entries: list[tuple[str, str, int, int]] = []
+    seen: set[str] = set()
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) != 5:
+            raise ValueError("invalid proc swaps row")
+        target, kind, size_text, used_text, priority = fields
+        if (
+            re.fullmatch(r"/[^\s\x00]+", target) is None
+            or target in seen
+            or kind not in {"file", "partition"}
+            or re.fullmatch(r"[0-9]+", size_text) is None
+            or re.fullmatch(r"[0-9]+", used_text) is None
+            or re.fullmatch(r"-?[0-9]+", priority) is None
+        ):
+            raise ValueError("invalid proc swaps row")
+        size_kib = int(size_text)
+        used_kib = int(used_text)
+        if size_kib <= 0 or not 0 <= used_kib <= size_kib:
+            raise ValueError("invalid proc swaps capacity")
+        seen.add(target)
+        entries.append((target, kind, size_kib, used_kib))
+
+    observed_total_bytes = sum(entry[2] for entry in entries) * 1024
+    if observed_total_bytes != swap_total_bytes:
+        raise ValueError("proc swaps and meminfo disagree")
+    if not entries:
+        return "missing"
+    if len(entries) != 1 or entries[0][0] != MANAGED_SWAP_TARGET:
+        return "wrong-target"
+    _, kind, size_kib, _ = entries[0]
+    if kind != "file":
+        return "wrong-target"
+    if size_kib < MANAGED_SWAP_MIN_SIZE_KIB:
+        return "undersized"
+    return "healthy"
 
 
 def parse_systemctl_show(text: str) -> dict[str, str]:
@@ -398,6 +452,8 @@ def collect_resource_snapshot(
             or not 0 <= swap_free <= swap_total
         ):
             raise ValueError("required meminfo value invalid")
+        proc_swaps = read_text("/proc/swaps")
+        swap_status = managed_swap_status(proc_swaps, swap_total)
 
         filesystem = statvfs("/")
         if (
@@ -426,6 +482,7 @@ def collect_resource_snapshot(
         root_bytes_used=max(0, (filesystem.f_blocks - filesystem.f_bfree) * filesystem.f_frsize),
         root_inodes_total=filesystem.f_files,
         root_inodes_used=max(0, filesystem.f_files - filesystem.f_ffree),
+        managed_swap_status=swap_status,
     )
     units = {
         unit_name: _collect_unit(unit_name, run_command)

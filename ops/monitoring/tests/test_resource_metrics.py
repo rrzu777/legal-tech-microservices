@@ -27,12 +27,17 @@ from ops.monitoring.alert_policy import advance_state, evaluate_rules
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def read_host_fixture(path):
+    fixture = "proc-swaps.txt" if path == "/proc/swaps" else "meminfo.txt"
+    return (FIXTURES / fixture).read_text()
+
+
 def test_parse_meminfo_converts_kilobytes_to_bytes():
     values = parse_meminfo((FIXTURES / "meminfo.txt").read_text())
 
     assert values["MemTotal"] == 16_777_216_000
     assert values["MemAvailable"] == 6_144_000_000
-    assert values["SwapTotal"] == 2_147_483_648
+    assert values["SwapTotal"] == 4_294_963_200
 
 
 def test_parse_systemctl_show_preserves_explicit_property_values():
@@ -111,7 +116,7 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
-        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        read_text=read_host_fixture,
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,
         loadavg=lambda: (1.25, 0.0, 0.0),
@@ -171,6 +176,111 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
     ]
 
 
+@pytest.mark.parametrize(
+    ("swap_total_kib", "proc_rows", "expected_status", "expected_alert"),
+    [
+        (0, [], "missing", True),
+        (2_097_152, [("/swapfile", "file", 2_097_152, 0, -2)], "undersized", True),
+        (
+            4_194_300,
+            [("/unmanaged-swap", "file", 4_194_300, 0, -2)],
+            "wrong-target",
+            True,
+        ),
+        (4_194_300, [("/swapfile", "file", 4_194_300, 0, -2)], "healthy", False),
+    ],
+)
+def test_managed_swap_proc_contract_reaches_policy_and_suppresses_heartbeat(
+    swap_total_kib, proc_rows, expected_status, expected_alert
+):
+    class FakeStatvfs:
+        f_blocks = 100
+        f_frsize = 1
+        f_bfree = 50
+        f_files = 100
+        f_ffree = 50
+
+    properties = (FIXTURES / "systemctl-show.txt").read_text()
+
+    def run_command(command, timeout):
+        unit_name = command[4] if command[1] == "--user" else command[2]
+        control_group = {
+            "legaltech.slice": "/legaltech.slice",
+            "estrado-pjud.service": "/legaltech.slice/estrado-pjud.service",
+            "estrado-pjud-worker.service": "/legaltech.slice/estrado-pjud-worker.service",
+            "user-4242.slice": "/user.slice/user-4242.slice",
+            "hermes-gateway.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-gateway.service"
+            ),
+            "hermes-dashboard.service": (
+                "/user.slice/user-4242.slice/user@4242.service/"
+                "app.slice/hermes-dashboard.service"
+            ),
+        }.get(unit_name, f"/system.slice/{unit_name}")
+        return properties.replace("/system.slice/legaltech.slice", control_group)
+
+    proc_swaps = "Filename\tType\tSize\tUsed\tPriority\n" + "".join(
+        f"{target}\t{kind}\t{size}\t{used}\t{priority}\n"
+        for target, kind, size, used, priority in proc_rows
+    )
+    meminfo = (
+        "MemTotal: 100 kB\nMemAvailable: 50 kB\n"
+        f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_total_kib} kB\n"
+    )
+
+    snapshot = collect_resource_snapshot(
+        hermes_user_slice="user-4242.slice",
+        read_text=lambda path: proc_swaps if path == "/proc/swaps" else meminfo,
+        statvfs=lambda path: FakeStatvfs(),
+        run_command=run_command,
+        loadavg=lambda: (0.0, 0.0, 0.0),
+        now=lambda: "2026-08-19T12:00:00Z",
+    )
+    events, _ = advance_state(
+        evaluate_rules(snapshot, {}),
+        {},
+        datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert snapshot.host.managed_swap_status == expected_status
+    assert any(event.key == "host.swap.managed" for event in events) is expected_alert
+    assert any(event.key == "healthy-heartbeat" for event in events) is not expected_alert
+    assert "/unmanaged-swap" not in json.dumps([event.__dict__ for event in events])
+
+
+@pytest.mark.parametrize(
+    "proc_swaps",
+    [
+        "not a proc swaps header\n",
+        "Filename Type Size Used Priority\n/sensitive-host-path file bad 0 -2\n",
+        "Filename Type Size Used Priority\n/swapfile file 4194300 0 -2\n",
+    ],
+)
+def test_malformed_or_inconsistent_proc_swaps_fails_closed_without_path_leak(
+    proc_swaps,
+):
+    meminfo = (
+        "MemTotal: 100 kB\nMemAvailable: 50 kB\n"
+        "SwapTotal: 0 kB\nSwapFree: 0 kB\n"
+    )
+    with pytest.raises(CollectionUnavailable) as raised:
+        collect_resource_snapshot(
+            hermes_user_slice="user-4242.slice",
+            read_text=lambda path: proc_swaps if path == "/proc/swaps" else meminfo,
+            statvfs=lambda path: (_ for _ in ()).throw(
+                AssertionError("statvfs must not run after invalid swap state")
+            ),
+            run_command=lambda command, timeout: (_ for _ in ()).throw(
+                AssertionError("systemd must not run after invalid swap state")
+            ),
+            loadavg=lambda: (0.0, 0.0, 0.0),
+        )
+
+    assert str(raised.value) == "Required host resource metrics are unavailable"
+    assert "/sensitive-host-path" not in str(raised.value)
+
+
 def test_collector_wrong_hermes_cgroup_reaches_policy_and_suppresses_heartbeat():
     class FakeStatvfs:
         f_blocks = 100
@@ -200,7 +310,7 @@ def test_collector_wrong_hermes_cgroup_reaches_policy_and_suppresses_heartbeat()
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
-        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        read_text=read_host_fixture,
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,
         loadavg=lambda: (0.0, 0.0, 0.0),
@@ -242,7 +352,7 @@ def test_hermes_user_manager_failure_is_sanitized_and_fails_closed(failure_mode)
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
-        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        read_text=read_host_fixture,
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,
         loadavg=lambda: (0.0, 0.0, 0.0),
@@ -301,7 +411,7 @@ def test_collected_disabled_inactive_hermes_service_needs_no_live_cgroup():
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-4242.slice",
-        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        read_text=read_host_fixture,
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,
         loadavg=lambda: (0.0, 0.0, 0.0),
@@ -335,7 +445,7 @@ def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-999.slice",
-        read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+        read_text=read_host_fixture,
         statvfs=lambda path: FakeStatvfs(),
         run_command=run_command,
         loadavg=lambda: (0.0, 0.0, 0.0),
@@ -365,7 +475,11 @@ def test_collect_rejects_missing_required_meminfo_key_with_sanitized_typed_error
     with pytest.raises(CollectionUnavailable) as raised:
         collect_resource_snapshot(
             hermes_user_slice="user-4242.slice",
-            read_text=lambda path: meminfo,
+            read_text=lambda path: (
+                (FIXTURES / "proc-swaps.txt").read_text()
+                if path == "/proc/swaps"
+                else meminfo
+            ),
             statvfs=lambda path: (_ for _ in ()).throw(
                 AssertionError("statvfs must not run after invalid meminfo")
             ),
@@ -406,7 +520,7 @@ def test_collect_wraps_statvfs_and_load_failures_as_sanitized_unavailable(
     with pytest.raises(CollectionUnavailable) as raised:
         collect_resource_snapshot(
             hermes_user_slice="user-4242.slice",
-            read_text=lambda path: (FIXTURES / "meminfo.txt").read_text(),
+            read_text=read_host_fixture,
             statvfs=statvfs,
             run_command=lambda command, timeout: (FIXTURES / "systemctl-show.txt").read_text(),
             loadavg=loadavg,
@@ -596,6 +710,7 @@ def test_append_csv_writes_versioned_stable_rows(tmp_path):
             root_bytes_used=400,
             root_inodes_total=300,
             root_inodes_used=60,
+            managed_swap_status="healthy",
         ),
         units={
             "z.service": UnitSnapshot(

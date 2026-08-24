@@ -1,0 +1,2 @@
+Filename	Type	Size	Used	Priority
+/swapfile	file	4194300	524288	-2

@@ -76,6 +76,7 @@ def snapshot(
             root_bytes_used=root_bytes_used,
             root_inodes_total=100,
             root_inodes_used=root_inodes_used,
+            managed_swap_status="healthy",
         ),
         units={
             "legaltech.slice": unit(
