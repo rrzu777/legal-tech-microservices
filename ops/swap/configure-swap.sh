@@ -124,6 +124,9 @@ swappiness_metadata_state=absent
 previous_swappiness=''
 apply_phase=''
 rollback_state=invalid
+transaction_temp_state=invalid
+transaction_temps=()
+generated_temp=''
 current_temp=''
 mutation_lock_fd=''
 mutation_lock_owned=0
@@ -434,6 +437,118 @@ sync_containing_directory() {
   durable_sync_path sync-dir "$parent"
 }
 
+new_transaction_temp_path() { # exact-prefix
+  local prefix=$1 output suffix
+  output=$("$python_bin" - temp-name "$prefix" "$$" <<'PY'
+import secrets
+import sys
+
+operation, prefix, pid = sys.argv[1:]
+if operation != "temp-name":
+    raise RuntimeError("invalid temp-name operation")
+if not pid.isdigit() or int(pid) <= 0:
+    raise RuntimeError("invalid pid")
+print(f"{prefix}{pid}.{secrets.token_hex(8)}")
+PY
+  ) || return 1
+  case "$output" in "$prefix$$."*) ;; *) return 1 ;; esac
+  suffix=${output#"$prefix$$."}
+  [ "${#suffix}" -eq 16 ] || return 1
+  case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
+  [ ! -e "$output" ] && [ ! -L "$output" ] || return 1
+  generated_temp=$output
+}
+
+valid_transaction_temp_path() { # full-path
+  local path=$1 prefix suffix pid token
+  local fstab_parent=${fstab_file%/*} sysctl_parent=${sysctl_file%/*}
+  case "$path" in
+    "$fstab_parent/${fstab_file##*/}.legaltech-swap.bak.tmp."*)
+      prefix="$fstab_parent/${fstab_file##*/}.legaltech-swap.bak.tmp." ;;
+    "$fstab_parent/${fstab_file##*/}.legaltech-swap.tmp."*)
+      prefix="$fstab_parent/${fstab_file##*/}.legaltech-swap.tmp." ;;
+    "$sysctl_parent/${sysctl_file##*/}.tmp."*)
+      prefix="$sysctl_parent/${sysctl_file##*/}.tmp." ;;
+    *) return 1 ;;
+  esac
+  suffix=${path#"$prefix"}
+  case "$suffix" in
+    *.*) pid=${suffix%%.*}; token=${suffix#*.} ;;
+    *) pid=$suffix; token='' ;;
+  esac
+  is_uint "$pid" && [ "$pid" -gt 0 ] || return 1
+  [ "$suffix" = "$pid" ] && return 0
+  [ "$suffix" = "$pid.$token" ] && [ "${#token}" -eq 16 ] || return 1
+  case "$token" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+inspect_transaction_temps() {
+  local output path
+  local fstab_parent=${fstab_file%/*} sysctl_parent=${sysctl_file%/*}
+  transaction_temp_state=absent
+  transaction_temps=()
+  output=$("$python_bin" - inspect-temps "$root_uid" "$root_gid" \
+    "$fstab_parent" "${fstab_file##*/}.legaltech-swap.bak.tmp." \
+    "$fstab_parent" "${fstab_file##*/}.legaltech-swap.tmp." \
+    "$sysctl_parent" "${sysctl_file##*/}.tmp." <<'PY'
+import os
+import re
+import stat
+import sys
+
+operation = sys.argv[1]
+if operation != "inspect-temps":
+    raise RuntimeError("invalid temp inspection operation")
+uid, gid = int(sys.argv[2]), int(sys.argv[3])
+items = sys.argv[4:]
+if len(items) % 2:
+    raise RuntimeError("invalid temp namespace inventory")
+candidates = []
+for parent, prefix in zip(items[0::2], items[1::2]):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(parent, flags)
+    try:
+        directory = os.fstat(dir_fd)
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid or directory.st_gid != gid:
+            raise RuntimeError("unsafe temp parent")
+        pattern = re.compile(re.escape(prefix) + r"[1-9][0-9]*(?:\.[0-9a-f]{16})?")
+        for name in os.listdir(dir_fd):
+            if not name.startswith(prefix):
+                continue
+            if pattern.fullmatch(name) is None:
+                raise RuntimeError("unsafe transaction temp name")
+            metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise RuntimeError("unsafe transaction temp")
+            if metadata.st_nlink != 1 or metadata.st_uid != uid or metadata.st_gid != gid:
+                raise RuntimeError("unsafe transaction temp identity")
+            candidates.append(os.path.join(parent, name))
+    finally:
+        os.close(dir_fd)
+for candidate in sorted(candidates):
+    print(candidate)
+PY
+  ) || return 1
+  while IFS= read -r path || [ -n "$path" ]; do
+    [ -n "$path" ] || continue
+    valid_transaction_temp_path "$path" || return 1
+    transaction_temps+=("$path")
+  done <<< "$output"
+  [ "${#transaction_temps[@]}" -eq 0 ] || transaction_temp_state=present
+}
+
+cleanup_transaction_temps() {
+  local path
+  inspect_transaction_temps || return 1
+  for path in "${transaction_temps[@]}"; do
+    "$rm_bin" "$path" || return 1
+  done
+  durable_sync_path sync-dir "${fstab_file%/*}" || return 1
+  durable_sync_path sync-dir "${sysctl_file%/*}" || return 1
+  inspect_transaction_temps || return 1
+  [ "$transaction_temp_state" = absent ]
+}
+
 validate_managed_sysctl_path() { # path
   local path=$1 metadata kind mode size links uid gid extra content=''
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
@@ -448,7 +563,9 @@ validate_managed_sysctl_path() { # path
 }
 
 create_managed_sysctl() {
-  local temp="${sysctl_file}.tmp.$$"
+  local temp=''
+  new_transaction_temp_path "${sysctl_file}.tmp." || return 1
+  temp=$generated_temp
   [ ! -e "$sysctl_file" ] && [ ! -L "$sysctl_file" ] \
     && [ ! -e "$temp" ] && [ ! -L "$temp" ] || return 1
   current_temp=$temp
@@ -457,6 +574,7 @@ create_managed_sysctl() {
   "$chmod_bin" 0600 "$temp" || return 1
   validate_managed_sysctl_path "$temp" || return 1
   sync_regular_file "$temp" || return 1
+  test_crash_after sysctl-temp
   "$mv_bin" "$temp" "$sysctl_file" || return 1
   current_temp=''
   test_crash_after sysctl-file
@@ -626,13 +744,14 @@ inspect_fstab_backup() {
   fi
   [ -f "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
   validate_backup_metadata "$backup_path" || return 1
-  [ "$backup_mode" = "$fstab_mode" ] || return 1
   case "$fstab_state" in
     absent)
+      [ "$backup_mode" = 600 ] || [ "$backup_mode" = "$fstab_mode" ] || return 1
       backup_matches_clean_fstab "$backup_path" || return 1
       backup_state=clean-copy
       ;;
     managed)
+      [ "$backup_mode" = "$fstab_mode" ] || return 1
       backup_reconstructs_managed_fstab "$backup_path" || return 1
       backup_state=managed
       ;;
@@ -823,18 +942,21 @@ preflight_state() {
 }
 
 replace_fstab_with_managed_block() {
-  local original='' backup_path backup_temp
+  local original='' backup_path backup_temp=''
   backup_path="${fstab_file}.legaltech-swap.bak"
-  backup_temp="${backup_path}.tmp.$$"
   read_text_file "$fstab_file" original || return 1
   [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] || return 1
-  [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
+  new_transaction_temp_path "${backup_path}.tmp." || return 1
+  backup_temp=$generated_temp
 
   current_temp=$backup_temp
-  "$cp_bin" -p -n "$fstab_file" "$backup_temp" || return 1
+  ( set -o noclobber; umask 077; : > "$backup_temp" ) 2>/dev/null || return 1
+  "$cp_bin" "$fstab_file" "$backup_temp" || return 1
   validate_backup_metadata "$backup_temp" || return 1
+  [ "$backup_mode" = 600 ] || return 1
   backup_matches_clean_fstab "$backup_temp" || return 1
   sync_regular_file "$backup_temp" || return 1
+  test_crash_after fstab-backup-temp
   "$mv_bin" -n "$backup_temp" "$backup_path" || return 1
   [ ! -e "$backup_temp" ] && [ ! -L "$backup_temp" ] || return 1
   current_temp=''
@@ -843,10 +965,12 @@ replace_fstab_with_managed_block() {
   validate_backup_metadata "$backup_path" || return 1
   backup_matches_clean_fstab "$backup_path" || return 1
 
-  current_temp="${fstab_file}.legaltech-swap.tmp.$$"
-  [ ! -e "$current_temp" ] && [ ! -L "$current_temp" ] || return 1
-  "$cp_bin" -p -n "$fstab_file" "$current_temp" || return 1
+  new_transaction_temp_path "${fstab_file}.legaltech-swap.tmp." || return 1
+  current_temp=$generated_temp
+  ( set -o noclobber; umask 077; : > "$current_temp" ) 2>/dev/null || return 1
+  "$cp_bin" "$fstab_file" "$current_temp" || return 1
   validate_backup_metadata "$current_temp" || return 1
+  [ "$backup_mode" = 600 ] || return 1
   backup_matches_clean_fstab "$current_temp" || return 1
   {
     if [ -n "$original" ] && [ "${original: -1}" != $'\n' ]; then printf '\n'; fi
@@ -855,6 +979,7 @@ replace_fstab_with_managed_block() {
   } >> "$current_temp" || return 1
 
   sync_regular_file "$current_temp" || return 1
+  test_crash_after fstab-managed-temp
   "$mv_bin" "$current_temp" "$fstab_file" || return 1
   current_temp=''
   test_crash_after fstab-managed
@@ -877,6 +1002,7 @@ replace_fstab_without_managed_block() {
 cleanup_current_apply() {
   if [ -n "$current_temp" ] && { [ -e "$current_temp" ] || [ -L "$current_temp" ]; }; then
     if "$rm_bin" "$current_temp"; then
+      sync_containing_directory "$current_temp" || return 1
       current_temp=''
     else
       return 1
@@ -926,6 +1052,7 @@ apply_swap() {
   "$chmod_bin" 0600 "$swap_file" || { abort_current_apply; return 1; }
   inspect_swap_file || { abort_current_apply; return 1; }
   sync_regular_file "$swap_file" || { abort_current_apply; return 1; }
+  sync_containing_directory "$swap_file" || { abort_current_apply; return 1; }
   durable_replace_phase_metadata "$original_swappiness" mkswap \
     || { abort_current_apply; return 1; }
   test_crash_after mkswap-phase
@@ -1071,13 +1198,31 @@ rollback_swap() {
   [ "$rollback_state" = clean ]
 }
 
+rollback_preflight_state() {
+  local state
+  state=$(inspect_rollback_state) || return 1
+  if [ "$state" = clean ] && [ "$transaction_temp_state" != absent ]; then
+    return 1
+  fi
+  printf '%s\n' "$state"
+}
+
 case "$command_name" in
   apply|rollback) acquire_mutation_lock || fail ;;
 esac
 
 case "$command_name" in
+  apply|rollback) cleanup_transaction_temps || fail ;;
+  preflight|verify)
+    inspect_transaction_temps || fail
+    [ "$transaction_temp_state" = absent ] || fail
+    ;;
+  rollback-preflight) inspect_transaction_temps || fail ;;
+esac
+
+case "$command_name" in
   preflight) preflight_state || fail; exit 0 ;;
-  rollback-preflight) inspect_rollback_state || fail; exit 0 ;;
+  rollback-preflight) rollback_preflight_state || fail; exit 0 ;;
   apply) apply_swap || fail ;;
   verify) verify_managed || fail ;;
   rollback) rollback_swap || fail ;;

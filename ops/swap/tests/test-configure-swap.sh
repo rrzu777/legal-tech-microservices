@@ -41,6 +41,20 @@ expect_log_before() {
     bad "$label (lineas '$first_line' y '$second_line')"
   fi
 }
+expect_exact_log_before() {
+  local label=$1 first_pattern=$2 first_n=$3 second_pattern=$4 second_n=$5
+  local first_line second_line
+  first_line=$(grep -nFx -- "$first_pattern" "$CALL_LOG" 2>/dev/null \
+    | sed -n "${first_n}p" | cut -d: -f1)
+  second_line=$(grep -nFx -- "$second_pattern" "$CALL_LOG" 2>/dev/null \
+    | sed -n "${second_n}p" | cut -d: -f1)
+  if [ -n "$first_line" ] && [ -n "$second_line" ] \
+    && [ "$first_line" -lt "$second_line" ]; then
+    ok "$label"
+  else
+    bad "$label (lineas '$first_line' y '$second_line')"
+  fi
+}
 file_mode() {
   "$(command -v python3)" -c \
     'import os,stat,sys; print(f"{stat.S_IMODE(os.lstat(sys.argv[1]).st_mode):o}")' "$1"
@@ -55,6 +69,16 @@ mutation_count() {
 fstab_temp_count() {
   find "${FSTAB_FILE%/*}" -maxdepth 1 -type f \
     -name 'fstab.legaltech-swap*.tmp.*' | wc -l | tr -d ' '
+}
+
+nonmetadata_temp_count() {
+  {
+    find "${FSTAB_FILE%/*}" -maxdepth 1 \
+      \( -name "${FSTAB_FILE##*/}.legaltech-swap.bak.tmp.*" \
+      -o -name "${FSTAB_FILE##*/}.legaltech-swap.tmp.*" \) -print
+    find "${SYSCTL_FILE%/*}" -maxdepth 1 \
+      -name "${SYSCTL_FILE##*/}.tmp.*" -print
+  } | wc -l | tr -d ' '
 }
 
 write_stub() {
@@ -107,6 +131,7 @@ setup() {
 
   write_stub phase-python '
 case "${2:-}" in
+  temp-name|inspect-temps) ;;
   sync-file|sync-dir)
     count=$(cat "$SWAP_TEST_SYNC_COUNT_FILE") || exit 8
     case "$count" in ""|*[!0-9]*) exit 8 ;; esac
@@ -574,7 +599,7 @@ run_rollback_retry_regressions() {
 
   prepare_retryable_managed_state corrupt-backup-mode
   STAT_OVERRIDE_PATH="$FSTAB_FILE.legaltech-swap.bak"
-  STAT_OVERRIDE_MODE=600
+  STAT_OVERRIDE_MODE=644
   before_mutations=$(mutation_count)
   run_swap rollback
   expect_eq 'backup mode differing from managed fstab is unknown' "$RC" 1
@@ -597,7 +622,7 @@ run_rollback_retry_regressions() {
 
   prepare_retryable_managed_state corrupt-fstab-mode
   STAT_OVERRIDE_PATH=$FSTAB_FILE
-  STAT_OVERRIDE_MODE=600
+  STAT_OVERRIDE_MODE=644
   before_mutations=$(mutation_count)
   run_swap rollback
   expect_eq 'managed fstab mode differing from backup is unknown' "$RC" 1
@@ -1076,7 +1101,7 @@ run_phase_durability_gate_regressions() {
     case "$phase" in
       swapfile) forbidden='fallocate ' ;;
       mkswap) forbidden='mkswap ' ;;
-      fstab) forbidden="cp -p -n $FSTAB_FILE" ;;
+      fstab) forbidden="cp $FSTAB_FILE" ;;
       sysctl) forbidden='sysctl -p ' ;;
       swappiness) forbidden='sysctl -p ' ;;
       swapon) forbidden='swapon ' ;;
@@ -1110,68 +1135,80 @@ if [ -z "${SWAP_FOCUS:-}" ]; then
 fi
 
 run_artifact_durability_regressions() {
-  local boundary failed_call forbidden original_fstab saved_backup saved_fstab
+  local before_mutations boundary failed_call forbidden original_fstab saved_backup saved_fstab
   echo '== artifact fsync and directory fsync precede every durable phase advance'
   setup artifact-sync-order
   printf '%s\n' 60 > "$SWAPPINESS_STATE"
   run_swap apply
   expect_eq 'durable artifact fixture apply succeeds' "$RC" 0
-  expect_eq 'apply performs exactly eight artifact syncs' \
-    "$(grep -Ec '^(sync-file|sync-dir) ' "$CALL_LOG" 2>/dev/null || true)" 8
-  expect_log_before 'allocated swapfile is synced before mkswap phase' \
-    "sync-file $SWAP_FILE" 1 'phase-write mkswap' 1
+  expect_eq 'apply performs exactly eleven artifact syncs' \
+    "$(grep -Ec '^(sync-file|sync-dir) ' "$CALL_LOG" 2>/dev/null || true)" 11
+  expect_exact_log_before 'allocated swapfile is synced before its parent directory' \
+    "sync-file $SWAP_FILE" 1 "sync-dir ${SWAP_FILE%/*}" 1
+  expect_exact_log_before 'swapfile parent is synced before mkswap phase' \
+    "sync-dir ${SWAP_FILE%/*}" 1 'phase-write mkswap' 1
   expect_log_before 'mkswap output is synced before fstab phase' \
     "sync-file $SWAP_FILE" 2 'phase-write fstab' 1
   expect_log_before 'backup file is synced before backup rename' \
     "sync-file $FSTAB_FILE.legaltech-swap.bak.tmp." 1 \
     "mv -n $FSTAB_FILE.legaltech-swap.bak.tmp." 1
   expect_log_before 'backup rename is directory-synced before managed fstab copy' \
-    "sync-dir ${FSTAB_FILE%/*}" 1 "cp -p -n $FSTAB_FILE" 2
+    "sync-dir ${FSTAB_FILE%/*}" 2 "cp $FSTAB_FILE" 2
   expect_log_before 'managed fstab temp is synced before promotion' \
     "sync-file $FSTAB_FILE.legaltech-swap.tmp." 1 \
     "mv $FSTAB_FILE.legaltech-swap.tmp." 1
   expect_log_before 'managed fstab promotion is directory-synced before sysctl phase' \
-    "sync-dir ${FSTAB_FILE%/*}" 2 'phase-write sysctl' 1
+    "sync-dir ${FSTAB_FILE%/*}" 3 'phase-write sysctl' 1
   expect_log_before 'sysctl temp is synced before atomic promotion' \
     "sync-file $SYSCTL_FILE.tmp." 1 "mv $SYSCTL_FILE.tmp." 1
   expect_log_before 'sysctl promotion is directory-synced before swappiness phase' \
-    "sync-dir ${SYSCTL_FILE%/*}" 1 'phase-write swappiness' 1
+    "sync-dir ${SYSCTL_FILE%/*}" 2 'phase-write swappiness' 1
 
   : > "$CALL_LOG"
   printf '%s\n' 0 > "$SYNC_COUNT_FILE"
   run_swap rollback
   expect_eq 'durable artifact fixture rollback succeeds' "$RC" 0
   expect_log_before 'fstab restore rename is synced before sysctl rollback phase' \
-    "sync-dir ${FSTAB_FILE%/*}" 1 'phase-write rollback-sysctl' 1
+    "sync-dir ${FSTAB_FILE%/*}" 2 'phase-write rollback-sysctl' 1
   expect_log_before 'sysctl unlink is synced before swapfile rollback phase' \
-    "sync-dir ${SYSCTL_FILE%/*}" 1 'phase-write rollback-swapfile' 1
+    "sync-dir ${SYSCTL_FILE%/*}" 2 'phase-write rollback-swapfile' 1
   expect_log_before 'swapfile unlink is synced before metadata rollback phase' \
     'sync-dir /' 1 'phase-write rollback-metadata' 1
   expect_log_before 'metadata unlink is followed by its containing directory fsync' \
-    "rm $SWAPPINESS_METADATA_FILE" 1 "sync-dir ${SWAPPINESS_METADATA_FILE%/*}" 2
+    "rm $SWAPPINESS_METADATA_FILE" 1 "sync-dir ${SWAPPINESS_METADATA_FILE%/*}" 3
 
   echo '== fsync failure or polluted producer output blocks the next phase'
-  for failed_call in 1 2 3 4 5 6 7 8; do
+  for failed_call in 1 2 3 4 5 6 7 8 9 10 11; do
     setup "artifact-sync-fail-$failed_call"
     printf '%s\n' 60 > "$SWAPPINESS_STATE"
     SYNC_FAIL_ON_CALL=$failed_call run_swap apply
     expect_eq "artifact sync $failed_call failure refuses apply" "$RC" 1
     case "$failed_call" in
-      1) forbidden='phase-write mkswap' ;;
-      2) forbidden='phase-write fstab' ;;
-      3) forbidden="mv $FSTAB_FILE.legaltech-swap.bak.tmp." ;;
-      4) forbidden="cp -p -n $FSTAB_FILE" ;;
-      5) forbidden="mv $FSTAB_FILE.legaltech-swap.tmp." ;;
-      6) forbidden='phase-write sysctl' ;;
-      7) forbidden="mv $SYSCTL_FILE.tmp." ;;
-      8) forbidden='phase-write swappiness' ;;
+      1) forbidden='phase-write swapfile' ;;
+      2) forbidden='phase-write swapfile' ;;
+      3) forbidden='phase-write mkswap' ;;
+      4) forbidden='phase-write mkswap' ;;
+      5) forbidden='phase-write fstab' ;;
+      6) forbidden="mv -n $FSTAB_FILE.legaltech-swap.bak.tmp." ;;
+      7) forbidden="cp $FSTAB_FILE" ;;
+      8) forbidden="mv $FSTAB_FILE.legaltech-swap.tmp." ;;
+      9) forbidden='phase-write sysctl' ;;
+      10) forbidden="mv $SYSCTL_FILE.tmp." ;;
+      11) forbidden='phase-write swappiness' ;;
     esac
-    if [ "$failed_call" -eq 4 ]; then
+    if [ "$failed_call" -eq 7 ]; then
       expect_eq 'backup directory fsync failure blocks managed fstab copy' \
         "$(count_log "$forbidden")" 1
     else
       expect_eq "artifact sync $failed_call blocks its protected advance" \
         "$(count_log "$forbidden")" 0
+    fi
+    if [ "$failed_call" -eq 3 ] || [ "$failed_call" -eq 4 ]; then
+      unset SYNC_FAIL_ON_CALL
+      run_swap rollback
+      expect_eq "swapfile sync $failed_call failure has no rollback wedge" "$RC" 0
+      expect_eq "swapfile sync $failed_call failure retry removes artifacts" \
+        "$(managed_artifact_count)" 0
     fi
     unset SYNC_FAIL_ON_CALL
   done
@@ -1183,6 +1220,18 @@ run_artifact_durability_regressions() {
   expect_eq 'polluted sync output blocks mkswap phase' \
     "$(count_log 'phase-write mkswap')" 0
   unset SYNC_EXTRA_OUTPUT
+
+  setup mkswap-phase-impossible-loss
+  printf '%s\n' 60 > "$SWAPPINESS_STATE"
+  CRASH_AFTER=mkswap-phase run_swap apply
+  unset CRASH_AFTER
+  /bin/rm -rf "$STATE_DIR/resource-lock-held"
+  /bin/rm -f "$SWAP_FILE"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'mkswap phase rejects swapfile loss after parent durability' "$RC" 1
+  expect_eq 'impossible post-mkswap loss causes zero mutation' \
+    "$(mutation_count)" "$before_mutations"
 
   echo '== loss of an unconfirmed apply effect remains an exact prior-phase tuple'
   for boundary in swapfile-allocated fstab-backup fstab-managed sysctl-file; do
@@ -1206,7 +1255,7 @@ run_artifact_durability_regressions() {
   done
 
   echo '== a failed rollback directory fsync leaves an exact retryable phase'
-  for failed_call in 1 2 3 4; do
+  for failed_call in 1 2 3 4 5 6; do
     prepare_retryable_managed_state "rollback-sync-fail-$failed_call"
     original_fstab="$TMP/rollback-sync-fail-$failed_call.fstab.before"
     printf '%s\n' 0 > "$SYNC_COUNT_FILE"
@@ -1218,13 +1267,14 @@ run_artifact_durability_regressions() {
     run_swap rollback
     expect_eq "rollback sync $failed_call retry converges" "$RC" 0
     case "$failed_call" in
-      1) forbidden="sync-dir ${FSTAB_FILE%/*}" ;;
-      2) forbidden="sync-dir ${SYSCTL_FILE%/*}" ;;
-      3) forbidden="sync-dir ${SWAP_FILE%/*}" ;;
-      4) forbidden="sync-dir ${SWAPPINESS_METADATA_FILE%/*}" ;;
+      1|2) forbidden="sync-dir ${FSTAB_FILE%/*}"; boundary=1 ;;
+      3) forbidden="sync-dir ${FSTAB_FILE%/*}"; boundary=3 ;;
+      4) forbidden="sync-dir ${SYSCTL_FILE%/*}"; boundary=3 ;;
+      5) forbidden="sync-dir ${SWAP_FILE%/*}"; boundary=3 ;;
+      6) forbidden="sync-dir ${SWAPPINESS_METADATA_FILE%/*}"; boundary=3 ;;
     esac
-    expect_eq "rollback sync $failed_call retry reconfirms the exact directory first" \
-      "$(grep -E '^(sync-file|sync-dir) ' "$CALL_LOG" | sed -n '1p')" "$forbidden"
+    expect_eq "rollback sync $failed_call retry reconfirms its durable boundary" \
+      "$(grep -E '^(sync-file|sync-dir) ' "$CALL_LOG" | sed -n "${boundary}p")" "$forbidden"
     expect_file_eq "rollback sync $failed_call restores fstab" "$original_fstab" "$FSTAB_FILE"
     expect_eq "rollback sync $failed_call removes all artifacts" "$(managed_artifact_count)" 0
   done
@@ -1275,6 +1325,129 @@ fi
 
 if [ -z "${SWAP_FOCUS:-}" ]; then
   run_artifact_durability_regressions
+fi
+
+run_nonmetadata_temp_regressions() {
+  local boundary before_mutations failed_call original_fstab parent safe_temp unsafe_temp
+  echo '== clean state cannot ignore transaction temp namespaces'
+  setup temp-clean-preflight
+  safe_temp="$FSTAB_FILE.legaltech-swap.tmp.12345"
+  printf '%s\n' stale > "$safe_temp"
+  /bin/chmod 600 "$safe_temp"
+  before_mutations=$(mutation_count)
+  run_swap preflight
+  expect_eq 'safe stale temp prevents clean preflight declaration' "$RC" 1
+  expect_eq 'preflight with stale temp is nonmutating' "$(mutation_count)" "$before_mutations"
+  run_swap rollback
+  expect_eq 'rollback cleans exact legacy temp under the shared lock' "$RC" 0
+  expect_eq 'rollback removes exact legacy temp' "$(nonmetadata_temp_count)" 0
+
+  echo '== mixed safe and unsafe temp candidates fail before every deletion'
+  setup temp-mixed-unsafe
+  safe_temp="$FSTAB_FILE.legaltech-swap.tmp.12345.0123456789abcdef"
+  unsafe_temp="$SYSCTL_FILE.tmp.12346.fedcba9876543210"
+  printf '%s\n' stale > "$safe_temp"
+  /bin/chmod 600 "$safe_temp"
+  /bin/ln -s "$FSTAB_FILE" "$unsafe_temp"
+  before_mutations=$(mutation_count)
+  run_swap apply
+  expect_eq 'mixed stale temp set fails closed' "$RC" 1
+  expect_eq 'mixed stale temp set causes zero mutation' "$(mutation_count)" "$before_mutations"
+  if [ -e "$safe_temp" ] && [ -L "$unsafe_temp" ]; then
+    ok 'mixed stale temp evidence remains intact'
+  else
+    bad 'mixed stale temp evidence remains intact'
+  fi
+
+  setup temp-malformed-name
+  unsafe_temp="$FSTAB_FILE.legaltech-swap.bak.tmp.not-a-producer-name"
+  printf '%s\n' stale > "$unsafe_temp"
+  /bin/chmod 600 "$unsafe_temp"
+  before_mutations=$(mutation_count)
+  run_swap rollback
+  expect_eq 'malformed temp namespace member blocks rollback' "$RC" 1
+  expect_eq 'malformed temp namespace member causes zero mutation' \
+    "$(mutation_count)" "$before_mutations"
+
+  echo '== PID reuse cannot adopt a stale exact random temp'
+  setup temp-pid-reuse
+  safe_temp="$SYSCTL_FILE.tmp.$$.0123456789abcdef"
+  printf '%s\n' stale > "$safe_temp"
+  /bin/chmod 600 "$safe_temp"
+  run_swap apply
+  expect_eq 'apply cleans exact stale temp even when PID is reused' "$RC" 0
+  if [ ! -e "$safe_temp" ]; then ok 'PID-reuse stale temp is removed'; else bad 'PID-reuse stale temp is removed'; fi
+  run_swap rollback
+  expect_eq 'PID-reuse fixture rollback converges' "$RC" 0
+
+  echo '== temp cleanup deletion is directory-durable before apply'
+  for parent in fstab sysctl; do
+    setup "temp-cleanup-sync-retry-$parent"
+    case "$parent" in
+      fstab)
+        safe_temp="$FSTAB_FILE.legaltech-swap.tmp.12345.0123456789abcdef"
+        failed_call=1
+        ;;
+      sysctl)
+        safe_temp="$SYSCTL_FILE.tmp.12345.0123456789abcdef"
+        failed_call=2
+        ;;
+    esac
+    printf '%s\n' stale > "$safe_temp"
+    /bin/chmod 600 "$safe_temp"
+    SYNC_FAIL_ON_CALL=$failed_call run_swap apply
+    expect_eq "$parent temp cleanup directory fsync failure refuses apply" "$RC" 1
+    expect_eq "$parent temp cleanup sync failure blocks metadata phase" \
+      "$(count_log 'phase-write swapfile')" 0
+    unset SYNC_FAIL_ON_CALL
+    # A reboot may resurrect the deletion whose parent fsync failed.
+    printf '%s\n' stale > "$safe_temp"
+    /bin/chmod 600 "$safe_temp"
+    : > "$CALL_LOG"
+    printf '%s\n' 0 > "$SYNC_COUNT_FILE"
+    run_swap apply
+    expect_eq "$parent resurrected temp durability retry succeeds" "$RC" 0
+    expect_eq "$parent resurrected temp is removed" \
+      "$(nonmetadata_temp_count)" 0
+    expect_eq "$parent cleanup retry reconfirms fstab parent first" \
+      "$(grep -E '^(sync-file|sync-dir) ' "$CALL_LOG" | sed -n '1p')" \
+      "sync-dir ${FSTAB_FILE%/*}"
+    expect_eq "$parent cleanup retry reconfirms sysctl parent second" \
+      "$(grep -E '^(sync-file|sync-dir) ' "$CALL_LOG" | sed -n '2p')" \
+      "sync-dir ${SYSCTL_FILE%/*}"
+    run_swap rollback
+    expect_eq "$parent temp cleanup durability fixture rolls back" "$RC" 0
+  done
+
+  echo '== crash-created exact temps survive reboot and are cleaned before rollback'
+  for boundary in fstab-backup-temp fstab-managed-temp sysctl-temp; do
+    setup "temp-crash-$boundary"
+    printf '%s\n' 60 > "$SWAPPINESS_STATE"
+    original_fstab="$TMP/temp-crash-$boundary.fstab.before"
+    /bin/cp "$FSTAB_FILE" "$original_fstab"
+    CRASH_AFTER=$boundary run_swap apply
+    if [ "$RC" -ne 0 ]; then ok "$boundary abrupt apply is nonzero"; else bad "$boundary abrupt apply is nonzero"; fi
+    unset CRASH_AFTER
+    expect_eq "$boundary leaves one exact transaction temp" "$(nonmetadata_temp_count)" 1
+    simulate_literal_reboot
+    run_swap rollback
+    expect_eq "$boundary reboot rollback converges" "$RC" 0
+    expect_file_eq "$boundary reboot restores fstab" "$original_fstab" "$FSTAB_FILE"
+    expect_eq "$boundary reboot removes every transaction temp" "$(nonmetadata_temp_count)" 0
+    expect_eq "$boundary reboot removes managed artifacts" "$(managed_artifact_count)" 0
+  done
+}
+
+if [ "${SWAP_FOCUS:-}" = transaction-temps ]; then
+  run_nonmetadata_temp_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_nonmetadata_temp_regressions
 fi
 
 run_swappiness_metadata_regressions() {
@@ -1448,7 +1621,7 @@ expect_eq "sysctl administrado exacto" "$(cat "$SYSCTL_FILE")" "vm.swappiness=10
 expect_file_eq "backup conserva fstab original" "$TMP/fstab.before" "$FSTAB_FILE.legaltech-swap.bak"
 MUTATIONS=$(grep -E '^(phase-write|sync-file|sync-dir|fallocate|chmod|mkswap|swapon|cp|mv|sysctl -p)' "$CALL_LOG" | cut -d' ' -f1 | tr '\n' ' ')
 expect_eq "metadata y estructura durable preceden activación" "$MUTATIONS" \
-  "phase-write fallocate chmod sync-file phase-write mkswap sync-file phase-write cp sync-file mv sync-dir cp sync-file mv sync-dir phase-write chmod sync-file mv sync-dir phase-write sysctl phase-write swapon phase-write "
+  "sync-dir sync-dir phase-write fallocate chmod sync-file sync-dir phase-write mkswap sync-file phase-write cp sync-file mv sync-dir cp sync-file mv sync-dir phase-write chmod sync-file mv sync-dir phase-write sysctl phase-write swapon phase-write "
 
 echo "== apply repetido es idempotente"
 cp "$FSTAB_FILE" "$TMP/fstab.applied"
