@@ -1498,8 +1498,16 @@ restore_enabled_state() { # system|user unit enabled|disabled|static
   [ "$current" = "$desired" ]
 }
 
-restore_unit_states() {
-  local index unit desired current rc=0 action
+worker_restoration_window_allows() { # 0=standalone, 1=same-transaction compensation
+  local compensation_mode=$1
+  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
+  maintenance_window_is_open && return 0
+  [ "$compensation_mode" -eq 1 ]
+}
+
+restore_unit_states() { # 0=standalone, 1=same-transaction compensation
+  local compensation_mode=$1 index unit desired current rc=0 action
+  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
   for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_enabled_states[$index]}
@@ -1520,7 +1528,8 @@ restore_unit_states() {
       && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; }; then
       if [ "$desired" = active ]; then
         if [ "$worker_restore_allowed" -eq 1 ] \
-          && load_worker_fence_config && maintenance_window_is_open; then
+          && load_worker_fence_config \
+          && worker_restoration_window_allows "$compensation_mode"; then
           if "$systemctl_bin" start "$unit" >"$null_file" 2>&1; then
             worker_runtime_matches_capture active || rc=1
           else
@@ -1541,7 +1550,8 @@ restore_unit_states() {
       fi
     elif [ "$current" != "$desired" ]; then
       if [ "$unit" = estrado-pjud-worker.service ] && [ "$desired" = active ]; then
-        if load_worker_fence_config && maintenance_window_is_open; then
+        if load_worker_fence_config \
+          && worker_restoration_window_allows "$compensation_mode"; then
           "$systemctl_bin" start "$unit" >"$null_file" 2>&1 || rc=1
         else
           rc=1
@@ -1638,8 +1648,9 @@ validate_swap_rollback_authority() {
   swap_state=$marker
 }
 
-do_rollback() {
-  local uid rollback_rc=0 swap_rc=0 swap_state
+do_rollback() { # backup-dir [0=standalone|1=same-transaction compensation]
+  local uid rollback_rc=0 swap_rc=0 swap_state compensation_mode=${2:-0}
+  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
   backup_dir=$1
   uid=$(validate_hermes_inventory) || { fail 'rollback cannot validate Hermes inventory'; return 1; }
   build_managed_paths "$uid"
@@ -1653,7 +1664,7 @@ do_rollback() {
   worker_restore_allowed=1
   if [ "${desired_active_states[1]}" = active ] \
     && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
-    && ! maintenance_window_is_open; then
+    && ! worker_restoration_window_allows "$compensation_mode"; then
     fail 'rollback active worker restoration is outside the maintenance window'
     return 1
   fi
@@ -1672,11 +1683,13 @@ do_rollback() {
   esac
   restore_manifest "$swap_rc" || rollback_rc=1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1
-  restore_unit_states || rollback_rc=1
+  restore_unit_states "$compensation_mode" || rollback_rc=1
   restore_hermes_unit_states || rollback_rc=1
   if [ "$rollback_rc" -ne 0 ]; then
-    printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
-      "$backup_dir" >&2
+    if [ "$compensation_mode" -eq 0 ]; then
+      printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
+        "$backup_dir" >&2
+    fi
     return 1
   fi
   printf '%s\n' "ROLLBACK OK: $backup_dir"
@@ -1685,8 +1698,13 @@ do_rollback() {
 rollback_once=0
 automatic_rollback() {
   [ "$rollback_once" -eq 0 ] || return 1
+  [ "$mutation_started" -eq 1 ] || return 1
+  is_uint "$resource_lock_fd" || return 1
   rollback_once=1
-  do_rollback "$backup_dir"
+  if do_rollback "$backup_dir" 1; then return 0; fi
+  printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
+    "$backup_dir" >&2
+  return 1
 }
 
 stop_legacy_monitor_if_changed() { # change-flag monitor-array-index system-unit-index
@@ -1958,5 +1976,5 @@ case "$command_name" in
   preflight) run_preflight ;;
   apply) run_apply ;;
   postflight) run_postflight ;;
-  rollback) do_rollback "$requested_backup" ;;
+  rollback) do_rollback "$requested_backup" 0 ;;
 esac

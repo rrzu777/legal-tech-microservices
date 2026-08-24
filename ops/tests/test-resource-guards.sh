@@ -645,7 +645,16 @@ case "$*" in
   '-u +%s') cat "$RG_TEST_STATE/now" ;;
   '-u +%Y%m%dT%H%M%SZ') cat "$RG_TEST_STATE/backup-timestamp" ;;
   '+%H')
-    cat "$RG_TEST_STATE/local-hour"
+    hour=''
+    if [ -f "$RG_TEST_STATE/local-hour-sequence" ]; then
+      calls=0
+      [ ! -f "$RG_TEST_STATE/local-hour-calls" ] \
+        || calls=$(cat "$RG_TEST_STATE/local-hour-calls")
+      calls=$((calls + 1))
+      printf '%s\n' "$calls" > "$RG_TEST_STATE/local-hour-calls"
+      hour=$(sed -n "${calls}p" "$RG_TEST_STATE/local-hour-sequence")
+    fi
+    if [ -n "$hour" ]; then printf '%s\n' "$hour"; else cat "$RG_TEST_STATE/local-hour"; fi
     [ ! -e "$RG_TEST_STATE/date-hour-fail-after-output" ]
     ;;
   *'@'*'+%Y-%m-%dT%H:%M:%SZ') echo 2026-08-21T20:03:00Z ;;
@@ -2127,6 +2136,55 @@ run_rollback_maintenance_window_regressions() {
     'systemctl stop estrado-pjud-worker.service' 0
 }
 
+run_rollback_window_crossing_regressions() {
+  local backup_path retry_path
+  echo '== an apply authorized at 03:59 can compensate after crossing 04:00'
+
+  setup
+  configure_active_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  printf '%s\n' 03 04 04 04 > "$STATE/local-hour-sequence"
+  printf '%s\n' 04 > "$STATE/local-hour"
+  : > "$STATE/postflight-fail"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'cross-window postflight failure keeps apply failed' "$RC" 1
+  expect_exact_count 'cross-window automatic compensation delegates swap once' \
+    'swap rollback' 1
+  expect_contains 'cross-window automatic compensation converges' "$OUT" 'ROLLBACK OK'
+  expect_eq 'cross-window compensation restores the captured active worker' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+  expect_eq 'compensation observes 03 for apply and 04 for both rollback gates' \
+    "$(cat "$STATE/local-hour-calls")" 3
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'standalone retry remains fenced after 04:00' "$RC" 1
+  expect_exact_count 'standalone retry after 04:00 performs no swap rollback' \
+    'swap rollback' 0
+  expect_count 'standalone retry after 04:00 performs no worker stop' \
+    'systemctl stop estrado-pjud-worker.service' 0
+
+  setup
+  configure_active_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  printf '%s\n' 03 04 04 04 > "$STATE/local-hour-sequence"
+  printf '%s\n' 04 > "$STATE/local-hour"
+  : > "$STATE/postflight-fail"
+  : > "$STATE/swap-rollback-preflight-fail"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  retry_path=$(printf '%s\n' "$OUT" \
+    | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+  expect_eq 'early failed cross-window compensation keeps apply failed' "$RC" 1
+  expect_eq 'early failed cross-window compensation reports the exact retry authority once' \
+    "$retry_path" "$backup_path"
+  expect_eq 'early failed cross-window compensation emits one retry diagnostic' \
+    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 1
+  expect_exact_count 'early failed compensation never reaches swap mutation' \
+    'swap rollback' 0
+}
+
 run_orchestrated_swap_crash_regression() {
   local backup_path retry_path
   echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
@@ -2178,6 +2236,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-maintenance-window ]; then
   run_rollback_maintenance_window_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-window-crossing ]; then
+  run_rollback_window_crossing_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
@@ -2296,6 +2362,7 @@ run_incomplete_rollback_retry_regression
 run_apply_compensation_retry_regressions
 run_orchestrated_swap_crash_regression
 run_rollback_precheck_regressions
+run_rollback_window_crossing_regressions
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions
