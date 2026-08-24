@@ -70,6 +70,7 @@ setup() {
   BIN="$CASE_DIR/bin"
   EVENTS="$STATE/events"
   mkdir -p "$FAKE/repo/estrado-pjud-service" "$FAKE/repo/ops/systemd" "$FAKE/systemd" "$FAKE/run" "$CASE_DIR/tmp" \
+    "$FAKE/usr/lib/systemd/system" \
     "$FAKE/etc/sysctl.d" "$FAKE/etc/caddy" "$FAKE/etc/logrotate.d" \
     "$FAKE/monitoring" "$FAKE/backups" "$STATE" "$BIN"
   chmod 700 "$FAKE/backups"
@@ -106,6 +107,11 @@ setup() {
   cp "$FAKE/systemd/estrado-pjud-worker.service.d/xvfb.conf" \
     "$FAKE/repo/ops/systemd/estrado-pjud-worker.service.d/xvfb.conf"
   printf 'original hermes\n' > "$FAKE/systemd/user-1002.slice.d/50-legaltech-resource-limits.conf"
+  SYSTEMD_VENDOR_DIR="$FAKE/usr/lib/systemd/system"
+  printf '%s\n' '[Unit]' 'Description=Getty on %I' '[Service]' \
+    'ExecStart=-/sbin/agetty --noclear %I linux' \
+    > "$SYSTEMD_VENDOR_DIR/getty@.service"
+  chmod 0644 "$SYSTEMD_VENDOR_DIR/getty@.service"
   printf 'monitor credential placeholder\n' > "$FAKE/monitoring.env"
   chmod 600 "$FAKE/monitoring.env"
   printf 'UUID=root / ext4 defaults 0 1\n' > "$FAKE/etc/fstab"
@@ -244,7 +250,47 @@ if [ "${1:-}" = list-unit-files ]; then
   case "$(cat "$RG_TEST_STATE/list-shape" 2>/dev/null || true)" in
     unexpected-state) printf '%s\n' 'estrado-pjud.service disabled enabled' ;;
     extra) printf '%s\n' 'estrado-pjud.service enabled enabled extra' ;;
-    *) printf '%s\n' 'estrado-pjud.service enabled enabled' 'hermes-gateway.service enabled enabled' 'hermes-dashboard.service enabled disabled' ;;
+    other-template) printf '%s\n' 'estrado-pjud.service enabled enabled' \
+      'hermes-gateway.service enabled enabled' \
+      'hermes-dashboard.service enabled disabled' \
+      'serial-getty@.service enabled enabled' ;;
+    *) printf '%s\n' 'estrado-pjud.service enabled enabled' \
+      'hermes-gateway.service enabled enabled' \
+      'hermes-dashboard.service enabled disabled' \
+      'getty@.service enabled enabled'
+      if [ -e "$RG_TEST_STATE/duplicate-getty-template-inventory" ]; then
+        printf '%s\n' 'getty@.service enabled enabled'
+      fi
+      ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = cat ] && [ "${2:-}" = getty@.service ] \
+  && [ "${3:-}" = --no-pager ] && [ "$#" -eq 3 ]; then
+  case "$(cat "$RG_TEST_STATE/getty-cat-shape" 2>/dev/null || true)" in
+    override)
+      printf '%s\n' '# /etc/systemd/system/getty@.service'
+      cat "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      ;;
+    dropin)
+      printf '# %s\n' "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      cat "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      printf '%s\n' '# /etc/systemd/system/getty@.service.d/override.conf' \
+        '[Service]' 'Environment=DRIFT=1'
+      ;;
+    unexpected-header)
+      printf '%s\n' '# /tmp/getty@.service'
+      cat "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      ;;
+    fail-after-output)
+      printf '# %s\n' "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      cat "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      exit 7
+      ;;
+    *)
+      printf '# %s\n' "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      cat "$RG_SYSTEMD_VENDOR_DIR/getty@.service"
+      ;;
   esac
   exit 0
 fi
@@ -367,6 +413,7 @@ if [ "${1:-}" = show ]; then
     previous=$arg
   done
   if [ "$property" = User ]; then
+    [ "$unit" != getty@.service ] || exit 1
     case "$unit" in hermes-*) printf '%s\n' hermes ;; *) printf '\n' ;; esac
     exit 0
   fi
@@ -785,6 +832,8 @@ links=$(/usr/bin/stat -f '%l' "$path")
 if [ -e "$RG_TEST_STATE/credential-wrong-gid" ] && [ "$path" = "$RG_CREDENTIAL_FILE" ]; then gid=$((gid + 1)); fi
 if [ -e "$RG_TEST_STATE/backup-parent-wrong-gid" ] \
   && [ "$path" = "${RG_BACKUP_ROOT%/*}" ]; then gid=$((gid + 1)); fi
+if [ -e "$RG_TEST_STATE/template-wrong-owner" ] \
+  && [ "$path" = "$RG_SYSTEMD_VENDOR_DIR/getty@.service" ]; then uid=$((uid + 1)); fi
 printf '%s|%s|%s|%s\n' "$mode" "$uid" "$gid" "$links"
 EOF
   write_stub sha256 <<'EOF'
@@ -1089,7 +1138,7 @@ run_guard() {
   OUT=$(env \
     RG_TEST_MODE=1 RG_TEST_STATE="$STATE" RG_TEST_OUTSIDE="$FAKE/outside" \
     RG_TEST_ROOT_UID="$TEST_UID" RG_TEST_ROOT_GID="$TEST_GID" \
-    RG_REPO_DIR="$FAKE/repo" RG_SYSTEMD_DIR="$FAKE/systemd" RG_TMP_ROOT="$CASE_DIR/tmp" RG_DISK_PATH="$FAKE" RG_NULL_FILE="$CASE_DIR/null" \
+    RG_REPO_DIR="$FAKE/repo" RG_SYSTEMD_DIR="$FAKE/systemd" RG_SYSTEMD_VENDOR_DIR="$SYSTEMD_VENDOR_DIR" RG_TMP_ROOT="$CASE_DIR/tmp" RG_DISK_PATH="$FAKE" RG_NULL_FILE="$CASE_DIR/null" \
     RG_CREDENTIAL_FILE="$FAKE/repo/estrado-pjud-service/.env" \
     RG_BACKUP_ROOT="${TEST_BACKUP_ROOT_OVERRIDE:-$FAKE/backups}" RG_MONITORING_DIR="$FAKE/monitoring" \
     RG_MONITOR_ENV_FILE="$FAKE/monitoring.env" RG_FSTAB_FILE="$FAKE/etc/fstab" \
@@ -2383,6 +2432,69 @@ run_hermes_os_auxiliary_inventory_regressions() {
   done
 }
 
+run_system_template_inventory_regressions() {
+  local scenario template_path
+  echo '== exact vendor getty template is inspected as data without systemd loading'
+
+  setup
+  run_guard preflight --expected-sha "$EXPECTED_SHA"
+  expect_eq 'production enabled getty template passes preflight' "$RC" 0
+  expect_count 'getty template is never loaded through systemctl show' \
+    'systemctl show getty@.service' 0
+  expect_exact_count 'getty effective unit is inspected exactly once with cat' \
+    'systemctl cat getty@.service --no-pager' 1
+  expect_count 'template-only preflight performs no provision mutation' provision 0
+
+  for scenario in other-template duplicate-inventory effective-override dropin \
+    unexpected-header cat-fail-after-output wrong-path wrong-owner writable \
+    symlink hardlink user-hermes user-uid user-specifier physical-continuation \
+    ordinary-show-failure; do
+    setup
+    template_path="$SYSTEMD_VENDOR_DIR/getty@.service"
+    case "$scenario" in
+      other-template) printf '%s\n' other-template > "$STATE/list-shape" ;;
+      duplicate-inventory) : > "$STATE/duplicate-getty-template-inventory" ;;
+      effective-override) printf '%s\n' override > "$STATE/getty-cat-shape" ;;
+      dropin) printf '%s\n' dropin > "$STATE/getty-cat-shape" ;;
+      unexpected-header) printf '%s\n' unexpected-header > "$STATE/getty-cat-shape" ;;
+      cat-fail-after-output) printf '%s\n' fail-after-output > "$STATE/getty-cat-shape" ;;
+      wrong-path) /bin/mv "$template_path" "$SYSTEMD_VENDOR_DIR/getty@.service.other" ;;
+      wrong-owner) : > "$STATE/template-wrong-owner" ;;
+      writable) chmod 0666 "$template_path" ;;
+      symlink)
+        /bin/mv "$template_path" "$SYSTEMD_VENDOR_DIR/getty@.service.real"
+        ln -s getty@.service.real "$template_path"
+        ;;
+      hardlink) ln "$template_path" "$SYSTEMD_VENDOR_DIR/getty@.service.hardlink" ;;
+      user-hermes)
+        printf '%s\n' '[Unit]' 'Description=getty' '[Service]' 'User=hermes' \
+          'ExecStart=/bin/true' > "$template_path"
+        ;;
+      user-uid)
+        printf '%s\n' '[Unit]' 'Description=getty' '[Service]' 'User=1002' \
+          'ExecStart=/bin/true' > "$template_path"
+        ;;
+      user-specifier)
+        printf '%s\n' '[Unit]' 'Description=getty' '[Service]' 'User=%i' \
+          'ExecStart=/bin/true' > "$template_path"
+        ;;
+      physical-continuation)
+        printf '%s\n' '[Unit]' 'Description=getty' '[Service]' "User\\" \
+          '=hermes' 'ExecStart=/bin/true' > "$template_path"
+        ;;
+      ordinary-show-failure)
+        printf '%s\n' 'show estrado-pjud.service --property User --value' \
+          > "$STATE/fail-command"
+        ;;
+    esac
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario system template inventory fails closed" "$RC" 1
+    expect_count "$scenario performs zero provision mutation" provision 0
+    expect_count "$scenario performs zero worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+  done
+}
+
 run_orchestrated_swap_crash_regression() {
   local backup_path retry_path
   echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
@@ -2458,6 +2570,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = hermes-os-auxiliaries ]; then
   run_hermes_os_auxiliary_inventory_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = system-template-inventory ]; then
+  run_system_template_inventory_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
@@ -2579,6 +2699,7 @@ run_rollback_precheck_regressions
 run_rollback_window_crossing_regressions
 run_rollback_worker_capability_regression
 run_hermes_os_auxiliary_inventory_regressions
+run_system_template_inventory_regressions
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions
