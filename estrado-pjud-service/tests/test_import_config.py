@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,17 @@ BASE = {
     "SUPABASE_URL": "https://example.supabase.co",
     "SUPABASE_SERVICE_KEY": "service-key",
 }
+
+
+def test_import_materializer_is_scheduled_by_the_versioned_vps_crontab():
+    snapshot = (
+        Path(__file__).resolve().parents[2] / "ops" / "cron" / "crontab.snapshot"
+    ).read_text(encoding="utf-8")
+    expected = (
+        "* * * * * /opt/estrado-cron/run-cron.sh /api/cron/pjud-imports"
+    )
+
+    assert [line for line in snapshot.splitlines() if line == expected] == [expected]
 
 
 def test_import_and_excel_flags_fail_closed_by_default(monkeypatch):
