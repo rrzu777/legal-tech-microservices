@@ -77,6 +77,16 @@ def test_temporary_override_can_initialize_outside_office_window():
     ) is True
 
 
+def test_paid_pool_cannot_initialize_during_maintenance_when_overrides_are_false():
+    tz = ZoneInfo("America/Santiago")
+
+    assert can_initialize_paid_pool(
+        datetime(2026, 3, 2, 22, 0, tzinfo=tz),
+        validation_once=False,
+        process_outside_office_hours=False,
+    ) is False
+
+
 @pytest.mark.asyncio
 async def test_one_shot_validation_never_waits_for_retry():
     shutdown = asyncio.Event()

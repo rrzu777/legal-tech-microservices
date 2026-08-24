@@ -1,0 +1,12 @@
+[Unit]
+Description=Record LegalTech resource metrics every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+RandomizedDelaySec=60s
+Unit=legaltech-resource-tracker.service
+
+[Install]
+WantedBy=timers.target
