@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -34,6 +35,7 @@ router = APIRouter(prefix="/api/v1/familia", tags=["familia"])
 
 # Familia sync is expensive: login + N queries at 2.5s each. Limit to 2/min per key.
 _SYNC_TIMEOUT_S = 60
+PrivateStageGuard = Callable[[str], Awaitable[bool]]
 
 
 def _private_failure(code: str) -> PrivateCauseResolutionResult:
@@ -45,12 +47,15 @@ async def _run_private_resolution(
     rate_s: float,
     bundle,
     catalog_service,
+    stage_guard: PrivateStageGuard | None = None,
 ) -> PrivateCauseResolutionResult:
     async with FamiliaAuthSession(
         bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
     ) as session:
         try:
             await session.login(req.rut, req.password, req.auth_type)
+            if stage_guard is None or not await stage_guard("login"):
+                return _private_failure("private_fence_unavailable")
             prefix, number, year = req.case_number.split("-", 2)
             if not prefix or not number.isdigit() or not year.isdigit():
                 return _private_failure("private_identifier_mismatch")
@@ -67,6 +72,14 @@ async def _run_private_resolution(
                 expected_tribunal_label=req.tribunal_label,
                 resolve_tribunal=resolve_tribunal,
             )
+            if not await stage_guard("detail"):
+                return _private_failure("private_fence_unavailable")
+            # Movement/enrichment remains a separate guarded boundary even
+            # though Familia is listing-only and therefore cannot reach it yet.
+            movements = resolution.movements
+            if not await stage_guard("movements"):
+                return _private_failure("private_fence_unavailable")
+            resolution = resolution.model_copy(update={"movements": movements})
             html = ""
             return PrivateCauseResolutionResult(ok=True, resolution=resolution)
         except PrivateResolutionError as error:
@@ -88,18 +101,19 @@ async def familia_resolve_private(
     settings = get_settings()
     if not settings.private_familia_enabled:
         raise HTTPException(status_code=404, detail="private_familia_disabled")
-    bundle = await familia_bundle_or_alert(request.app.state.session_pool, request)
-    api_metrics.record_request("familia")
-    try:
-        async with asyncio.timeout(_SYNC_TIMEOUT_S):
-            result = await _run_private_resolution(
-                req,
-                settings.RATE_LIMIT_MS / 1000.0,
-                bundle,
-                request.app.state.catalog_service,
-            )
-    except TimeoutError:
-        result = _private_failure("timeout")
+    async with request.app.state.private_resolution_budget.slot():
+        bundle = await familia_bundle_or_alert(request.app.state.session_pool, request)
+        api_metrics.record_request("familia")
+        try:
+            async with asyncio.timeout(_SYNC_TIMEOUT_S):
+                result = await _run_private_resolution(
+                    req,
+                    settings.RATE_LIMIT_MS / 1000.0,
+                    bundle,
+                    request.app.state.catalog_service,
+                )
+        except TimeoutError:
+            result = _private_failure("timeout")
     if result.ok:
         api_metrics.record_success("familia")
     else:

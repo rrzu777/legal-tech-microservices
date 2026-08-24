@@ -20,6 +20,7 @@ from app.familia.auth import FamiliaAuthSession
 from app.my_causes.client import DiscoveryResult, DiscoveryStatus, discover_my_causes
 from app.my_causes.models import ImportCandidate, Matter
 from app.ojv.errors import OjvSessionError
+from app.ojv.budget import OjvLaneBudget
 from app.proxy_billing import ProxyBillingExhaustedError
 from worker.config import run_query
 
@@ -175,6 +176,7 @@ class ImportDiscoveryWorker:
         lease_seconds: int = 120,
         renewal_interval_seconds: float | None = None,
         enabled: bool = True,
+        lane_budget: OjvLaneBudget | None = None,
     ):
         if concurrency < 1:
             raise ValueError("import_concurrency_must_be_positive")
@@ -186,7 +188,7 @@ class ImportDiscoveryWorker:
         self._fetch_credential = fetch_credential
         self._discover = discover
         self._session_factory = session_factory
-        self._semaphore = asyncio.Semaphore(concurrency)
+        self._lane_budget = lane_budget or OjvLaneBudget(concurrency)
         self._lease_seconds = lease_seconds
         self._renewal_interval_seconds = (
             renewal_interval_seconds
@@ -314,7 +316,7 @@ class ImportDiscoveryWorker:
     async def process_next(self) -> bool:
         if not self._enabled:
             return False
-        async with self._semaphore:
+        async with self._lane_budget.slot():
             job = await self._claim()
             if job is None:
                 return False
@@ -337,7 +339,7 @@ class ImportDiscoveryWorker:
             if isinstance(raw_job, ClaimedImportJob)
             else ClaimedImportJob.model_validate(raw_job)
         )
-        async with self._semaphore:
+        async with self._lane_budget.slot():
             await self._process_claimed_with_budget(job)
 
     async def _process_claimed_with_budget(self, job: ClaimedImportJob) -> None:

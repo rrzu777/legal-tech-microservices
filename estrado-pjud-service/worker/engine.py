@@ -32,6 +32,7 @@ from app.failure_kind import (
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
 from app.familia.parser import parse_familia_results
 from app.ojv.errors import OjvSessionError
+from app.ojv.budget import OjvWorkBudgets
 from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
 from app.models import CandidateMatch, SearchRequest
 from app.parsers.anexo_parser import parse_anexo_list
@@ -659,6 +660,31 @@ class SyncEngine:
             pool, proxy_usage=self._proxy_usage,
         )
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
+        raw_capacity = (
+            getattr(config, "OJV_PROXY_POOL_SIZE", 1)
+            if getattr(config, "OJV_PROXY_URL", None)
+            else getattr(config, "POOL_SIZE", 1)
+        )
+        session_capacity = raw_capacity if isinstance(raw_capacity, int) and not isinstance(raw_capacity, bool) else 1
+        imports_enabled = getattr(config, "ENABLE_PJUD_MY_CAUSES_IMPORT", False) is True
+        raw_rate_ms = getattr(config, "RATE_LIMIT_MS", 2500)
+        lane_rate_seconds = (
+            float(raw_rate_ms) / 1000.0
+            if isinstance(raw_rate_ms, (int, float)) and not isinstance(raw_rate_ms, bool)
+            and raw_rate_ms >= 0
+            else 2.5
+        )
+        self._work_budgets = OjvWorkBudgets(
+            discovery_concurrency=1,
+            private_concurrency=1,
+            scheduled_concurrency=max(1, session_capacity - (1 if imports_enabled else 0)),
+            discovery_min_start_interval_seconds=lane_rate_seconds,
+            private_min_start_interval_seconds=lane_rate_seconds,
+            # Scheduled adapters already own one rate clock per borrowed
+            # session/IP. A second global clock here would collapse the
+            # independent proxy capacity back to one lane-wide request.
+            scheduled_min_start_interval_seconds=0.0,
+        )
         self._import_worker = ImportDiscoveryWorker(
             supabase=supabase,
             pool=pool,
@@ -666,6 +692,7 @@ class SyncEngine:
             fetch_credential=self._get_import_credential,
             concurrency=1,
             enabled=getattr(config, "ENABLE_PJUD_MY_CAUSES_IMPORT", False),
+            lane_budget=self._work_budgets.discovery,
         )
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
@@ -679,6 +706,13 @@ class SyncEngine:
     async def process_import_job(self) -> bool:
         """Poll one discovery job outside the paid public batch semaphore."""
         return await self._import_worker.process_next()
+
+    def stop_accepting_work(self) -> None:
+        """Close all local lanes before structured process drain."""
+        self._work_budgets.stop_accepting()
+
+    async def drain_work(self, *, timeout_seconds: float) -> None:
+        await self._work_budgets.drain(timeout_seconds=timeout_seconds)
 
     async def _enrich_candidates(
         self, matches: list[dict], request: SearchRequest
@@ -852,6 +886,16 @@ class SyncEngine:
         raise RuntimeError("sync_run_unavailable")
 
     async def sync_case(self, case: dict) -> dict:
+        """Run normal scheduled sync in its lane, independent of imports."""
+        async with self._work_budgets.scheduled_sync.slot():
+            return await self._sync_case_unbudgeted(case)
+
+    async def run_private_resolution(self, operation):
+        """Reserved authenticated lane; callers provide one closed operation."""
+        async with self._work_budgets.private_resolution.slot():
+            return await operation()
+
+    async def _sync_case_unbudgeted(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
 
         sync_run_id = str(uuid.uuid4())

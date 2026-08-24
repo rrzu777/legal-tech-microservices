@@ -101,6 +101,7 @@ PrivateResolutionErrorCode = Literal[
     "private_identifier_mismatch",
     "private_tribunal_mismatch",
     "private_evidence_incomplete",
+    "private_fence_unavailable",
     "credential_invalid",
     "session_expired",
     "waf",

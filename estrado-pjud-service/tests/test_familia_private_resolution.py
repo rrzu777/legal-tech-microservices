@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from unittest.mock import AsyncMock, MagicMock
 
-from app.familia.models import PrivateCauseResolutionRequest, PrivateCauseResolutionResult
+from app.familia.models import (
+    PrivateCauseResolution,
+    PrivateCauseResolutionRequest,
+    PrivateCauseResolutionResult,
+    SanitizedCaseDetail,
+    SanitizedMovement,
+)
 from app.familia.parser import PrivateResolutionError, resolve_private_familia_html
 from app.cookie_store import CookieBundle
 from app.ojv.errors import OjvTimeoutError
 from app.config import Settings
 from app.config import get_settings
+from app.ojv.budget import OjvLaneBudget
 
 
 def _html(*rows: str) -> str:
@@ -38,6 +47,10 @@ def _resolve(html: str, *, expected_tribunal_code: int = 77):
         expected_tribunal_label="1º Juzgado de Familia",
         resolve_tribunal=lambda label: 77 if label == "1º Juzgado de Familia" else None,
     )
+
+
+async def _allow_private_stage(_stage: str) -> bool:
+    return True
 
 
 def test_exact_listing_row_is_not_fabricated_into_private_detail_or_movements():
@@ -177,6 +190,7 @@ async def test_private_route_uses_one_session_but_refuses_listing_only_evidence(
 
     result = await route._run_private_resolution(
         request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None), catalog,
+        _allow_private_stage,
     )
 
     assert result.model_dump() == {
@@ -206,6 +220,7 @@ async def test_private_route_preserves_safe_session_taxonomy(monkeypatch):
 
     result = await route._run_private_resolution(
         request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None), MagicMock(),
+        _allow_private_stage,
     )
 
     assert result.model_dump() == {"ok": False, "resolution": None, "error_code": "timeout"}
@@ -228,6 +243,7 @@ async def test_private_route_maps_unexpected_upstream_failure_without_leaking(mo
 
     result = await route._run_private_resolution(
         request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None), MagicMock(),
+        _allow_private_stage,
     )
 
     assert result.model_dump() == {
@@ -235,3 +251,135 @@ async def test_private_route_maps_unexpected_upstream_failure_without_leaking(mo
     }
     assert "synthetic private body" not in result.model_dump_json()
     assert "synthetic private body" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_private_resolution_without_distributed_guard_stops_after_login(monkeypatch):
+    from app.routes import familia as route
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(route, "FamiliaAuthSession", MagicMock(return_value=session))
+    req = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+
+    result = await route._run_private_resolution(
+        req, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None),
+        MagicMock(),
+    )
+
+    assert result.error_code == "private_fence_unavailable"
+    session.login.assert_awaited_once()
+    session.search_familia.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_resolution_cannot_reach_movements_without_detail_guard(monkeypatch):
+    from app.routes import familia as route
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    session.search_familia = AsyncMock(return_value="synthetic")
+    monkeypatch.setattr(route, "FamiliaAuthSession", MagicMock(return_value=session))
+    monkeypatch.setattr(
+        route,
+        "resolve_private_familia_html",
+        MagicMock(return_value=PrivateCauseResolution(
+            matter="familia", case_number="C-88-2023", tribunal_code=77,
+            tribunal_label="1º Juzgado de Familia",
+            detail=SanitizedCaseDetail(
+                caption="PERSONA M / PERSONA N", subject=None,
+                status="Vigente", filed_at="2023-03-12",
+            ),
+            movements=[SanitizedMovement(
+                kind="status", label="Vigente", date="2023-03-12",
+            )],
+        )),
+    )
+    stages: list[str] = []
+
+    async def guard(stage: str) -> bool:
+        stages.append(stage)
+        return stage == "login"
+
+    req = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+    result = await route._run_private_resolution(
+        req, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None),
+        MagicMock(), guard,
+    )
+
+    assert result.error_code == "private_fence_unavailable"
+    assert stages == ["login", "detail"]
+
+
+@pytest.mark.asyncio
+async def test_private_http_route_uses_its_dedicated_local_budget(monkeypatch):
+    from app.routes import familia as route
+
+    request = MagicMock()
+    request.app.state.private_resolution_budget = OjvLaneBudget(1)
+    request.app.state.session_pool = MagicMock()
+    request.app.state.catalog_service = MagicMock()
+    monkeypatch.setattr(
+        route,
+        "get_settings",
+        MagicMock(return_value=MagicMock(
+            private_familia_enabled=True,
+            RATE_LIMIT_MS=0,
+        )),
+    )
+    monkeypatch.setattr(
+        route,
+        "familia_bundle_or_alert",
+        AsyncMock(return_value=CookieBundle(
+            cookies={}, user_agent="UA", saved_at=0, proxy_url=None,
+        )),
+    )
+
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def resolve(*_args):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        first_entered.set()
+        if active == 1:
+            await release_first.wait()
+        active -= 1
+        return PrivateCauseResolutionResult(
+            ok=False, resolution=None, error_code="upstream_changed",
+        )
+
+    monkeypatch.setattr(route, "_run_private_resolution", resolve)
+    req = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+
+    first = asyncio.create_task(
+        route.familia_resolve_private.__wrapped__(request, req, "test"),
+    )
+    await first_entered.wait()
+    second = asyncio.create_task(
+        route.familia_resolve_private.__wrapped__(request, req, "test"),
+    )
+    await asyncio.sleep(0)
+
+    assert peak == 1
+    assert not second.done()
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert peak == 1

@@ -59,13 +59,14 @@ async def process_batch(
     backoff: CircuitBreaker,
     proxy_control: ProxyControl | None = None,
     processing_window=is_scheduled_processing_window,
+    shutdown_grace_seconds: float = 30.0,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
 
-    Cases already dispatched (past the semaphore gate) are allowed to finish
-    even if shutdown is requested or the circuit breaker opens mid-batch; only
-    not-yet-started cases are skipped, for a graceful drain.
+    Cases already dispatched get a bounded graceful drain after shutdown;
+    unfinished work is then cancelled and remains unacknowledged for lease
+    takeover. Not-yet-started cases are skipped immediately.
     """
     sem = asyncio.Semaphore(concurrency)
 
@@ -88,10 +89,36 @@ async def process_batch(
             except Exception:
                 logger.exception("Unhandled error syncing case %s", case.get("id"))
 
-    # _run_one nunca propaga una Exception (la captura y loguea internamente);
-    # return_exceptions=True contiene además cualquier BaseException (p.ej.
-    # CancelledError durante shutdown) para que un caso no cancele a los demás.
-    await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
+    if (
+        isinstance(shutdown_grace_seconds, bool)
+        or not isinstance(shutdown_grace_seconds, (int, float))
+        or shutdown_grace_seconds < 0
+    ):
+        raise ValueError("invalid_shutdown_grace_seconds")
+
+    case_tasks = [asyncio.create_task(_run_one(case)) for case in batch]
+    batch_future = asyncio.gather(*case_tasks, return_exceptions=True)
+    shutdown_wait = asyncio.create_task(shutdown_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {batch_future, shutdown_wait}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if batch_future in done:
+            await batch_future
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(batch_future), timeout=float(shutdown_grace_seconds),
+            )
+        except asyncio.TimeoutError:
+            for task in case_tasks:
+                if not task.done():
+                    task.cancel()
+            await batch_future
+    finally:
+        if not shutdown_wait.done():
+            shutdown_wait.cancel()
+        await asyncio.gather(shutdown_wait, return_exceptions=True)
 
 
 BANDWIDTH_ALERT_COOLDOWN_S = 6 * 60 * 60  # 6h, avoid spamming ops once over budget
@@ -588,9 +615,13 @@ async def main():
         notify_stopping()
         logger.info("Shutting down...")
         shutdown_event.set()
+        if 'engine' in locals():
+            engine.stop_accepting_work()
         if import_task is not None:
             import_task.cancel()
             await asyncio.gather(import_task, return_exceptions=True)
+        if 'engine' in locals():
+            await engine.drain_work(timeout_seconds=5.0)
         await metrics.stop()
         await pool.close_all()
         logger.info("Worker stopped")
