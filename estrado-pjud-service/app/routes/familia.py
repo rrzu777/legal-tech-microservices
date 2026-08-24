@@ -112,7 +112,11 @@ async def _run_private_resolution(
                 return _private_failure("private_fence_unavailable")
             resolution = resolution.model_copy(update={"movements": movements})
             html = ""
-            return PrivateCauseResolutionResult(ok=True, resolution=resolution)
+            return PrivateCauseResolutionResult(
+                ok=True,
+                resolution=resolution,
+                error_code=None,
+            )
         except PrivateResolutionError as error:
             code = _closed_private_resolution_code(error)
             if code == "upstream_changed":

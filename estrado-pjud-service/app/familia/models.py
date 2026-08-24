@@ -114,8 +114,8 @@ class PrivateCauseResolutionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    resolution: PrivateCauseResolution | None = None
-    error_code: PrivateResolutionErrorCode | None = None
+    resolution: PrivateCauseResolution | None
+    error_code: PrivateResolutionErrorCode | None
 
     @model_validator(mode="after")
     def _consistent_result(self):

@@ -1026,7 +1026,9 @@
           }
         },
         "required": [
-          "ok"
+          "ok",
+          "resolution",
+          "error_code"
         ],
         "title": "PrivateCauseResolutionResult",
         "type": "object"
