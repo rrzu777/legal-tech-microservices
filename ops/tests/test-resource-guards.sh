@@ -154,6 +154,27 @@ setup() {
     printf '/user.slice/user-1002.slice/user@1002.service/app.slice/%s\n' "$unit" \
       > "$STATE/user-unit-$unit-control-group"
   done
+  printf '%s\n' static > "$STATE/user-unit-dbus.service-enabled"
+  printf '%s\n' active > "$STATE/user-unit-dbus.service-active"
+  printf '%s\n' loaded > "$STATE/user-unit-dbus.service-load"
+  printf '%s\n' 4303 > "$STATE/user-unit-dbus.service-main-pid"
+  printf '%s\n' /user.slice/user-1002.slice/user@1002.service/session.slice/dbus.service \
+    > "$STATE/user-unit-dbus.service-control-group"
+  printf '%s\n' notify > "$STATE/user-unit-dbus.service-type"
+  printf '%s\n' no > "$STATE/user-unit-dbus.service-remain-after-exit"
+  printf '%s\n' running > "$STATE/user-unit-dbus.service-sub-state"
+  printf '%s\n' /usr/lib/systemd/user/dbus.service \
+    > "$STATE/user-unit-dbus.service-fragment-path"
+  printf '%s\n' enabled > "$STATE/user-unit-session-migration.service-enabled"
+  printf '%s\n' inactive > "$STATE/user-unit-session-migration.service-active"
+  printf '%s\n' loaded > "$STATE/user-unit-session-migration.service-load"
+  printf '%s\n' 0 > "$STATE/user-unit-session-migration.service-main-pid"
+  : > "$STATE/user-unit-session-migration.service-control-group"
+  printf '%s\n' oneshot > "$STATE/user-unit-session-migration.service-type"
+  printf '%s\n' no > "$STATE/user-unit-session-migration.service-remain-after-exit"
+  printf '%s\n' dead > "$STATE/user-unit-session-migration.service-sub-state"
+  printf '%s\n' /usr/lib/systemd/user/session-migration.service \
+    > "$STATE/user-unit-session-migration.service-fragment-path"
   printf '%s\n' loaded > "$STATE/unit-user-1002.slice-load"
   printf '%s\n' active > "$STATE/unit-user-1002.slice-active"
   printf '%s\n' /user.slice/user-1002.slice > "$STATE/unit-user-1002.slice-control-group"
@@ -201,7 +222,14 @@ if [ "${1:-}" = -p ]; then
   cat "$RG_TEST_STATE/pid-$pid-unit"
   exit 0
 fi
-printf '%s\n' 'user@1002.service hermes-gateway.service' 'user@1002.service hermes-dashboard.service'
+if [ -f "$RG_TEST_STATE/hermes-ps-ownership" ]; then
+  cat "$RG_TEST_STATE/hermes-ps-ownership"
+else
+  printf '%s\n' 'user@1002.service init.scope' \
+    'user@1002.service hermes-gateway.service' \
+    'user@1002.service hermes-dashboard.service' \
+    'user@1002.service dbus.service'
+fi
 EOF
   write_stub systemctl <<'EOF'
 printf 'systemctl %s\n' "$*" >> "$RG_TEST_STATE/events"
@@ -240,11 +268,31 @@ if [ "${1:-}" = --user ]; then
           LoadState) value=$(cat "$(user_state_file "$unit" load)") || exit 1 ;;
           ActiveState) value=$(cat "$(user_state_file "$unit" active)") || exit 1 ;;
           MainPID)
-            if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=0
-            else value=$(cat "$(user_state_file "$unit" main-pid)") || exit 1; fi ;;
+            case "$unit" in
+              dbus.service|session-migration.service)
+                value=$(cat "$(user_state_file "$unit" main-pid)") || exit 1 ;;
+              *)
+                if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=0
+                else value=$(cat "$(user_state_file "$unit" main-pid)") || exit 1; fi ;;
+            esac ;;
           ControlGroup)
-            if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=
-            else value=$(cat "$(user_state_file "$unit" control-group)") || exit 1; fi ;;
+            case "$unit" in
+              dbus.service|session-migration.service)
+                value=$(cat "$(user_state_file "$unit" control-group)") || exit 1 ;;
+              *)
+                if [ "$(cat "$(user_state_file "$unit" active)")" = inactive ]; then value=
+                else value=$(cat "$(user_state_file "$unit" control-group)") || exit 1; fi ;;
+            esac ;;
+          UnitFileState)
+            if [ -f "$(user_state_file "$unit" unit-file-state)" ]; then
+              value=$(cat "$(user_state_file "$unit" unit-file-state)") || exit 1
+            else
+              value=$(cat "$(user_state_file "$unit" enabled)") || exit 1
+            fi ;;
+          Type) value=$(cat "$(user_state_file "$unit" type)") || exit 1 ;;
+          RemainAfterExit) value=$(cat "$(user_state_file "$unit" remain-after-exit)") || exit 1 ;;
+          SubState) value=$(cat "$(user_state_file "$unit" sub-state)") || exit 1 ;;
+          FragmentPath) value=$(cat "$(user_state_file "$unit" fragment-path)") || exit 1 ;;
           *) exit 1 ;;
         esac
       fi
@@ -261,10 +309,18 @@ if [ "${1:-}" = --user ]; then
     exit 0
   fi
   if [ "$command" = list-unit-files ]; then
-    for candidate in hermes-gateway.service hermes-dashboard.service; do
+    for candidate in hermes-gateway.service hermes-dashboard.service \
+      session-migration.service; do
       value=$(cat "$(user_state_file "$candidate" enabled)") || exit 1
       [ "$value" != enabled ] || printf '%s enabled enabled\n' "$candidate"
+      if [ "$candidate" = session-migration.service ] \
+        && [ -e "$RG_TEST_STATE/duplicate-session-migration-inventory" ]; then
+        printf '%s enabled enabled\n' "$candidate"
+      fi
     done
+    if [ -e "$RG_TEST_STATE/include-unknown-user-unit" ]; then
+      printf '%s\n' 'arbitrary-workload.service enabled enabled'
+    fi
     exit 0
   fi
   case "$command" in
@@ -2231,6 +2287,102 @@ run_rollback_worker_capability_regression() {
   expect_missing 'daytime compensation emits no retry action' "$OUT" '/retry'
 }
 
+run_hermes_os_auxiliary_inventory_regressions() {
+  local scenario
+  echo '== exact vendor Hermes OS auxiliaries are allowed without widening workloads'
+
+  setup
+  run_guard preflight --expected-sha "$EXPECTED_SHA"
+  expect_eq 'production-shaped dbus and session migration inventory passes' "$RC" 0
+  expect_count 'auxiliary validation performs no provision mutation' provision 0
+
+  for scenario in unknown-ps duplicate-dbus-ps dbus-changed dbus-unit-state dbus-remain \
+    dbus-active dbus-path dbus-cgroup dbus-duplicate session-unknown \
+    session-changed session-duplicate-inventory session-unit-state session-remain session-path \
+    session-cgroup session-pid session-active; do
+    setup
+    case "$scenario" in
+      unknown-ps)
+        printf '%s\n' 'user@1002.service init.scope' \
+          'user@1002.service hermes-gateway.service' \
+          'user@1002.service hermes-dashboard.service' \
+          'user@1002.service dbus.service' \
+          'user@1002.service arbitrary-workload.service' \
+          > "$STATE/hermes-ps-ownership"
+        ;;
+      duplicate-dbus-ps)
+        printf '%s\n' 'user@1002.service init.scope' \
+          'user@1002.service hermes-gateway.service' \
+          'user@1002.service hermes-dashboard.service' \
+          'user@1002.service dbus.service' \
+          'user@1002.service dbus.service' \
+          > "$STATE/hermes-ps-ownership"
+        ;;
+      dbus-changed)
+        printf '%s\n' simple > "$STATE/user-unit-dbus.service-type"
+        ;;
+      dbus-unit-state)
+        printf '%s\n' enabled > "$STATE/user-unit-dbus.service-unit-file-state"
+        ;;
+      dbus-remain)
+        printf '%s\n' yes > "$STATE/user-unit-dbus.service-remain-after-exit"
+        ;;
+      dbus-active)
+        printf '%s\n' inactive > "$STATE/user-unit-dbus.service-active"
+        ;;
+      dbus-path)
+        printf '%s\n' /etc/systemd/user/dbus.service \
+          > "$STATE/user-unit-dbus.service-fragment-path"
+        ;;
+      dbus-cgroup)
+        printf '%s\n' /user.slice/user-1002.slice/user@1002.service/app.slice/dbus.service \
+          > "$STATE/user-unit-dbus.service-control-group"
+        ;;
+      dbus-duplicate)
+        printf '%s\n' dbus.service:Type > "$STATE/property-duplicate"
+        ;;
+      session-unknown)
+        printf '%s\n' enabled > "$STATE/user-unit-arbitrary-workload.service-enabled"
+        : > "$STATE/include-unknown-user-unit"
+        ;;
+      session-changed)
+        printf '%s\n' simple > "$STATE/user-unit-session-migration.service-type"
+        ;;
+      session-duplicate-inventory)
+        : > "$STATE/duplicate-session-migration-inventory"
+        ;;
+      session-unit-state)
+        printf '%s\n' static \
+          > "$STATE/user-unit-session-migration.service-unit-file-state"
+        ;;
+      session-remain)
+        printf '%s\n' yes \
+          > "$STATE/user-unit-session-migration.service-remain-after-exit"
+        ;;
+      session-path)
+        printf '%s\n' /etc/systemd/user/session-migration.service \
+          > "$STATE/user-unit-session-migration.service-fragment-path"
+        ;;
+      session-cgroup)
+        printf '%s\n' /user.slice/user-1002.slice/user@1002.service/app.slice/session-migration.service \
+          > "$STATE/user-unit-session-migration.service-control-group"
+        ;;
+      session-pid)
+        printf '%s\n' 4401 > "$STATE/user-unit-session-migration.service-main-pid"
+        ;;
+      session-active)
+        printf '%s\n' active > "$STATE/user-unit-session-migration.service-active"
+        printf '%s\n' running > "$STATE/user-unit-session-migration.service-sub-state"
+        ;;
+    esac
+    TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario auxiliary drift fails closed" "$RC" 1
+    expect_count "$scenario auxiliary drift runs no provision" provision 0
+    expect_count "$scenario auxiliary drift performs no worker stop" \
+      'systemctl stop estrado-pjud-worker.service' 0
+  done
+}
+
 run_orchestrated_swap_crash_regression() {
   local backup_path retry_path
   echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
@@ -2298,6 +2450,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-worker-capability ]; then
   run_rollback_worker_capability_regression
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = hermes-os-auxiliaries ]; then
+  run_hermes_os_auxiliary_inventory_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
@@ -2418,6 +2578,7 @@ run_orchestrated_swap_crash_regression
 run_rollback_precheck_regressions
 run_rollback_window_crossing_regressions
 run_rollback_worker_capability_regression
+run_hermes_os_auxiliary_inventory_regressions
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions

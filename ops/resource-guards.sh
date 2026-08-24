@@ -718,9 +718,78 @@ check_ram() {
   [ "$available" -ge "$MIN_RAM_BYTES" ]
 }
 
+validate_hermes_os_auxiliary() { # uid dbus.service|session-migration.service
+  local uid=$1 unit=$2 output line key value line_count=0
+  local load_state='' unit_file_state='' type='' remain_after_exit=''
+  local active_state='' sub_state='' main_pid='' control_group='' fragment_path=''
+  local load_count=0 unit_file_count=0 type_count=0 remain_count=0
+  local active_count=0 sub_count=0 pid_count=0 control_count=0 fragment_count=0
+  local expected_unit_file expected_type expected_active expected_sub expected_fragment
+  case "$unit" in
+    dbus.service)
+      expected_unit_file=static
+      expected_type=notify
+      expected_active=active
+      expected_sub=running
+      expected_fragment=/usr/lib/systemd/user/dbus.service
+      ;;
+    session-migration.service)
+      expected_unit_file=enabled
+      expected_type=oneshot
+      expected_active=inactive
+      expected_sub=dead
+      expected_fragment=/usr/lib/systemd/user/session-migration.service
+      ;;
+    *) return 1 ;;
+  esac
+  output=$("$systemctl_bin" --user --machine=hermes@.host show "$unit" \
+    --property=LoadState --property=UnitFileState --property=Type \
+    --property=RemainAfterExit --property=ActiveState --property=SubState \
+    --property=MainPID --property=ControlGroup --property=FragmentPath \
+    2>"$null_file") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_count=$((line_count + 1))
+    case "$line" in *$'\r'*|*$'\t'*|*' '*) return 1 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    [ "$key" != "$line" ] || return 1
+    case "$key" in
+      LoadState) load_count=$((load_count + 1)); load_state=$value ;;
+      UnitFileState) unit_file_count=$((unit_file_count + 1)); unit_file_state=$value ;;
+      Type) type_count=$((type_count + 1)); type=$value ;;
+      RemainAfterExit) remain_count=$((remain_count + 1)); remain_after_exit=$value ;;
+      ActiveState) active_count=$((active_count + 1)); active_state=$value ;;
+      SubState) sub_count=$((sub_count + 1)); sub_state=$value ;;
+      MainPID) pid_count=$((pid_count + 1)); main_pid=$value ;;
+      ControlGroup) control_count=$((control_count + 1)); control_group=$value ;;
+      FragmentPath) fragment_count=$((fragment_count + 1)); fragment_path=$value ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [ "$line_count" -eq 9 ] && [ "$load_count" -eq 1 ] \
+    && [ "$unit_file_count" -eq 1 ] && [ "$type_count" -eq 1 ] \
+    && [ "$remain_count" -eq 1 ] && [ "$active_count" -eq 1 ] \
+    && [ "$sub_count" -eq 1 ] && [ "$pid_count" -eq 1 ] \
+    && [ "$control_count" -eq 1 ] && [ "$fragment_count" -eq 1 ] || return 1
+  [ "$load_state" = loaded ] && [ "$unit_file_state" = "$expected_unit_file" ] \
+    && [ "$type" = "$expected_type" ] && [ "$remain_after_exit" = no ] \
+    && [ "$active_state" = "$expected_active" ] && [ "$sub_state" = "$expected_sub" ] \
+    && [ "$fragment_path" = "$expected_fragment" ] || return 1
+  case "$unit" in
+    dbus.service)
+      is_uint "$main_pid" && [ "$main_pid" -gt 0 ] || return 1
+      [ "$control_group" \
+        = "/user.slice/user-$uid.slice/user@$uid.service/session.slice/dbus.service" ]
+      ;;
+    session-migration.service)
+      [ "$main_pid" = 0 ] && [ -z "$control_group" ]
+      ;;
+  esac
+}
+
 validate_hermes_inventory() {
   local uid reverse ownership system_units user_units system_unit user_unit extra
-  local unit_name unit_state preset unit_user
+  local unit_name unit_state preset unit_user dbus_seen=0 session_migration_seen=0
   uid=$("$id_bin" -u hermes 2>"$null_file") || return 1
   is_uint "$uid" || return 1
   reverse=$("$id_bin" -nu "$uid" 2>"$null_file") || return 1
@@ -729,8 +798,14 @@ validate_hermes_inventory() {
   while read -r system_unit user_unit extra; do
     [ -n "${system_unit:-}" ] || continue
     [ "$system_unit" = "user@$uid.service" ] && [ -z "${extra:-}" ] || return 1
-    case "$user_unit" in init.scope|hermes-gateway.service|hermes-dashboard.service) ;; *) return 1 ;; esac
+    case "$user_unit" in
+      init.scope|hermes-gateway.service|hermes-dashboard.service) ;;
+      dbus.service) dbus_seen=$((dbus_seen + 1)); [ "$dbus_seen" -eq 1 ] || return 1 ;;
+      *) return 1 ;;
+    esac
   done <<< "$ownership"
+  [ "$dbus_seen" -eq 1 ] || return 1
+  validate_hermes_os_auxiliary "$uid" dbus.service || return 1
   system_units=$("$systemctl_bin" list-unit-files --type=service --state=enabled --no-legend --no-pager 2>"$null_file") || return 1
   while read -r unit_name unit_state preset extra; do
     [ -n "${unit_name:-}" ] || continue
@@ -746,7 +821,15 @@ validate_hermes_inventory() {
     [ -n "${unit_name:-}" ] || continue
     [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]] && [ "$unit_state" = enabled ] && [ -z "${extra:-}" ] || return 1
     case "${preset:-}" in ''|enabled|disabled|ignored|-) ;; *) return 1 ;; esac
-    case "$unit_name" in hermes-gateway.service|hermes-dashboard.service) ;; *) return 1 ;; esac
+    case "$unit_name" in
+      hermes-gateway.service|hermes-dashboard.service) ;;
+      session-migration.service)
+        session_migration_seen=$((session_migration_seen + 1))
+        [ "$session_migration_seen" -eq 1 ] || return 1
+        validate_hermes_os_auxiliary "$uid" "$unit_name" || return 1
+        ;;
+      *) return 1 ;;
+    esac
   done <<< "$user_units"
   printf '%s\n' "$uid"
 }
