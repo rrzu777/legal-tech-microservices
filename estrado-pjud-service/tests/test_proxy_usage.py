@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -24,6 +25,11 @@ def _supabase():
     sb.from_.return_value = chain
     chain.insert.return_value = chain
     chain.upsert.return_value = chain
+    chain.select.return_value = chain
+    chain.eq.return_value = chain
+    chain.in_.return_value = chain
+    chain.gt.return_value = chain
+    chain.limit.return_value = chain
     return sb
 
 
@@ -137,6 +143,52 @@ async def test_usage_tracker_reserves_persists_and_finalizes_actual_bytes():
     assert finalize.args[0] == "pjud_proxy_finalize_budget_reservation"
     assert finalize.args[1]["p_reservation_id"] == "reservation-1"
     assert finalize.args[1]["p_release"] is False
+
+
+@pytest.mark.asyncio
+async def test_api_lookup_subject_is_validated_before_budget_and_ledger():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="api")
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{"id": "lookup-1"}]),
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        with usage_scope(
+            law_firm_id="firm-1", lookup_attempt_id="lookup-1",
+        ):
+            async with tracker.track(operation="search"):
+                record_proxy_request(10)
+
+    sb.from_.assert_any_call("pjud_lookup_attempts")
+    expires_filter = sb.from_.return_value.gt.call_args
+    assert expires_filter.args[0] == "expires_at"
+    assert abs(datetime.fromisoformat(expires_filter.args[1]) - datetime.now(timezone.utc)) < timedelta(seconds=1)
+    reserve = sb.rpc.call_args_list[0]
+    assert reserve.args[0] == "pjud_proxy_reserve_budget"
+    assert reserve.args[1]["p_law_firm_id"] == "firm-1"
+    assert reserve.args[1]["p_case_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["cross_tenant", "terminal_or_missing", "expired"])
+async def test_api_lookup_subject_fails_closed_before_paid_reservation(reason):
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="api")
+    with patch("worker.proxy_usage.run_query", return_value=_response([])):
+        with usage_scope(
+            law_firm_id="firm-other" if reason == "cross_tenant" else "firm-1",
+            lookup_attempt_id="lookup-1",
+        ):
+            with pytest.raises(ProxyUsagePersistenceError):
+                async with tracker.track(operation="search"):
+                    pass
+
+    sb.rpc.assert_not_called()
 
 
 @pytest.mark.asyncio

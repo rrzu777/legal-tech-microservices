@@ -882,6 +882,365 @@
         "title": "Movement",
         "type": "object"
       },
+      "PenalBookBatchSearchRequest": {
+        "description": "Closed internal contract for resolving one observed Penal RIT.",
+        "properties": {
+          "books": {
+            "items": {
+              "enum": [
+                "1",
+                "2",
+                "3",
+                "4",
+                "5"
+              ],
+              "type": "string"
+            },
+            "title": "Books",
+            "type": "array"
+          },
+          "caption": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Caption",
+            "type": "string"
+          },
+          "case_number": {
+            "title": "Case Number",
+            "type": "string"
+          },
+          "case_type": {
+            "const": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "competencia": {
+            "const": "penal",
+            "title": "Competencia",
+            "type": "string"
+          },
+          "contract_version": {
+            "const": 2,
+            "title": "Contract Version",
+            "type": "integer"
+          },
+          "tribunal_label": {
+            "maxLength": 240,
+            "minLength": 3,
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_version",
+          "competencia",
+          "case_type",
+          "case_number",
+          "books",
+          "tribunal_label",
+          "caption"
+        ],
+        "title": "PenalBookBatchSearchRequest",
+        "type": "object"
+      },
+      "PenalBookBatchSearchResponse": {
+        "additionalProperties": false,
+        "description": "Closed batch result: verified identity + safe detail, never a PJUD key.",
+        "properties": {
+          "blocked": {
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "case_type": {
+            "const": "rit",
+            "default": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PenalBookSafeDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "found": {
+            "title": "Found",
+            "type": "boolean"
+          },
+          "match_count": {
+            "title": "Match Count",
+            "type": "integer"
+          },
+          "status": {
+            "default": "not_found",
+            "enum": [
+              "found",
+              "not_found",
+              "needs_disambiguation",
+              "pjud_blocked",
+              "pjud_timeout",
+              "upstream_changed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "verified_match": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PenalBookVerifiedMatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "found",
+          "match_count",
+          "blocked",
+          "error"
+        ],
+        "title": "PenalBookBatchSearchResponse",
+        "type": "object"
+      },
+      "PenalBookSafeDetail": {
+        "additionalProperties": false,
+        "description": "Closed detail payload with every document/session capability removed.",
+        "properties": {
+          "blocked": {
+            "default": false,
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "error": {
+            "title": "Error",
+            "type": "null"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "litigantes": {
+            "items": {
+              "$ref": "#/components/schemas/Litigante"
+            },
+            "title": "Litigantes",
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/CaseMetadata"
+          },
+          "movements": {
+            "items": {
+              "$ref": "#/components/schemas/PenalBookSafeMovement"
+            },
+            "title": "Movements",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metadata",
+          "movements",
+          "litigantes"
+        ],
+        "title": "PenalBookSafeDetail",
+        "type": "object"
+      },
+      "PenalBookSafeMovement": {
+        "additionalProperties": false,
+        "description": "Movement evidence safe to cross the batch boundary.",
+        "properties": {
+          "cuaderno": {
+            "title": "Cuaderno",
+            "type": "string"
+          },
+          "descripcion": {
+            "title": "Descripcion",
+            "type": "string"
+          },
+          "documento_url": {
+            "title": "Documento Url",
+            "type": "null"
+          },
+          "estado": {
+            "default": "",
+            "title": "Estado",
+            "type": "string"
+          },
+          "etapa": {
+            "title": "Etapa",
+            "type": "string"
+          },
+          "fecha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha"
+          },
+          "foja": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Foja"
+          },
+          "folio": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folio"
+          },
+          "sala": {
+            "default": "",
+            "title": "Sala",
+            "type": "string"
+          },
+          "tramite": {
+            "title": "Tramite",
+            "type": "string"
+          }
+        },
+        "required": [
+          "folio",
+          "cuaderno",
+          "etapa",
+          "tramite",
+          "descripcion",
+          "fecha",
+          "foja"
+        ],
+        "title": "PenalBookSafeMovement",
+        "type": "object"
+      },
+      "PenalBookVerifiedMatch": {
+        "additionalProperties": false,
+        "description": "Verified Penal identity evidence; deliberately excludes the PJUD JWT key.",
+        "properties": {
+          "caratulado": {
+            "title": "Caratulado",
+            "type": "string"
+          },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "corte_code": {
+            "title": "Corte Code",
+            "type": "integer"
+          },
+          "fecha_ingreso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha Ingreso"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "libro_code": {
+            "enum": [
+              "1",
+              "2",
+              "3",
+              "4",
+              "5"
+            ],
+            "title": "Libro Code",
+            "type": "string"
+          },
+          "rol": {
+            "title": "Rol",
+            "type": "string"
+          },
+          "ruc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruc"
+          },
+          "tribunal": {
+            "title": "Tribunal",
+            "type": "string"
+          },
+          "tribunal_code": {
+            "title": "Tribunal Code",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rol",
+          "tribunal",
+          "caratulado",
+          "fecha_ingreso",
+          "tribunal_code",
+          "corte_code",
+          "libro_code"
+        ],
+        "title": "PenalBookVerifiedMatch",
+        "type": "object"
+      },
       "PrivateCauseResolution": {
         "additionalProperties": false,
         "properties": {
@@ -1622,6 +1981,52 @@
           }
         ],
         "summary": "Search Case",
+        "tags": [
+          "search"
+        ]
+      }
+    },
+    "/api/v1/search/penal-books": {
+      "post": {
+        "operationId": "search_penal_books_api_v1_search_penal_books_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PenalBookBatchSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PenalBookBatchSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Search Penal Books",
         "tags": [
           "search"
         ]

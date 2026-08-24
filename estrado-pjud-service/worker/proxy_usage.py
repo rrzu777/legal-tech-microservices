@@ -7,6 +7,7 @@ import hashlib
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Literal
 
 import httpx
@@ -308,6 +309,40 @@ class ProxyUsageTracker:
                     raise
                 await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
 
+    async def _validate_lookup_scope(
+        self,
+        *,
+        lookup_attempt_id: str,
+        law_firm_id: str | None,
+        operation: str,
+    ) -> None:
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._sb.from_("pjud_lookup_attempts")
+                    .select("id")
+                    .eq("id", lookup_attempt_id)
+                    .eq("law_firm_id", law_firm_id)
+                    .in_("status", ["searching", "needs_confirmation"])
+                    .gt("expires_at", datetime.now(timezone.utc).isoformat())
+                    .limit(1)
+                )
+                rows = response.data if isinstance(response.data, list) else []
+                if len(rows) != 1:
+                    raise RuntimeError(
+                        "lookup attempt attribution does not match active law firm"
+                    )
+                return
+            except httpx.TransportError:
+                logger.warning(
+                    "Transient lookup attribution operation=%s attempt=%d/%d",
+                    operation, attempt + 1, attempts,
+                )
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+
     @staticmethod
     def _normalize_session_telemetry(
         *,
@@ -355,6 +390,7 @@ class ProxyUsageTracker:
         law_firm_id: str | None = None,
         case_id: str | None = None,
         sync_run_id: str | None = None,
+        lookup_attempt_id: str | None = None,
         movement_id: str | None = None,
         transaction_key: str | None = None,
         estimated_bytes: int | None = None,
@@ -378,6 +414,7 @@ class ProxyUsageTracker:
         law_firm_id = law_firm_id or inherited["law_firm_id"]
         case_id = case_id or inherited["case_id"]
         sync_run_id = sync_run_id or inherited["sync_run_id"]
+        lookup_attempt_id = lookup_attempt_id or inherited["lookup_attempt_id"]
         if not self._enabled:
             with capture_proxy_usage() as usage:
                 usage.cause_operation = cause_operation
@@ -402,6 +439,14 @@ class ProxyUsageTracker:
                 await self._validate_sync_scope(
                     sync_run_id=sync_run_id,
                     case_id=case_id,
+                    law_firm_id=law_firm_id,
+                    operation=operation,
+                )
+            if self._component == "api" and lookup_attempt_id is not None:
+                if case_id is not None or sync_run_id is not None:
+                    raise RuntimeError("lookup attribution subject is not exclusive")
+                await self._validate_lookup_scope(
+                    lookup_attempt_id=lookup_attempt_id,
                     law_firm_id=law_firm_id,
                     operation=operation,
                 )

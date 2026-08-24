@@ -65,7 +65,7 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
     # test de arriba pasaría con un archivo vacío-consistente.
     spec = json.loads(OUT.read_text())
     for path in [
-        "/api/v1/search", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
+        "/api/v1/search", "/api/v1/search/penal-books", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
         "/api/v1/familia/resolve-private",
     ]:
         assert path in spec["paths"], f"el contrato perdió {path}"

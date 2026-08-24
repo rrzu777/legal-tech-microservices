@@ -289,6 +289,33 @@ class CatalogService:
         matches = [option for option in options if option["code"] == book_code]
         return dict(matches[0]) if len(matches) == 1 else None
 
+    def resolve_loaded_book_hint(
+        self, competencia: str, book_code: str, anno: int,
+    ) -> str | None:
+        """Validate an observed book code before its court is known.
+
+        This is deliberately only a staging hint. It proves that the code
+        exists in at least one official loaded slice for matter/year; the
+        post-selection broad lookup must still validate the exact court slice
+        before the code becomes canonical case identity.
+        """
+        prefix = f"{competencia}:"
+        suffix = f":{anno}"
+        loaded_options: list[CatalogOptions] = []
+        books = self._snapshot.get("books")
+        if isinstance(books, dict):
+            for key, record in books.items():
+                if key.startswith(prefix) and key.endswith(suffix) and isinstance(record, dict):
+                    loaded_options.append(_snapshot_options(record.get("options")))
+        for key, cached in self._cache.items():
+            if key.startswith(f"books:{prefix}") and key.endswith(suffix):
+                loaded_options.append(cached.options)
+        return book_code if any(
+            option["code"] == book_code
+            for options in loaded_options
+            for option in options
+        ) else None
+
     def resolve_loaded_tribunal(
         self, competencia: str, tribunal_label: str, *, corte: int | None = None
     ) -> TribunalIdentity | None:

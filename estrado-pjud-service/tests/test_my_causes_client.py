@@ -190,6 +190,59 @@ async def test_one_session_and_cookie_jar_are_reused_sequentially_across_matters
     assert requests[0][1] == requests[1][1] == "OJVID=session-secret"
 
 
+async def test_discovery_resolves_public_rows_before_the_persistence_boundary(
+    session_factory,
+) -> None:
+    fixtures = iter(
+        (
+            page("suprema_page_1.html"),
+            page("apelaciones_page_1.html"),
+            page("civil_page_1.html"),
+            page("laboral_page_1.html"),
+            page("cobranza_page_1.html"),
+            page("penal_page_1.html"),
+        )
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=next(fixtures), request=request)
+
+    session = session_factory(handler)
+    result = await discover_my_causes(
+        session,
+        ("suprema", "apelaciones", "civil", "laboral", "cobranza", "penal"),
+        include_closed=True,
+    )
+    await session.close()
+
+    assert result.status == "ok"
+    by_matter = {}
+    for candidate in result.candidates:
+        by_matter.setdefault(candidate.matter, candidate)
+    assert (by_matter["suprema"].court_code, by_matter["suprema"].court_label) == (None, None)
+    assert (by_matter["apelaciones"].court_code, by_matter["apelaciones"].libro) == (90, None)
+    assert (
+        by_matter["civil"].court_code,
+        by_matter["civil"].tribunal_code,
+        by_matter["civil"].libro,
+    ) == (None, None, "C")
+    assert (
+        by_matter["laboral"].court_code,
+        by_matter["laboral"].tribunal_code,
+        by_matter["laboral"].libro,
+    ) == (None, None, "T")
+    assert (
+        by_matter["cobranza"].court_code,
+        by_matter["cobranza"].tribunal_code,
+        by_matter["cobranza"].libro,
+    ) == (None, None, "C")
+    assert (
+        by_matter["penal"].court_code,
+        by_matter["penal"].tribunal_code,
+        by_matter["penal"].libro,
+    ) == (None, None, "1")
+
+
 async def test_next_page_is_traversed_with_same_form_and_bounded_page_number(
     session_factory,
 ) -> None:

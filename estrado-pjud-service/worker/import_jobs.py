@@ -78,7 +78,24 @@ def _normalize_identity_text(value: str | None) -> str | None:
 
 
 def _source_hash(candidate: ImportCandidate) -> str:
-    """Hash canonical identity only; captions, labels and row order are mutable."""
+    """Hash canonical identity plus evidence needed while territory is unknown.
+
+    Abbreviated listing labels can represent tribunals in several regions. In
+    that provisional state the caption is not canonical case identity, but it
+    must keep otherwise indistinguishable source rows apart until the selected
+    candidate is enriched. Once official codes are present it is excluded.
+    """
+    needs_evidence_discriminator = (
+        candidate.matter != "suprema"
+        and (
+            candidate.court_code is None
+            or (
+                candidate.matter not in {"apelaciones"}
+                and candidate.tribunal_code is None
+            )
+            or (candidate.matter == "apelaciones" and candidate.libro is None)
+        )
+    )
     identity = [
         candidate.matter,
         candidate.case_type,
@@ -89,6 +106,11 @@ def _source_hash(candidate: ImportCandidate) -> str:
         None if candidate.tribunal_code is not None else _normalize_identity_text(candidate.tribunal_label),
         _normalize_identity_text(candidate.libro),
     ]
+    if needs_evidence_discriminator:
+        identity.extend([
+            _normalize_identity_text(candidate.caption),
+            candidate.filed_at.isoformat() if candidate.filed_at else None,
+        ])
     encoded = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

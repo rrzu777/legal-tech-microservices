@@ -20,8 +20,10 @@ from bs4 import BeautifulSoup
 
 from pydantic import BaseModel, ConfigDict
 
+from app.catalogs import CatalogService
 from app.ojv.errors import OjvTimeoutError, SessionError
 from app.ojv.session import OjvSession, decode_ojv_html
+from app.my_causes.identity import resolve_public_import_candidate
 from app.my_causes.models import ImportCandidate, Matter
 from app.my_causes.parser import UpstreamChangedError, parse_my_causes_page
 from app.parsers.search_parser import detect_blocked
@@ -37,6 +39,7 @@ _AJAX_HEADERS = {
 }
 _MAX_PAGES_HARD = 100
 _TRANSIENT_ATTEMPTS = 2
+_PUBLIC_IMPORT_CATALOGS = CatalogService(None)
 
 
 @dataclass(frozen=True)
@@ -314,6 +317,10 @@ async def discover_my_causes(
                 parsed = parse_my_causes_page(html, matter)
             except UpstreamChangedError:
                 return _result(collected, page_count, "upstream_changed")
+            parsed = [
+                resolve_public_import_candidate(candidate, _PUBLIC_IMPORT_CATALOGS)
+                for candidate in parsed
+            ]
 
             fingerprint = _fingerprint(parsed)
             if fingerprint in seen_fingerprints:

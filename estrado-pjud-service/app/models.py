@@ -183,6 +183,33 @@ class SearchRequest(BaseModel):
         return self
 
 
+class PenalBookBatchSearchRequest(BaseModel):
+    """Closed internal contract for resolving one observed Penal RIT."""
+
+    contract_version: Literal[2]
+    competencia: Literal["penal"]
+    case_type: Literal["rit"]
+    case_number: str
+    books: list[Literal["1", "2", "3", "4", "5"]]
+    tribunal_label: str = Field(min_length=3, max_length=240)
+    caption: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _validate_closed_batch(self):
+        if self.books != ["1", "2", "3", "4", "5"]:
+            raise ValueError("books must be the official closed Penal set 1-5")
+        _validate_v2_search_contract(
+            case_type=self.case_type,
+            case_number=self.case_number,
+            competencia=self.competencia,
+            corte=None,
+            tribunal=None,
+            libro="1",
+            search_mode=None,
+            allow_broad=True,
+        )
+        return self
+
 class CandidateMatch(BaseModel):
     key: str
     rol: str
@@ -198,6 +225,23 @@ class CandidateMatch(BaseModel):
     corte_code: int | None = None
     libro: str | None = None
     libro_code: str | None = None
+
+
+class PenalBookVerifiedMatch(BaseModel):
+    """Verified Penal identity evidence; deliberately excludes the PJUD JWT key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rol: str
+    ruc: str | None = None
+    tribunal: str
+    caratulado: str
+    fecha_ingreso: str | None
+    tribunal_code: int
+    corte: str | None = None
+    corte_code: int
+    libro: str | None = None
+    libro_code: Literal["1", "2", "3", "4", "5"]
 
 
 class SearchResponse(BaseModel):
@@ -327,6 +371,51 @@ class DetailResponse(BaseModel):
     # Exhortos and Incompetencia tables
     exhortos: list[dict] = []
     incompetencia: list[dict] = []
+
+
+class PenalBookSafeMovement(BaseModel):
+    """Movement evidence safe to cross the batch boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    folio: int | None
+    cuaderno: str
+    etapa: str
+    tramite: str
+    descripcion: str
+    fecha: str | None
+    foja: int | None
+    documento_url: None = None
+    sala: str = ""
+    estado: str = ""
+
+
+class PenalBookSafeDetail(BaseModel):
+    """Closed detail payload with every document/session capability removed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: CaseMetadata
+    movements: list[PenalBookSafeMovement]
+    litigantes: list[Litigante]
+    libro: str | None = None
+    blocked: bool = False
+    error: None = None
+
+
+class PenalBookBatchSearchResponse(BaseModel):
+    """Closed batch result: verified identity + safe detail, never a PJUD key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    match_count: int
+    verified_match: PenalBookVerifiedMatch | None = None
+    detail: PenalBookSafeDetail | None = None
+    blocked: bool
+    error: str | None
+    case_type: Literal["rit"] = "rit"
+    status: SearchStatus = "not_found"
 
 
 class PrivateSyncHealth(BaseModel):
