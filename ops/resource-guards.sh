@@ -31,7 +31,7 @@ is_uint() {
 }
 
 readonly -a OVERRIDE_NAMES=(
-  RG_REPO_DIR RG_SYSTEMD_DIR RG_CREDENTIAL_FILE RG_BACKUP_ROOT RG_TMP_ROOT RG_DISK_PATH RG_NULL_FILE
+  RG_REPO_DIR RG_SYSTEMD_DIR RG_SYSTEMD_VENDOR_DIR RG_CREDENTIAL_FILE RG_BACKUP_ROOT RG_TMP_ROOT RG_DISK_PATH RG_NULL_FILE
   RG_MONITORING_DIR RG_MONITOR_ENV_FILE RG_FSTAB_FILE RG_SYSCTL_FILE RG_SWAPPINESS_METADATA_FILE
   RG_CADDYFILE RG_LOGROTATE_FILE RG_JURISTRACK_HEALTH_URL
   RG_ESTRADO_HEALTH_URL RG_GIT_BIN RG_DF_BIN RG_FREE_BIN RG_ID_BIN RG_PS_BIN
@@ -62,6 +62,7 @@ if [ "${PROV_ENABLE_PJUD_WORKER:-0}" != 0 ]; then usage; fi
 
 repo_dir=${RG_REPO_DIR:-/opt/legal-tech-microservices}
 systemd_dir=${RG_SYSTEMD_DIR:-/etc/systemd/system}
+systemd_vendor_dir=${RG_SYSTEMD_VENDOR_DIR:-/usr/lib/systemd/system}
 credential_file=${RG_CREDENTIAL_FILE:-$repo_dir/estrado-pjud-service/.env}
 backup_root=${RG_BACKUP_ROOT:-/var/backups/legaltech-resource-guards}
 tmp_root=${RG_TMP_ROOT:-/tmp}
@@ -308,7 +309,7 @@ except BaseException:
 sys.stdout.write("DURABLE_SYNC_OK\n")'
 
 for absolute_value in \
-  "$repo_dir" "$systemd_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
+  "$repo_dir" "$systemd_dir" "$systemd_vendor_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
   "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" \
   "$caddyfile" "$logrotate_file" "$git_bin" "$df_bin" "$free_bin" \
   "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" "$sleep_bin" \
@@ -787,9 +788,79 @@ validate_hermes_os_auxiliary() { # uid dbus.service|session-migration.service
   esac
 }
 
+validate_getty_system_template() { # Hermes uid
+  local uid=$1 path="$systemd_vendor_dir/getty@.service" fields fields_after
+  local mode owner group links extra line section='' key service_sections=0
+  local vendor_content vendor_content_after output body='' line_number=0 header_count=0
+  safe_existing_path "$path" && [ -f "$path" ] || return 1
+  fields=$(stat_fields "$path") || return 1
+  IFS='|' read -r mode owner group links extra <<< "$fields"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ "$owner" = "$root_uid" ] \
+    && [ "$group" = "$root_gid" ] && [ "$links" = 1 ] \
+    && [ -z "${extra:-}" ] || return 1
+  [ $((8#$mode & 022)) -eq 0 ] || return 1
+  vendor_content=$(<"$path") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *$'\r'*) return 1 ;; esac
+    case "$line" in *\\) return 1 ;; esac
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case "$line" in ''|'#'*|';'*) continue ;; esac
+    case "$line" in
+      '['*']')
+        if [ "$line" = '[Service]' ]; then
+          service_sections=$((service_sections + 1))
+          section=Service
+        elif [[ "$line" =~ ^\[[A-Za-z0-9_.-]+\]$ ]]; then
+          section=${line#'['}
+          section=${section%']'}
+        else
+          return 1
+        fi
+        ;;
+      *)
+        [ -n "$section" ] || return 1
+        [ "$section" = Service ] || continue
+        key=${line%%=*}
+        [ "$key" != "$line" ] || continue
+        key=${key#"${key%%[![:space:]]*}"}
+        key=${key%"${key##*[![:space:]]}"}
+        [ "$key" != User ] || return 1
+        ;;
+    esac
+  done < "$path"
+  [ "$service_sections" -eq 1 ] || return 1
+
+  output=$("$systemctl_bin" cat getty@.service --no-pager 2>"$null_file") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    case "$line" in *$'\r'*) return 1 ;; esac
+    case "$line" in
+      '# /'*)
+        header_count=$((header_count + 1))
+        [ "$header_count" -eq 1 ] && [ "$line_number" -eq 1 ] \
+          && [ "$line" = "# $path" ] || return 1
+        ;;
+      *)
+        [ "$header_count" -eq 1 ] || return 1
+        if [ -n "$body" ]; then body+=$'\n'; fi
+        body+=$line
+        ;;
+    esac
+  done <<< "$output"
+  [ "$header_count" -eq 1 ] && [ "$body" = "$vendor_content" ] || return 1
+
+  safe_existing_path "$path" && [ -f "$path" ] || return 1
+  fields_after=$(stat_fields "$path") || return 1
+  [ "$fields_after" = "$fields" ] || return 1
+  vendor_content_after=$(<"$path") || return 1
+  [ "$vendor_content_after" = "$vendor_content" ]
+}
+
 validate_hermes_inventory() {
   local uid reverse ownership system_units user_units system_unit user_unit extra
   local unit_name unit_state preset unit_user dbus_seen=0 session_migration_seen=0
+  local getty_template_seen=0
   uid=$("$id_bin" -u hermes 2>"$null_file") || return 1
   is_uint "$uid" || return 1
   reverse=$("$id_bin" -nu "$uid" 2>"$null_file") || return 1
@@ -811,11 +882,21 @@ validate_hermes_inventory() {
     [ -n "${unit_name:-}" ] || continue
     [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]] && [ "$unit_state" = enabled ] && [ -z "${extra:-}" ] || return 1
     case "${preset:-}" in ''|enabled|disabled|ignored|-) ;; *) return 1 ;; esac
+    case "$unit_name" in
+      getty@.service)
+        getty_template_seen=$((getty_template_seen + 1))
+        [ "$getty_template_seen" -eq 1 ] || return 1
+        validate_getty_system_template "$uid" || return 1
+        continue
+        ;;
+      *@.service) return 1 ;;
+    esac
     unit_user=$("$systemctl_bin" show "$unit_name" --property User --value 2>"$null_file") || return 1
     if [ "$unit_user" = hermes ] || [ "$unit_user" = "$uid" ]; then
       case "$unit_name" in hermes-gateway.service|hermes-dashboard.service|"user@$uid.service") ;; *) return 1 ;; esac
     fi
   done <<< "$system_units"
+  [ "$getty_template_seen" -eq 1 ] || return 1
   user_units=$("$systemctl_bin" --user --machine=hermes@.host list-unit-files --type=service --state=enabled --no-legend --no-pager 2>"$null_file") || return 1
   while read -r unit_name unit_state preset extra; do
     [ -n "${unit_name:-}" ] || continue
