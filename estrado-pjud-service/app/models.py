@@ -1,7 +1,7 @@
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
 SearchMode = Literal["supreme_resource", "appeals_resource", "first_instance"]
@@ -132,7 +132,13 @@ def _validate_v2_search_contract(
 
 class SearchRequest(BaseModel):
     contract_version: Literal[1, 2] = 1
-    case_type: str
+    case_type: str = Field(
+        description=(
+            "Case identifier type. Canonical values are rol, rit, and ruc. "
+            "For cobranza, use rit; the temporary deprecated rol alias is accepted "
+            "and normalized to rit. Cobranza does not accept ruc."
+        ),
+    )
     case_number: str  # "X-NNNN-YYYY"
     competencia: COMPETENCIA_TYPE
     corte: int | None = None
@@ -144,6 +150,12 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_corte(self):
+        if self.competencia == "cobranza":
+            if self.case_type == "rol":
+                self.case_type = "rit"
+            elif self.case_type == "ruc":
+                raise ValueError("cobranza requires rit; rol is accepted as a deprecated alias")
+
         if self.contract_version == 2:
             return self._validate_v2()
 
@@ -171,6 +183,33 @@ class SearchRequest(BaseModel):
         return self
 
 
+class PenalBookBatchSearchRequest(BaseModel):
+    """Closed internal contract for resolving one observed Penal RIT."""
+
+    contract_version: Literal[2]
+    competencia: Literal["penal"]
+    case_type: Literal["rit"]
+    case_number: str
+    books: list[Literal["1", "2", "3", "4", "5"]]
+    tribunal_label: str = Field(min_length=3, max_length=240)
+    caption: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _validate_closed_batch(self):
+        if self.books != ["1", "2", "3", "4", "5"]:
+            raise ValueError("books must be the official closed Penal set 1-5")
+        _validate_v2_search_contract(
+            case_type=self.case_type,
+            case_number=self.case_number,
+            competencia=self.competencia,
+            corte=None,
+            tribunal=None,
+            libro="1",
+            search_mode=None,
+            allow_broad=True,
+        )
+        return self
+
 class CandidateMatch(BaseModel):
     key: str
     rol: str
@@ -188,12 +227,36 @@ class CandidateMatch(BaseModel):
     libro_code: str | None = None
 
 
+class PenalBookVerifiedMatch(BaseModel):
+    """Verified Penal identity evidence; deliberately excludes the PJUD JWT key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rol: str
+    ruc: str | None = None
+    tribunal: str
+    caratulado: str
+    fecha_ingreso: str | None
+    tribunal_code: int
+    corte: str | None = None
+    corte_code: int
+    libro: str | None = None
+    libro_code: Literal["1", "2", "3", "4", "5"]
+
+
 class SearchResponse(BaseModel):
     found: bool
     match_count: int
     matches: list[CandidateMatch]
     blocked: bool
     error: str | None
+    case_type: str | None = Field(
+        default=None,
+        description=(
+            "Normalized request case identifier type. Cobranza responses emit rit; "
+            "deprecated rol is accepted only as an input alias."
+        ),
+    )
     libro_used: str | None = None
     # Additive v2 rollout fields.  The legacy quartet above keeps its exact
     # semantics until JurisTrack has switched to the canonical contract.
@@ -310,6 +373,68 @@ class DetailResponse(BaseModel):
     incompetencia: list[dict] = []
 
 
+class PenalBookSafeMovement(BaseModel):
+    """Movement evidence safe to cross the batch boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    folio: int | None
+    cuaderno: str
+    etapa: str
+    tramite: str
+    descripcion: str
+    fecha: str | None
+    foja: int | None
+    documento_url: None = None
+    sala: str = ""
+    estado: str = ""
+
+
+class PenalBookSafeDetail(BaseModel):
+    """Closed detail payload with every document/session capability removed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: CaseMetadata
+    movements: list[PenalBookSafeMovement]
+    litigantes: list[Litigante]
+    libro: str | None = None
+    blocked: bool = False
+    error: None = None
+
+
+class PenalBookBatchSearchResponse(BaseModel):
+    """Closed batch result: verified identity + safe detail, never a PJUD key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    match_count: int
+    verified_match: PenalBookVerifiedMatch | None = None
+    detail: PenalBookSafeDetail | None = None
+    blocked: bool
+    error: str | None
+    case_type: Literal["rit"] = "rit"
+    status: SearchStatus = "not_found"
+
+
+class PrivateSyncHealth(BaseModel):
+    """Closed count-only schema: dimensions and arbitrary keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempts: int = Field(default=0, ge=0)
+    credential_invalid: int = Field(default=0, ge=0)
+    session_expired: int = Field(default=0, ge=0)
+    waf: int = Field(default=0, ge=0)
+    timeout: int = Field(default=0, ge=0)
+    upstream_schema_change: int = Field(default=0, ge=0)
+    lease_churn: int = Field(default=0, ge=0)
+    lease_loss: int = Field(default=0, ge=0)
+    retry_exhaustion: int = Field(default=0, ge=0)
+    incomplete_enrichment: int = Field(default=0, ge=0)
+
+
 class HealthResponse(BaseModel):
     status: str
     last_successful_request: str | None
@@ -332,3 +457,6 @@ class HealthResponse(BaseModel):
     # otra IP residencial salvó la consulta. Sin los dos, un pool con 2 de 3
     # bundles quemados se ve igual que uno sano, porque la app recibió su 200.
     total_bundle_retries: int = 0
+    # Un solo objeto de contadores finitos: nunca dimensiones por tenant,
+    # credencial, usuario, causa o RUT.
+    private_sync: PrivateSyncHealth = Field(default_factory=PrivateSyncHealth)

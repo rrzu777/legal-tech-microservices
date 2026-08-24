@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import httpx
@@ -11,7 +12,22 @@ from app.matching import (
     is_definitive_not_found,
     matches_requested_candidate,
 )
-from app.models import SearchRequest, SearchResponse, CandidateMatch
+from app.models import (
+    CandidateMatch,
+    DetailResponse,
+    CaseMetadata,
+    Litigante,
+    Movement,
+    PenalBookBatchSearchResponse,
+    PenalBookBatchSearchRequest,
+    PenalBookSafeDetail,
+    PenalBookSafeMovement,
+    PenalBookVerifiedMatch,
+    SearchRequest,
+    SearchResponse,
+)
+from app.my_causes.identity import known_penal_book_code_for_rit
+from app.parsers.detail_parser import parse_detail
 from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import competencia_path, parse_search_identifier, resolve_libro
 from app.parsers.search_parser import parse_search_results, detect_blocked
@@ -136,19 +152,29 @@ def _enrich_v2_candidates(
             match.libro = official_book["label"]
 
 
-@router.post("/search", response_model=SearchResponse)
-@limiter.limit("5/minute")
-async def search_case(req: SearchRequest, request: Request, _api_key: str = verify_api_key):
+async def _search_case(
+    req: SearchRequest,
+    request: Request,
+    *,
+    session=None,
+) -> SearchResponse:
     pool = request.app.state.session_pool
     # Fuera del `try` de abajo a proposito: ese try devuelve 200 con `error` para
     # TODO lo que falla adentro, asi que un fallo de pool ahi seria invisible.
     # `acquire_or_alert` lo cuenta, alerta y convierte indisponibilidad conocida
     # en 503; un 500 queda reservado para defectos inesperados.
-    session = await acquire_or_alert(pool, request, "search")
+    owns_session = session is None
+    if owns_session:
+        session = await acquire_or_alert(pool, request, "search")
 
     healthy = True
     try:
         api_metrics.record_request("search")
+        logger.info(
+            "PJUD search requested competencia=%s case_type=%s",
+            req.competencia,
+            req.case_type,
+        )
 
         parsed = parse_search_identifier(req.case_type, req.case_number)
         comp_path = competencia_path(req.competencia)
@@ -186,6 +212,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=True,
                 error="Request blocked by WAF or captcha",
+                case_type=req.case_type,
                 libro_used=None,
                 status="pjud_blocked",
             )
@@ -196,7 +223,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
             if req.contract_version == 2:
                 return SearchResponse(
                     found=False, match_count=0, matches=[], blocked=False,
-                    error="PJUD search response could not be parsed", libro_used=None,
+                    error="PJUD search response could not be parsed", case_type=req.case_type,
+                    libro_used=None,
                     status="upstream_changed",
                 )
             raise
@@ -205,7 +233,8 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if req.contract_version == 2 and not matches and not is_definitive_not_found(html):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=False,
-                error="PJUD search response could not be parsed", libro_used=None,
+                error="PJUD search response could not be parsed", case_type=req.case_type,
+                libro_used=None,
                 status="upstream_changed",
             )
 
@@ -261,13 +290,16 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
                 logger.warning("Loaded PJUD catalog could not resolve search identity")
                 return SearchResponse(
                     found=False, match_count=0, matches=[], blocked=False,
-                    error="PJUD search identity could not be resolved", libro_used=None,
+                    error="PJUD search identity could not be resolved", case_type=req.case_type,
+                    libro_used=None,
                     status="upstream_changed",
                 )
 
         api_metrics.record_success("search")
 
-        return build_search_response(matches, req, libro_used=libro_used)
+        response = build_search_response(matches, req, libro_used=libro_used)
+        response.case_type = req.case_type
+        return response
 
     except Exception as e:
         logger.exception("Search failed")
@@ -276,7 +308,7 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         if req.contract_version == 2 and isinstance(e, httpx.TimeoutException):
             return SearchResponse(
                 found=False, match_count=0, matches=[], blocked=False,
-                error="PJUD request timed out", libro_used=None,
+                error="PJUD request timed out", case_type=req.case_type, libro_used=None,
                 status="pjud_timeout",
             )
         kind = await classify_and_alert(e, request, "search")
@@ -290,8 +322,237 @@ async def search_case(req: SearchRequest, request: Request, _api_key: str = veri
         return SearchResponse(
             found=False, match_count=0, matches=[], blocked=kind == "ojv",
             error=safe_error(e),
+            case_type=req.case_type,
             libro_used=None,
             status="pjud_blocked" if kind == "ojv" else "not_found",
         )
     finally:
-        await pool.release(session, healthy=healthy)
+        if owns_session:
+            await pool.release(session, healthy=healthy)
+
+
+def _tribunal_tokens(value: str) -> list[str]:
+    aliases = {"JDO": "JUZGADO", "COB": "COBRANZA"}
+    return [
+        aliases.get(token, token)
+        for token in normalize_catalog_label(value).split()
+        if token not in {"DE", "DEL", "LA", "EL"}
+    ]
+
+
+def _batch_evidence_compatible(
+    candidate: CandidateMatch,
+    req: PenalBookBatchSearchRequest,
+) -> bool:
+    expected = _tribunal_tokens(req.tribunal_label)
+    actual = _tribunal_tokens(candidate.tribunal)
+    return (
+        len(expected) >= 3
+        and len(expected) <= len(actual)
+        and expected == actual[:len(expected)]
+        and normalize_catalog_label(candidate.caratulado)
+        == normalize_catalog_label(req.caption)
+        and candidate.corte_code is not None
+        and candidate.tribunal_code is not None
+        and candidate.libro_code in req.books
+    )
+
+
+def _batch_response(
+    match_count: int,
+    status: str,
+    *,
+    verified_match: PenalBookVerifiedMatch | None = None,
+    detail: PenalBookSafeDetail | None = None,
+    error: str | None = None,
+    blocked: bool = False,
+) -> PenalBookBatchSearchResponse:
+    return PenalBookBatchSearchResponse(
+        found=verified_match is not None and detail is not None,
+        match_count=match_count,
+        verified_match=verified_match,
+        detail=detail,
+        blocked=blocked, error=error, case_type="rit",
+        status=status,
+    )
+
+
+def _safe_penal_detail(
+    detail: DetailResponse,
+    candidate: CandidateMatch,
+) -> PenalBookSafeDetail:
+    return PenalBookSafeDetail(
+        metadata=detail.metadata,
+        movements=[PenalBookSafeMovement(
+            folio=movement.folio,
+            cuaderno=movement.cuaderno,
+            etapa=movement.etapa,
+            tramite=movement.tramite,
+            descripcion=movement.descripcion,
+            fecha=movement.fecha,
+            foja=movement.foja,
+            documento_url=None,
+            sala=movement.sala,
+            estado=movement.estado,
+        ) for movement in detail.movements],
+        litigantes=detail.litigantes,
+        libro=candidate.libro_code,
+    )
+
+
+def _penal_detail_matches_listing(
+    detail: DetailResponse,
+    candidate: CandidateMatch,
+    req: PenalBookBatchSearchRequest,
+) -> bool:
+    metadata = detail.metadata
+    detail_rol = metadata.rol if isinstance(metadata, CaseMetadata) else str(metadata.get("rol", ""))
+    detail_tribunal = metadata.tribunal if isinstance(metadata, CaseMetadata) else str(metadata.get("tribunal", ""))
+    detail_libro = (detail.libro or (
+        metadata.libro if isinstance(metadata, CaseMetadata) else str(metadata.get("libro", ""))
+    ))
+    detail_caption = (
+        metadata.caratulado if isinstance(metadata, CaseMetadata)
+        else str(metadata.get("caratulado", ""))
+    )
+    observed_prefix = candidate.rol.split("-", 1)[0].strip().upper()
+    known_book_code = known_penal_book_code_for_rit(candidate.rol)
+    return (
+        normalize_catalog_label(detail_rol) == normalize_catalog_label(candidate.rol)
+        and normalize_catalog_label(detail_tribunal)
+        == normalize_catalog_label(candidate.tribunal)
+        and normalize_catalog_label(detail_libro)
+        == normalize_catalog_label(observed_prefix)
+        and (known_book_code is None or known_book_code == candidate.libro_code)
+        and (
+            not detail_caption
+            or normalize_catalog_label(detail_caption)
+            == normalize_catalog_label(req.caption)
+        )
+    )
+
+
+async def _fetch_penal_detail(
+    session,
+    candidate: CandidateMatch,
+    request: Request,
+) -> DetailResponse:
+    proxy_usage = getattr(request.app.state, "proxy_usage", DISABLED_PROXY_USAGE)
+    async with proxy_usage.track(operation="detail") as usage:
+        html = await session.detail(competencia_path("penal"), candidate.key)
+        reject_empty_body(html, "penal batch detail")
+        blocked_response = detect_blocked(html)
+        if blocked_response:
+            usage.status = "blocked"
+            usage.error_kind = "ojv"
+    if blocked_response:
+        return DetailResponse(
+            metadata={}, movements=[], litigantes=[], libro=None,
+            blocked=True, error="Empty or blocked response from OJV",
+        )
+    parsed = parse_detail(html)
+    metadata = CaseMetadata(**parsed["metadata"]) if parsed["metadata"] else CaseMetadata()
+    return DetailResponse(
+        metadata=metadata,
+        movements=[Movement(**movement) for movement in parsed["movements"]],
+        litigantes=[Litigante(**party) for party in parsed["litigantes"]],
+        libro=metadata.libro or None,
+        blocked=False,
+        error=None,
+    )
+
+
+async def _run_penal_book_batch(
+    req: PenalBookBatchSearchRequest,
+    request: Request,
+    *,
+    session=None,
+) -> PenalBookBatchSearchResponse:
+    owns_session = session is None
+    pool = request.app.state.session_pool if owns_session else None
+    if owns_session:
+        session = await acquire_or_alert(pool, request, "penal_book_batch")
+    healthy = True
+    compatible: dict[tuple[int, int, str], CandidateMatch] = {}
+    try:
+        for book in req.books:
+            branch = await _search_case(SearchRequest(
+                contract_version=2,
+                competencia="penal",
+                case_type="rit",
+                case_number=req.case_number,
+                libro=book,
+                allow_broad=True,
+                max_matches=100,
+            ), request, session=session)
+            if branch.blocked or branch.error or branch.truncated:
+                # The nested search owns no release when it shares the batch
+                # session, so the outer owner must retire it for every
+                # incomplete/blocked response (including a caught timeout).
+                healthy = False
+                return _batch_response(
+                    0, branch.status, error=branch.error, blocked=branch.blocked,
+                )
+            for candidate in branch.matches:
+                if _batch_evidence_compatible(candidate, req):
+                    compatible[(
+                        candidate.corte_code,
+                        candidate.tribunal_code,
+                        candidate.libro_code,
+                    )] = candidate
+
+        if len(compatible) == 0:
+            return _batch_response(0, "not_found")
+        if len(compatible) != 1:
+            return _batch_response(len(compatible), "needs_disambiguation")
+
+        verified_candidate = next(iter(compatible.values()))
+        detail = await _fetch_penal_detail(session, verified_candidate, request)
+        if detail.blocked or detail.error:
+            healthy = False
+            return _batch_response(
+                0, "pjud_blocked" if detail.blocked else "upstream_changed",
+                error=detail.error, blocked=detail.blocked,
+            )
+        if not _penal_detail_matches_listing(detail, verified_candidate, req):
+            healthy = False
+            return _batch_response(
+                0, "upstream_changed", error="PJUD detail identity mismatch",
+            )
+        return _batch_response(
+            1,
+            "found",
+            verified_match=PenalBookVerifiedMatch.model_validate(
+                verified_candidate.model_dump(exclude={"key"}),
+            ),
+            detail=_safe_penal_detail(detail, verified_candidate),
+        )
+    except BaseException:
+        healthy = False
+        raise
+    finally:
+        if owns_session:
+            assert pool is not None
+            await pool.release(session, healthy=healthy)
+
+
+@router.post("/search", response_model=SearchResponse)
+@limiter.limit("5/minute")
+async def search_case(req: SearchRequest, request: Request, _api_key: str = verify_api_key):
+    return await _search_case(req, request)
+
+
+@router.post("/search/penal-books", response_model=PenalBookBatchSearchResponse)
+@limiter.limit("1/minute")
+async def search_penal_books(
+    req: PenalBookBatchSearchRequest,
+    request: Request,
+    _api_key: str = verify_api_key,
+):
+    try:
+        async with asyncio.timeout(45):
+            return await _run_penal_book_batch(req, request)
+    except TimeoutError:
+        return _batch_response(
+            0, "pjud_timeout", error="PJUD batch request timed out",
+        )

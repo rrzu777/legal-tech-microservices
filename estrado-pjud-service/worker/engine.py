@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, date
 
 import httpx
+from pydantic import SecretStr
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
@@ -28,8 +29,10 @@ from app.failure_kind import (
     reject_empty_body,
     slot_still_healthy,
 )
-from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
 from app.familia.parser import parse_familia_results
+from app.ojv.errors import OjvSessionError
+from app.ojv.budget import OjvWorkBudgets
 from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
 from app.models import CandidateMatch, SearchRequest
 from app.parsers.anexo_parser import parse_anexo_list
@@ -37,7 +40,7 @@ from app.parsers.form_builder import build_search_form_data
 from app.parsers.normalizer import parse_case_identifier, competencia_path
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
-from app.proxy_billing import is_proxy_billing_error
+from app.proxy_billing import ProxyBillingExhaustedError, is_proxy_billing_error
 from app.proxy_cost import (
     ProxyBudgetExceededError,
     ProxyUsagePersistenceError,
@@ -45,6 +48,7 @@ from app.proxy_cost import (
 )
 from app.r2 import R2Client
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
+from worker.import_jobs import ImportDiscoveryWorker
 from worker.sync_messages import BlockCause, blocked_error_message
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import (
@@ -114,11 +118,19 @@ class InvalidCanonicalIdentityError(ValueError):
     """Persisted v2 identity is present but violates PJUD's v2 contract."""
 
 
+class ImportCredentialInfrastructureError(RuntimeError):
+    """The app credential boundary is temporarily unavailable."""
+
+
 def _release_disposition_for_error(
     error: BaseException,
     *,
     transport_revalidation_enabled: bool,
 ) -> ReleaseDisposition:
+    if isinstance(error, OjvSessionError) and error.code.value == "upstream_changed":
+        # Markup drift is independent of residential egress. A paid remint
+        # cannot repair it and would only retry a terminal contract failure.
+        return "healthy"
     if transport_revalidation_enabled and isinstance(
         error, httpx.RemoteProtocolError,
     ):
@@ -134,6 +146,14 @@ def _sync_run_error_code(
     """Map worker outcomes to the database's closed scheduled-run taxonomy."""
     if error is None:
         return None
+    if isinstance(error, OjvSessionError):
+        return {
+            "upstream_changed": "upstream_changed",
+            "timeout": "pjud_timeout",
+            "waf": "ojv_blocked",
+            "session_expired": "infra_unavailable",
+            "credential_invalid": "credential_unavailable",
+        }[error.code.value]
     if isinstance(error, httpx.RemoteProtocolError):
         return "remote_protocol_disconnect"
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
@@ -640,6 +660,41 @@ class SyncEngine:
             pool, proxy_usage=self._proxy_usage,
         )
         self._last_parse_alert_at = float("-inf")  # cooldown de alertas parse_failed
+        raw_capacity = (
+            getattr(config, "OJV_PROXY_POOL_SIZE", 1)
+            if getattr(config, "OJV_PROXY_URL", None)
+            else getattr(config, "POOL_SIZE", 1)
+        )
+        session_capacity = raw_capacity if isinstance(raw_capacity, int) and not isinstance(raw_capacity, bool) else 1
+        imports_enabled = getattr(config, "ENABLE_PJUD_MY_CAUSES_IMPORT", False) is True
+        raw_rate_ms = getattr(config, "RATE_LIMIT_MS", 2500)
+        lane_rate_seconds = (
+            float(raw_rate_ms) / 1000.0
+            if isinstance(raw_rate_ms, (int, float)) and not isinstance(raw_rate_ms, bool)
+            and raw_rate_ms >= 0
+            else 2.5
+        )
+        self._work_budgets = OjvWorkBudgets(
+            discovery_concurrency=1,
+            private_concurrency=1,
+            scheduled_concurrency=max(1, session_capacity - (1 if imports_enabled else 0)),
+            discovery_min_start_interval_seconds=lane_rate_seconds,
+            private_min_start_interval_seconds=lane_rate_seconds,
+            # Scheduled adapters already own one rate clock per borrowed
+            # session/IP. A second global clock here would collapse the
+            # independent proxy capacity back to one lane-wide request.
+            scheduled_min_start_interval_seconds=0.0,
+        )
+        self._import_worker = ImportDiscoveryWorker(
+            supabase=supabase,
+            pool=pool,
+            worker_id=getattr(config, "WORKER_ID", "worker-1"),
+            fetch_credential=self._get_import_credential,
+            concurrency=1,
+            enabled=imports_enabled,
+            lane_budget=self._work_budgets.discovery,
+            proxy_usage=self._proxy_usage,
+        )
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:
             self._r2 = R2Client(
@@ -648,6 +703,17 @@ class SyncEngine:
                 endpoint=config.R2_ENDPOINT,
                 bucket=config.R2_BUCKET,
             )
+
+    async def process_import_job(self) -> bool:
+        """Poll one discovery job outside the paid public batch semaphore."""
+        return await self._import_worker.process_next()
+
+    def stop_accepting_work(self) -> None:
+        """Close all local lanes before structured process drain."""
+        self._work_budgets.stop_accepting()
+
+    async def drain_work(self, *, timeout_seconds: float) -> None:
+        await self._work_budgets.drain(timeout_seconds=timeout_seconds)
 
     async def _enrich_candidates(
         self, matches: list[dict], request: SearchRequest
@@ -821,6 +887,16 @@ class SyncEngine:
         raise RuntimeError("sync_run_unavailable")
 
     async def sync_case(self, case: dict) -> dict:
+        """Run normal scheduled sync in its lane, independent of imports."""
+        async with self._work_budgets.scheduled_sync.slot():
+            return await self._sync_case_unbudgeted(case)
+
+    async def run_private_resolution(self, operation):
+        """Reserved authenticated lane; callers provide one closed operation."""
+        async with self._work_budgets.private_resolution.slot():
+            return await operation()
+
+    async def _sync_case_unbudgeted(self, case: dict) -> dict:
         started_at = datetime.now(TZ_SANTIAGO)
 
         sync_run_id = str(uuid.uuid4())
@@ -1293,7 +1369,8 @@ class SyncEngine:
                     )
 
     async def _call_app_internal(
-        self, method: str, path: str, what: str
+        self, method: str, path: str, what: str, *, law_firm_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response | None:
         """Una request a la API interna de la app, o `None` si no salio.
 
@@ -1308,9 +1385,20 @@ class SyncEngine:
             logger.error("VERCEL_APP_URL or INTERNAL_CREDENTIALS_API_KEY not configured")
             return None
         try:
+            headers = {"Authorization": f"Bearer {key}"}
+            if law_firm_id is not None:
+                headers["X-Law-Firm-Id"] = law_firm_id
+            if extra_headers:
+                if any(
+                    name.lower() in {"authorization", "x-law-firm-id"}
+                    for name in extra_headers
+                ):
+                    logger.error("unsafe internal request header override (%s)", path)
+                    return None
+                headers.update(extra_headers)
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.request(
-                    method, f"{url}{path}", headers={"Authorization": f"Bearer {key}"}
+                    method, f"{url}{path}", headers=headers
                 )
             if resp.status_code != 200:
                 logger.warning("%s returned %d (%s)", what, resp.status_code, path)
@@ -1319,12 +1407,57 @@ class SyncEngine:
             logger.exception("%s failed (%s)", what, path)
             return None
 
-    async def _get_decrypted_credential(self, credential_id: str) -> dict | None:
+    async def _get_decrypted_credential(
+        self, credential_id: str, law_firm_id: str
+    ) -> dict | None:
         """Fetch decrypted credential from Vercel internal endpoint."""
         resp = await self._call_app_internal(
-            "GET", f"/api/internal/credentials/{credential_id}/decrypt", "Decrypt endpoint"
+            "GET",
+            f"/api/internal/credentials/{credential_id}/decrypt",
+            "Decrypt endpoint",
+            law_firm_id=law_firm_id,
         )
         return resp.json() if resp is not None and resp.status_code == 200 else None
+
+    async def _get_import_credential(
+        self, credential_id: str, law_firm_id: str, job_id: str,
+        claim_token: str, worker_id: str,
+    ) -> dict | None:
+        """Keep terminal credential absence distinct from internal outages."""
+        resp = await self._call_app_internal(
+            "GET",
+            f"/api/internal/pjud-import/credentials/{credential_id}/decrypt",
+            "Import decrypt endpoint",
+            law_firm_id=law_firm_id,
+            extra_headers={
+                "X-Pjud-Import-Job-Id": job_id,
+                "X-Pjud-Import-Claim-Token": claim_token,
+                "X-Pjud-Import-Worker-Id": worker_id,
+            },
+        )
+        if resp is None or resp.status_code in {401, 403, 408, 429} or resp.status_code >= 500:
+            raise ImportCredentialInfrastructureError("import_credential_boundary_unavailable")
+        if resp.status_code in {404, 410, 422}:
+            return None
+        if resp.status_code != 200:
+            raise ImportCredentialInfrastructureError("import_credential_boundary_unexpected")
+        data = resp.json()
+        if not isinstance(data, dict) or set(data) != {
+            "rut", "password", "password_type", "binding_version",
+        } or any(
+            not isinstance(data.get(field), str) or not data[field]
+            for field in ("rut", "password", "password_type", "binding_version")
+        ) or data["password_type"] != "clave_poder_judicial":
+            raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
+        try:
+            binding = datetime.fromisoformat(data["binding_version"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ImportCredentialInfrastructureError(
+                "import_credential_contract_invalid",
+            ) from exc
+        if binding.tzinfo is None:
+            raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
+        return data
 
     async def _report_invalid_credential(self, credential_id: str) -> None:
         """Tell the app that OJV rejected this credential.
@@ -1353,7 +1486,9 @@ class SyncEngine:
             await self._terminal_error(case["id"], "Causa Familia sin credencial OJV configurada")
             return {"success": False, "new_movements": 0}
 
-        cred = await self._get_decrypted_credential(credential_id)
+        cred = await self._get_decrypted_credential(
+            credential_id, case["law_firm_id"]
+        )
         if not cred:
             await self._finish_run(sync_run_id, started_at, "error", 0, "Credential inactive or missing")
             await self._terminal_error(case["id"], "Credencial OJV inactiva o no encontrada")
@@ -1402,7 +1537,11 @@ class SyncEngine:
                             bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
                         ) as session:
                             try:
-                                await session.login(cred["rut"], cred["password"], auth_type)
+                                await session.login(
+                                    SecretStr(cred["rut"]),
+                                    SecretStr(cred["password"]),
+                                    auth_type,
+                                )
                             except InvalidCredentialsError:
                                 # Credencial inválida = terminal (no reintenta en loop);
                                 # la IP está sana, se libera healthy=True.
@@ -1415,7 +1554,7 @@ class SyncEngine:
                                 return {"success": False, "new_movements": 0}
 
                             html = await session.search_familia(
-                                rut=cred["rut"],
+                                rut=SecretStr(cred["rut"]),
                                 rit=str(parsed["numero"]),
                                 year=str(parsed["anno"]),
                             )
@@ -1429,7 +1568,8 @@ class SyncEngine:
             # terminaba penalizando la causa.
             except (
                 FamiliaBlockedError,
-                SessionError,
+                OjvSessionError,
+                ProxyBillingExhaustedError,
                 TimeoutError,
                 httpx.TransportError,
                 httpx.HTTPStatusError,

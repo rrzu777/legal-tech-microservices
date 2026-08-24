@@ -16,6 +16,7 @@ from app.config import Settings
 from worker.config import WorkerConfig
 
 INVENTORY = Path(__file__).resolve().parents[2] / "ops" / "env.inventory"
+ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
 
 def nombres_inventario() -> set[str]:
@@ -51,3 +52,20 @@ def test_toda_variable_sin_default_esta_en_el_inventario():
     assert faltan == [], (
         f"Variables OBLIGATORIAS fuera del inventario (una reconstrucción moriría sin ellas): {faltan}"
     )
+
+
+def test_todos_los_feature_flags_estan_inventariados_y_documentados():
+    flags = {
+        nombre
+        for cls in (Settings, WorkerConfig)
+        for nombre in cls.model_fields
+        if nombre.startswith("ENABLE_")
+    }
+    ejemplo = {
+        line.split("=", 1)[0].strip()
+        for line in ENV_EXAMPLE.read_text().splitlines()
+        if line.strip() and not line.startswith("#") and "=" in line
+    }
+    assert flags - nombres_inventario() == set()
+    assert flags - ejemplo == set()
+    assert "ENABLE_PJUD_PRIVATE_FAMILIA=false" in ENV_EXAMPLE.read_text().splitlines()

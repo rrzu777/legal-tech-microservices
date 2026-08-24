@@ -3,6 +3,7 @@ from fastapi import APIRouter, Request
 from app.config import get_settings
 from app.metrics import api_metrics
 from app.models import HealthResponse
+from app.ojv.private_telemetry import private_operational_metrics
 
 router = APIRouter(prefix="/api/v1", tags=["health"])
 
@@ -32,5 +33,6 @@ async def health(request: Request):
         status=derived_status,
         last_successful_request=last,
         pjud_available=not control_required or bool(control_snapshot and control_snapshot.allowed),
+        private_sync=private_operational_metrics.snapshot(),
         **snapshot,
     )

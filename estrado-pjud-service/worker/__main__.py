@@ -59,13 +59,14 @@ async def process_batch(
     backoff: CircuitBreaker,
     proxy_control: ProxyControl | None = None,
     processing_window=is_scheduled_processing_window,
+    shutdown_grace_seconds: float = 30.0,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
 
-    Cases already dispatched (past the semaphore gate) are allowed to finish
-    even if shutdown is requested or the circuit breaker opens mid-batch; only
-    not-yet-started cases are skipped, for a graceful drain.
+    Cases already dispatched get a bounded graceful drain after shutdown;
+    unfinished work is then cancelled and remains unacknowledged for lease
+    takeover. Not-yet-started cases are skipped immediately.
     """
     sem = asyncio.Semaphore(concurrency)
 
@@ -88,10 +89,36 @@ async def process_batch(
             except Exception:
                 logger.exception("Unhandled error syncing case %s", case.get("id"))
 
-    # _run_one nunca propaga una Exception (la captura y loguea internamente);
-    # return_exceptions=True contiene además cualquier BaseException (p.ej.
-    # CancelledError durante shutdown) para que un caso no cancele a los demás.
-    await asyncio.gather(*(_run_one(c) for c in batch), return_exceptions=True)
+    if (
+        isinstance(shutdown_grace_seconds, bool)
+        or not isinstance(shutdown_grace_seconds, (int, float))
+        or shutdown_grace_seconds < 0
+    ):
+        raise ValueError("invalid_shutdown_grace_seconds")
+
+    case_tasks = [asyncio.create_task(_run_one(case)) for case in batch]
+    batch_future = asyncio.gather(*case_tasks, return_exceptions=True)
+    shutdown_wait = asyncio.create_task(shutdown_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {batch_future, shutdown_wait}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if batch_future in done:
+            await batch_future
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(batch_future), timeout=float(shutdown_grace_seconds),
+            )
+        except asyncio.TimeoutError:
+            for task in case_tasks:
+                if not task.done():
+                    task.cancel()
+            await batch_future
+    finally:
+        if not shutdown_wait.done():
+            shutdown_wait.cancel()
+        await asyncio.gather(shutdown_wait, return_exceptions=True)
 
 
 BANDWIDTH_ALERT_COOLDOWN_S = 6 * 60 * 60  # 6h, avoid spamming ops once over budget
@@ -206,6 +233,51 @@ async def safe_get_next_batch(scheduler, metrics, backoff):
         return None
 
 
+async def safe_process_import_job(engine, metrics) -> bool:
+    """Poll one discovery job without coupling failures to public case sync."""
+    try:
+        return await engine.process_import_job()
+    except Exception as exc:
+        logger.error(
+            "Failed to process PJUD import discovery job (error_class=%s)",
+            type(exc).__name__,
+        )
+        metrics.record_error("infra")
+        if is_proxy_billing_error(exc):
+            proxy_control = getattr(engine, "_proxy_control", None)
+            if proxy_control is not None:
+                await proxy_control.trip_billing_exhausted()
+            backoff = getattr(engine, "_backoff", None)
+            if backoff is not None:
+                backoff.open_permanently("billing_exhausted")
+        return False
+
+
+async def run_import_discovery_loop(
+    engine,
+    metrics,
+    shutdown_event: asyncio.Event,
+    *,
+    poll_interval: float = 5.0,
+    traffic_allowed=lambda: True,
+) -> None:
+    """Independent one-at-a-time discovery loop with structured cancellation."""
+    while not shutdown_event.is_set():
+        if traffic_allowed():
+            processed = await safe_process_import_job(engine, metrics)
+            if processed:
+                continue
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+def public_sync_concurrency(session_capacity: int, *, imports_enabled: bool) -> int:
+    """Reserve one pool session for imports without ever starving public sync."""
+    return max(1, session_capacity - (1 if imports_enabled else 0))
+
+
 async def safe_reconcile_stale_runs(scheduler, metrics, backoff) -> bool:
     """Run bounded maintenance fail-closed before any traffic gate or claim."""
     try:
@@ -305,6 +377,7 @@ async def main():
     notify_ready()
     notify_status("starting")
     bandwidth_alert_state = BandwidthAlertState()
+    import_task: asyncio.Task | None = None
 
     try:
         initialized = False
@@ -398,6 +471,40 @@ async def main():
         metrics.set_status("running")
         notify_status("running")
 
+        session_capacity = (
+            config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+        )
+        if (
+            config.ENABLE_PJUD_MY_CAUSES_IMPORT
+            and session_capacity >= 2
+            and not validation_once
+        ):
+            import_task = asyncio.create_task(
+                run_import_discovery_loop(
+                    engine,
+                    metrics,
+                    shutdown_event,
+                    traffic_allowed=(
+                        lambda: not backoff.is_open
+                        and is_processing_allowed(
+                            process_outside_office_hours=process_outside_office_hours,
+                        )
+                    ),
+                ),
+                name="pjud-import-discovery",
+            )
+            logger.info(
+                "Import discovery loop enabled with one reserved budget; public capacity=%d",
+                session_capacity - 1,
+            )
+        else:
+            logger.warning(
+                "Import discovery loop disabled (enabled=%s session_capacity=%d validation_once=%s)",
+                config.ENABLE_PJUD_MY_CAUSES_IMPORT,
+                session_capacity,
+                validation_once,
+            )
+
         while not shutdown_event.is_set():
             if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
@@ -476,7 +583,13 @@ async def main():
 
             case_ids = [c["id"] for c in batch]
 
-            concurrency = config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            session_capacity = (
+                config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+            )
+            concurrency = public_sync_concurrency(
+                session_capacity,
+                imports_enabled=import_task is not None,
+            )
             await process_batch(
                 batch,
                 engine,
@@ -501,6 +614,14 @@ async def main():
     finally:
         notify_stopping()
         logger.info("Shutting down...")
+        shutdown_event.set()
+        if 'engine' in locals():
+            engine.stop_accepting_work()
+        if import_task is not None:
+            import_task.cancel()
+            await asyncio.gather(import_task, return_exceptions=True)
+        if 'engine' in locals():
+            await engine.drain_work(timeout_seconds=5.0)
         await metrics.stop()
         await pool.close_all()
         logger.info("Worker stopped")

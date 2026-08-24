@@ -2,16 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.auth import verify_api_key
 from app.config import get_settings
 from app.errors import safe_error
 from app.failure_kind import classify_exception
-from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError, SessionError
-from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
-from app.familia.parser import parse_familia_results
+from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
+from app.familia.models import (
+    FamiliaSyncRequest,
+    FamiliaSyncResponse,
+    PrivateCauseResolutionRequest,
+    PrivateCauseResolutionResult,
+)
+from app.familia.parser import (
+    PrivateResolutionError,
+    parse_familia_results,
+    resolve_private_familia_html,
+)
+from app.ojv.errors import OjvSessionError
+from app.ojv.private_telemetry import (
+    emit_private_event,
+    private_operational_metrics,
+)
 from app.metrics import api_metrics
 from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
 from app.proxy_billing import is_proxy_billing_error
@@ -20,10 +35,153 @@ from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 logger = logging.getLogger(__name__)
 
+_PRIVATE_RESOLUTION_CODES = frozenset((
+    "private_not_found", "private_ambiguous", "private_identifier_mismatch",
+    "private_tribunal_mismatch", "private_evidence_incomplete",
+    "private_fence_unavailable", "credential_invalid", "session_expired",
+    "waf", "timeout", "upstream_changed",
+))
+
+
+def _closed_private_resolution_code(error: PrivateResolutionError) -> str:
+    value = error.args[0] if len(error.args) == 1 else None
+    return value if isinstance(value, str) and value in _PRIVATE_RESOLUTION_CODES else "upstream_changed"
+
 router = APIRouter(prefix="/api/v1/familia", tags=["familia"])
 
 # Familia sync is expensive: login + N queries at 2.5s each. Limit to 2/min per key.
 _SYNC_TIMEOUT_S = 60
+PrivateStageGuard = Callable[[str], Awaitable[bool]]
+
+
+def _private_failure(code: str) -> PrivateCauseResolutionResult:
+    return PrivateCauseResolutionResult(ok=False, resolution=None, error_code=code)
+
+
+async def _run_private_resolution(
+    req: PrivateCauseResolutionRequest,
+    rate_s: float,
+    bundle,
+    catalog_service,
+    stage_guard: PrivateStageGuard | None = None,
+) -> PrivateCauseResolutionResult:
+    async with FamiliaAuthSession(
+        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
+    ) as session:
+        try:
+            await session.login(req.rut, req.password, req.auth_type)
+            if stage_guard is None or not await stage_guard("login"):
+                private_operational_metrics.record_result("lease_loss")
+                emit_private_event(
+                    logger, event="private_resolution", status="failed",
+                    error_code="private_fence_unavailable", stage="login",
+                )
+                return _private_failure("private_fence_unavailable")
+            prefix, number, year = req.case_number.split("-", 2)
+            if not prefix or not number.isdigit() or not year.isdigit():
+                return _private_failure("private_identifier_mismatch")
+            html = await session.search_familia(rut=req.rut, rit=number, year=year)
+
+            def resolve_tribunal(label: str) -> int | None:
+                identity = catalog_service.resolve_loaded_tribunal("familia", label)
+                return identity.tribunal_code if identity is not None else None
+
+            resolution = resolve_private_familia_html(
+                html,
+                expected_case_number=req.case_number,
+                expected_tribunal_code=req.tribunal_code,
+                expected_tribunal_label=req.tribunal_label,
+                resolve_tribunal=resolve_tribunal,
+            )
+            if not await stage_guard("detail"):
+                private_operational_metrics.record_result("lease_loss")
+                emit_private_event(
+                    logger, event="private_resolution", status="failed",
+                    error_code="private_fence_unavailable", stage="detail",
+                )
+                return _private_failure("private_fence_unavailable")
+            # Movement/enrichment remains a separate guarded boundary even
+            # though Familia is listing-only and therefore cannot reach it yet.
+            movements = resolution.movements
+            if not await stage_guard("movements"):
+                private_operational_metrics.record_result("lease_loss")
+                emit_private_event(
+                    logger, event="private_resolution", status="failed",
+                    error_code="private_fence_unavailable", stage="movements",
+                )
+                return _private_failure("private_fence_unavailable")
+            resolution = resolution.model_copy(update={"movements": movements})
+            html = ""
+            return PrivateCauseResolutionResult(
+                ok=True,
+                resolution=resolution,
+                error_code=None,
+            )
+        except PrivateResolutionError as error:
+            code = _closed_private_resolution_code(error)
+            if code == "upstream_changed":
+                private_operational_metrics.record_result("upstream_changed")
+                emit_private_event(
+                    logger, event="private_resolution", status="failed",
+                    error_code="upstream_changed", stage="detail",
+                )
+            return _private_failure(code)
+        except OjvSessionError as error:
+            private_operational_metrics.record_result(error.code.value)
+            emit_private_event(
+                logger, event="private_resolution", status="failed",
+                error_code=error.code.value, stage="login",
+            )
+            return _private_failure(error.code.value)
+        except asyncio.CancelledError:
+            emit_private_event(
+                logger, event="private_session", status="cancelled",
+                error_code="cancelled", stage="shutdown",
+            )
+            raise
+        except Exception:
+            private_operational_metrics.record_result("upstream_changed")
+            emit_private_event(
+                logger, event="private_resolution", status="failed",
+                error_code="upstream_changed", stage="login",
+            )
+            return _private_failure("upstream_changed")
+
+
+@router.post("/resolve-private", response_model=PrivateCauseResolutionResult)
+@limiter.limit("2/minute")
+async def familia_resolve_private(
+    request: Request,
+    req: PrivateCauseResolutionRequest,
+    _api_key: str = verify_api_key,
+) -> PrivateCauseResolutionResult:
+    settings = get_settings()
+    if not settings.private_familia_enabled:
+        raise HTTPException(status_code=404, detail="private_familia_disabled")
+    private_operational_metrics.record_attempt()
+    async with request.app.state.private_resolution_budget.slot():
+        bundle = await familia_bundle_or_alert(request.app.state.session_pool, request)
+        api_metrics.record_request("familia")
+        try:
+            async with asyncio.timeout(_SYNC_TIMEOUT_S):
+                result = await _run_private_resolution(
+                    req,
+                    settings.RATE_LIMIT_MS / 1000.0,
+                    bundle,
+                    request.app.state.catalog_service,
+                )
+        except TimeoutError:
+            private_operational_metrics.record_result("timeout")
+            emit_private_event(
+                logger, event="private_resolution", status="failed",
+                error_code="timeout", stage="detail",
+            )
+            result = _private_failure("timeout")
+    if result.ok:
+        api_metrics.record_success("familia")
+    else:
+        api_metrics.record_error("familia")
+    return result
 
 
 @router.post("/sync", response_model=FamiliaSyncResponse)
@@ -120,7 +278,7 @@ async def _run_sync(
                 error_code="invalid_credentials",
                 error="Las credenciales proporcionadas no son válidas",
             )
-        except SessionError as e:
+        except OjvSessionError as e:
             logger.warning("familia_sync: session error: %s", safe_error(e))
             return FamiliaSyncResponse(
                 ok=False, casos=[],
@@ -134,11 +292,14 @@ async def _run_sync(
                     proxy_usage_capture.status = "error"
                     proxy_usage_capture.error_kind = "billing"
                 return billing
-            logger.exception("familia_sync: unexpected error during login")
+            emit_private_event(
+                logger, event="private_session", status="failed",
+                error_code="upstream_changed", stage="login",
+            )
             return FamiliaSyncResponse(
                 ok=False, casos=[],
                 error_code="session_error",
-                error=safe_error(e),
+                error="No se pudo establecer sesión con OJV",
             )
 
         if req.cases:
@@ -150,15 +311,23 @@ async def _run_sync(
                     )
                     casos, err = parse_familia_results(html)
                     if err and err != "no_cases":
-                        logger.warning(
-                            "familia_sync: parse error for RIT %s-%s: %s",
-                            case_filter.rit, case_filter.year, err,
-                        )
+                        logger.warning("familia_sync: parse error code=%s", err)
                     all_casos.extend(casos)
                 except FamiliaBlockedError:
                     # Un bloqueo F5 aborta el batch: no seguir martillando la
                     # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
                     return _blocked()
+                except OjvSessionError as e:
+                    logger.warning(
+                        "familia_sync: authenticated session failure code=%s",
+                        e.code.value,
+                    )
+                    return FamiliaSyncResponse(
+                        ok=False,
+                        casos=[],
+                        error_code="session_error",
+                        error="No se pudo consultar la causa en OJV",
+                    )
                 except Exception as e:
                     billing = await _proxy_billing_response(e, proxy_control)
                     if billing:
@@ -181,22 +350,36 @@ async def _run_sync(
                     if kind == "ojv":
                         return _blocked()
                     if kind == "infra":
-                        logger.warning(
-                            "familia_sync: fallo de infra en RIT %s: %s",
-                            case_filter.rit, safe_error(e),
+                        emit_private_event(
+                            logger, event="private_session", status="failed",
+                            error_code="upstream_changed", stage="detail",
                         )
                         return FamiliaSyncResponse(
                             ok=False, casos=[],
                             error_code="session_error",
-                            error=safe_error(e),
+                            error="No se pudo consultar la causa en OJV",
                         )
-                    logger.warning("familia_sync: error querying RIT %s: %s", case_filter.rit, safe_error(e))
+                    emit_private_event(
+                        logger, event="private_session", status="failed",
+                        error_code="upstream_changed", stage="detail",
+                    )
             return FamiliaSyncResponse(ok=True, casos=all_casos)
 
         try:
             html = await session.search_familia(rut=req.rut)
         except FamiliaBlockedError:
             return _blocked()
+        except OjvSessionError as e:
+            logger.warning(
+                "familia_sync: authenticated session failure code=%s",
+                e.code.value,
+            )
+            return FamiliaSyncResponse(
+                ok=False,
+                casos=[],
+                error_code="session_error",
+                error="No se pudo consultar OJV",
+            )
         except Exception as e:
             billing = await _proxy_billing_response(e, proxy_control)
             if billing:
@@ -204,11 +387,14 @@ async def _run_sync(
                     proxy_usage_capture.status = "error"
                     proxy_usage_capture.error_kind = "billing"
                 return billing
-            logger.exception("familia_sync: unexpected error querying Familia")
+            emit_private_event(
+                logger, event="private_session", status="failed",
+                error_code="upstream_changed", stage="detail",
+            )
             return FamiliaSyncResponse(
                 ok=False, casos=[],
                 error_code="session_error",
-                error=safe_error(e),
+                error="No se pudo consultar OJV",
             )
 
         all_casos, error_code = parse_familia_results(html)

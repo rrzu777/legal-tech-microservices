@@ -16,6 +16,11 @@
 # Estrado Cron Jobs (Vercel App)
 # All times in UTC (Chile = UTC-3 horario verano)
 
+# Materializa una selección de Mis Causas por ciclo. Vive en el scheduler
+# versionado del VPS porque Vercel Hobby sólo admite crons diarios. Instalar
+# este snapshot únicamente después del rollout web/DB y del flag público.
+* * * * * /opt/estrado-cron/run-cron.sh /api/cron/pjud-imports
+
 # PJUD sync cada 4 horas (8am, 12pm, 4pm, 8pm Chile = 11, 15, 19, 23 UTC)
 # 0 11,15,19,23 * * * /opt/estrado-cron/run-cron.sh /api/cron/pjud-sync  # DISABLED - rate limiting OJV
 

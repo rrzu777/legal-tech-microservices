@@ -16,7 +16,13 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     SESSION_POOL_SIZE: int = 2
     SESSION_MAX_AGE_S: int = 1200
+    PRIVATE_RESOLUTION_CONCURRENCY: int = 1
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
+    ENABLE_PJUD_PRIVATE_FAMILIA: str = "false"
+
+    @property
+    def private_familia_enabled(self) -> bool:
+        return self.ENABLE_PJUD_PRIVATE_FAMILIA == "true"
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""
@@ -37,6 +43,13 @@ class Settings(BaseSettings):
     @classmethod
     def _valid_sticky_lifetime(cls, value: str) -> str:
         sticky_lifetime_seconds(value)
+        return value
+
+    @field_validator("PRIVATE_RESOLUTION_CONCURRENCY")
+    @classmethod
+    def _valid_private_resolution_concurrency(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 1:
+            raise ValueError("private_resolution_concurrency_must_be_positive")
         return value
 
     # extra=ignore: el .env es compartido y trae claves del worker (POOL_SIZE,

@@ -20,7 +20,11 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from app.familia.models import FamiliaCaso
+from app.familia.models import (
+    FamiliaCaso,
+    PrivateCauseResolution,
+)
+from app.my_causes.parser import UpstreamChangedError, parse_my_causes_page
 
 logger = logging.getLogger(__name__)
 
@@ -112,3 +116,45 @@ def parse_familia_results(html: str) -> tuple[list[FamiliaCaso], str | None]:
         logger.debug("parse_familia: skipped %d rows", skipped)
 
     return (casos, None) if casos else ([], "no_cases")
+
+
+class PrivateResolutionError(ValueError):
+    """Safe, machine-readable rejection of non-materializable private evidence."""
+
+
+def resolve_private_familia_html(
+    html: str,
+    *,
+    expected_case_number: str,
+    expected_tribunal_code: int | None,
+    expected_tribunal_label: str,
+    resolve_tribunal,
+) -> PrivateCauseResolution:
+    """Resolve exactly one authenticated listing row without returning raw data."""
+
+    try:
+        rows = parse_my_causes_page(html, "familia")
+    except UpstreamChangedError as exc:
+        raise PrivateResolutionError("upstream_changed") from exc
+    exact_identifier = [row for row in rows if row.case_number == expected_case_number]
+    if not exact_identifier:
+        if rows:
+            raise PrivateResolutionError("private_identifier_mismatch")
+        raise PrivateResolutionError("private_not_found")
+    if len(exact_identifier) != 1:
+        raise PrivateResolutionError("private_ambiguous")
+    row = exact_identifier[0]
+    if row.tribunal_label is None or " ".join(row.tribunal_label.split()).casefold() \
+       != " ".join(expected_tribunal_label.split()).casefold():
+        raise PrivateResolutionError("private_tribunal_mismatch")
+    resolved_code = resolve_tribunal(row.tribunal_label)
+    if expected_tribunal_code is not None and resolved_code is not None \
+       and resolved_code != expected_tribunal_code:
+        raise PrivateResolutionError("private_tribunal_mismatch")
+
+    # The listing proves only that one private identity is visible to this
+    # session. It is not authenticated cause detail and exposes no reviewed
+    # movement contract. Until the row action/detail request and Familia
+    # tribunal mapping are captured as sanitized fixtures, never fabricate a
+    # materializable payload from listing columns.
+    raise PrivateResolutionError("upstream_changed")

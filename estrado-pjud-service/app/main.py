@@ -2,7 +2,9 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -16,10 +18,25 @@ from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
 from app.routes import health, search, detail, familia
+from app.ojv.budget import OjvLaneBudget
 from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import ProxyUsageTracker
+
+
+async def _redacted_request_validation_handler(
+    _request: Request,
+    _error: RequestValidationError,
+) -> JSONResponse:
+    """Never reflect request bodies from private credential boundaries."""
+    return JSONResponse(status_code=422, content={
+        "detail": [{
+            "type": "request_validation",
+            "loc": ["body"],
+            "msg": "Invalid request",
+        }],
+    })
 
 
 @asynccontextmanager
@@ -51,6 +68,11 @@ async def lifespan(app: FastAPI):
     app.state.proxy_control_required = proxy_control_required
     app.state.catalog_service = CatalogService(pool, proxy_usage=proxy_usage)
     app.state.catalog_refresh_queue = None
+    private_resolution_budget = OjvLaneBudget(
+        settings.PRIVATE_RESOLUTION_CONCURRENCY,
+        settings.RATE_LIMIT_MS / 1000.0,
+    )
+    app.state.private_resolution_budget = private_resolution_budget
 
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
         from app.alert_cooldown_store import (
@@ -73,6 +95,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        private_resolution_budget.stop_accepting()
+        await private_resolution_budget.drain(timeout_seconds=5)
         try:
             await pool.close_all()
         finally:
@@ -124,6 +148,7 @@ def create_app() -> FastAPI:
         ProxyBudgetExceededError, proxy_cost_control_exception_handler,
     )
     app.add_exception_handler(httpx.ProxyError, proxy_cost_control_exception_handler)
+    app.add_exception_handler(RequestValidationError, _redacted_request_validation_handler)
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

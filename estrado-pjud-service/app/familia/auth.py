@@ -1,299 +1,104 @@
-"""Authenticated OJV session for Familia — supports Clave PJ and Clave Única login."""
+"""Familia-specific operations over the shared authenticated OJV session."""
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import time
-from collections.abc import Mapping, Sequence
+from pydantic import SecretStr
 
-import httpx
-from bs4 import BeautifulSoup
-
-from app.adapters.http_adapter import _USER_AGENT
-from app.bandwidth import estimate_request_bytes, record_proxy_request, record_proxy_response
-from app.cookie_scope import (
-    CookieRecord,
-    cookie_jar_from_records,
-    legacy_cookie_records,
-    legacy_cookie_scope,
+from app.ojv.errors import (
+    FamiliaBlockedError,
+    InvalidCredentialsError,
+    OjvSessionError,
+    OjvTimeoutError,
+    OjvUpstreamChangedError,
+    SessionError,
+    SessionExpiredError,
+)
+from app.ojv.session import (
+    OjvSession,
+    decode_ojv_html,
+    detect_login_error,
+    looks_like_login_url,
+    rut_parts,
 )
 from app.parsers.search_parser import detect_blocked
 
-logger = logging.getLogger(__name__)
 
-_OJV_BASE   = "https://oficinajudicialvirtual.pjud.cl"
-_OJV_KPITEC = "https://ojv.pjud.cl"
-_CU_BASE    = "https://accounts.claveunica.gob.cl"
-
-_CPJ_LOGIN_PAGE = f"{_OJV_KPITEC}/kpitec-ojv-web/views/login_pjud.html"
-_CPJ_LOGIN_API  = f"{_OJV_KPITEC}/kpitec-ojv-web/login_pjud"
-
-_CU_HOME     = f"{_OJV_BASE}/home/index.php"
-_CU_INIT_URL = f"{_OJV_BASE}/home/initCU.php"
-
-# SHA1 field name in cuform on home/index.php — CONSTANT (verified 2026-04-20)
-_CU_FORM_FIELD = "2257e205d71edbaab04591f61be0066f5582d591"
-
+_OJV_BASE = "https://oficinajudicialvirtual.pjud.cl"
 _FAMILIA_SEARCH = f"{_OJV_BASE}/misCausas/familia/consultaMisCausasFamilia.php"
-
 _FAMILIA_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Referer": f"{_OJV_BASE}/consultaUnificada.php",
 }
 
-
-def _decode(resp: httpx.Response) -> str:
-    try:
-        return resp.content.decode("utf-8")
-    except UnicodeDecodeError:
-        text = resp.content.decode("latin-1")
-        try:
-            return text.encode("latin-1").decode("utf-8", errors="replace")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return text
+# Compatibility names retained while callers migrate to ``app.ojv``.
+_decode = decode_ojv_html
+_detect_login_error = detect_login_error
+_detect_session_error = looks_like_login_url
+_rut_parts = rut_parts
 
 
-def _rut_parts(rut: str) -> tuple[str, str]:
-    """Return (digits_only_8, dv) from any RUT format."""
-    clean = rut.replace(".", "").replace("-", "").strip()
-    if len(clean) >= 9:
-        return clean[:-1][:8], clean[-1]
-    return clean[:8], ""
+class FamiliaAuthSession(OjvSession):
+    """Shared OJV session plus Familia's observed listing form."""
 
-
-def _extract_cu_login_params(html: str) -> tuple[str | None, str | None]:
-    """Parse CU login page once; return (csrf_token, next_value)."""
-    soup = BeautifulSoup(html, "html.parser")
-    csrf_inp = soup.find("input", {"name": "csrfmiddlewaretoken"})
-    next_inp = soup.find("input", {"name": "next"})
-    return (
-        csrf_inp.get("value") if csrf_inp else None,
-        next_inp.get("value") if next_inp else None,
-    )
-
-
-def _detect_login_error(html: str) -> bool:
-    lower = html.lower()
-    return any(k in lower for k in [
-        "gob-response-error", "clave incorrecta", "rut o clave",
-        "rut o contraseña", "rut o constraseña",  # variante correcta + typo real del portal
-        "credenciales inválidas", "no existe", "contraseña incorrecta",
-        "rut incorrecto", "usuario no encontrado",
-        "clave poder judicial incorrecta", "rut no registrado",
-    ])
-
-
-def _detect_session_error(url: str) -> bool:
-    """Return True if the final URL looks like a login/error page rather than an OJV session."""
-    low = url.lower()
-    return any(k in low for k in ["login", "error", "claveunica.gob.cl", "ojv.pjud.cl"])
-
-
-class FamiliaAuthSession:
-    """Short-lived authenticated OJV session for a single Familia sync."""
-
-    def __init__(
+    async def search_familia(
         self,
-        proxy_url: str | None = None,
-        cookies: Sequence[CookieRecord] | Mapping[str, str] | None = None,
-        user_agent: str | None = None,
-        rate_limit_s: float = 2.5,
-    ):
-        self._rate_s = rate_limit_s
-        self._last: float = 0.0
-        cookie_records = cookies or ()
-        if isinstance(cookie_records, Mapping):
-            domain, secure = legacy_cookie_scope(_OJV_BASE)
-            cookie_records = legacy_cookie_records(
-                cookie_records, domain=domain, secure=secure,
-            )
-        self._client = httpx.AsyncClient(
-            proxy=proxy_url,
-            cookies=cookie_jar_from_records(cookie_records),
-            timeout=httpx.Timeout(30.0),
-            follow_redirects=True,
-            headers={
-                "User-Agent": user_agent or _USER_AGENT,
-                "Accept-Language": "es-CL,es;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-
-    async def _get(self, url: str, **kwargs) -> httpx.Response:
-        record_proxy_request(estimate_request_bytes(kwargs))
-        resp = await self._client.get(url, **kwargs)
-        record_proxy_response(len(resp.content))
-        return resp
-
-    async def _post(self, url: str, **kwargs) -> httpx.Response:
-        record_proxy_request(estimate_request_bytes(kwargs))
-        resp = await self._client.post(url, **kwargs)
-        record_proxy_response(len(resp.content))
-        return resp
-
-    async def _wait(self) -> None:
-        elapsed = time.monotonic() - self._last
-        if elapsed < self._rate_s:
-            await asyncio.sleep(self._rate_s - elapsed)
-        self._last = time.monotonic()
-
-    async def _login_clave_pj(self, rut: str, password: str) -> None:
-        rut_digits, _ = _rut_parts(rut)
-
-        await self._wait()
-        await self._get(_CPJ_LOGIN_PAGE)  # obtain F5 BIG-IP cookies
-
-        await self._wait()
-        resp = await self._post(
-            _CPJ_LOGIN_API,
-            data={"rutPjud": rut_digits, "passwordPjud": password},
-            headers={"Referer": _CPJ_LOGIN_PAGE, "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        html = _decode(resp)
-        final_url = str(resp.url)
-
-        if detect_blocked(html):
-            raise FamiliaBlockedError("Clave PJ login: challenge F5")
-
-        # TODO(U3): validar con credencial Clave PJ productiva real:
-        #  (1) la URL/HTML exacta del RECHAZO de credencial (hoy _detect_login_error
-        #      es por texto de body; confirmar si además existe una URL tipo
-        #      loginErrorPjud.html), y
-        #  (2) el redirect del ÉXITO. OJO: _detect_session_error matchea la
-        #      subcadena "ojv.pjud.cl", que ES el host de login Clave PJ. Si un
-        #      login exitoso queda en ojv.pjud.cl, daría un SessionError falso
-        #      (transitorio → causa atascada en "blocked"). Verificar el host de
-        #      éxito real antes de confiar en _detect_session_error para Clave PJ.
-
-        if _detect_login_error(html):
-            raise InvalidCredentialsError("Clave PJ: credentials rejected")
-        if _detect_session_error(final_url):
-            logger.warning("Clave PJ login: unexpected final URL %s", final_url[:80])
-            raise SessionError(f"Clave PJ: unexpected redirect to {final_url[:80]}")
-
-        logger.info("Clave PJ session established")
-
-    async def _login_clave_unica(self, rut: str, password: str) -> None:
-        # DORMANT: login() ya no enruta a clave_unica (decisión: solo Clave PJ).
-        # Se conserva para una eventual reactivación; ver TODO(U3) en _login_clave_pj.
-        rut_digits, _ = _rut_parts(rut)
-
-        await self._wait()
-        resp_home = await self._get(_CU_HOME)
-        soup = BeautifulSoup(_decode(resp_home), "html.parser")
-        cuform = soup.find("form", {"id": "cuform"})
-        if not cuform:
-            raise SessionError("Clave Única: cuform not found on home/index.php")
-        inp = cuform.find("input")
-        if not inp:
-            raise SessionError("Clave Única: cuform has no hidden input")
-
-        field_name = inp.get("name", "")
-        jwt_value  = inp.get("value", "")
-
-        if field_name != _CU_FORM_FIELD:
-            logger.warning(
-                "Clave Única: cuform field name changed from %s to %s — update _CU_FORM_FIELD",
-                _CU_FORM_FIELD, field_name,
-            )
-
-        await self._wait()
-        resp_cu = await self._post(
-            _CU_INIT_URL,
-            data={field_name: jwt_value},
-            headers={"Referer": _CU_HOME},
-        )
-        html_cu = _decode(resp_cu)
-        cu_url  = str(resp_cu.url)
-
-        if _CU_BASE not in cu_url:
-            raise SessionError(f"Clave Única: expected CU login page, got {cu_url[:80]}")
-
-        csrf, next_val = _extract_cu_login_params(html_cu)
-        if not csrf:
-            raise SessionError("Clave Única: CSRF token not found on login page")
-
-        # token="" is intentional — reCAPTCHA v3 present but not enforced server-side (verified 2026-04-20)
-        await self._wait()
-        resp_login = await self._post(
-            cu_url,
-            data={
-                "csrfmiddlewaretoken": csrf,
-                "next":                next_val or "",
-                "app_name":            "PJUD",
-                "token":               "",
-                "run":                 rut_digits,
-                "password":            password,
-            },
-            headers={"Referer": cu_url, "Origin": _CU_BASE, "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        html_login = _decode(resp_login)
-        final_url  = str(resp_login.url)
-
-        if _detect_login_error(html_login):
-            raise InvalidCredentialsError("Clave Única: credentials rejected")
-        if _detect_session_error(final_url):
-            logger.warning("Clave Única login: unexpected final URL %s", final_url[:80])
-            raise SessionError(f"Clave Única: unexpected redirect to {final_url[:80]}")
-
-        logger.info("Clave Única session established via %s", final_url[:60])
-
-    async def login(self, rut: str, password: str, auth_type: str) -> None:
-        if auth_type == "clave_pj":
-            await self._login_clave_pj(rut, password)
-        elif auth_type == "clave_unica":
-            # Clave Única quedó dormida (solo Clave PJ). El método sigue en el
-            # archivo pero login() ya no enruta a él.
-            raise ValueError("Clave Única no soportada; usá Clave Poder Judicial")
-        else:
-            raise ValueError(f"Unknown auth_type: {auth_type!r}")
-
-    async def search_familia(self, rut: str, rit: str = "", year: str = "") -> str:
-        rut_digits, dv = _rut_parts(rut)
-        form_data: dict[str, str] = {
-            "rutMisCauFam":           rut_digits[:8],
-            "dvMisCauFam":            dv,
-            "tipoMisCauFam":          "0",
-            "rolMisCauFam":           rit,
-            "anhoMisCauFam":          year,
-            "tipCausaMisCauFam[]":    "M",
+        rut: SecretStr,
+        rit: str = "",
+        year: str = "",
+    ) -> str:
+        if not isinstance(rut, SecretStr):
+            raise TypeError("rut must be SecretStr")
+        rut_digits, dv = rut_parts(rut.get_secret_value())
+        form_data = {
+            "rutMisCauFam": rut_digits[:8],
+            "dvMisCauFam": dv,
+            "tipoMisCauFam": "0",
+            "rolMisCauFam": rit,
+            "anhoMisCauFam": year,
+            "tipCausaMisCauFam[]": "M",
             "estadoCausaMisCauFam[]": "1",
-            "fecDesdeMisCauFam":      "",
-            "fecHastaMisCauFam":      "",
-            "nombreMisCauFam":        "",
-            "apePatMisCauFam":        "",
-            "apeMatMisCauFam":        "",
+            "fecDesdeMisCauFam": "",
+            "fecHastaMisCauFam": "",
+            "nombreMisCauFam": "",
+            "apePatMisCauFam": "",
+            "apeMatMisCauFam": "",
         }
-        await self._wait()
-        resp = await self._post(
-            _FAMILIA_SEARCH,
-            data=form_data,
-            headers={**_FAMILIA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp.raise_for_status()
-        html = _decode(resp)
-        if detect_blocked(html):
-            raise FamiliaBlockedError("Familia search: challenge F5")
+        try:
+            response = await self.post_form(
+                _FAMILIA_SEARCH,
+                list(form_data.items()),
+                headers={
+                    **_FAMILIA_HEADERS,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+        finally:
+            form_data.clear()
+            rut_digits = ""
+            dv = ""
+        html = decode_ojv_html(response)
+        search_error: OjvSessionError | None = None
+        if response.status_code in {403, 429} or detect_blocked(html):
+            search_error = FamiliaBlockedError()
+        elif response.status_code in {401, 419} or looks_like_login_url(str(response.url)):
+            search_error = SessionExpiredError()
+        elif response.status_code == 408 or response.status_code >= 500:
+            search_error = OjvTimeoutError()
+        elif response.status_code >= 400:
+            search_error = OjvUpstreamChangedError()
+        response = None
+        if search_error is not None:
+            html = ""
+            raise search_error
         return html
 
-    async def close(self) -> None:
-        await self._client.aclose()
 
-    async def __aenter__(self) -> "FamiliaAuthSession":
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        await self.close()
-
-
-class InvalidCredentialsError(Exception):
-    """OJV/CU rejected the provided credentials."""
-
-
-class SessionError(Exception):
-    """Failed to establish an authenticated OJV session."""
-
-
-class FamiliaBlockedError(Exception):
-    """OJV devolvió un challenge F5 (bloqueo transitorio; NO penaliza consecutive_sync_failures)."""
+__all__ = [
+    "FamiliaAuthSession",
+    "FamiliaBlockedError",
+    "InvalidCredentialsError",
+    "OjvSession",
+    "SessionError",
+    "SessionExpiredError",
+    "decode_ojv_html",
+]

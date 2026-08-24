@@ -666,6 +666,9 @@
             "title": "Pjud Available",
             "type": "boolean"
           },
+          "private_sync": {
+            "$ref": "#/components/schemas/PrivateSyncHealth"
+          },
           "search_requests": {
             "default": 0,
             "title": "Search Requests",
@@ -879,6 +882,665 @@
         "title": "Movement",
         "type": "object"
       },
+      "PenalBookBatchSearchRequest": {
+        "description": "Closed internal contract for resolving one observed Penal RIT.",
+        "properties": {
+          "books": {
+            "items": {
+              "enum": [
+                "1",
+                "2",
+                "3",
+                "4",
+                "5"
+              ],
+              "type": "string"
+            },
+            "title": "Books",
+            "type": "array"
+          },
+          "caption": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Caption",
+            "type": "string"
+          },
+          "case_number": {
+            "title": "Case Number",
+            "type": "string"
+          },
+          "case_type": {
+            "const": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "competencia": {
+            "const": "penal",
+            "title": "Competencia",
+            "type": "string"
+          },
+          "contract_version": {
+            "const": 2,
+            "title": "Contract Version",
+            "type": "integer"
+          },
+          "tribunal_label": {
+            "maxLength": 240,
+            "minLength": 3,
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_version",
+          "competencia",
+          "case_type",
+          "case_number",
+          "books",
+          "tribunal_label",
+          "caption"
+        ],
+        "title": "PenalBookBatchSearchRequest",
+        "type": "object"
+      },
+      "PenalBookBatchSearchResponse": {
+        "additionalProperties": false,
+        "description": "Closed batch result: verified identity + safe detail, never a PJUD key.",
+        "properties": {
+          "blocked": {
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "case_type": {
+            "const": "rit",
+            "default": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PenalBookSafeDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "found": {
+            "title": "Found",
+            "type": "boolean"
+          },
+          "match_count": {
+            "title": "Match Count",
+            "type": "integer"
+          },
+          "status": {
+            "default": "not_found",
+            "enum": [
+              "found",
+              "not_found",
+              "needs_disambiguation",
+              "pjud_blocked",
+              "pjud_timeout",
+              "upstream_changed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "verified_match": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PenalBookVerifiedMatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "found",
+          "match_count",
+          "blocked",
+          "error"
+        ],
+        "title": "PenalBookBatchSearchResponse",
+        "type": "object"
+      },
+      "PenalBookSafeDetail": {
+        "additionalProperties": false,
+        "description": "Closed detail payload with every document/session capability removed.",
+        "properties": {
+          "blocked": {
+            "default": false,
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "error": {
+            "title": "Error",
+            "type": "null"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "litigantes": {
+            "items": {
+              "$ref": "#/components/schemas/Litigante"
+            },
+            "title": "Litigantes",
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/CaseMetadata"
+          },
+          "movements": {
+            "items": {
+              "$ref": "#/components/schemas/PenalBookSafeMovement"
+            },
+            "title": "Movements",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metadata",
+          "movements",
+          "litigantes"
+        ],
+        "title": "PenalBookSafeDetail",
+        "type": "object"
+      },
+      "PenalBookSafeMovement": {
+        "additionalProperties": false,
+        "description": "Movement evidence safe to cross the batch boundary.",
+        "properties": {
+          "cuaderno": {
+            "title": "Cuaderno",
+            "type": "string"
+          },
+          "descripcion": {
+            "title": "Descripcion",
+            "type": "string"
+          },
+          "documento_url": {
+            "title": "Documento Url",
+            "type": "null"
+          },
+          "estado": {
+            "default": "",
+            "title": "Estado",
+            "type": "string"
+          },
+          "etapa": {
+            "title": "Etapa",
+            "type": "string"
+          },
+          "fecha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha"
+          },
+          "foja": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Foja"
+          },
+          "folio": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folio"
+          },
+          "sala": {
+            "default": "",
+            "title": "Sala",
+            "type": "string"
+          },
+          "tramite": {
+            "title": "Tramite",
+            "type": "string"
+          }
+        },
+        "required": [
+          "folio",
+          "cuaderno",
+          "etapa",
+          "tramite",
+          "descripcion",
+          "fecha",
+          "foja"
+        ],
+        "title": "PenalBookSafeMovement",
+        "type": "object"
+      },
+      "PenalBookVerifiedMatch": {
+        "additionalProperties": false,
+        "description": "Verified Penal identity evidence; deliberately excludes the PJUD JWT key.",
+        "properties": {
+          "caratulado": {
+            "title": "Caratulado",
+            "type": "string"
+          },
+          "corte": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corte"
+          },
+          "corte_code": {
+            "title": "Corte Code",
+            "type": "integer"
+          },
+          "fecha_ingreso": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fecha Ingreso"
+          },
+          "libro": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Libro"
+          },
+          "libro_code": {
+            "enum": [
+              "1",
+              "2",
+              "3",
+              "4",
+              "5"
+            ],
+            "title": "Libro Code",
+            "type": "string"
+          },
+          "rol": {
+            "title": "Rol",
+            "type": "string"
+          },
+          "ruc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ruc"
+          },
+          "tribunal": {
+            "title": "Tribunal",
+            "type": "string"
+          },
+          "tribunal_code": {
+            "title": "Tribunal Code",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rol",
+          "tribunal",
+          "caratulado",
+          "fecha_ingreso",
+          "tribunal_code",
+          "corte_code",
+          "libro_code"
+        ],
+        "title": "PenalBookVerifiedMatch",
+        "type": "object"
+      },
+      "PrivateCauseResolution": {
+        "additionalProperties": false,
+        "properties": {
+          "case_number": {
+            "title": "Case Number",
+            "type": "string"
+          },
+          "case_type": {
+            "const": "rit",
+            "default": "rit",
+            "title": "Case Type",
+            "type": "string"
+          },
+          "detail": {
+            "$ref": "#/components/schemas/SanitizedCaseDetail"
+          },
+          "matter": {
+            "const": "familia",
+            "default": "familia",
+            "title": "Matter",
+            "type": "string"
+          },
+          "movements": {
+            "items": {
+              "$ref": "#/components/schemas/SanitizedMovement"
+            },
+            "title": "Movements",
+            "type": "array"
+          },
+          "tribunal_code": {
+            "exclusiveMinimum": 0.0,
+            "title": "Tribunal Code",
+            "type": "integer"
+          },
+          "tribunal_label": {
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_number",
+          "tribunal_code",
+          "tribunal_label",
+          "detail",
+          "movements"
+        ],
+        "title": "PrivateCauseResolution",
+        "type": "object"
+      },
+      "PrivateCauseResolutionRequest": {
+        "additionalProperties": false,
+        "description": "Closed request boundary for one explicitly selected Familia candidate.",
+        "properties": {
+          "auth_type": {
+            "const": "clave_pj",
+            "default": "clave_pj",
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "case_number": {
+            "maxLength": 128,
+            "pattern": "^[A-Z]+-[0-9]+-[0-9]{4}$",
+            "title": "Case Number",
+            "type": "string"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "rut": {
+            "title": "Rut",
+            "type": "string"
+          },
+          "tribunal_code": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tribunal Code"
+          },
+          "tribunal_label": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Tribunal Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rut",
+          "password",
+          "case_number",
+          "tribunal_label"
+        ],
+        "title": "PrivateCauseResolutionRequest",
+        "type": "object"
+      },
+      "PrivateCauseResolutionResult": {
+        "additionalProperties": false,
+        "properties": {
+          "error_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "private_not_found",
+                  "private_ambiguous",
+                  "private_identifier_mismatch",
+                  "private_tribunal_mismatch",
+                  "private_evidence_incomplete",
+                  "private_fence_unavailable",
+                  "credential_invalid",
+                  "session_expired",
+                  "waf",
+                  "timeout",
+                  "upstream_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrivateCauseResolution"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "resolution",
+          "error_code"
+        ],
+        "title": "PrivateCauseResolutionResult",
+        "type": "object"
+      },
+      "PrivateSyncHealth": {
+        "additionalProperties": false,
+        "description": "Closed count-only schema: dimensions and arbitrary keys are rejected.",
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "credential_invalid": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Credential Invalid",
+            "type": "integer"
+          },
+          "incomplete_enrichment": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Incomplete Enrichment",
+            "type": "integer"
+          },
+          "lease_churn": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Churn",
+            "type": "integer"
+          },
+          "lease_loss": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Loss",
+            "type": "integer"
+          },
+          "retry_exhaustion": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Retry Exhaustion",
+            "type": "integer"
+          },
+          "session_expired": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Session Expired",
+            "type": "integer"
+          },
+          "timeout": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Timeout",
+            "type": "integer"
+          },
+          "upstream_schema_change": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Upstream Schema Change",
+            "type": "integer"
+          },
+          "waf": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Waf",
+            "type": "integer"
+          }
+        },
+        "title": "PrivateSyncHealth",
+        "type": "object"
+      },
+      "SanitizedCaseDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "caption": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Caption",
+            "type": "string"
+          },
+          "filed_at": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filed At"
+          },
+          "status": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "required": [
+          "caption",
+          "status"
+        ],
+        "title": "SanitizedCaseDetail",
+        "type": "object"
+      },
+      "SanitizedMovement": {
+        "additionalProperties": false,
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "kind": {
+            "const": "status",
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "title": "SanitizedMovement",
+        "type": "object"
+      },
       "SearchRequest": {
         "properties": {
           "allow_broad": {
@@ -891,6 +1553,7 @@
             "type": "string"
           },
           "case_type": {
+            "description": "Case identifier type. Canonical values are rol, rit, and ruc. For cobranza, use rit; the temporary deprecated rol alias is accepted and normalized to rit. Cobranza does not accept ruc.",
             "title": "Case Type",
             "type": "string"
           },
@@ -985,6 +1648,18 @@
           "blocked": {
             "title": "Blocked",
             "type": "boolean"
+          },
+          "case_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Normalized request case identifier type. Cobranza responses emit rit; deprecated rol is accepted only as an input alias.",
+            "title": "Case Type"
           },
           "error": {
             "anyOf": [
@@ -1152,6 +1827,52 @@
         ]
       }
     },
+    "/api/v1/familia/resolve-private": {
+      "post": {
+        "operationId": "familia_resolve_private_api_v1_familia_resolve_private_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivateCauseResolutionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateCauseResolutionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Familia Resolve Private",
+        "tags": [
+          "familia"
+        ]
+      }
+    },
     "/api/v1/familia/sync": {
       "post": {
         "operationId": "familia_sync_api_v1_familia_sync_post",
@@ -1260,6 +1981,52 @@
           }
         ],
         "summary": "Search Case",
+        "tags": [
+          "search"
+        ]
+      }
+    },
+    "/api/v1/search/penal-books": {
+      "post": {
+        "operationId": "search_penal_books_api_v1_search_penal_books_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PenalBookBatchSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PenalBookBatchSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Search Penal Books",
         "tags": [
           "search"
         ]

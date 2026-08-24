@@ -49,6 +49,11 @@ class WorkerConfig(BaseSettings):
     # por defecto conserva estrictamente la ventana hábil.
     PJUD_PROCESS_OUTSIDE_OFFICE_HOURS: bool = False
 
+    # "Mis Causas" requires independent opt-in on web and worker. The Excel
+    # endpoint is undocumented and intentionally cannot be enabled.
+    ENABLE_PJUD_MY_CAUSES_IMPORT: bool = False
+    ENABLE_PJUD_MY_CAUSES_EXCEL: bool = False
+
     # R2 document storage
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""
@@ -88,6 +93,22 @@ class WorkerConfig(BaseSettings):
     def _valid_sticky_lifetime(cls, value: str) -> str:
         sticky_lifetime_seconds(value)
         return value
+
+    @field_validator("ENABLE_PJUD_MY_CAUSES_EXCEL")
+    @classmethod
+    def _excel_endpoint_remains_disabled(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("pjud_my_causes_excel_must_remain_disabled")
+        return False
+
+    @field_validator("ENABLE_PJUD_MY_CAUSES_IMPORT", mode="before")
+    @classmethod
+    def _literal_import_flag(cls, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value in {"true", "false"}:
+            return value == "true"
+        raise ValueError("pjud_my_causes_import_flag_must_be_literal")
 
     @property
     def session_hard_effective_age_s(self) -> int:

@@ -32,12 +32,13 @@ CONSUMED = {
         "found", "match_count", "matches", "blocked", "error", "status", "truncated",
     ],
     "CandidateMatch": [
-        "key", "caratulado", "fecha_ingreso", "tribunal", "tribunal_code", "ruc",
+        "key", "rol", "ruc", "caratulado", "fecha_ingreso", "tribunal",
+        "tribunal_code", "corte", "corte_code", "libro", "libro_code",
     ],
     "DetailResponse": [
         "metadata", "movements", "litigantes", "ebook_token",
         "certificado_disponible", "suprema_docs", "exhortos", "incompetencia",
-        "blocked", "error",
+        "libro", "blocked", "error",
     ],
     "CaseMetadata": [
         "rol", "tribunal", "estado_administrativo", "procedimiento",
@@ -52,7 +53,7 @@ CONSUMED = {
     # fue exactamente total_bundle_retries desapareciendo en silencio.
     "HealthResponse": [
         "status", "last_successful_request", "uptime_seconds",
-        "total_bundle_retries", "total_pool_failures",
+        "total_bundle_retries", "total_pool_failures", "pjud_available", "private_sync",
     ],
     "FamiliaSyncResponse": ["ok", "casos", "error_code", "error"],
     "FamiliaCaso": ["rit", "tribunal", "caratulado", "materia", "estado", "fecha_ingreso"],
@@ -64,7 +65,8 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
     # test de arriba pasaría con un archivo vacío-consistente.
     spec = json.loads(OUT.read_text())
     for path in [
-        "/api/v1/search", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
+        "/api/v1/search", "/api/v1/search/penal-books", "/api/v1/detail", "/api/v1/health", "/api/v1/familia/sync",
+        "/api/v1/familia/resolve-private",
     ]:
         assert path in spec["paths"], f"el contrato perdió {path}"
     assert not any(path.startswith("/api/v1/catalogs/") for path in spec["paths"]), (
@@ -79,3 +81,21 @@ def test_el_contrato_cubre_lo_que_la_app_consume():
             f"{schema} perdió campos que la app lee: {missing} — si es intencional, "
             "actualizar el espejo en la app (tests/unit/pjud-contract.test.ts)"
         )
+
+    assert set(schemas["PrivateCauseResolutionResult"]["required"]) == {
+        "ok", "resolution", "error_code",
+    }
+
+
+def test_cobranza_documents_canonical_rit_and_legacy_rol_alias():
+    spec = json.loads(OUT.read_text())
+    schemas = spec["components"]["schemas"]
+
+    request_case_type = schemas["SearchRequest"]["properties"]["case_type"]
+    assert "rit" in request_case_type["description"].lower()
+    assert "rol" in request_case_type["description"].lower()
+    assert "cobranza" in request_case_type["description"].lower()
+
+    response_case_type = schemas["SearchResponse"]["properties"]["case_type"]
+    assert "rit" in response_case_type["description"].lower()
+    assert "rol" in response_case_type["description"].lower()

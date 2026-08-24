@@ -752,8 +752,10 @@ class TestSearch:
         assert body["found"] is True
         assert body["match_count"] >= 1
 
-    def test_search_cobranza(self, client):
-        """POST /api/v1/search with cobranza competencia returns results."""
+    def test_search_cobranza(self, client, caplog):
+        """Legacy Cobranza ROL is emitted as the canonical RIT identity."""
+        import logging
+
         html = _load("search_Cobranza_C_1000_2024.html")
         mock_session = _make_mock_session(search_html=html)
         mock_pool = _make_mock_pool(mock_session)
@@ -764,12 +766,18 @@ class TestSearch:
             "case_number": "C-1000-2024",
             "competencia": "cobranza",
         }
-        resp = client.post("/api/v1/search", json=payload, headers=AUTH)
+        with caplog.at_level(logging.INFO, logger="app.routes.search"):
+            resp = client.post("/api/v1/search", json=payload, headers=AUTH)
 
         assert resp.status_code == 200
         body = resp.json()
         assert body["found"] is True
         assert body["match_count"] >= 1
+        assert body["case_type"] == "rit"
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("case_type=rit" in message for message in messages)
+        assert all(payload["case_number"] not in message for message in messages)
+        assert all("test-key" not in message for message in messages)
 
     def test_search_requires_auth(self, client):
         """POST /api/v1/search without Authorization header returns 401."""

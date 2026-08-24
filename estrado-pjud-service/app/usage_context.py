@@ -15,10 +15,14 @@ from app.auth import has_valid_authorization_header
 LAW_FIRM_ID_HEADER = "X-JurisTrack-Law-Firm-ID"
 CASE_ID_HEADER = "X-JurisTrack-Case-ID"
 SYNC_RUN_ID_HEADER = "X-JurisTrack-Sync-Run-ID"
+LOOKUP_ATTEMPT_ID_HEADER = "X-JurisTrack-Lookup-Attempt-ID"
 
 _SCOPE: ContextVar[dict[str, str | None]] = ContextVar(
     "pjud_usage_scope",
-    default={"law_firm_id": None, "case_id": None, "sync_run_id": None},
+    default={
+        "law_firm_id": None, "case_id": None, "lookup_attempt_id": None,
+        "sync_run_id": None,
+    },
 )
 
 
@@ -27,10 +31,14 @@ def current_usage_scope() -> dict[str, str | None]:
 
 
 @contextmanager
-def usage_scope(*, law_firm_id: str, case_id: str, sync_run_id: str | None = None):
+def usage_scope(
+    *, law_firm_id: str, case_id: str | None = None,
+    lookup_attempt_id: str | None = None, sync_run_id: str | None = None,
+):
     token = _SCOPE.set({
         "law_firm_id": law_firm_id,
         "case_id": case_id,
+        "lookup_attempt_id": lookup_attempt_id,
         "sync_run_id": sync_run_id,
     })
     try:
@@ -58,14 +66,16 @@ class PjudUsageContextMiddleware:
         raw_firm = headers.get(LAW_FIRM_ID_HEADER)
         raw_case = headers.get(CASE_ID_HEADER)
         raw_run = headers.get(SYNC_RUN_ID_HEADER)
+        raw_lookup = headers.get(LOOKUP_ATTEMPT_ID_HEADER)
         valid_auth = has_valid_authorization_header(headers.get("Authorization"))
-        if not any((raw_firm, raw_case, raw_run)):
+        if not any((raw_firm, raw_case, raw_lookup, raw_run)):
             app = scope.get("app")
             proxy_required = bool(
                 app is not None and getattr(app.state, "proxy_control_required", False)
             )
             paid_case_path = scope.get("path") in {
                 "/api/v1/search",
+                "/api/v1/search/penal-books",
                 "/api/v1/detail",
                 "/api/v1/familia/sync",
             }
@@ -79,6 +89,7 @@ class PjudUsageContextMiddleware:
         try:
             firm_id = _uuid(raw_firm)
             case_id = _uuid(raw_case)
+            lookup_attempt_id = _uuid(raw_lookup)
             run_id = _uuid(raw_run)
         except (ValueError, AttributeError):
             if not valid_auth:
@@ -88,7 +99,7 @@ class PjudUsageContextMiddleware:
                 scope, receive, send,
             )
             return
-        if firm_id is None or case_id is None:
+        if firm_id is None or (case_id is None) == (lookup_attempt_id is None):
             if not valid_auth:
                 await self.app(scope, receive, send)
                 return
@@ -97,5 +108,14 @@ class PjudUsageContextMiddleware:
             )
             return
 
-        with usage_scope(law_firm_id=firm_id, case_id=case_id, sync_run_id=run_id):
+        if lookup_attempt_id is not None and run_id is not None:
+            await JSONResponse({"detail": "Incomplete PJUD usage attribution"}, status_code=422)(
+                scope, receive, send,
+            )
+            return
+
+        with usage_scope(
+            law_firm_id=firm_id, case_id=case_id,
+            lookup_attempt_id=lookup_attempt_id, sync_run_id=run_id,
+        ):
             await self.app(scope, receive, send)

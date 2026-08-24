@@ -37,6 +37,25 @@ def _make_mock_pool():
 
 
 class TestRateLimit:
+    def test_penal_batch_is_one_rate_limited_api_operation(self, client, monkeypatch):
+        from app.models import SearchResponse
+        from app.routes import search as search_route
+
+        run_batch = AsyncMock(return_value=SearchResponse(
+            found=False, match_count=0, matches=[], blocked=False, error=None,
+            case_type="rit", status="not_found",
+        ))
+        monkeypatch.setattr(search_route, "_run_penal_book_batch", run_batch)
+        payload = {
+            "contract_version": 2, "competencia": "penal", "case_type": "rit",
+            "case_number": "E-77-2025", "books": ["1", "2", "3", "4", "5"],
+            "tribunal_label": "7º Juzgado de Garantía",
+            "caption": "MINISTERIO PÚBLICO / PERSONA E",
+        }
+        assert client.post("/api/v1/search/penal-books", json=payload, headers=AUTH).status_code == 200
+        assert client.post("/api/v1/search/penal-books", json=payload, headers=AUTH).status_code == 429
+        assert run_batch.await_count == 1
+
     def test_search_rate_limited_after_5_requests(self, client):
         """6th request within a minute should return 429."""
         client.app.state.session_pool = _make_mock_pool()
