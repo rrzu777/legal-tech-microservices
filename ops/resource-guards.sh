@@ -1653,6 +1653,12 @@ do_rollback() {
   worker_restore_allowed=1
   if [ "${desired_active_states[1]}" = active ] \
     && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
+    && ! maintenance_window_is_open; then
+    fail 'rollback active worker restoration is outside the maintenance window'
+    return 1
+  fi
+  if [ "${desired_active_states[1]}" = active ] \
+    && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
     && ! quiesce_worker_for_restore; then
     rollback_rc=1
     worker_restore_allowed=0

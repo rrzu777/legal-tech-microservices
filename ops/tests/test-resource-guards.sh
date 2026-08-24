@@ -2078,6 +2078,55 @@ run_rollback_precheck_regressions() {
   done
 }
 
+run_rollback_maintenance_window_regressions() {
+  local backup_path before_mutations
+  echo '== rollback fences active-worker restoration before every mutation'
+
+  setup
+  configure_active_worker
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'outside-window fixture captures changed active worker' "$RC" 0
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  printf '%s\n' 19 > "$STATE/local-hour"
+  : > "$EVENTS"
+  before_mutations=$(grep -Ec '^(systemctl (start|stop|restart|daemon-reload)|swap rollback$|provision|cp |mv |rm )' "$EVENTS" 2>/dev/null || true)
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'outside-window active-worker rollback fails closed' "$RC" 1
+  expect_eq 'outside-window rollback performs zero host mutation' \
+    "$(grep -Ec '^(systemctl (start|stop|restart|daemon-reload)|swap rollback$|provision|cp |mv |rm )' "$EVENTS" 2>/dev/null || true)" \
+    "$before_mutations"
+  expect_count 'outside-window rollback performs no worker stop' \
+    'systemctl stop estrado-pjud-worker.service' 0
+  expect_exact_count 'outside-window rollback performs no swap rollback' 'swap rollback' 0
+  expect_count 'outside-window rollback performs no manifest reload' \
+    'systemctl daemon-reload' 0
+  expect_eq 'outside-window rollback leaves changed worker active' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+
+  printf '%s\n' 20 > "$STATE/local-hour"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'inside-window active-worker rollback still converges' "$RC" 0
+  expect_exact_count 'inside-window rollback delegates swap once' 'swap rollback' 1
+
+  setup
+  printf '%s\n' inactive > "$STATE/unit-estrado-pjud-worker.service-active"
+  printf '%s\n' 0 > "$STATE/unit-estrado-pjud-worker.service-main-pid"
+  : > "$STATE/unit-estrado-pjud-worker.service-control-group"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'inactive-worker fixture applies without activation' "$RC" 0
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  printf '%s\n' 19 > "$STATE/local-hour"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'outside-window captured-inactive rollback still converges' "$RC" 0
+  expect_count 'captured-inactive rollback performs no worker start' \
+    'systemctl start estrado-pjud-worker.service' 0
+  expect_count 'captured-inactive rollback performs no worker stop' \
+    'systemctl stop estrado-pjud-worker.service' 0
+}
+
 run_orchestrated_swap_crash_regression() {
   local backup_path retry_path
   echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
@@ -2121,6 +2170,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-precheck ]; then
   run_rollback_precheck_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-maintenance-window ]; then
+  run_rollback_maintenance_window_regressions
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
