@@ -666,6 +666,9 @@
             "title": "Pjud Available",
             "type": "boolean"
           },
+          "private_sync": {
+            "$ref": "#/components/schemas/PrivateSyncHealth"
+          },
           "search_requests": {
             "default": 0,
             "title": "Search Requests",
@@ -1026,6 +1029,74 @@
           "ok"
         ],
         "title": "PrivateCauseResolutionResult",
+        "type": "object"
+      },
+      "PrivateSyncHealth": {
+        "additionalProperties": false,
+        "description": "Closed count-only schema: dimensions and arbitrary keys are rejected.",
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "credential_invalid": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Credential Invalid",
+            "type": "integer"
+          },
+          "incomplete_enrichment": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Incomplete Enrichment",
+            "type": "integer"
+          },
+          "lease_churn": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Churn",
+            "type": "integer"
+          },
+          "lease_loss": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Loss",
+            "type": "integer"
+          },
+          "retry_exhaustion": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Retry Exhaustion",
+            "type": "integer"
+          },
+          "session_expired": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Session Expired",
+            "type": "integer"
+          },
+          "timeout": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Timeout",
+            "type": "integer"
+          },
+          "upstream_schema_change": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Upstream Schema Change",
+            "type": "integer"
+          },
+          "waf": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Waf",
+            "type": "integer"
+          }
+        },
+        "title": "PrivateSyncHealth",
         "type": "object"
       },
       "SanitizedCaseDetail": {

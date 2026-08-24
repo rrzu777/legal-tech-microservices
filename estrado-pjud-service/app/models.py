@@ -1,7 +1,7 @@
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 COMPETENCIA_TYPE = Literal["suprema", "apelaciones", "civil", "laboral", "penal", "cobranza"]
 SearchMode = Literal["supreme_resource", "appeals_resource", "first_instance"]
@@ -329,6 +329,23 @@ class DetailResponse(BaseModel):
     incompetencia: list[dict] = []
 
 
+class PrivateSyncHealth(BaseModel):
+    """Closed count-only schema: dimensions and arbitrary keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempts: int = Field(default=0, ge=0)
+    credential_invalid: int = Field(default=0, ge=0)
+    session_expired: int = Field(default=0, ge=0)
+    waf: int = Field(default=0, ge=0)
+    timeout: int = Field(default=0, ge=0)
+    upstream_schema_change: int = Field(default=0, ge=0)
+    lease_churn: int = Field(default=0, ge=0)
+    lease_loss: int = Field(default=0, ge=0)
+    retry_exhaustion: int = Field(default=0, ge=0)
+    incomplete_enrichment: int = Field(default=0, ge=0)
+
+
 class HealthResponse(BaseModel):
     status: str
     last_successful_request: str | None
@@ -351,3 +368,6 @@ class HealthResponse(BaseModel):
     # otra IP residencial salvó la consulta. Sin los dos, un pool con 2 de 3
     # bundles quemados se ve igual que uno sano, porque la app recibió su 200.
     total_bundle_retries: int = 0
+    # Un solo objeto de contadores finitos: nunca dimensiones por tenant,
+    # credencial, usuario, causa o RUT.
+    private_sync: PrivateSyncHealth = Field(default_factory=PrivateSyncHealth)

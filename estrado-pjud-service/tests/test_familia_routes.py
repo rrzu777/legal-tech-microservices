@@ -162,6 +162,63 @@ async def test_una_sesion_que_no_levanta_no_se_reporta_como_bloqueo(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_unexpected_authenticated_login_never_serializes_secret_or_traceback(monkeypatch, caplog):
+    from app.routes import familia as mod
+
+    secret = "11.111.111-1 synthetic-password OJVID=synthetic-cookie <html>PERSONA A</html>"
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(side_effect=RuntimeError(secret))
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    resp = await mod._run_sync(
+        FamiliaSyncRequest(rut="11111111-1", password="synthetic-password", auth_type="clave_pj"),
+        rate_s=0.0,
+        bundle=_bundle(),
+    )
+
+    assert resp.model_dump() == {
+        "ok": False,
+        "casos": [],
+        "error_code": "session_error",
+        "error": "No se pudo establecer sesión con OJV",
+    }
+    rendered = caplog.text + resp.model_dump_json()
+    for forbidden in ("11.111.111-1", "synthetic-password", "OJVID", "<html>", "PERSONA A"):
+        assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
+async def test_case_scoped_unknown_failure_logs_no_rit_or_upstream_message(monkeypatch, caplog):
+    from app.familia.models import FamiliaCaseFilter
+    from app.routes import familia as mod
+
+    fake_session = AsyncMock()
+    fake_session.login = AsyncMock(return_value=None)
+    fake_session.search_familia = AsyncMock(
+        side_effect=RuntimeError("OJVID=secret <html>PERSONA A / PERSONA B</html>")
+    )
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
+
+    response = await mod._run_sync(
+        FamiliaSyncRequest(
+            rut="11111111-1", password="synthetic-password", auth_type="clave_pj",
+            cases=[FamiliaCaseFilter(rit="987654", year="2026")],
+        ),
+        rate_s=0.0,
+        bundle=_bundle(),
+    )
+
+    assert response.ok is True
+    rendered = caplog.text + response.model_dump_json()
+    for forbidden in ("987654", "OJVID", "<html>", "PERSONA A", "PERSONA B"):
+        assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
 async def test_un_fallo_de_red_en_el_rit_no_se_disfraza_de_causa_inexistente(monkeypatch):
     """El camino que la app usa SIEMPRE, y el que quedaba abierto.
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -227,6 +229,96 @@ async def test_private_route_preserves_safe_session_taxonomy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_private_route_emits_only_closed_login_failure_telemetry(monkeypatch, caplog):
+    from app.routes import familia as route
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    session.login = AsyncMock(side_effect=OjvTimeoutError("11.111.111-1 synthetic-secret"))
+    monkeypatch.setattr(route, "FamiliaAuthSession", MagicMock(return_value=session))
+    request = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+
+    with caplog.at_level(logging.INFO, logger=route.logger.name):
+        result = await route._run_private_resolution(
+            request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None),
+            MagicMock(), _allow_private_stage,
+        )
+
+    assert result.error_code == "timeout"
+    payloads = [json.loads(record.message) for record in caplog.records if record.message.startswith("{")]
+    assert payloads[-1] == {
+        "error_code": "timeout", "event": "private_resolution",
+        "stage": "login", "status": "failed",
+    }
+    assert "11111111" not in caplog.text
+    assert "synthetic-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_private_resolution_unknown_parser_error_is_closed_and_redacted(monkeypatch, caplog):
+    from app.routes import familia as route
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    session.search_familia = AsyncMock(return_value="synthetic")
+    monkeypatch.setattr(route, "FamiliaAuthSession", MagicMock(return_value=session))
+    monkeypatch.setattr(
+        route, "resolve_private_familia_html",
+        MagicMock(side_effect=PrivateResolutionError("11.111.111-1 synthetic-secret")),
+    )
+    request = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+
+    with caplog.at_level(logging.INFO, logger=route.logger.name):
+        result = await route._run_private_resolution(
+            request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None),
+            MagicMock(), _allow_private_stage,
+        )
+
+    assert result.error_code == "upstream_changed"
+    assert "11.111.111-1" not in caplog.text
+    assert "synthetic-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_private_route_reraises_cancellation_after_closed_shutdown_log(monkeypatch, caplog):
+    from app.routes import familia as route
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    session.login = AsyncMock(side_effect=asyncio.CancelledError("synthetic-secret"))
+    monkeypatch.setattr(route, "FamiliaAuthSession", MagicMock(return_value=session))
+    request = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+
+    with caplog.at_level(logging.INFO, logger=route.logger.name):
+        with pytest.raises(asyncio.CancelledError):
+            await route._run_private_resolution(
+                request, 0, CookieBundle(cookies={}, user_agent="UA", saved_at=0, proxy_url=None),
+                MagicMock(), _allow_private_stage,
+            )
+    payloads = [json.loads(record.message) for record in caplog.records if record.message.startswith("{")]
+    assert payloads[-1] == {
+        "error_code": "cancelled", "event": "private_session",
+        "stage": "shutdown", "status": "cancelled",
+    }
+    assert "synthetic-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_private_route_maps_unexpected_upstream_failure_without_leaking(monkeypatch, caplog):
     from app.routes import familia as route
 
@@ -383,3 +475,52 @@ async def test_private_http_route_uses_its_dedicated_local_budget(monkeypatch):
     release_first.set()
     await asyncio.gather(first, second)
     assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_private_http_deadline_records_only_closed_timeout_telemetry(monkeypatch, caplog):
+    from app.ojv.private_telemetry import private_operational_metrics
+    from app.routes import familia as route
+
+    request = MagicMock()
+    request.app.state.private_resolution_budget = OjvLaneBudget(1)
+    request.app.state.session_pool = MagicMock()
+    request.app.state.catalog_service = MagicMock()
+    monkeypatch.setattr(route, "_SYNC_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(
+        route,
+        "get_settings",
+        MagicMock(return_value=MagicMock(private_familia_enabled=True, RATE_LIMIT_MS=0)),
+    )
+    monkeypatch.setattr(
+        route,
+        "familia_bundle_or_alert",
+        AsyncMock(return_value=CookieBundle(
+            cookies={}, user_agent="UA", saved_at=0, proxy_url=None,
+        )),
+    )
+
+    async def resolve(*_args):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(route, "_run_private_resolution", resolve)
+    req = PrivateCauseResolutionRequest(
+        rut=SecretStr("11111111-1"), password=SecretStr("synthetic-secret"),
+        case_number="C-88-2023", tribunal_code=77,
+        tribunal_label="1º Juzgado de Familia",
+    )
+    before = private_operational_metrics.snapshot()
+
+    with caplog.at_level(logging.INFO, logger=route.logger.name):
+        result = await route.familia_resolve_private.__wrapped__(request, req, "test")
+
+    after = private_operational_metrics.snapshot()
+    assert result.error_code == "timeout"
+    assert after["attempts"] == before["attempts"] + 1
+    assert after["timeout"] == before["timeout"] + 1
+    assert json.loads(caplog.records[-1].message) == {
+        "error_code": "timeout", "event": "private_resolution",
+        "stage": "detail", "status": "failed",
+    }
+    assert "11111111" not in caplog.text
+    assert "synthetic-secret" not in caplog.text
