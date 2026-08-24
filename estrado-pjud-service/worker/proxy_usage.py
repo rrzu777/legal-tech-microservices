@@ -8,7 +8,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, cast
 
 import httpx
 from postgrest.exceptions import APIError
@@ -108,6 +108,10 @@ class ProxyUsageTracker:
         self._provider = provider
         self._price_per_gb_usd = price_per_gb_usd
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     async def _owned_reservation(
         self, idempotency_key: str, claim_token: str,
     ) -> dict | None:
@@ -122,6 +126,31 @@ class ProxyUsageTracker:
         if len(rows) != 1 or rows[0].get("claim_token") != claim_token:
             return None
         return rows[0]
+
+    async def _validate_import_job_scope(
+        self,
+        *,
+        import_job_id: str,
+        law_firm_id: str | None,
+        import_claim_token: str,
+        import_worker_id: str,
+    ) -> None:
+        if law_firm_id is None:
+            raise RuntimeError("import usage attribution requires tenant")
+        response = await run_query(
+            self._sb.from_("pjud_import_jobs")
+            .select("id")
+            .eq("id", import_job_id)
+            .eq("law_firm_id", law_firm_id)
+            .eq("status", "discovering")
+            .eq("claim_token", import_claim_token)
+            .eq("lease_worker_id", import_worker_id)
+            .gt("lease_expires_at", datetime.now(timezone.utc).isoformat())
+            .limit(1)
+        )
+        rows = response.data if isinstance(response.data, list) else []
+        if len(rows) != 1 or rows[0].get("id") != import_job_id:
+            raise RuntimeError("invalid import job usage attribution")
 
     async def _existing_usage_event(self, payload: dict) -> dict | None:
         response = await run_query(
@@ -391,6 +420,9 @@ class ProxyUsageTracker:
         case_id: str | None = None,
         sync_run_id: str | None = None,
         lookup_attempt_id: str | None = None,
+        import_job_id: str | None = None,
+        import_claim_token: str | None = None,
+        import_worker_id: str | None = None,
         movement_id: str | None = None,
         transaction_key: str | None = None,
         estimated_bytes: int | None = None,
@@ -450,6 +482,18 @@ class ProxyUsageTracker:
                     law_firm_id=law_firm_id,
                     operation=operation,
                 )
+            import_subject = (import_job_id, import_claim_token, import_worker_id)
+            if any(value is not None for value in import_subject):
+                if not all(isinstance(value, str) and value for value in import_subject):
+                    raise RuntimeError("incomplete import job usage attribution")
+                if case_id is not None or sync_run_id is not None or lookup_attempt_id is not None:
+                    raise RuntimeError("import attribution subject is not exclusive")
+                await self._validate_import_job_scope(
+                    import_job_id=cast(str, import_job_id),
+                    law_firm_id=law_firm_id,
+                    import_claim_token=cast(str, import_claim_token),
+                    import_worker_id=cast(str, import_worker_id),
+                )
             reservation = await self._reserve_budget(
                 case_id=case_id,
                 law_firm_id=law_firm_id,
@@ -488,6 +532,7 @@ class ProxyUsageTracker:
                         case_id=case_id,
                         sync_run_id=sync_run_id,
                         movement_id=movement_id,
+                        import_job_id=import_job_id,
                         error=caught,
                         estimated_bytes=estimate,
                         session_cycle_id=normalized_session_cycle_id,
@@ -515,6 +560,7 @@ class ProxyUsageTracker:
         case_id: str | None,
         sync_run_id: str | None,
         movement_id: str | None,
+        import_job_id: str | None,
         error: BaseException | None,
         estimated_bytes: int,
         session_cycle_id: str | None,
@@ -582,6 +628,10 @@ class ProxyUsageTracker:
             "provider": self._provider,
             "price_per_gb_usd": self._price_per_gb_usd,
         }
+        # The compatible micro is deployed before migration 00082. Legacy sync
+        # events must remain insertable while production lacks this new column.
+        if import_job_id is not None:
+            payload["import_job_id"] = import_job_id
         if session_cycle_id is not None:
             payload.update({
                 "session_cycle_id": session_cycle_id,

@@ -12,8 +12,10 @@ import hashlib
 import logging
 import re
 import unicodedata
+from contextlib import asynccontextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import AsyncContextManager, Literal, cast
 
 import httpx
 from bs4 import BeautifulSoup
@@ -229,15 +231,26 @@ def _candidate_key(candidate: ImportCandidate) -> tuple[object, ...]:
 
 
 async def _post_with_bounded_retry(
-    session: OjvSession, endpoint: str, payload: list[tuple[str, str]]
+    session: OjvSession,
+    endpoint: str,
+    payload: list[tuple[str, str]],
+    *,
+    request_key: str,
+    request_scope: Callable[[str], AsyncContextManager[None]] | None,
 ) -> httpx.Response | None:
     for attempt in range(_TRANSIENT_ATTEMPTS):
         try:
-            response = await session.post_form(
-                f"{_OJV_BASE}{endpoint}",
-                payload,
-                headers=_AJAX_HEADERS,
+            scope = (
+                request_scope(f"{request_key}:{attempt + 1}")
+                if request_scope is not None
+                else _untracked_request()
             )
+            async with scope:
+                response = await session.post_form(
+                    f"{_OJV_BASE}{endpoint}",
+                    payload,
+                    headers=_AJAX_HEADERS,
+                )
             if response.status_code < 500 and response.status_code != 408:
                 return response
             if detect_blocked(response.text):
@@ -247,6 +260,11 @@ async def _post_with_bounded_retry(
         if attempt + 1 == _TRANSIENT_ATTEMPTS:
             return None
     return None
+
+
+@asynccontextmanager
+async def _untracked_request():
+    yield
 
 
 def _result(
@@ -266,6 +284,7 @@ async def discover_my_causes(
     matters: tuple[Matter, ...],
     include_closed: bool,
     max_pages: int = 100,
+    request_scope: Callable[[str], AsyncContextManager[None]] | None = None,
 ) -> DiscoveryResult:
     page_limit = min(max_pages, _MAX_PAGES_HARD)
     if page_limit < 1:
@@ -299,6 +318,8 @@ async def discover_my_causes(
                     include_closed=include_closed,
                     page=current_page,
                 ),
+                request_key=f"{matter}:{current_page}",
+                request_scope=request_scope,
             )
             if response is None:
                 return _result(collected, page_count, "timeout")

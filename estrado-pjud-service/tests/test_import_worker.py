@@ -17,6 +17,7 @@ from app.ojv.errors import (
     SessionExpiredError,
 )
 from app.proxy_billing import ProxyBillingExhaustedError
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from worker.import_jobs import ImportDiscoveryWorker
 
 
@@ -84,6 +85,32 @@ class FakePool:
         self.release_familia_bundle = AsyncMock()
 
 
+class FakeProxyUsage:
+    def __init__(self):
+        self.calls = []
+
+    enabled = True
+
+    @asynccontextmanager
+    async def track(self, **kwargs):
+        self.calls.append(kwargs)
+        yield
+
+
+class RejectingProxyUsage:
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    enabled = True
+
+    @asynccontextmanager
+    async def track(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.error
+        yield  # pragma: no cover - keeps this an async context manager
+
+
 def candidate(**overrides):
     values = {
         "matter": "civil",
@@ -102,7 +129,10 @@ def candidate(**overrides):
     return ImportCandidate.model_validate(values)
 
 
-def make_worker(*, claim=JOB, discovery=None, credential=None, session=None, concurrency=1):
+def make_worker(
+    *, claim=JOB, discovery=None, credential=None, session=None, concurrency=1,
+    proxy_usage=None,
+):
     sb = FakeSupabase(claim)
     pool = FakePool()
     discovery = discovery or AsyncMock(return_value=DiscoveryResult(
@@ -114,6 +144,7 @@ def make_worker(*, claim=JOB, discovery=None, credential=None, session=None, con
     })
     session = session or FakeSession()
     session_factory = MagicMock(return_value=session)
+    proxy_usage = proxy_usage or FakeProxyUsage()
     worker = ImportDiscoveryWorker(
         supabase=sb,
         pool=pool,
@@ -124,6 +155,7 @@ def make_worker(*, claim=JOB, discovery=None, credential=None, session=None, con
         concurrency=concurrency,
         lease_seconds=30,
         renewal_interval_seconds=0.001,
+        proxy_usage=proxy_usage,
     )
     return worker, sb, pool, discovery, credential, session_factory, session
 
@@ -131,6 +163,7 @@ def make_worker(*, claim=JOB, discovery=None, credential=None, session=None, con
 @pytest.mark.asyncio
 async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
     worker, sb, pool, discover, credential, session_factory, session = make_worker()
+    proxy_usage = worker._proxy_usage
 
     assert await worker.process_next() is True
 
@@ -176,6 +209,46 @@ async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
         "p_credential_id": JOB["credential_id"],
         "p_expected_credential_updated_at": "2026-08-23T12:00:00.000Z",
     } for payload in validations)
+    assert len(proxy_usage.calls) == 1
+    assert proxy_usage.calls[0] == {
+        "operation": "other",
+        "law_firm_id": JOB["law_firm_id"],
+        "import_job_id": JOB["job_id"],
+        "import_claim_token": JOB["claim_token"],
+        "import_worker_id": "import-worker",
+        "transaction_key": f"{JOB['job_id']}:{JOB['claim_token']}:session-1:login",
+    }
+    request_scope = discover.await_args.kwargs["request_scope"]
+    async with request_scope("civil:1:1"):
+        pass
+    assert proxy_usage.calls[-1]["operation"] == "search"
+    assert proxy_usage.calls[-1]["transaction_key"].endswith(":session-1:page:civil:1:1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary_error",
+    [
+        ProxyBudgetExceededError("proxy budget exceeded"),
+        ProxyUsagePersistenceError("proxy usage persistence unavailable"),
+    ],
+)
+async def test_paid_boundary_failure_stops_before_import_login_or_listing(boundary_error):
+    proxy_usage = RejectingProxyUsage(boundary_error)
+    worker, sb, pool, discover, _credential, _factory, session = make_worker(
+        proxy_usage=proxy_usage,
+    )
+
+    with pytest.raises(type(boundary_error)):
+        await worker.process_next()
+
+    session.login.assert_not_awaited()
+    discover.assert_not_awaited()
+    assert not any(name == "finalize_pjud_import_discovery" for name, _ in sb.calls)
+    assert proxy_usage.calls[0]["operation"] == "other"
+    pool.release_familia_bundle.assert_awaited_once_with(
+        pool.slot, disposition="healthy", remint=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -483,12 +556,14 @@ async def test_incomplete_same_number_different_tribunal_labels_are_not_collapse
 async def test_discovery_concurrency_budget_is_independent_and_bounded():
     active = 0
     max_active = 0
+    entered = asyncio.Event()
     release = asyncio.Event()
 
     async def discover(*_args, **_kwargs):
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
+        entered.set()
         await release.wait()
         active -= 1
         return DiscoveryResult(candidates=[], page_count=1, status="ok")
@@ -496,7 +571,7 @@ async def test_discovery_concurrency_budget_is_independent_and_bounded():
     worker, *_ = make_worker(discovery=AsyncMock(side_effect=discover), concurrency=1)
     first = asyncio.create_task(worker.process_claimed(dict(JOB)))
     second = asyncio.create_task(worker.process_claimed({**JOB, "job_id": "98200000-0000-4000-8000-000000000042"}))
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(entered.wait(), timeout=1)
     assert max_active == 1
     release.set()
     await asyncio.gather(first, second)

@@ -22,7 +22,9 @@ from app.my_causes.models import ImportCandidate, Matter
 from app.ojv.errors import OjvSessionError
 from app.ojv.budget import OjvLaneBudget
 from app.proxy_billing import ProxyBillingExhaustedError
+from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from worker.config import run_query
+from worker.proxy_usage import DISABLED_PROXY_USAGE, ProxyUsageTracker
 
 
 logger = logging.getLogger(__name__)
@@ -200,6 +202,7 @@ class ImportDiscoveryWorker:
         renewal_interval_seconds: float | None = None,
         enabled: bool = True,
         lane_budget: OjvLaneBudget | None = None,
+        proxy_usage: ProxyUsageTracker | None = None,
     ):
         if concurrency < 1:
             raise ValueError("import_concurrency_must_be_positive")
@@ -212,6 +215,9 @@ class ImportDiscoveryWorker:
         self._discover = discover
         self._session_factory = session_factory
         self._lane_budget = lane_budget or OjvLaneBudget(concurrency)
+        self._proxy_usage = proxy_usage or DISABLED_PROXY_USAGE
+        if enabled and not self._proxy_usage.enabled:
+            raise ValueError("import_proxy_usage_tracking_required")
         self._lease_seconds = lease_seconds
         self._renewal_interval_seconds = (
             renewal_interval_seconds
@@ -293,7 +299,12 @@ class ImportDiscoveryWorker:
         if valid is not True:
             raise RuntimeError("import_credential_revision_lost")
 
-    async def _discover_once(self, job: ClaimedImportJob, credential: dict) -> DiscoveryResult:
+    async def _discover_once(
+        self,
+        job: ClaimedImportJob,
+        credential: dict,
+        session_attempt: int,
+    ) -> DiscoveryResult:
         bundle, slot = await self._pool.acquire_familia_bundle()
         if bundle is None:
             await self._pool.release_familia_bundle(slot, disposition="healthy")
@@ -307,15 +318,39 @@ class ImportDiscoveryWorker:
                 bundle.user_agent,
                 rate_limit_s=2.5,
             ) as session:
+                common_usage = {
+                    "law_firm_id": str(job.law_firm_id),
+                    "import_job_id": str(job.job_id),
+                    "import_claim_token": str(job.claim_token),
+                    "import_worker_id": self._worker_id,
+                }
+
+                def request_scope(request_key: str):
+                    return self._proxy_usage.track(
+                        operation="search",
+                        **common_usage,
+                        transaction_key=(
+                            f"{job.job_id}:{job.claim_token}:session-{session_attempt}:"
+                            f"page:{request_key}"
+                        ),
+                    )
+
                 try:
                     await self._validate_credential_revision(
                         job, credential["binding_version"],
                     )
-                    await session.login(
-                        SecretStr(credential["rut"]),
-                        SecretStr(credential["password"]),
-                        "clave_pj",
-                    )
+                    async with self._proxy_usage.track(
+                        operation="other",
+                        **common_usage,
+                        transaction_key=(
+                            f"{job.job_id}:{job.claim_token}:session-{session_attempt}:login"
+                        ),
+                    ):
+                        await session.login(
+                            SecretStr(credential["rut"]),
+                            SecretStr(credential["password"]),
+                            "clave_pj",
+                        )
                 except OjvSessionError as error:
                     if error.code.value in {"session_expired", "waf", "timeout"}:
                         disposition = "replace_before_reuse"
@@ -331,6 +366,7 @@ class ImportDiscoveryWorker:
                     session,
                     job.matters,
                     job.include_closed,
+                    request_scope=request_scope,
                 )
         except asyncio.CancelledError:
             # The borrowed F5 bundle is read-only and the authenticated client
@@ -340,6 +376,12 @@ class ImportDiscoveryWorker:
             raise
         except ProxyBillingExhaustedError:
             disposition = "replace_before_reuse"
+            remint = False
+            raise
+        except (ProxyBudgetExceededError, ProxyUsagePersistenceError):
+            # These boundaries fail before provider traffic or after telemetry
+            # reconciliation. Neither outcome authorizes a paid reactive mint.
+            disposition = "healthy"
             remint = False
             raise
         except BaseException:
@@ -353,10 +395,10 @@ class ImportDiscoveryWorker:
     async def _discover_with_session_retry(
         self, job: ClaimedImportJob, credential: dict,
     ) -> DiscoveryResult:
-        result = await self._discover_once(job, credential)
+        result = await self._discover_once(job, credential, 1)
         if result.status != "session_expired":
             return result
-        return await self._discover_once(job, credential)
+        return await self._discover_once(job, credential, 2)
 
     async def process_next(self) -> bool:
         if not self._enabled:

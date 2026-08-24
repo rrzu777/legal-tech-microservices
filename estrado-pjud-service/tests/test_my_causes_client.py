@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -188,6 +189,41 @@ async def test_one_session_and_cookie_jar_are_reused_sequentially_across_matters
         "/misCausas/civil/consultaMisCausasCivil.php",
     ]
     assert requests[0][1] == requests[1][1] == "OJVID=session-secret"
+
+
+async def test_each_page_and_transport_retry_gets_its_own_paid_scope(
+    session_factory,
+) -> None:
+    attempts = 0
+    paid_keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("synthetic")
+        html = page("civil_page_1.html", next_page=2 if attempts == 2 else None)
+        if attempts == 3:
+            html = html.replace("C-1.234-2024", "C-9.999-2024")
+        return httpx.Response(200, text=html, request=request)
+
+    @asynccontextmanager
+    async def paid_scope(key: str):
+        paid_keys.append(key)
+        yield
+
+    session = session_factory(handler)
+    result = await discover_my_causes(
+        session,
+        ("civil",),
+        include_closed=False,
+        request_scope=paid_scope,
+    )
+    await session.close()
+
+    assert result.status == "ok"
+    assert attempts == 3
+    assert paid_keys == ["civil:1:1", "civil:1:2", "civil:2:1"]
 
 
 async def test_discovery_resolves_public_rows_before_the_persistence_boundary(

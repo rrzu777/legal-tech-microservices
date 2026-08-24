@@ -691,8 +691,9 @@ class SyncEngine:
             worker_id=getattr(config, "WORKER_ID", "worker-1"),
             fetch_credential=self._get_import_credential,
             concurrency=1,
-            enabled=getattr(config, "ENABLE_PJUD_MY_CAUSES_IMPORT", False),
+            enabled=imports_enabled,
             lane_budget=self._work_budgets.discovery,
+            proxy_usage=self._proxy_usage,
         )
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:

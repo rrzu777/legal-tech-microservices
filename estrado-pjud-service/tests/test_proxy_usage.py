@@ -192,6 +192,81 @@ async def test_api_lookup_subject_fails_closed_before_paid_reservation(reason):
 
 
 @pytest.mark.asyncio
+async def test_import_job_subject_is_validated_and_persisted_before_paid_traffic():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="worker")
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{"id": "job-1"}]),
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="search",
+            law_firm_id="firm-1",
+            import_job_id="job-1",
+            import_claim_token="claim-1",
+            import_worker_id="worker-1",
+            transaction_key="job-1:claim-1:page:civil:1:1",
+        ):
+            record_proxy_request(10)
+
+    sb.from_.assert_any_call("pjud_import_jobs")
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert payload["law_firm_id"] == "firm-1"
+    assert payload["import_job_id"] == "job-1"
+    reserve = sb.rpc.call_args_list[0]
+    assert reserve.args[0] == "pjud_proxy_reserve_budget"
+    assert reserve.args[1]["p_case_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_usage_payload_omits_import_column_before_linked_migration():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="worker")
+    with patch("worker.proxy_usage.run_query", side_effect=[
+        _response([{
+            "allowed": True, "reservation_id": "reservation-1",
+            "claim_status": "claimed", "blocking_scope": None,
+        }]),
+        _response([{"id": "event-1"}]),
+        _response(None),
+    ]):
+        async with tracker.track(
+            operation="search",
+            law_firm_id="firm-1",
+            case_id="case-1",
+            transaction_key="legacy-before-import-job-column",
+        ):
+            record_proxy_request(10)
+
+    payload = sb.from_.return_value.insert.call_args.args[0]
+    assert "import_job_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_import_job_subject_fails_closed_before_budget_or_traffic():
+    sb = _supabase()
+    tracker = ProxyUsageTracker(sb, enabled=True, component="worker")
+    with patch("worker.proxy_usage.run_query", return_value=_response([])):
+        with pytest.raises(ProxyUsagePersistenceError):
+            async with tracker.track(
+                operation="search",
+                law_firm_id="firm-other",
+                import_job_id="job-1",
+                import_claim_token="stale-claim",
+                import_worker_id="worker-1",
+                transaction_key="job-1:stale:page:civil:1:1",
+            ):
+                record_proxy_request(10)
+
+    sb.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_session_usage_serializes_closed_safe_metadata_and_clamps_age():
     """Dropping lifecycle fields or persisting an unbounded age hides session cost."""
     sb = _supabase()

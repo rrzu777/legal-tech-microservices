@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from worker.config import WorkerConfig
 from worker.import_jobs import ImportDiscoveryWorker
+from worker.proxy_usage import DISABLED_PROXY_USAGE
 
 
 BASE = {
@@ -41,6 +42,18 @@ def test_import_flag_rejects_noncanonical_truthy_values(value):
 def test_excel_endpoint_cannot_be_enabled_even_by_environment():
     with pytest.raises(ValidationError, match="pjud_my_causes_excel_must_remain_disabled"):
         WorkerConfig(**BASE, ENABLE_PJUD_MY_CAUSES_EXCEL="true")
+
+
+def test_enabled_import_worker_requires_proxy_cost_tracking():
+    with pytest.raises(ValueError, match="import_proxy_usage_tracking_required"):
+        ImportDiscoveryWorker(
+            supabase=AsyncMock(),
+            pool=AsyncMock(),
+            worker_id="worker-1",
+            fetch_credential=AsyncMock(),
+            enabled=True,
+            proxy_usage=DISABLED_PROXY_USAGE,
+        )
 
 
 @pytest.mark.asyncio
