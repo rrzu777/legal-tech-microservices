@@ -317,6 +317,15 @@ if [ "${1:-}" = show ]; then
   if [ -e "$RG_TEST_STATE/postflight-fail" ] && [ -e "$RG_TEST_STATE/postflight-armed" ]; then
     # Fail one postflight read, then let rollback prove the restored runtime.
     rm -f "$RG_TEST_STATE/postflight-armed"
+    if [ -e "$RG_TEST_STATE/worker-falls-before-postflight" ]; then
+      old_pid=$(cat "$RG_TEST_STATE/unit-estrado-pjud-worker.service-main-pid") || exit 1
+      case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
+      printf '%s\n' inactive \
+        > "$RG_TEST_STATE/unit-estrado-pjud-worker.service-active"
+      printf '%s\n' 0 \
+        > "$RG_TEST_STATE/unit-estrado-pjud-worker.service-main-pid"
+      : > "$RG_TEST_STATE/unit-estrado-pjud-worker.service-control-group"
+    fi
     exit 1
   fi
   property_value() {
@@ -2185,6 +2194,43 @@ run_rollback_window_crossing_regressions() {
     'swap rollback' 0
 }
 
+run_rollback_worker_capability_regression() {
+  local backup_path retry_path
+  echo '== automatic rollback cannot activate an unchanged worker outside the window'
+
+  setup
+  configure_active_worker
+  printf '%s\n' 12 > "$STATE/local-hour"
+  : > "$STATE/postflight-fail"
+  : > "$STATE/worker-falls-before-postflight"
+  export RG_WORKER_RESTORE_WINDOW_CAPABILITY=1
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  unset RG_WORKER_RESTORE_WINDOW_CAPABILITY
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  retry_path=$(printf '%s\n' "$OUT" \
+    | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+
+  expect_eq 'daytime later failure keeps apply failed' "$RC" 1
+  expect_eq 'daytime fixture leaves originally unchanged worker inactive' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" inactive
+  expect_count 'daytime compensation never starts the unchanged worker' \
+    'systemctl start estrado-pjud-worker.service' 0
+  expect_count 'daytime compensation never restarts the unchanged worker' \
+    'systemctl restart estrado-pjud-worker.service' 0
+  expect_count 'daytime compensation performs no protected heartbeat query' \
+    'curl heartbeat' 0
+  expect_count 'daytime compensation performs no protected claims query' \
+    'curl claims' 0
+  expect_eq 'daytime incomplete compensation reports exact retry authority' \
+    "$retry_path" "$backup_path"
+  expect_eq 'daytime incomplete compensation emits one retry diagnostic' \
+    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 1
+  expect_missing 'daytime compensation emits no paid sync action' "$OUT" '/api/v1/sync'
+  expect_missing 'daytime compensation emits no proxy action' "$OUT" '/proxy'
+  expect_missing 'daytime compensation emits no session mint action' "$OUT" '/session/mint'
+  expect_missing 'daytime compensation emits no retry action' "$OUT" '/retry'
+}
+
 run_orchestrated_swap_crash_regression() {
   local backup_path retry_path
   echo '== outer attempted authority delegates inner crash recovery and exact retry converges'
@@ -2244,6 +2290,14 @@ fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-window-crossing ]; then
   run_rollback_window_crossing_regressions
+  echo
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-worker-capability ]; then
+  run_rollback_worker_capability_regression
   echo
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
@@ -2363,6 +2417,7 @@ run_apply_compensation_retry_regressions
 run_orchestrated_swap_crash_regression
 run_rollback_precheck_regressions
 run_rollback_window_crossing_regressions
+run_rollback_worker_capability_regression
 run_api_enablement_regressions
 run_worker_pre_target_cgroup_regressions
 run_mutator_lock_regressions

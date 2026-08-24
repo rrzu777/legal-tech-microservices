@@ -1498,16 +1498,16 @@ restore_enabled_state() { # system|user unit enabled|disabled|static
   [ "$current" = "$desired" ]
 }
 
-worker_restoration_window_allows() { # 0=standalone, 1=same-transaction compensation
-  local compensation_mode=$1
-  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
+worker_restoration_window_allows() { # 0=no capability, 1=admitted changed-worker restore
+  local worker_restore_capability=$1
+  case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
   maintenance_window_is_open && return 0
-  [ "$compensation_mode" -eq 1 ]
+  [ "$worker_restore_capability" -eq 1 ]
 }
 
-restore_unit_states() { # 0=standalone, 1=same-transaction compensation
-  local compensation_mode=$1 index unit desired current rc=0 action
-  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
+restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
+  local worker_restore_capability=$1 index unit desired current rc=0 action
+  case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
   for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_enabled_states[$index]}
@@ -1529,7 +1529,7 @@ restore_unit_states() { # 0=standalone, 1=same-transaction compensation
       if [ "$desired" = active ]; then
         if [ "$worker_restore_allowed" -eq 1 ] \
           && load_worker_fence_config \
-          && worker_restoration_window_allows "$compensation_mode"; then
+          && worker_restoration_window_allows "$worker_restore_capability"; then
           if "$systemctl_bin" start "$unit" >"$null_file" 2>&1; then
             worker_runtime_matches_capture active || rc=1
           else
@@ -1551,7 +1551,7 @@ restore_unit_states() { # 0=standalone, 1=same-transaction compensation
     elif [ "$current" != "$desired" ]; then
       if [ "$unit" = estrado-pjud-worker.service ] && [ "$desired" = active ]; then
         if load_worker_fence_config \
-          && worker_restoration_window_allows "$compensation_mode"; then
+          && worker_restoration_window_allows "$worker_restore_capability"; then
           "$systemctl_bin" start "$unit" >"$null_file" 2>&1 || rc=1
         else
           rc=1
@@ -1648,9 +1648,11 @@ validate_swap_rollback_authority() {
   swap_state=$marker
 }
 
-do_rollback() { # backup-dir [0=standalone|1=same-transaction compensation]
-  local uid rollback_rc=0 swap_rc=0 swap_state compensation_mode=${2:-0}
-  case "$compensation_mode" in 0|1) ;; *) return 1 ;; esac
+do_rollback() { # backup-dir worker-restore-capability automatic-compensation
+  local uid rollback_rc=0 swap_rc=0 swap_state
+  local worker_restore_capability=${2:-0} automatic_compensation=${3:-0}
+  case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
+  case "$automatic_compensation" in 0|1) ;; *) return 1 ;; esac
   backup_dir=$1
   uid=$(validate_hermes_inventory) || { fail 'rollback cannot validate Hermes inventory'; return 1; }
   build_managed_paths "$uid"
@@ -1664,7 +1666,7 @@ do_rollback() { # backup-dir [0=standalone|1=same-transaction compensation]
   worker_restore_allowed=1
   if [ "${desired_active_states[1]}" = active ] \
     && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; } \
-    && ! worker_restoration_window_allows "$compensation_mode"; then
+    && ! worker_restoration_window_allows "$worker_restore_capability"; then
     fail 'rollback active worker restoration is outside the maintenance window'
     return 1
   fi
@@ -1683,10 +1685,10 @@ do_rollback() { # backup-dir [0=standalone|1=same-transaction compensation]
   esac
   restore_manifest "$swap_rc" || rollback_rc=1
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1
-  restore_unit_states "$compensation_mode" || rollback_rc=1
+  restore_unit_states "$worker_restore_capability" || rollback_rc=1
   restore_hermes_unit_states || rollback_rc=1
   if [ "$rollback_rc" -ne 0 ]; then
-    if [ "$compensation_mode" -eq 0 ]; then
+    if [ "$automatic_compensation" -eq 0 ]; then
       printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
         "$backup_dir" >&2
     fi
@@ -1700,8 +1702,9 @@ automatic_rollback() {
   [ "$rollback_once" -eq 0 ] || return 1
   [ "$mutation_started" -eq 1 ] || return 1
   is_uint "$resource_lock_fd" || return 1
+  case "$worker_restore_window_capability" in 0|1) ;; *) return 1 ;; esac
   rollback_once=1
-  if do_rollback "$backup_dir" 1; then return 0; fi
+  if do_rollback "$backup_dir" "$worker_restore_window_capability" 1; then return 0; fi
   printf 'ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: %s\n' \
     "$backup_dir" >&2
   return 1
@@ -1869,6 +1872,7 @@ run_apply_steps() {
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
     maintenance_window_is_open || return 1
+    worker_restore_window_capability=1
     worker_heartbeat_is_idle 0 || return 1
     worker_pre_stop_heartbeat_order=$worker_last_heartbeat_order
     worker_count=$(active_claim_count) || return 1
@@ -1956,6 +1960,7 @@ run_apply_steps() {
 
 run_apply() {
   local uid
+  worker_restore_window_capability=0
   run_preflight || return 1
   uid=$(validate_hermes_inventory) || return 1
   build_managed_paths "$uid"
@@ -1976,5 +1981,5 @@ case "$command_name" in
   preflight) run_preflight ;;
   apply) run_apply ;;
   postflight) run_postflight ;;
-  rollback) do_rollback "$requested_backup" 0 ;;
+  rollback) do_rollback "$requested_backup" 0 0 ;;
 esac
