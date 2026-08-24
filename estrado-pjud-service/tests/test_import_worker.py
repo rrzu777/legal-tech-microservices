@@ -47,6 +47,7 @@ class FakeSupabase:
         self.claim = claim
         self.calls = []
         self.renew_result = True
+        self.credential_valid = True
 
     def rpc(self, name, payload):
         self.calls.append((name, payload))
@@ -54,7 +55,11 @@ class FakeSupabase:
             return Rpc(self.claim)
         if name == "renew_pjud_import_job_claim":
             return Rpc(self.renew_result)
+        if name == "validate_pjud_import_credential_claim":
+            return Rpc(self.credential_valid)
         if name == "finalize_pjud_import_discovery":
+            if not self.credential_valid:
+                return Rpc(RuntimeError("import_credential_revision_mismatch"))
             return Rpc(None)
         raise AssertionError(name)
 
@@ -105,6 +110,7 @@ def make_worker(*, claim=JOB, discovery=None, credential=None, session=None, con
     ))
     credential = credential or AsyncMock(return_value={
         "rut": "11111111-1", "password": "secret-value", "password_type": "clave_poder_judicial",
+        "binding_version": "2026-08-23T12:00:00.000Z",
     })
     session = session or FakeSession()
     session_factory = MagicMock(return_value=session)
@@ -128,7 +134,10 @@ async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
 
     assert await worker.process_next() is True
 
-    credential.assert_awaited_once_with(JOB["credential_id"], JOB["law_firm_id"])
+    credential.assert_awaited_once_with(
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+        JOB["claim_token"], "import-worker",
+    )
     login_args = session.login.await_args.args
     assert login_args[2] == "clave_pj"
     assert isinstance(login_args[0], SecretStr)
@@ -145,6 +154,7 @@ async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
     payload = finalize[0][1]
     assert payload["p_job_id"] == JOB["job_id"]
     assert payload["p_claim_token"] == JOB["claim_token"]
+    assert payload["p_expected_credential_updated_at"] == "2026-08-23T12:00:00.000Z"
     assert payload["p_summary"] == {
         "status": "needs_selection", "pages": 1, "discovered": 1,
     }
@@ -157,6 +167,49 @@ async def test_claims_fetches_scoped_credential_discovers_and_finalizes_once():
     assert "secret-value" not in json.dumps(payload)
     pool.release_familia_bundle.assert_awaited_once()
     assert session.closed is True
+    validations = [payload for name, payload in sb.calls if name == "validate_pjud_import_credential_claim"]
+    assert len(validations) == 2
+    assert all(payload == {
+        "p_job_id": JOB["job_id"],
+        "p_claim_token": JOB["claim_token"],
+        "p_worker_id": "import-worker",
+        "p_credential_id": JOB["credential_id"],
+        "p_expected_credential_updated_at": "2026-08-23T12:00:00.000Z",
+    } for payload in validations)
+
+
+@pytest.mark.asyncio
+async def test_revoke_after_fetch_blocks_login_and_never_publishes_candidates():
+    worker, sb, _pool, discover, *_ = make_worker()
+
+    async def revoke_during_login(*_args):
+        sb.credential_valid = False
+
+    worker._session_factory.return_value.login.side_effect = revoke_during_login
+
+    with pytest.raises(RuntimeError, match="import_credential_revision_lost"):
+        await worker.process_next()
+
+    discover.assert_not_awaited()
+    assert not any(name == "finalize_pjud_import_discovery" for name, _ in sb.calls)
+
+
+@pytest.mark.asyncio
+async def test_replace_during_listing_is_rejected_by_atomic_finalize():
+    worker, sb, _pool, discover, *_ = make_worker()
+
+    async def replace_during_listing(*_args, **_kwargs):
+        sb.credential_valid = False
+        return DiscoveryResult(candidates=[candidate()], page_count=1, status="ok")
+
+    discover.side_effect = replace_during_listing
+
+    with pytest.raises(RuntimeError, match="import_credential_revision_mismatch"):
+        await worker.process_next()
+
+    final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"]
+    assert len(final) == 1
+    assert final[0]["p_expected_credential_updated_at"] == "2026-08-23T12:00:00.000Z"
 
 
 @pytest.mark.asyncio
@@ -327,6 +380,7 @@ async def test_lease_heartbeat_starts_before_slow_internal_credential_fetch():
             "rut": "11111111-1",
             "password": "secret-value",
             "password_type": "clave_poder_judicial",
+            "binding_version": "2026-08-23T12:00:00.000Z",
         }
 
     worker, sb, *_ = make_worker(credential=AsyncMock(side_effect=slow_fetch))
@@ -629,7 +683,10 @@ async def test_import_credential_fetch_treats_internal_outage_as_retryable():
     engine._call_app_internal = AsyncMock(return_value=None)
 
     with pytest.raises(ImportCredentialInfrastructureError):
-        await engine._get_import_credential(JOB["credential_id"], JOB["law_firm_id"])
+        await engine._get_import_credential(
+            JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+            JOB["claim_token"], "import-worker",
+        )
 
 
 @pytest.mark.asyncio
@@ -641,12 +698,18 @@ async def test_import_credential_fetch_keeps_terminal_not_found_distinct():
         return_value=SimpleNamespace(status_code=404, json=lambda: {"error": "not found"}),
     )
 
-    assert await engine._get_import_credential(JOB["credential_id"], JOB["law_firm_id"]) is None
+    assert await engine._get_import_credential(
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+        JOB["claim_token"], "import-worker",
+    ) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [None, [], {}, {"rut": "11111111-1"}, {
     "rut": "11111111-1", "password": "secret", "password_type": "clave_unica",
+}, {
+    "rut": "11111111-1", "password": "secret",
+    "password_type": "clave_poder_judicial", "binding_version": "not-a-date",
 }])
 async def test_import_credential_fetch_retries_malformed_200_contract(payload):
     from worker.engine import ImportCredentialInfrastructureError, SyncEngine
@@ -657,4 +720,34 @@ async def test_import_credential_fetch_retries_malformed_200_contract(payload):
     )
 
     with pytest.raises(ImportCredentialInfrastructureError):
-        await engine._get_import_credential(JOB["credential_id"], JOB["law_firm_id"])
+        await engine._get_import_credential(
+            JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+            JOB["claim_token"], "import-worker",
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_credential_fetch_uses_import_specific_claim_boundary():
+    from worker.engine import SyncEngine
+
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._call_app_internal = AsyncMock(
+        return_value=SimpleNamespace(status_code=404, json=lambda: {"error": "closed"}),
+    )
+
+    await engine._get_import_credential(
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+        JOB["claim_token"], "import-worker",
+    )
+
+    engine._call_app_internal.assert_awaited_once_with(
+        "GET",
+        f"/api/internal/pjud-import/credentials/{JOB['credential_id']}/decrypt",
+        "Import decrypt endpoint",
+        law_firm_id=JOB["law_firm_id"],
+        extra_headers={
+            "X-Pjud-Import-Job-Id": JOB["job_id"],
+            "X-Pjud-Import-Claim-Token": JOB["claim_token"],
+            "X-Pjud-Import-Worker-Id": "import-worker",
+        },
+    )

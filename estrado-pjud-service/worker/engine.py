@@ -1368,7 +1368,8 @@ class SyncEngine:
                     )
 
     async def _call_app_internal(
-        self, method: str, path: str, what: str, *, law_firm_id: str | None = None
+        self, method: str, path: str, what: str, *, law_firm_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response | None:
         """Una request a la API interna de la app, o `None` si no salio.
 
@@ -1386,6 +1387,14 @@ class SyncEngine:
             headers = {"Authorization": f"Bearer {key}"}
             if law_firm_id is not None:
                 headers["X-Law-Firm-Id"] = law_firm_id
+            if extra_headers:
+                if any(
+                    name.lower() in {"authorization", "x-law-firm-id"}
+                    for name in extra_headers
+                ):
+                    logger.error("unsafe internal request header override (%s)", path)
+                    return None
+                headers.update(extra_headers)
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.request(
                     method, f"{url}{path}", headers=headers
@@ -1410,14 +1419,20 @@ class SyncEngine:
         return resp.json() if resp is not None and resp.status_code == 200 else None
 
     async def _get_import_credential(
-        self, credential_id: str, law_firm_id: str,
+        self, credential_id: str, law_firm_id: str, job_id: str,
+        claim_token: str, worker_id: str,
     ) -> dict | None:
         """Keep terminal credential absence distinct from internal outages."""
         resp = await self._call_app_internal(
             "GET",
-            f"/api/internal/credentials/{credential_id}/decrypt",
+            f"/api/internal/pjud-import/credentials/{credential_id}/decrypt",
             "Import decrypt endpoint",
             law_firm_id=law_firm_id,
+            extra_headers={
+                "X-Pjud-Import-Job-Id": job_id,
+                "X-Pjud-Import-Claim-Token": claim_token,
+                "X-Pjud-Import-Worker-Id": worker_id,
+            },
         )
         if resp is None or resp.status_code in {401, 403, 408, 429} or resp.status_code >= 500:
             raise ImportCredentialInfrastructureError("import_credential_boundary_unavailable")
@@ -1426,10 +1441,20 @@ class SyncEngine:
         if resp.status_code != 200:
             raise ImportCredentialInfrastructureError("import_credential_boundary_unexpected")
         data = resp.json()
-        if not isinstance(data, dict) or any(
+        if not isinstance(data, dict) or set(data) != {
+            "rut", "password", "password_type", "binding_version",
+        } or any(
             not isinstance(data.get(field), str) or not data[field]
-            for field in ("rut", "password", "password_type")
+            for field in ("rut", "password", "password_type", "binding_version")
         ) or data["password_type"] != "clave_poder_judicial":
+            raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
+        try:
+            binding = datetime.fromisoformat(data["binding_version"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ImportCredentialInfrastructureError(
+                "import_credential_contract_invalid",
+            ) from exc
+        if binding.tzinfo is None:
             raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
         return data
 

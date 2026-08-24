@@ -12,7 +12,7 @@ import json
 import logging
 import unicodedata
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
 
@@ -26,6 +26,7 @@ from worker.config import run_query
 
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 _MAX_CANDIDATES = 1_000
 _MAX_CANDIDATE_BYTES = 4_096
@@ -169,7 +170,7 @@ class ImportDiscoveryWorker:
         supabase,
         pool,
         worker_id: str,
-        fetch_credential: Callable[[str, str], Awaitable[dict | None]],
+        fetch_credential: Callable[[str, str, str, str, str], Awaitable[dict | None]],
         discover: Callable[..., Awaitable[DiscoveryResult]] = discover_my_causes,
         session_factory=FamiliaAuthSession,
         concurrency: int = 1,
@@ -237,7 +238,7 @@ class ImportDiscoveryWorker:
             if renewed is not True:
                 raise RuntimeError("import_job_claim_lost")
 
-    async def _run_fenced(self, job: ClaimedImportJob, operation: Awaitable[DiscoveryResult]) -> DiscoveryResult:
+    async def _run_fenced(self, job: ClaimedImportJob, operation: Awaitable[_T]) -> _T:
         operation_task = asyncio.create_task(operation)
         renewal_task = asyncio.create_task(self._renew_until_cancelled(job))
         try:
@@ -254,6 +255,22 @@ class ImportDiscoveryWorker:
                     task.cancel()
             await asyncio.gather(operation_task, renewal_task, return_exceptions=True)
 
+    async def _validate_credential_revision(
+        self, job: ClaimedImportJob, binding_version: str,
+    ) -> None:
+        valid = await self._rpc(
+            "validate_pjud_import_credential_claim",
+            {
+                "p_job_id": str(job.job_id),
+                "p_claim_token": str(job.claim_token),
+                "p_worker_id": self._worker_id,
+                "p_credential_id": str(job.credential_id),
+                "p_expected_credential_updated_at": binding_version,
+            },
+        )
+        if valid is not True:
+            raise RuntimeError("import_credential_revision_lost")
+
     async def _discover_once(self, job: ClaimedImportJob, credential: dict) -> DiscoveryResult:
         bundle, slot = await self._pool.acquire_familia_bundle()
         if bundle is None:
@@ -269,6 +286,9 @@ class ImportDiscoveryWorker:
                 rate_limit_s=2.5,
             ) as session:
                 try:
+                    await self._validate_credential_revision(
+                        job, credential["binding_version"],
+                    )
                     await session.login(
                         SecretStr(credential["rut"]),
                         SecretStr(credential["password"]),
@@ -282,6 +302,9 @@ class ImportDiscoveryWorker:
                         page_count=0,
                         status=cast(DiscoveryStatus, error.code.value),
                     )
+                await self._validate_credential_revision(
+                    job, credential["binding_version"],
+                )
                 return await self._discover(
                     session,
                     job.matters,
@@ -323,15 +346,21 @@ class ImportDiscoveryWorker:
             await self._process_claimed_with_budget(job)
             return True
 
-    async def _fetch_and_discover(self, job: ClaimedImportJob) -> DiscoveryResult:
+    async def _fetch_and_discover(
+        self, job: ClaimedImportJob,
+    ) -> tuple[DiscoveryResult, str | None]:
         credential = await self._fetch_credential(
-            str(job.credential_id), str(job.law_firm_id),
+            str(job.credential_id), str(job.law_firm_id), str(job.job_id),
+            str(job.claim_token), self._worker_id,
         )
         if not credential or credential.get("password_type") != "clave_poder_judicial":
             return DiscoveryResult(
                 candidates=[], page_count=0, status="credential_invalid",
-            )
-        return await self._discover_with_session_retry(job, credential)
+            ), None
+        binding_version = credential.get("binding_version")
+        if not isinstance(binding_version, str) or not binding_version:
+            raise RuntimeError("invalid_import_credential_contract")
+        return await self._discover_with_session_retry(job, credential), binding_version
 
     async def process_claimed(self, raw_job: ClaimedImportJob | dict[str, Any]) -> None:
         job = (
@@ -343,7 +372,9 @@ class ImportDiscoveryWorker:
             await self._process_claimed_with_budget(job)
 
     async def _process_claimed_with_budget(self, job: ClaimedImportJob) -> None:
-        result = await self._run_fenced(job, self._fetch_and_discover(job))
+        result, credential_binding_version = await self._run_fenced(
+            job, self._fetch_and_discover(job),
+        )
         try:
             candidates = _candidate_payloads(list(result.candidates))
             summary = _summary(result, len(candidates))
@@ -363,6 +394,8 @@ class ImportDiscoveryWorker:
                 "p_claim_token": str(job.claim_token),
                 "p_candidates": candidates,
                 "p_summary": summary,
+                "p_worker_id": self._worker_id,
+                "p_expected_credential_updated_at": credential_binding_version,
             },
         )
         logger.info(
