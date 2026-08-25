@@ -554,7 +554,17 @@ case "${1:-}" in
         *) exit 4 ;;
       esac
     else
-      case "$value" in active) exit 0 ;; inactive) exit 3 ;; *) exit 4 ;; esac
+      case "$value" in
+        active) exit 0 ;;
+        inactive)
+          if [ -f "$RG_TEST_STATE/unit-$unit-active-status" ]; then
+            exit "$(cat "$RG_TEST_STATE/unit-$unit-active-status")"
+          fi
+          [ "$(cat "$(state_file "$unit" enabled)")" != not-found ] || exit 4
+          exit 3
+          ;;
+        *) exit 4 ;;
+      esac
     fi
     ;;
   enable|disable)
@@ -1319,7 +1329,7 @@ configure_absent_timer_base() {
 }
 
 run_absent_timer_regressions() {
-  local timer
+  local timer contradictory_enabled
   echo '== first rollout supports truly absent timer units and restores absence'
   setup
   configure_absent_timer_base
@@ -1351,6 +1361,18 @@ run_absent_timer_regressions() {
   run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'contradictory absent active timer refuses apply' "$RC" 1
   expect_count 'contradictory absent active timer runs no provision' provision 0
+
+  for contradictory_enabled in enabled disabled static; do
+    setup
+    printf '%s\n' "$contradictory_enabled" \
+      > "$STATE/unit-legaltech-monitor.timer-enabled"
+    printf '%s\n' inactive > "$STATE/unit-legaltech-monitor.timer-active"
+    printf '%s\n' 4 > "$STATE/unit-legaltech-monitor.timer-active-status"
+    run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$contradictory_enabled timer with unknown activity refuses apply" "$RC" 1
+    expect_count "$contradictory_enabled timer with unknown activity runs no provision" \
+      provision 0
+  done
 }
 
 run_swappiness_namespace_regressions() {

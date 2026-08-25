@@ -1022,6 +1022,25 @@ read_unit_state() { # system|user is-enabled|is-active unit
     is-enabled:not-found:1|is-enabled:not-found:4) printf '%s\n' absent ;;
     is-active:active:0) printf '%s\n' active ;;
     is-active:inactive:3) printf '%s\n' inactive ;;
+    is-active:inactive:4) printf '%s\n' unknown-inactive ;;
+    *) return 1 ;;
+  esac
+}
+
+read_correlated_unit_activity() { # scope unit enabled-state
+  local scope=$1 unit=$2 enabled=$3 active
+  active=$(read_unit_state "$scope" is-active "$unit") || return 1
+  case "$active" in
+    active|inactive) printf '%s\n' "$active" ;;
+    unknown-inactive)
+      [ "$enabled" = absent ] || return 1
+      case "$scope:$unit" in
+        system:legaltech-monitor.timer|system:legaltech-resource-tracker.timer)
+          printf '%s\n' inactive
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
 }
@@ -1032,7 +1051,7 @@ capture_unit_states() {
     unit=${tracked_units[$index]}
     scope=${tracked_unit_scopes[$index]}
     enabled=$(read_unit_state "$scope" is-enabled "$unit") || return 1
-    active=$(read_unit_state "$scope" is-active "$unit") || return 1
+    active=$(read_correlated_unit_activity "$scope" "$unit" "$enabled") || return 1
     printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active"
   done
 }
@@ -1681,7 +1700,8 @@ restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
   for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_active_states[$index]}
-    current=$(read_unit_state system is-active "$unit") || { rc=1; continue; }
+    current=$(read_correlated_unit_activity system "$unit" \
+      "${desired_enabled_states[$index]}") || { rc=1; continue; }
     if [ "$unit" = estrado-pjud.service ] && [ "$changed_api" -eq 1 ]; then
       if [ "$desired" = active ]; then
         "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
@@ -1725,7 +1745,8 @@ restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
         "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || rc=1
       fi
     fi
-    current=$(read_unit_state system is-active "$unit") || { rc=1; continue; }
+    current=$(read_correlated_unit_activity system "$unit" \
+      "${desired_enabled_states[$index]}") || { rc=1; continue; }
     [ "$current" = "$desired" ] || rc=1
     if [ "$unit" = estrado-pjud-worker.service ] \
       && { [ "$changed_worker" -eq 1 ] || [ "$worker_stopped" -eq 1 ]; }; then
@@ -1746,13 +1767,15 @@ restore_hermes_unit_states() {
   for ((index = system_unit_count; index < ${#tracked_units[@]}; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_active_states[$index]}
-    current=$(read_unit_state user is-active "$unit") || { rc=1; continue; }
+    current=$(read_correlated_unit_activity user "$unit" \
+      "${desired_enabled_states[$index]}") || { rc=1; continue; }
     if [ "$desired" = active ]; then
       scoped_systemctl user restart "$unit" >"$null_file" 2>&1 || rc=1
     elif [ "$current" = active ]; then
       scoped_systemctl user stop "$unit" >"$null_file" 2>&1 || rc=1
     fi
-    current=$(read_unit_state user is-active "$unit") || { rc=1; continue; }
+    current=$(read_correlated_unit_activity user "$unit" \
+      "${desired_enabled_states[$index]}") || { rc=1; continue; }
     [ "$current" = "$desired" ] || rc=1
   done
   return "$rc"
