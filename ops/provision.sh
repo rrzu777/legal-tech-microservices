@@ -134,6 +134,7 @@ main() {
   # proceso. Cualquier owner persistente fuera de este set explícito aborta.
   local hermes_uid hermes_reverse hermes_ownership system_unit user_unit extra
   local enabled_system_units enabled_user_units unit_name unit_user
+  local dbus_seen=0 session_migration_seen=0
   if ! hermes_uid=$("$id_bin" -u hermes 2>/dev/null); then
     echo "FALTA el usuario hermes; no se instala el límite de su user slice." >&2
     exit 1
@@ -160,6 +161,13 @@ main() {
     fi
     case "$user_unit" in
       init.scope|hermes-gateway.service|hermes-dashboard.service) ;;
+      dbus.service)
+        dbus_seen=$((dbus_seen + 1))
+        if [ "$dbus_seen" -ne 1 ]; then
+          echo "Unit persistente duplicada para hermes: dbus.service" >&2
+          exit 1
+        fi
+        ;;
       *)
         if [[ "$user_unit" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
           echo "Unit persistente inesperada para hermes: $user_unit" >&2
@@ -212,6 +220,13 @@ main() {
     [ -z "${unit_name:-}" ] && continue
     case "$unit_name" in
       hermes-gateway.service|hermes-dashboard.service) ;;
+      session-migration.service)
+        session_migration_seen=$((session_migration_seen + 1))
+        if [ "$session_migration_seen" -ne 1 ]; then
+          echo "Unit de usuario habilitada duplicada para hermes: session-migration.service" >&2
+          exit 1
+        fi
+        ;;
       *)
         if [[ "$unit_name" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
           echo "Unit de usuario habilitada inesperada para hermes: $unit_name" >&2

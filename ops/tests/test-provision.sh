@@ -433,6 +433,33 @@ expect_contains "nombra sólo la unit inesperada" "$OUT" "rogue-daemon.service"
 expect_eq "no instala drop-in" "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 expect_missing "no habilita nada" "$(cat "$LOG_SYSCTL")" "enable"
 
+echo "== auxiliares OS permitidos de Hermes permiten provisionar sin ampliar workloads"
+setup osaux
+printf 'user@4242.service dbus.service\n' >> "$TMP/osaux/hermes.ps"
+printf 'session-migration.service enabled\n' >> "$USER_UNITS"
+run_prov
+expect_eq "dbus y session-migration permiten provisionar" "$RC" "0"
+expect_contains "provision llega a habilitar timers" "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud.service legaltech-monitor.timer legaltech-resource-tracker.timer"
+
+setup duplicatedbus
+printf 'user@4242.service dbus.service\nuser@4242.service dbus.service\n' \
+  >> "$TMP/duplicatedbus/hermes.ps"
+run_prov
+expect_eq "dbus duplicado falla cerrado" "$RC" "1"
+expect_eq "dbus duplicado no instala systemd" \
+  "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
+setup duplicatesession
+printf 'session-migration.service enabled\nsession-migration.service enabled\n' \
+  >> "$USER_UNITS"
+run_prov
+expect_eq "session-migration duplicado falla cerrado" "$RC" "1"
+expect_contains "duplicado se diagnostica por unit exacta" "$OUT" \
+  "session-migration.service"
+expect_eq "session-migration duplicado no instala systemd" \
+  "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
+
 echo "== unit de usuario habilitada pero inactiva: falla cerrado"
 setup inactiverogue; printf 'rogue-inactive.service enabled\n' >> "$USER_UNITS"; run_prov
 expect_eq "exit 1" "$RC" "1"
