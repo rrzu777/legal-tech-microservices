@@ -12,6 +12,7 @@ import json
 import logging
 import unicodedata
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
@@ -117,9 +118,14 @@ def _source_hash(candidate: ImportCandidate) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _candidate_payloads(raw_candidates: list[Any]) -> list[dict[str, Any]]:
-    if len(raw_candidates) > _MAX_CANDIDATES:
-        raise ValueError("too_many_import_candidates")
+@dataclass(frozen=True)
+class CandidatePayloadBatch:
+    payloads: list[dict[str, Any]]
+    total_unique: int
+    truncated: bool
+
+
+def _candidate_payloads(raw_candidates: list[Any]) -> CandidatePayloadBatch:
 
     payloads_by_hash: dict[str, dict[str, Any]] = {}
     for raw_candidate in raw_candidates:
@@ -153,10 +159,23 @@ def _candidate_payloads(raw_candidates: list[Any]) -> list[dict[str, Any]]:
                 for key, value in payload.items()
             }
 
-    payloads = list(payloads_by_hash.values())
-    if len(json.dumps(payloads, ensure_ascii=False).encode("utf-8")) > _MAX_PAYLOAD_BYTES:
-        raise ValueError("import_candidates_payload_too_large")
-    return payloads
+    total_unique = len(payloads_by_hash)
+    payloads: list[dict[str, Any]] = []
+    encoded_size = 2  # Opening and closing brackets of the JSON array.
+    for payload in payloads_by_hash.values():
+        if len(payloads) >= _MAX_CANDIDATES:
+            break
+        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        next_size = encoded_size + len(encoded_payload) + (2 if payloads else 0)
+        if next_size > _MAX_PAYLOAD_BYTES:
+            break
+        payloads.append(payload)
+        encoded_size = next_size
+    return CandidatePayloadBatch(
+        payloads=payloads,
+        total_unique=total_unique,
+        truncated=total_unique > len(payloads),
+    )
 
 
 _ERRORS: dict[str, tuple[str, str, str]] = {
@@ -168,8 +187,21 @@ _ERRORS: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _summary(result: DiscoveryResult, candidate_count: int) -> dict[str, Any]:
+def _summary(
+    result: DiscoveryResult,
+    candidate_count: int,
+    *,
+    truncated: bool = False,
+) -> dict[str, Any]:
     if result.status == "ok":
+        if truncated:
+            return {
+                "status": "needs_selection",
+                "pages": result.page_count,
+                "discovered": candidate_count,
+                "error_code": "candidate_limit_reached",
+                "error_class": "limit",
+            }
         return {
             "status": "needs_selection",
             "pages": result.page_count,
@@ -440,8 +472,13 @@ class ImportDiscoveryWorker:
             job, self._fetch_and_discover(job),
         )
         try:
-            candidates = _candidate_payloads(list(result.candidates))
-            summary = _summary(result, len(candidates))
+            batch = _candidate_payloads(list(result.candidates))
+            candidates = batch.payloads
+            summary = _summary(
+                result,
+                len(candidates),
+                truncated=batch.truncated,
+            )
         except ValueError:
             candidates = []
             summary = {

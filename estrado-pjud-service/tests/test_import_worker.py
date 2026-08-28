@@ -515,21 +515,70 @@ async def test_candidate_allowlist_rejects_nested_or_oversized_values_before_rpc
 
 
 @pytest.mark.asyncio
-async def test_deterministic_candidate_overflow_finalizes_failed_instead_of_reclaim_loop():
+async def test_duplicate_rows_are_collapsed_before_candidate_limit_is_applied():
     result = SimpleNamespace(candidates=[candidate()] * 1001, page_count=2, status="ok")
     worker, sb, *_ = make_worker(discovery=AsyncMock(return_value=result))
 
     assert await worker.process_next() is True
 
-    final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"]
-    assert len(final) == 1
-    assert final[0]["p_candidates"] == []
-    assert final[0]["p_summary"] == {
-        "status": "failed",
+    final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"][0]
+    assert len(final["p_candidates"]) == 1
+    assert final["p_summary"] == {
+        "status": "needs_selection",
         "pages": 2,
-        "discovered": 0,
-        "error_code": "invalid_candidate_payload",
-        "error_class": "contract",
+        "discovered": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unique_candidate_overflow_keeps_first_thousand_as_selectable_review():
+    result = SimpleNamespace(
+        candidates=[candidate(case_number=f"C-{number}-2026") for number in range(1001)],
+        page_count=51,
+        status="ok",
+    )
+    worker, sb, *_ = make_worker(discovery=AsyncMock(return_value=result))
+
+    assert await worker.process_next() is True
+
+    final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"][0]
+    assert len(final["p_candidates"]) == 1000
+    assert final["p_candidates"][0]["case_number"] == "C-0-2026"
+    assert final["p_candidates"][-1]["case_number"] == "C-999-2026"
+    assert final["p_summary"] == {
+        "status": "needs_selection",
+        "pages": 51,
+        "discovered": 1000,
+        "error_code": "candidate_limit_reached",
+        "error_class": "limit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_payload_byte_limit_keeps_a_selectable_prefix_instead_of_failing_review():
+    result = SimpleNamespace(
+        candidates=[candidate(
+            case_number=f"C-{number}-2026",
+            court_label="C" * 200,
+            tribunal_label="T" * 200,
+            caption="A" * 500,
+        ) for number in range(1000)],
+        page_count=50,
+        status="ok",
+    )
+    worker, sb, *_ = make_worker(discovery=AsyncMock(return_value=result))
+
+    assert await worker.process_next() is True
+
+    final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"][0]
+    assert 0 < len(final["p_candidates"]) < 1000
+    assert len(json.dumps(final["p_candidates"], ensure_ascii=False).encode("utf-8")) <= 1_048_576
+    assert final["p_summary"] == {
+        "status": "needs_selection",
+        "pages": 50,
+        "discovered": len(final["p_candidates"]),
+        "error_code": "candidate_limit_reached",
+        "error_class": "limit",
     }
 
 
