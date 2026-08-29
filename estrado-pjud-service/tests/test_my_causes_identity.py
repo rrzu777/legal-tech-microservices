@@ -118,9 +118,12 @@ def test_provisional_rows_with_same_abbreviated_identity_keep_distinct_captions(
     )
     other_region_evidence = candidate.model_copy(update={"caption": "OTRA EMPRESA / PERSONA"})
 
-    payloads = _candidate_payloads([candidate, candidate, other_region_evidence])
+    batch = _candidate_payloads([candidate, candidate, other_region_evidence])
+    payloads = batch.payloads
 
     assert len(payloads) == 2
+    assert batch.total_unique == 2
+    assert batch.truncated is False
     assert {payload["caption"] for payload in payloads} == {
         "EMPRESA E / PERSONA F", "OTRA EMPRESA / PERSONA",
     }
