@@ -29,7 +29,7 @@ def test_import_materializer_is_scheduled_by_the_versioned_vps_crontab():
 def test_import_and_excel_flags_fail_closed_by_default(monkeypatch):
     monkeypatch.delenv("ENABLE_PJUD_MY_CAUSES_IMPORT", raising=False)
     monkeypatch.delenv("ENABLE_PJUD_MY_CAUSES_EXCEL", raising=False)
-    config = WorkerConfig(**BASE)
+    config = WorkerConfig(**BASE, _env_file=None)
     assert config.ENABLE_PJUD_MY_CAUSES_IMPORT is False
     assert config.ENABLE_PJUD_MY_CAUSES_EXCEL is False
 
