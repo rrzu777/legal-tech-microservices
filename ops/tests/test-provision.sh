@@ -23,6 +23,9 @@ expect_eq() { [ "$2" = "$3" ] && ok "$1" || bad "$1 (esperaba '$3', vino '$2')";
 expect_contains() {
   printf '%s' "$2" | grep -qF -- "$3" && ok "$1" || bad "$1 (no contiene '$3'; salida: ${2:-<vacía>})"
 }
+expect_line() {
+  printf '%s\n' "$2" | grep -qxF -- "$3" && ok "$1" || bad "$1 (falta línea exacta '$3')"
+}
 expect_missing() {
   printf '%s' "$2" | grep -qF -- "$3" && bad "$1 (contiene '$3' y no debería)" || ok "$1"
 }
@@ -236,6 +239,12 @@ expect_contains "API escribe cookies con el grupo compartido" "$API_UNIT" \
 WORKER_UNIT=$(cat "$OPS_DIR/systemd/estrado-pjud-worker.service")
 expect_contains "worker conserva escritura del grupo compartido" "$WORKER_UNIT" \
   "StateDirectoryMode=0770"
+ENV_INVENTORY=$(cat "$OPS_DIR/env.inventory")
+ENV_EXAMPLE=$(cat "$OPS_DIR/../estrado-pjud-service/.env.example")
+for key in PJUD_OFF_HOURS_VALIDATION_ONCE WORKER_TRANSPORT_REVALIDATION_ENABLED; do
+  expect_line "inventario documenta $key" "$ENV_INVENTORY" "$key"
+  expect_line ".env.example deja $key apagado" "$ENV_EXAMPLE" "$key=false"
+done
 
 echo "== primera corrida: instala todo, un daemon-reload, enable, exit 0"
 setup fresh; run_prov
