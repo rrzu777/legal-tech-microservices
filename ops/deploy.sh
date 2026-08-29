@@ -43,7 +43,16 @@ main() {
   local health_sleep="${DEPLOY_HEALTH_SLEEP:-1}"
   local systemctl_bin="${DEPLOY_SYSTEMCTL:-systemctl}"
   local shared_state_dir="${DEPLOY_STATE_DIR:-/var/lib/estrado-pjud}"
+  local playwright_browsers_path="${DEPLOY_PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"
+  local allow_test_browser_path="${DEPLOY_ALLOW_TEST_BROWSER_PATH:-0}"
+  local browser_owner_uid="${DEPLOY_BROWSER_OWNER_UID:-0}"
+  local browser_owner_gid="${DEPLOY_BROWSER_OWNER_GID:-0}"
+  local xvfb_run_bin="${DEPLOY_XVFB_RUN:-/usr/bin/xvfb-run}"
+  local runuser_bin="${DEPLOY_RUNUSER:-/usr/sbin/runuser}"
+  local find_bin="${DEPLOY_FIND:-find}"
   local keep_worker_stopped="${DEPLOY_KEEP_WORKER_STOPPED:-0}"
+  local deps_changed=0
+  local playwright_changed=0
   local services=(estrado-pjud.service)
   local worker_enabled=0
   local worker_enabled_state worker_active_state
@@ -123,26 +132,38 @@ main() {
   git merge --ff-only origin/main
 
   # requirements.txt cambió → instalar ANTES de los tests, que ya importan lo
-  # nuevo. En el rollback las deps nuevas quedan instaladas: casi siempre son
-  # compatibles hacia atrás y reinstalar acá alargaría la ventana caída; si un
-  # rollback llegara a fallar por deps, es intervención manual igual.
+  # nuevo. Si cambia Playwright, instalar y abrir además su Chromium exacto.
+  # Cualquier rollback restaura requirements y browser desde $prev antes de
+  # volver a levantar servicios, para no mezclar código y runtime incompatibles.
   if ! git diff --quiet "$prev"..HEAD -- estrado-pjud-service/requirements.txt; then
+    deps_changed=1
     echo "==> requirements.txt cambió: pip install"
     # Guardado: sin esto, un pip fallido (red, conflicto de versiones) moría
     # por set -e con HEAD ya avanzado, y la corrida siguiente veía
     # HEAD == origin/main y decía "Ya al día" sin haber desplegado nada.
     # Con el reset, reintentar el deploy es simplemente volver a correrlo.
     if ! "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"; then
-      echo "PIP FALLÓ: código de vuelta a $prev; los servicios no se tocaron." >&2
-      git reset --hard "$prev"
+      echo "PIP FALLÓ: restaurando código y dependencias de $prev; los servicios no se tocaron." >&2
+      rollback_code_and_dependencies || true
       exit 1
+    fi
+
+    if ! git diff "$prev"..HEAD -- estrado-pjud-service/requirements.txt \
+      | grep -qE '^[+-]playwright(==|>=|<=|~=|>|<)'; then
+      playwright_changed=0
+    else
+      playwright_changed=1
+      if ! install_and_verify_playwright; then
+        rollback_code_and_dependencies || true
+        exit 1
+      fi
     fi
   fi
 
   echo "==> pytest en el VPS"
   if ! (cd "$service_dir" && .venv/bin/python -m pytest -q); then
-    echo "TESTS ROJOS: código de vuelta a $prev; los servicios no se tocaron." >&2
-    git reset --hard "$prev"
+    echo "TESTS ROJOS: restaurando código y dependencias de $prev; los servicios no se tocaron." >&2
+    rollback_code_and_dependencies || true
     exit 1
   fi
 
@@ -186,14 +207,93 @@ main() {
 # si ni el restart ni el health del rollback sanan, lo dice y pide manos.
 rollback_and_exit() { # rollback_and_exit <motivo>
   echo "$1: rollback a $prev" >&2
-  git reset --hard "$prev"
-  if "$systemctl_bin" restart "${services[@]}" \
+  local rollback_ready=1
+  if ! rollback_code_and_dependencies; then
+    rollback_ready=0
+  fi
+  if [ "$rollback_ready" = "1" ] \
+    && "$systemctl_bin" restart "${services[@]}" \
     && wait_health "$health_url" "$health_retries" "$health_sleep"; then
     echo "Rollback OK: el VPS quedó en $prev y sano. El deploy NO entró." >&2
   else
     echo "El rollback TAMPOCO sana — intervención manual YA (journalctl -u ${services[0]})" >&2
   fi
   exit 1
+}
+
+install_and_verify_playwright() {
+  if [ "$allow_test_browser_path" != "1" ] \
+    && [ "$playwright_browsers_path" != "/opt/ms-playwright" ]; then
+    echo "CHROMIUM FALLÓ: producción exige el path canónico /opt/ms-playwright." >&2
+    return 1
+  fi
+  if [ -L "$playwright_browsers_path" ]; then
+    echo "CHROMIUM FALLÓ: el directorio de browsers no puede ser un symlink." >&2
+    return 1
+  fi
+  if ! (umask 022 && mkdir -p "$playwright_browsers_path"); then
+    echo "CHROMIUM FALLÓ: no se pudo preparar el directorio canónico de browsers." >&2
+    return 1
+  fi
+  if ! chown "$browser_owner_uid:$browser_owner_gid" "$playwright_browsers_path" \
+    || ! chmod 0755 "$playwright_browsers_path"; then
+    echo "CHROMIUM FALLÓ: no se pudo fijar owner/mode seguros en el cache." >&2
+    return 1
+  fi
+  if ! validate_browser_cache_permissions; then
+    return 1
+  fi
+
+  if ! (umask 022 && env PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
+    "$service_dir/.venv/bin/python" -m playwright install chromium); then
+    echo "CHROMIUM FALLÓ: no se pudo instalar la revisión compatible; no se reinició ningún servicio." >&2
+    return 1
+  fi
+  if ! validate_browser_cache_permissions; then
+    return 1
+  fi
+
+  local smoke_user
+  for smoke_user in www-data estrado; do
+    if ! "$runuser_bin" -u "$smoke_user" -- "$xvfb_run_bin" -a \
+      env PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
+      HOME=/tmp TMPDIR=/tmp PYTHONPATH="$service_dir" \
+      "$service_dir/.venv/bin/python" -c \
+        'from app.minter import _ANTIBOT_ARGS; from playwright.sync_api import sync_playwright; playwright = sync_playwright().start(); browser = playwright.chromium.launch(headless=False, args=_ANTIBOT_ARGS); page = browser.new_page(); page.set_content("<title>juristrack-playwright-smoke</title>"); assert page.title() == "juristrack-playwright-smoke"; browser.close(); playwright.stop()'; then
+      echo "CHROMIUM NO ABRE: el smoke headed falló como $smoke_user bajo Xvfb; no se reinició ningún servicio." >&2
+      return 1
+    fi
+  done
+}
+
+validate_browser_cache_permissions() {
+  local unsafe_entry
+  if ! unsafe_entry=$("$find_bin" "$playwright_browsers_path" -mindepth 1 \
+    \( ! -user "$browser_owner_uid" -o -perm -0020 -o -perm -0002 \) -print -quit); then
+    echo "CHROMIUM FALLÓ: no se pudo inspeccionar owner/permisos del cache." >&2
+    return 1
+  fi
+  if [ -n "$unsafe_entry" ]; then
+    echo "CHROMIUM FALLÓ: el cache tiene owner o permisos inseguros." >&2
+    return 1
+  fi
+}
+
+rollback_code_and_dependencies() {
+  git reset --hard "$prev"
+  if [ "$deps_changed" != "1" ]; then
+    return 0
+  fi
+
+  echo "==> restaurando dependencias de $prev"
+  if ! "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"; then
+    echo "ROLLBACK DE DEPS FALLÓ: el código volvió a $prev pero la venv requiere intervención manual." >&2
+    return 1
+  fi
+  if [ "$playwright_changed" = "1" ] && ! install_and_verify_playwright; then
+    echo "ROLLBACK DE CHROMIUM FALLÓ: el código volvió a $prev pero browser/venv requieren intervención manual." >&2
+    return 1
+  fi
 }
 
 wait_health() {

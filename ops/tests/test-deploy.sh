@@ -44,15 +44,18 @@ expect_missing() {
 # Cada test estrena un par origin/clone. El clone es DEPLOY_REPO_DIR; los stubs
 # viven como untracked adentro (sobreviven al reset --hard, igual que el .venv
 # real).
-setup() { # setup <nombre> — deja ORIGIN, REPO, LOG_SYSCTL, LOG_PIP, SYSCTL
+setup() { # setup <nombre> — deja stubs y logs del deploy
   local base="$TMP/$1"
+  rm -rf "$TMP/ms-playwright"
+  mkdir -p "$TMP/ms-playwright"
   ORIGIN="$base/origin"; REPO="$base/repo"
-  LOG_SYSCTL="$base/systemctl.log"; LOG_PIP="$base/pip.log"
+  LOG_SYSCTL="$base/systemctl.log"; LOG_PIP="$base/pip.log"; LOG_PYTHON="$base/python.log"
+  LOG_XVFB="$base/xvfb.log"; LOG_RUNUSER="$base/runuser.log"
   mkdir -p "$ORIGIN/estrado-pjud-service"
   git -C "$ORIGIN" init -q -b main
   git -C "$ORIGIN" config user.email t@t
   git -C "$ORIGIN" config user.name t
-  echo "httpx==0.27" > "$ORIGIN/estrado-pjud-service/requirements.txt"
+  printf 'httpx==0.27\nplaywright==1.61.0\n' > "$ORIGIN/estrado-pjud-service/requirements.txt"
   printf '.venv/\n' > "$ORIGIN/estrado-pjud-service/.gitignore"
   git -C "$ORIGIN" add estrado-pjud-service/requirements.txt estrado-pjud-service/.gitignore
   git -C "$ORIGIN" commit -q -m base
@@ -60,12 +63,15 @@ setup() { # setup <nombre> — deja ORIGIN, REPO, LOG_SYSCTL, LOG_PIP, SYSCTL
 
   local venv="$REPO/estrado-pjud-service/.venv/bin"
   mkdir -p "$venv"
-  printf '#!/bin/bash\nexit "${FAKE_PYTEST_EXIT:-0}"\n' > "$venv/python"
+  printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = -m ] && [ "$2" = playwright ]; then exit "${FAKE_PLAYWRIGHT_INSTALL_EXIT:-0}"; fi\nif [ "$1" = -c ]; then exit "${FAKE_PLAYWRIGHT_VERIFY_EXIT:-0}"; fi\nexit "${FAKE_PYTEST_EXIT:-0}"\n' "$LOG_PYTHON" > "$venv/python"
   printf '#!/bin/bash\necho "$@" >> "%s"\nexit "${FAKE_PIP_EXIT:-0}"\n' "$LOG_PIP" > "$venv/pip"
+  printf '#!/bin/bash\necho "$@" >> "%s"\n[ "${FAKE_XVFB_EXIT:-0}" = 0 ] || exit "$FAKE_XVFB_EXIT"\n[ "$1" = -a ] && shift\nexec "$@"\n' "$LOG_XVFB" > "$base/xvfb-run"
+  printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = -u ] || exit 64\nshift 2\n[ "$1" = -- ] || exit 64\nshift\nexec "$@"\n' "$LOG_RUNUSER" > "$base/runuser"
+  printf '#!/bin/bash\n[ "${FAKE_FIND_EXIT:-0}" = 0 ] || exit "$FAKE_FIND_EXIT"\nexec /usr/bin/find "$@"\n' > "$base/find"
   printf '#!/bin/bash\necho "$@" >> "%s"\nSTATE="%s/worker-disabled"\nFORCE_ACTIVE="%s/worker-force-active"\nif [ "${FAKE_SYSTEMCTL_STATE_UNKNOWN:-0}" = 1 ] && { [ "$1" = is-enabled ] || [ "$1" = is-active ]; }; then exit 4; fi\nif [ "$1" = disable ]; then touch "$STATE"; rm -f "$FORCE_ACTIVE"; exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = stop ] && [ "$2" = estrado-pjud-worker.service ]; then rm -f "$FORCE_ACTIVE"; exit 0; fi\nif [ "$1" = is-active ] && { [ "$2" = estrado-pjud-worker.service ] || [ "${3:-}" = estrado-pjud-worker.service ]; }; then [ -f "$FORCE_ACTIVE" ] && { echo active; exit 0; }; [ -f "$STATE" ] && { echo inactive; exit 3; }; echo active; exit 0; fi\nif [ "$1" = is-enabled ]; then [ -f "$STATE" ] && { echo disabled; exit 1; }; echo enabled; exit 0; fi\nif [ "$1" = restart ]; then exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = is-active ]; then echo active; exit 0; fi\nexit 0\n' "$LOG_SYSCTL" "$base" "$base" > "$base/systemctl"
-  chmod +x "$venv/python" "$venv/pip" "$base/systemctl"
-  : > "$LOG_SYSCTL"; : > "$LOG_PIP"
-  SYSCTL="$base/systemctl"
+  chmod +x "$venv/python" "$venv/pip" "$base/systemctl" "$base/xvfb-run" "$base/runuser" "$base/find"
+  : > "$LOG_SYSCTL"; : > "$LOG_PIP"; : > "$LOG_PYTHON"; : > "$LOG_XVFB"; : > "$LOG_RUNUSER"
+  SYSCTL="$base/systemctl"; XVFB="$base/xvfb-run"; RUNUSER="$base/runuser"; FIND="$base/find"
 }
 
 avanza_origin() { # avanza_origin [archivo] — commit B en origin
@@ -76,11 +82,23 @@ avanza_origin() { # avanza_origin [archivo] — commit B en origin
   git -C "$ORIGIN" commit -q -m B
 }
 
+avanza_playwright() {
+  sed -i.bak 's/playwright==1.61.0/playwright==1.62.0/' \
+    "$ORIGIN/estrado-pjud-service/requirements.txt"
+  rm "$ORIGIN/estrado-pjud-service/requirements.txt.bak"
+  git -C "$ORIGIN" add estrado-pjud-service/requirements.txt
+  git -C "$ORIGIN" commit -q -m playwright
+}
+
 # Sin set -e en este archivo: RC se captura a mano y los asserts guardan solos.
 run_deploy() { # run_deploy — usa REPO/SYSCTL/HEALTH; deja RC y OUT
-  mkdir -p "$TMP/state"
+  mkdir -p "$TMP/state" "$TMP/ms-playwright"
   OUT=$(DEPLOY_REPO_DIR="$REPO" DEPLOY_SYSTEMCTL="$SYSCTL" DEPLOY_HEALTH_URL="$HEALTH" \
         DEPLOY_STATE_DIR="$TMP/state" \
+        DEPLOY_PLAYWRIGHT_BROWSERS_PATH="${BROWSER_PATH:-$TMP/ms-playwright}" \
+        DEPLOY_ALLOW_TEST_BROWSER_PATH="${ALLOW_TEST_BROWSER_PATH:-1}" \
+        DEPLOY_BROWSER_OWNER_UID="$(id -u)" DEPLOY_BROWSER_OWNER_GID="$(id -g)" \
+        DEPLOY_XVFB_RUN="$XVFB" DEPLOY_RUNUSER="$RUNUSER" DEPLOY_FIND="$FIND" \
         DEPLOY_KEEP_WORKER_STOPPED="${KEEP_WORKER_STOPPED:-0}" \
         DEPLOY_HEALTH_RETRIES=2 DEPLOY_HEALTH_SLEEP=0 bash "$DEPLOY" 2>&1)
   RC=$?
@@ -192,10 +210,94 @@ expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "lo dice" "$OUT" "Ya al día"
 
 echo "== requirements cambió: pip install antes de los tests"
-setup deps; avanza_origin estrado-pjud-service/requirements.txt; health_ok
+setup deps; avanza_playwright; health_ok
 run_deploy
 expect_eq "exit 0" "$RC" "0"
 expect_contains "instaló deps" "$(cat "$LOG_PIP")" "install"
+expect_contains "instaló Chromium compatible" "$(cat "$LOG_PYTHON")" "-m playwright install chromium"
+expect_contains "verificó que Chromium abre" "$(cat "$LOG_PYTHON")" "from playwright.sync_api import sync_playwright"
+expect_contains "smoke usa headed y flags productivos" "$(cat "$LOG_PYTHON")" "headless=False"
+expect_contains "smoke corre dentro de Xvfb" "$(cat "$LOG_XVFB")" "-a env"
+expect_contains "smoke valida usuario API" "$(cat "$LOG_RUNUSER")" "-u www-data --"
+expect_contains "smoke valida usuario worker" "$(cat "$LOG_RUNUSER")" "-u estrado --"
+expect_eq "normaliza sólo la raíz del cache a 0755" \
+  "$(stat -f '%Lp' "$TMP/ms-playwright" 2>/dev/null || stat -c '%a' "$TMP/ms-playwright")" "755"
+
+echo "== path de browsers demasiado amplio: falla antes de instalar"
+setup browserpath; avanza_playwright; health_ok
+PREV=$(sha_repo)
+BROWSER_PATH=/opt ALLOW_TEST_BROWSER_PATH=0 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "no intenta instalar" "$(grep -c -- '-m playwright install chromium' "$LOG_PYTHON" || true)" "0"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "rechaza el path" "$OUT" "path canónico"
+unset BROWSER_PATH ALLOW_TEST_BROWSER_PATH
+
+echo "== symlink de browsers: falla antes de instalar"
+setup browsersymlink; avanza_playwright; health_ok
+PREV=$(sha_repo)
+mkdir -p "$TMP/browser-target"
+rm -rf "$TMP/ms-playwright"
+ln -s "$TMP/browser-target" "$TMP/ms-playwright"
+run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "no instala siguiendo symlink" "$(grep -c -- '-m playwright install chromium' "$LOG_PYTHON" || true)" "0"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "rechaza el symlink" "$OUT" "symlink"
+
+echo "== contenido del cache escribible por grupo: falla cerrado"
+setup browserpermissions; avanza_playwright; health_ok
+PREV=$(sha_repo)
+touch "$TMP/ms-playwright/browser-mutable"
+chmod 0664 "$TMP/ms-playwright/browser-mutable"
+run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "rechaza contenido reemplazable" "$OUT" "permisos inseguros"
+
+echo "== inspección del cache falla: no asume que sea seguro"
+setup browserfindfail; avanza_playwright; health_ok
+PREV=$(sha_repo)
+FAKE_FIND_EXIT=74 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "falla cerrado" "$OUT" "no se pudo inspeccionar"
+unset FAKE_FIND_EXIT
+
+echo "== Chromium no se instala: revierte código, no reinicia y falla cerrado"
+setup browserfail; avanza_playwright; health_ok
+PREV=$(sha_repo)
+FAKE_PLAYWRIGHT_INSTALL_EXIT=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "nombra la causa" "$OUT" "CHROMIUM FALLÓ"
+unset FAKE_PLAYWRIGHT_INSTALL_EXIT
+
+echo "== Chromium no abre: revierte código, no reinicia y falla cerrado"
+setup browsersmokefail; avanza_playwright; health_ok
+PREV=$(sha_repo)
+FAKE_PLAYWRIGHT_VERIFY_EXIT=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+expect_contains "nombra la causa" "$OUT" "CHROMIUM NO ABRE"
+unset FAKE_PLAYWRIGHT_VERIFY_EXIT
+
+echo "== tests rojos tras cambiar deps: restaura requirements y browser previos"
+setup depsrollback; avanza_playwright; health_ok
+PREV=$(sha_repo)
+FAKE_PYTEST_EXIT=1 run_deploy
+expect_eq "exit 1" "$RC" "1"
+expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
+expect_eq "reinstala requirements previos" "$(grep -c '^install ' "$LOG_PIP" || true)" "2"
+expect_eq "reinstala Chromium compatible con el rollback" "$(grep -c -- '-m playwright install chromium' "$LOG_PYTHON" || true)" "2"
+expect_eq "cero rondas de restart" "$(restarts)" "0"
+unset FAKE_PYTEST_EXIT
 
 echo "== pip falla: código vuelve, sin restarts, y el reintento sí entra"
 setup pipfail; avanza_origin estrado-pjud-service/requirements.txt; health_ok
