@@ -460,6 +460,17 @@ expect_contains "duplicado se diagnostica por unit exacta" "$OUT" \
 expect_eq "session-migration duplicado no instala systemd" \
   "$(find "$SYSD" -type f | wc -l | tr -d ' ')" "0"
 
+echo "== template vendor getty habilitado no se consulta como instancia"
+setup gettytemplate
+printf 'getty@.service enabled enabled\n' >> "$SYSTEM_UNITS"
+run_prov
+expect_eq "getty template permite provisionar" "$RC" "0"
+expect_missing "getty template no recibe systemctl show inválido" \
+  "$(cat "$LOG_SYSCTL")" "show getty@.service"
+expect_contains "getty template llega a habilitar timers" \
+  "$(cat "$LOG_SYSCTL")" \
+  "enable estrado-pjud.service legaltech-monitor.timer legaltech-resource-tracker.timer"
+
 echo "== unit de usuario habilitada pero inactiva: falla cerrado"
 setup inactiverogue; printf 'rogue-inactive.service enabled\n' >> "$USER_UNITS"; run_prov
 expect_eq "exit 1" "$RC" "1"
