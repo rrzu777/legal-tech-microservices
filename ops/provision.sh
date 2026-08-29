@@ -189,6 +189,11 @@ main() {
   fi
   while read -r unit_name _ extra; do
     [ -z "${unit_name:-}" ] && continue
+    # Una template habilitada no es una instancia consultable con `show`.
+    # El resource guard valida por separado el vendor getty exacto.
+    if [ "$unit_name" = "getty@.service" ]; then
+      continue
+    fi
     if ! unit_user=$("$systemctl_bin" show "$unit_name" \
       --property=User --value); then
       echo "No se pudo leer el User efectivo de una unit habilitada; se aborta cerrado." >&2
