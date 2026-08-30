@@ -1512,6 +1512,29 @@ verify_runtime_postflight() { # Hermes uid
   done
 }
 
+verify_timer_schedule() {
+  local unit=$1 output line boot=0 active=0 calendar=0
+  local schedule_pattern='^TimersMonotonic=\{ (OnBootUSec|OnUnitActiveUSec)=5min ; next_elapse=([[:alnum:].]+( [[:alnum:].]+)*|\[not set\]) \}$'
+  # systemd exposes a repeated composite property, not direct On* properties.
+  # Even --all omits empty arrays on systemd 255. Any nonempty calendar entry
+  # is forbidden; an omitted calendar property therefore means no schedule.
+  output=$(LC_ALL=C "$systemctl_bin" show "$unit" --all \
+    --property=TimersMonotonic --property=TimersCalendar 2>"$null_file") || return 1
+  while IFS= read -r line; do
+    if [ "$line" = 'TimersCalendar=' ]; then
+      calendar=$((calendar + 1))
+    elif [[ "$line" =~ $schedule_pattern ]]; then
+      case "${BASH_REMATCH[1]}" in
+        OnBootUSec) boot=$((boot + 1)) ;;
+        OnUnitActiveUSec) active=$((active + 1)) ;;
+      esac
+    else
+      return 1
+    fi
+  done <<< "$output"
+  [ "$boot" -eq 1 ] && [ "$active" -eq 1 ] && [ "$calendar" -le 1 ]
+}
+
 run_postflight() {
   local uid timer target enabled active
   uid=$(validate_hermes_inventory) || { fail 'postflight Hermes inventory is unknown'; return 1; }
@@ -1542,7 +1565,8 @@ run_postflight() {
       legaltech-monitor.timer) target=legaltech-monitor.service ;;
       legaltech-resource-tracker.timer) target=legaltech-resource-tracker.service ;;
     esac
-    show_contract "$timer" Unit "$target" OnBootUSec 5min OnUnitActiveUSec 5min Persistent yes RandomizedDelayUSec 1min || return 1
+    show_contract "$timer" Unit "$target" Persistent yes RandomizedDelayUSec 1min || return 1
+    verify_timer_schedule "$timer" || { fail 'timer schedule contract is invalid'; return 1; }
     enabled=$(read_unit_state system is-enabled "$timer") || return 1
     active=$(read_unit_state system is-active "$timer") || return 1
     [ "$enabled" = enabled ] && [ "$active" = active ] || return 1

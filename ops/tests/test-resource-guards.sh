@@ -516,20 +516,28 @@ if [ "${1:-}" = show ]; then
     legaltech-resource-tracker.service:PartOf|legaltech-resource-tracker.service:EnvironmentFiles) echo '' ;;
     legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
     legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
-    legaltech-monitor.timer:OnBootUSec|legaltech-resource-tracker.timer:OnBootUSec) echo 5min ;;
-    legaltech-monitor.timer:OnUnitActiveUSec|legaltech-resource-tracker.timer:OnUnitActiveUSec) echo 5min ;;
+    *.timer:TimersMonotonic)
+      printf '%s\n' '{ OnUnitActiveUSec=5min ; next_elapse=4month 4d 6h 21min 56.028417s }' '{ OnBootUSec=5min ; next_elapse=5min }' ;;
+    *.timer:TimersCalendar) echo '' ;;
     legaltech-monitor.timer:Persistent|legaltech-resource-tracker.timer:Persistent) echo yes ;;
     legaltech-monitor.timer:RandomizedDelayUSec|legaltech-resource-tracker.timer:RandomizedDelayUSec) echo 1min ;;
     *) exit 1 ;;
   esac; }
   if [ "$value_mode" -eq 1 ]; then property_value "$property"; else
     for property in "${properties[@]}"; do
+      # systemd 255 has no direct OnBootUSec/OnUnitActiveUSec properties.
+      case "$unit:$property" in *.timer:OnBootUSec|*.timer:OnUnitActiveUSec) continue ;; esac
       if [ -e "$RG_TEST_STATE/property-omit" ] \
         && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-omit")" ]; then
         continue
       fi
       value=$(property_value "$property") || exit 1
-      printf '%s=%s\n' "$property" "$value"
+      if [ "$property" = TimersCalendar ] && [ -z "$value" ]; then continue; fi
+      if [ "$property" = TimersMonotonic ]; then
+        while IFS= read -r timer_value; do printf '%s=%s\n' "$property" "$timer_value"; done <<< "$value"
+      else
+        printf '%s=%s\n' "$property" "$value"
+      fi
       if [ -e "$RG_TEST_STATE/property-duplicate" ] \
         && [ "$unit:$property" = "$(cat "$RG_TEST_STATE/property-duplicate")" ]; then
         printf '%s=%s\n' "$property" "$value"
@@ -2630,6 +2638,44 @@ run_explicit_daytime_maintenance_regressions() {
   run_rollback_worker_capability_regression --allow-daytime-maintenance
 }
 
+run_real_timer_contract_regressions() {
+  local scenario value
+  echo '== real systemd timer schedule contract'
+  setup
+  : > "$STATE/swap-applied"
+  run_guard postflight
+  expect_eq 'real repeated monotonic entries pass postflight' "$RC" 0
+  for scenario in wrong-duration duplicate missing extra malformed empty; do
+    setup
+    : > "$STATE/swap-applied"
+    printf '%s\n' legaltech-monitor.timer:TimersMonotonic > "$STATE/property-bad"
+    case "$scenario" in
+      wrong-duration) value=$'{ OnBootUSec=4min ; next_elapse=4min }\n{ OnUnitActiveUSec=5min ; next_elapse=1h }' ;;
+      duplicate) value=$'{ OnBootUSec=5min ; next_elapse=5min }\n{ OnUnitActiveUSec=5min ; next_elapse=1h }\n{ OnBootUSec=5min ; next_elapse=5min }' ;;
+      missing) value='{ OnBootUSec=5min ; next_elapse=5min }' ;;
+      extra) value=$'{ OnBootUSec=5min ; next_elapse=5min }\n{ OnUnitActiveUSec=5min ; next_elapse=1h }\n{ OnActiveUSec=5min ; next_elapse=1h }' ;;
+      malformed) value=$'{ OnBootUSec=5min ; next_elapse=5min }\n{ OnUnitActiveUSec=5min ; next_elapse= }' ;;
+      empty) value='' ;;
+    esac
+    printf '%s\n' "$value" > "$STATE/property-bad-value"
+    run_guard postflight
+    expect_eq "$scenario monotonic schedule fails closed" "$RC" 1
+  done
+  setup
+  : > "$STATE/swap-applied"
+  printf '%s\n' legaltech-resource-tracker.timer:TimersCalendar > "$STATE/property-bad"
+  printf '%s\n' '{ OnCalendar=*-*-* 00:00:00 ; next_elapse=1h }' > "$STATE/property-bad-value"
+  run_guard postflight
+  expect_eq 'additional calendar schedule fails closed' "$RC" 1
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = real-timer-contract ]; then
+  run_real_timer_contract_regressions
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = explicit-daytime-maintenance ]; then
   run_explicit_daytime_maintenance_regressions
   echo "$PASS ok, $FAIL fail"
@@ -2797,6 +2843,7 @@ if [ "${RESOURCE_GUARDS_FOCUS:-}" = swap-apply-compensation-retry ]; then
   exit
 fi
 
+run_real_timer_contract_regressions
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
@@ -3166,8 +3213,8 @@ postflight_drifts=(
   legaltech-resource-tracker.service:RestrictAddressFamilies
   legaltech-resource-tracker.service:StateDirectory
   legaltech-monitor.timer:Unit
-  legaltech-resource-tracker.timer:OnBootUSec
-  legaltech-monitor.timer:OnUnitActiveUSec
+  legaltech-resource-tracker.timer:TimersMonotonic
+  legaltech-monitor.timer:TimersCalendar
   legaltech-resource-tracker.timer:Persistent
   legaltech-monitor.timer:RandomizedDelayUSec
 )
