@@ -1,0 +1,12 @@
+ControlGroup=/system.slice/legaltech.slice
+MemoryCurrent=1048576
+MemoryPeak=2097152
+CPUUsageNSec=987654321
+TasksCurrent=
+MemoryHigh=max
+MemoryMax=[not set]
+TasksMax=512
+LoadState=loaded
+ActiveState=active
+SubState=active
+UnitFileState=static

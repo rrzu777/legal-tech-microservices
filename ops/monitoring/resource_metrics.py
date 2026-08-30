@@ -42,6 +42,13 @@ SYSTEMD_PROPERTIES = (
     "NRestarts",
     "ControlGroup",
 )
+# These are native systemd interfaces, not optional missing service metrics.
+# Slices have no process Result/NRestarts; timers have no resource cgroup.
+SYSTEMD_PROPERTIES_BY_TYPE = {
+    "service": SYSTEMD_PROPERTIES,
+    "slice": tuple(p for p in SYSTEMD_PROPERTIES if p not in {"Result", "NRestarts"}),
+    "timer": ("LoadState", "UnitFileState", "ActiveState", "SubState", "Result"),
+}
 BASE_UNITS = (
     "legaltech.slice",
     "estrado-pjud.service",
@@ -514,12 +521,14 @@ def _collect_unit(
     command = ["systemctl"]
     if hermes_user_manager:
         command += ["--user", "--machine=hermes@.host"]
-    command += ["show", unit_name, "--no-pager"] + [
-        f"--property={property_name}" for property_name in SYSTEMD_PROPERTIES
-    ]
     try:
+        unit_type = unit_name.rsplit(".", 1)[-1]
+        properties = SYSTEMD_PROPERTIES_BY_TYPE[unit_type]
+        command += ["show", unit_name, "--no-pager"] + [
+            f"--property={property_name}" for property_name in properties
+        ]
         output = run_command(command, SYSTEMD_TIMEOUT_SECONDS)
-        values = _parse_exact_unit_properties(output)
+        values = _parse_exact_unit_properties(output, properties)
         numeric_values = {
             name: _strict_optional_int(values[name])
             for name in (
@@ -532,6 +541,7 @@ def _collect_unit(
                 "CPUUsageNSec",
                 "NRestarts",
             )
+            if name in properties
         }
     except Exception:
         return UnitSnapshot(
@@ -556,26 +566,26 @@ def _collect_unit(
         name=unit_name,
         active_state=values.get("ActiveState", "unknown"),
         sub_state=values.get("SubState", "unknown"),
-        memory_current_bytes=numeric_values["MemoryCurrent"],
-        memory_peak_bytes=numeric_values["MemoryPeak"],
-        memory_high_bytes=numeric_values["MemoryHigh"],
-        memory_max_bytes=numeric_values["MemoryMax"],
-        tasks_current=numeric_values["TasksCurrent"],
-        tasks_max=numeric_values["TasksMax"],
-        cpu_usage_ns=numeric_values["CPUUsageNSec"],
-        n_restarts=numeric_values["NRestarts"],
+        memory_current_bytes=numeric_values.get("MemoryCurrent"),
+        memory_peak_bytes=numeric_values.get("MemoryPeak"),
+        memory_high_bytes=numeric_values.get("MemoryHigh"),
+        memory_max_bytes=numeric_values.get("MemoryMax"),
+        tasks_current=numeric_values.get("TasksCurrent"),
+        tasks_max=numeric_values.get("TasksMax"),
+        cpu_usage_ns=numeric_values.get("CPUUsageNSec"),
+        n_restarts=numeric_values.get("NRestarts"),
         load_state=values.get("LoadState", "unknown") or "unknown",
         unit_file_state=values.get("UnitFileState", "unknown") or "unknown",
-        result=values.get("Result", "unknown") or "unknown",
+        result="not-applicable" if unit_type == "slice" else values["Result"] or "unknown",
         control_group=values.get("ControlGroup") or None,
     )
 
 
-def _parse_exact_unit_properties(text: str) -> dict[str, str]:
+def _parse_exact_unit_properties(text: str, properties: Sequence[str]) -> dict[str, str]:
     if not isinstance(text, str) or "\r" in text or "\x00" in text:
         raise ValueError("invalid systemctl output")
     values: dict[str, str] = {}
-    allowed = set(SYSTEMD_PROPERTIES)
+    allowed = set(properties)
     for line in text.splitlines():
         key, separator, value = line.partition("=")
         if (
@@ -592,9 +602,9 @@ def _parse_exact_unit_properties(text: str) -> dict[str, str]:
     if set(values) != allowed:
         raise ValueError("invalid systemctl output")
     for key in ("LoadState", "UnitFileState", "ActiveState", "SubState", "Result"):
-        if re.fullmatch(r"[A-Za-z0-9_.@:-]*", values[key]) is None:
+        if key in allowed and re.fullmatch(r"[A-Za-z0-9_.@:-]*", values[key]) is None:
             raise ValueError("invalid systemctl output")
-    control_group = values["ControlGroup"]
+    control_group = values.get("ControlGroup", "")
     if control_group and (
         re.fullmatch(r"/[A-Za-z0-9_.@:/-]+", control_group) is None
         or "//" in control_group
