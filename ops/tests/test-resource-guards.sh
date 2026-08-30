@@ -78,7 +78,7 @@ write_stub() { # name, body on stdin
 }
 
 setup() {
-  CASE_DIR="$TMP/case-$RANDOM-$RANDOM"
+  CASE_DIR=$(mktemp -d "$TMP/case.XXXXXXXXXX") || return 1
   FAKE="$CASE_DIR/root"
   STATE="$CASE_DIR/state"
   BIN="$CASE_DIR/bin"
