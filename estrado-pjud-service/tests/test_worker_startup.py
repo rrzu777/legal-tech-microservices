@@ -28,9 +28,12 @@ def _entrypoint_config(*, validation_once=False):
     config.TELEGRAM_CHAT_ID = ""
     config.SUPABASE_SERVICE_KEY = "secret-placeholder"
     config.OJV_PROXY_PRICE_PER_GB_USD = 1.0
+    config.OJV_PROXY_GB_BUDGET = 10.0
+    config.OJV_PROXY_GB_ALERT_PCT = 80
     config.BLOCK_PAUSE_S = 0
     config.WORKER_ID = "test-worker"
     config.R2_ENABLED = False
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = False
     config.R2_ACCESS_KEY_ID = ""
     return config
 
@@ -60,6 +63,62 @@ def test_paid_pool_initialization_only_during_office_window():
     assert can_initialize_paid_pool(datetime(2026, 3, 1, 10, 0, tzinfo=tz)) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warm_start,reopen", [(False, False), (True, False), (False, True)])
+async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm_start, reopen):
+    """Catch both the cold-start gate and the discovery-loop office-hours gate."""
+    from worker import __main__ as worker_main
+    from worker.proxy_control import ProxyControlSnapshot
+
+    config = _entrypoint_config()
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = True
+    scheduler = AsyncMock()
+    pool = MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
+    metrics = MagicMock(stop=AsyncMock())
+    backoff = MagicMock(is_open=False)
+    _patch_entrypoint(
+        monkeypatch, worker_main, config=config, scheduler=scheduler,
+        pool=pool, metrics=metrics, backoff=backoff,
+    )
+    handlers = {}
+    monkeypatch.setattr(worker_main.signal, "signal", lambda sig, fn: handlers.update({sig: fn}))
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", AsyncMock(return_value=ProxyControlSnapshot(
+        allowed=True, status="enabled", reason_code=None, revision=1, source="database",
+    )))
+    # Cold Sunday versus a pool that was started during office hours.
+    monkeypatch.setattr(worker_main, "can_initialize_paid_pool", lambda **_kw: warm_start)
+    monkeypatch.setattr(worker_main, "is_processing_allowed", lambda **_kw: reopen)
+    engine = MagicMock(drain_work=AsyncMock())
+
+    async def sync_case(_case):
+        handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
+
+    engine.sync_case = AsyncMock(side_effect=sync_case)
+    scheduler.get_next_batch.return_value = [{"id": "scheduled-case"}]
+
+    async def process_import():
+        if not reopen:
+            handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
+        return False
+
+    engine.process_import_job = AsyncMock(side_effect=process_import)
+    monkeypatch.setattr(worker_main, "SyncEngine", lambda **_kw: engine)
+    await asyncio.wait_for(worker_main.main(), timeout=0.3)
+
+    if reopen:
+        scheduler.get_next_batch.assert_awaited_once()
+        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case"})
+    else:
+        engine.process_import_job.assert_awaited_once()
+        scheduler.get_next_batch.assert_not_awaited()
+        engine.sync_case.assert_not_called()
+    if warm_start:
+        pool.initialize.assert_awaited_once_with()
+    else:
+        pool.initialize.assert_awaited_once_with(prewarm=False)
+    pool.close_all.assert_awaited_once()
+
+
 def test_one_shot_validation_can_initialize_outside_office_window():
     tz = ZoneInfo("America/Santiago")
 
@@ -85,6 +144,39 @@ def test_paid_pool_cannot_initialize_during_maintenance_when_overrides_are_false
         validation_once=False,
         process_outside_office_hours=False,
     ) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_by", ["disabled", "capacity", "proxy", "contract", "reconcile"])
+async def test_manual_import_cold_start_retains_operational_gates(monkeypatch, blocked_by):
+    from worker import __main__ as worker_main
+    from worker.proxy_control import ProxyControlSnapshot
+
+    config = _entrypoint_config()
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = blocked_by != "disabled"
+    config.OJV_PROXY_POOL_SIZE = 1 if blocked_by == "capacity" else 3
+    scheduler = AsyncMock()
+    if blocked_by == "contract":
+        scheduler.verify_claim_contract.side_effect = RuntimeError("unavailable")
+    if blocked_by == "reconcile":
+        scheduler.reconcile_stale_runs.side_effect = RuntimeError("unavailable")
+    pool = MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
+    engine_factory = MagicMock()
+    _patch_entrypoint(
+        monkeypatch, worker_main, config=config, scheduler=scheduler,
+        pool=pool, metrics=MagicMock(stop=AsyncMock()), backoff=MagicMock(is_open=False),
+    )
+    monkeypatch.setattr(worker_main, "SyncEngine", engine_factory)
+    monkeypatch.setattr(worker_main, "can_initialize_paid_pool", lambda **_kw: False)
+    monkeypatch.setattr(worker_main, "wait_before_retry", AsyncMock(return_value=False))
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", AsyncMock(return_value=ProxyControlSnapshot(
+        allowed=blocked_by != "proxy", status="paused" if blocked_by == "proxy" else "enabled",
+        reason_code=None, revision=1, source="database",
+    )))
+    await worker_main.main()
+    pool.initialize.assert_not_awaited()
+    engine_factory.assert_not_called()
+    scheduler.get_next_batch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

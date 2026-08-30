@@ -335,6 +335,14 @@ async def main():
         config.OJV_PROXY_POOL_SIZE = 1
         config.POOL_SIZE = 1
         config.MINT_MAX_RETRIES = 1
+    session_capacity = (
+        config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+    )
+    imports_enabled = (
+        config.ENABLE_PJUD_MY_CAUSES_IMPORT is True
+        and session_capacity >= 2
+        and not validation_once
+    )
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
@@ -407,10 +415,11 @@ async def main():
                     return
                 continue
 
-            if not can_initialize_paid_pool(
+            prewarm = can_initialize_paid_pool(
                 validation_once=validation_once,
                 process_outside_office_hours=process_outside_office_hours,
-            ):
+            )
+            if not prewarm and not imports_enabled:
                 metrics.set_status("idle_off_hours")
                 notify_status("idle outside PJUD office hours")
                 if not await wait_before_retry(
@@ -427,6 +436,14 @@ async def main():
                 ):
                     return
                 continue
+
+            if not prewarm:
+                # Manual discovery claims and authorizes credentials before
+                # checkout. Preparing empty slots does not mint/pay for idle
+                # capacity; normal acquisition retains proxy/cost controls.
+                await pool.initialize(prewarm=False)
+                initialized = True
+                break
 
             metrics.set_status("starting")
             notify_status("initializing proxy pool")
@@ -471,25 +488,13 @@ async def main():
         metrics.set_status("running")
         notify_status("running")
 
-        session_capacity = (
-            config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
-        )
-        if (
-            config.ENABLE_PJUD_MY_CAUSES_IMPORT
-            and session_capacity >= 2
-            and not validation_once
-        ):
+        if imports_enabled:
             import_task = asyncio.create_task(
                 run_import_discovery_loop(
                     engine,
                     metrics,
                     shutdown_event,
-                    traffic_allowed=(
-                        lambda: not backoff.is_open
-                        and is_processing_allowed(
-                            process_outside_office_hours=process_outside_office_hours,
-                        )
-                    ),
+                    traffic_allowed=lambda: not backoff.is_open,
                 ),
                 name="pjud-import-discovery",
             )
@@ -534,7 +539,10 @@ async def main():
                 process_outside_office_hours=process_outside_office_hours,
             ):
                 metrics.set_status("idle_off_hours")
-                notify_status("idle outside PJUD office hours")
+                notify_status(
+                    "scheduled sync outside office hours; manual imports available"
+                    if imports_enabled else "idle outside PJUD office hours"
+                )
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=30)
                 except asyncio.TimeoutError:
