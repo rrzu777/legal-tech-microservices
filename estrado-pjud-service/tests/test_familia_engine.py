@@ -73,6 +73,31 @@ async def test_old_or_replayed_success_never_notifies(monkeypatch, status):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before_decrypt", "before_login", "after_search"])
+async def test_judicial_identity_edit_rejects_old_case_snapshot(monkeypatch, phase):
+    # SQL's native edit matrix proves the binding increment. At this boundary,
+    # preserve the captured version and obey stale without any generic writer.
+    outcomes = [False] if phase == "before_login" else [True, True, {"status": "stale", "new_movements": 0}]
+    engine, session, _ = make_engine(monkeypatch, outcomes)
+    if phase == "before_decrypt":
+        from httpx import _client
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _client.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(409, json={"error": "sync_claim_stale"})), **kw))
+    result = await sync(engine, case={**CASE})
+    assert result == {"success": False, "new_movements": 0,
+                      "status": "stale" if phase == "after_search" else "sync_claim_stale"}
+    assert session.login.await_count == (1 if phase == "after_search" else 0)
+    assert session.search_familia.await_count == (1 if phase == "after_search" else 0)
+    for call in engine._sb.rpc.call_args_list:
+        assert call.args[1]["p_context"]["case_binding_version"] == 7
+        assert call.args[0] in {"check_pjud_sync_credential_claim", "finalize_pjud_private_sync"}
+    engine._notifier.notify_new_movements.assert_not_awaited()
+    for name in ("_finish_run", "_terminal_error", "_update_case_error", "_handle_blocked", "_update_case_blocked"):
+        getattr(engine, name).assert_not_awaited()
+    engine._pool.release_familia_bundle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcomes,login_count", [([False], 0), ([True, False], 1)])
 async def test_lost_claim_prevents_next_pjud_phase(monkeypatch, outcomes, login_count):
     engine, session, _ = make_engine(monkeypatch, outcomes)
