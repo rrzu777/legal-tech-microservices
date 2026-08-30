@@ -15,6 +15,13 @@ SECRET_SENTINEL=fixture-credential-not-a-token
 
 ok() { printf '  ok   %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
+file_mode() {
+  if /usr/bin/stat --version >/dev/null 2>&1; then
+    /usr/bin/stat -c '%a' "$1"
+  else
+    /usr/bin/stat -f '%Lp' "$1"
+  fi
+}
 expect_eq() {
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got=$2 want=$3)"; fi
 }
@@ -835,10 +842,12 @@ EOF
   write_stub stat <<'EOF'
 path=${@: -1}
 [ -e "$path" ] || [ -L "$path" ] || exit 1
-if [ -d "$path" ]; then mode=$(/usr/bin/stat -f '%Lp' "$path"); else mode=$(/usr/bin/stat -f '%Lp' "$path"); fi
-uid=$(/usr/bin/stat -f '%u' "$path")
-gid=$(/usr/bin/stat -f '%g' "$path")
-links=$(/usr/bin/stat -f '%l' "$path")
+if /usr/bin/stat --version >/dev/null 2>&1; then
+  fields=$(/usr/bin/stat -c '%a|%u|%g|%h' "$path") || exit 1
+else
+  fields=$(/usr/bin/stat -f '%Lp|%u|%g|%l' "$path") || exit 1
+fi
+IFS='|' read -r mode uid gid links <<< "$fields"
 if [ -e "$RG_TEST_STATE/credential-wrong-gid" ] && [ "$path" = "$RG_CREDENTIAL_FILE" ]; then gid=$((gid + 1)); fi
 if [ -e "$RG_TEST_STATE/backup-parent-wrong-gid" ] \
   && [ "$path" = "${RG_BACKUP_ROOT%/*}" ]; then gid=$((gid + 1)); fi
@@ -1026,7 +1035,11 @@ if [ -e "$RG_TEST_STATE/audit-mkdir-mode" ]; then
   for path in "$@"; do
     case "$path" in --|-*) continue ;; esac
     [ -d "$path" ] || continue
-    mode=$(/usr/bin/stat -f '%Lp' "$path") || exit 1
+    if /usr/bin/stat --version >/dev/null 2>&1; then
+      mode=$(/usr/bin/stat -c '%a' "$path") || exit 1
+    else
+      mode=$(/usr/bin/stat -f '%Lp' "$path") || exit 1
+    fi
     printf 'mkdir-mode %s %s\n' "$path" "$mode" >> "$RG_TEST_STATE/events"
     permissions=$((8#$mode))
     if [ $((permissions & 8#0077)) -ne 0 ]; then
@@ -1167,7 +1180,7 @@ run_guard() {
     RG_SLEEP_BIN="$BIN/sleep" \
     RG_SHA256_BIN="$BIN/sha256" RG_FIND_BIN="$BIN/find" RG_CP_BIN="$BIN/cp" \
     RG_RM_BIN=/bin/rm RG_MKDIR_BIN="$BIN/mkdir" RG_CHMOD_BIN="$BIN/chmod" \
-    RG_CHOWN_BIN=/usr/sbin/chown RG_MKTEMP_BIN=/usr/bin/mktemp RG_JQ_BIN="$BIN/jq" \
+    RG_CHOWN_BIN="$(command -v chown)" RG_MKTEMP_BIN=/usr/bin/mktemp RG_JQ_BIN="$BIN/jq" \
     RG_PROVISION_BIN="$BIN/provision" RG_SWAP_BIN="$BIN/swap" RG_PYTHON_BIN="$BIN/python" \
     RG_TEST_DISK_BYTES="${TEST_DISK_BYTES:-9663676416}" \
     RG_TEST_RAM_BYTES="${TEST_RAM_BYTES:-7516192768}" \
@@ -2331,7 +2344,7 @@ run_rollback_worker_capability_regression() {
   : > "$STATE/postflight-fail"
   : > "$STATE/worker-falls-before-postflight"
   export RG_WORKER_RESTORE_WINDOW_CAPABILITY=1
-  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA"
+  TEST_MUTATE=api run_guard apply --expected-sha "$EXPECTED_SHA" "$@"
   unset RG_WORKER_RESTORE_WINDOW_CAPABILITY
   backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
   retry_path=$(printf '%s\n' "$OUT" \
@@ -2549,6 +2562,80 @@ run_orchestrated_swap_crash_regression() {
     bad 'same backup retry removes the exact inner crash state'
   fi
 }
+
+run_explicit_daytime_maintenance_regressions() {
+  local scenario backup_path command
+  echo '== daytime maintenance requires explicit apply-only authorization'
+  setup
+  configure_active_worker
+  printf '%s\n' 09 > "$STATE/local-hour"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'daytime without authorization stays refused' "$RC" 1
+  expect_count 'refused daytime does not stop worker' 'systemctl stop estrado-pjud-worker.service' 0
+
+  for command in preflight postflight rollback; do
+    setup
+    case "$command" in
+      preflight) run_guard "$command" --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance ;;
+      postflight) run_guard "$command" --allow-daytime-maintenance ;;
+      rollback) run_guard "$command" --backup-dir "$FAKE/backups/unused" --allow-daytime-maintenance ;;
+    esac
+    expect_eq "$command rejects apply-only daytime flag" "$RC" 2
+    expect_count "$command invalid flag has no provision side effect" provision 0
+  done
+  setup
+  run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance --allow-daytime-maintenance
+  expect_eq 'duplicate daytime authorization is rejected' "$RC" 2
+
+  setup
+  configure_active_worker
+  printf '%s\n' 09 > "$STATE/local-hour"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
+  expect_eq 'explicit daytime authorization admits safe idle worker' "$RC" 0
+  expect_exact_count 'authorized daytime stops worker once' 'systemctl stop estrado-pjud-worker.service' 1
+  expect_exact_count 'authorized daytime starts worker once' 'systemctl start estrado-pjud-worker.service' 1
+  expect_contains 'explicit authorization is visible in safe output' "$OUT" 'DAYTIME MAINTENANCE AUTHORIZED'
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'daytime approval is not persisted into manual rollback' "$RC" 1
+  expect_count 'manual rollback outside window does not stop worker' 'systemctl stop estrado-pjud-worker.service' 0
+
+  for scenario in hour-missing hour-multiline hour-nondecimal hour-producer-fail \
+    heartbeat-running heartbeat-stale claims-active override-true validation-once-true proxy-telemetry; do
+    setup
+    configure_active_worker
+    printf '%s\n' 09 > "$STATE/local-hour"
+    configure_worker_precondition_scenario "$scenario"
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
+    expect_eq "$scenario is not bypassed by daytime authorization" "$RC" 1
+    expect_count "$scenario refuses before stopping worker" 'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$scenario refuses before provision" provision 0
+  done
+  setup
+  configure_active_worker
+  printf '%s\n' 24 > "$STATE/local-hour"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
+  expect_eq 'invalid numeric hour is not authorized' "$RC" 1
+  expect_count 'invalid hour does not stop worker' 'systemctl stop estrado-pjud-worker.service' 0
+
+  setup
+  configure_active_worker
+  printf '%s\n' 09 > "$STATE/local-hour"
+  : > "$STATE/postflight-fail"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
+  expect_eq 'daytime failure keeps apply failed' "$RC" 1
+  expect_contains 'daytime failure automatically restores captured worker' "$OUT" 'ROLLBACK OK'
+  expect_eq 'daytime automatic rollback leaves worker active' "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+  run_rollback_worker_capability_regression --allow-daytime-maintenance
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = explicit-daytime-maintenance ]; then
+  run_explicit_daytime_maintenance_regressions
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = swap-crash-recovery ]; then
   run_orchestrated_swap_crash_regression
@@ -2884,10 +2971,10 @@ expect_missing 'orchestration output contains no service credential' "$OUT$(cat 
 expect_missing 'suppressed dependency output contains no service credential' "$(cat "$CASE_DIR/null")" "$SECRET_SENTINEL"
 SUCCESS_EVENTS=$(cat "$EVENTS")
 BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
-expect_eq 'service credential backup is root-only 0600' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR/entries/0010")" 600
+expect_eq 'service credential backup is root-only 0600' "$(file_mode "$BACKUP_DIR/entries/0010")" 600
 expect_missing 'manifest stores metadata but no credential content' "$(cat "$BACKUP_DIR/manifest.tsv")" "$SECRET_SENTINEL"
 expect_eq 'manifest has one record for every exact managed path' "$(wc -l < "$BACKUP_DIR/manifest.tsv" | tr -d ' ')" 16
-expect_eq 'timestamped backup directory is 0700' "$(/usr/bin/stat -f '%Lp' "$BACKUP_DIR")" 700
+expect_eq 'timestamped backup directory is 0700' "$(file_mode "$BACKUP_DIR")" 700
 if [ -f "$BACKUP_DIR/unit-states.tsv" ]; then
   live_state_lines=$(wc -l < "$BACKUP_DIR/unit-states.tsv" | tr -d ' ')
 else
@@ -3175,7 +3262,7 @@ expect_count 'rollback does not restart unaffected worker' 'systemctl restart es
 expect_count 'rollback does not restart unaffected Hermes' 'restart hermes-gateway.service' 0
 expect_eq 'manifest restores an existing API unit' "$(cat "$FAKE/systemd/estrado-pjud.service")" "$before_api"
 expect_eq 'rollback restores protected credential bytes without printing them' "$(cat "$FAKE/repo/estrado-pjud-service/.env")" "$before_credential"
-expect_eq 'rollback restores protected credential mode from manifest metadata' "$(/usr/bin/stat -f '%Lp' "$FAKE/repo/estrado-pjud-service/.env")" 640
+expect_eq 'rollback restores protected credential mode from manifest metadata' "$(file_mode "$FAKE/repo/estrado-pjud-service/.env")" 640
 if [ ! -e "$FAKE/etc/sysctl.d/60-legaltech-swap.conf" ]; then ok 'rollback removes exact newly-created managed path'; else bad 'rollback left newly-created managed path'; fi
 expect_eq 'rollback does not restore an unlisted path' "$(cat "$FAKE/outside")" 'outside changed'
 
@@ -3299,6 +3386,8 @@ echo '== public subcommands never call forbidden PJUD actions'
 for forbidden in '/api/v1/sync' '/proxy' '/session/mint' '/retry'; do
   expect_missing "no $forbidden endpoint/action" "$SUCCESS_EVENTS" "$forbidden"
 done
+
+run_explicit_daytime_maintenance_regressions
 
 echo
 echo "$PASS ok, $FAIL fail"

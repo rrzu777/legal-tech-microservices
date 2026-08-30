@@ -16,6 +16,7 @@ readonly WORKER_CGROUP=/legaltech.slice/estrado-pjud-worker.service
 usage() {
   printf '%s\n' \
     'usage: resource-guards.sh preflight|apply --expected-sha <40-hex-sha>' \
+    '       resource-guards.sh apply --expected-sha <40-hex-sha> --allow-daytime-maintenance' \
     '       resource-guards.sh postflight' \
     '       resource-guards.sh rollback --backup-dir <timestamped-backup>' >&2
   exit "$EXIT_USAGE"
@@ -335,6 +336,7 @@ command_name=${1:-}
 shift || true
 expected_sha=''
 requested_backup=''
+allow_daytime_maintenance=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --expected-sha)
@@ -346,6 +348,11 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] && [ -z "$requested_backup" ] || usage
       requested_backup=$2
       shift 2
+      ;;
+    --allow-daytime-maintenance)
+      [ "$command_name" = apply ] && [ "$allow_daytime_maintenance" -eq 0 ] || usage
+      allow_daytime_maintenance=1
+      shift
       ;;
     *) usage ;;
   esac
@@ -597,6 +604,19 @@ maintenance_window_is_open() {
   hour=$((10#$hour))
   { [ "$hour" -ge 20 ] && [ "$hour" -le 23 ]; } \
     || { [ "$hour" -ge 0 ] && [ "$hour" -le 3 ]; }
+}
+
+apply_maintenance_window_is_open() {
+  if [ "$allow_daytime_maintenance" -eq 0 ]; then
+    maintenance_window_is_open
+    return
+  fi
+  # Explicit operator consent relaxes only the hour, never a broken clock or
+  # idle/claims fences. It is not persisted or accepted by manual rollback.
+  local hour
+  hour=$(TZ=America/Santiago LC_ALL=C "$date_bin" +%H 2>"$null_file") || return 1
+  [[ "$hour" =~ ^[0-9]{2}$ ]] && [ "$((10#$hour))" -le 23 ] || return 1
+  printf '%s\n' 'DAYTIME MAINTENANCE AUTHORIZED; all worker safety fences still required'
 }
 
 worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-order
@@ -2058,7 +2078,7 @@ run_apply_steps() {
   check_git || return 1
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
-    maintenance_window_is_open || return 1
+    apply_maintenance_window_is_open || return 1
     worker_restore_window_capability=1
     worker_heartbeat_is_idle 0 || return 1
     worker_pre_stop_heartbeat_order=$worker_last_heartbeat_order
