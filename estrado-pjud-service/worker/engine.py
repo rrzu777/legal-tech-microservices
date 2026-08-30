@@ -1440,9 +1440,9 @@ class SyncEngine:
                     logger.error("unsafe internal request header override (%s)", path)
                     return None
                 headers.update(extra_headers)
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
                 resp = await client.request(
-                    method, f"{url}{path}", headers=headers
+                    method, f"{url.rstrip('/')}{path}", headers=headers
                 )
             if resp.status_code != 200:
                 logger.warning("%s returned %d (%s)", what, resp.status_code, path)
