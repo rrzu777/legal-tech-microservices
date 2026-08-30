@@ -36,7 +36,7 @@ readonly -a OVERRIDE_NAMES=(
   RG_MONITORING_DIR RG_MONITOR_ENV_FILE RG_FSTAB_FILE RG_SYSCTL_FILE RG_SWAPPINESS_METADATA_FILE
   RG_CADDYFILE RG_LOGROTATE_FILE RG_JURISTRACK_HEALTH_URL
   RG_ESTRADO_HEALTH_URL RG_GIT_BIN RG_DF_BIN RG_FREE_BIN RG_ID_BIN RG_PS_BIN
-  RG_SYSTEMCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_SLEEP_BIN RG_STAT_BIN RG_SHA256_BIN
+  RG_SYSTEMCTL_BIN RG_BUSCTL_BIN RG_CURL_BIN RG_DATE_BIN RG_SLEEP_BIN RG_STAT_BIN RG_SHA256_BIN
   RG_FLOCK_BIN RG_READLINK_BIN RG_LOCK_FILE RG_FD_ROOT
   RG_FIND_BIN RG_CP_BIN RG_RM_BIN RG_MKDIR_BIN RG_CHMOD_BIN RG_CHOWN_BIN
   RG_MKTEMP_BIN RG_JQ_BIN RG_PROVISION_BIN RG_SWAP_BIN RG_PYTHON_BIN
@@ -85,6 +85,7 @@ free_bin=${RG_FREE_BIN:-/usr/bin/free}
 id_bin=${RG_ID_BIN:-/usr/bin/id}
 ps_bin=${RG_PS_BIN:-/usr/bin/ps}
 systemctl_bin=${RG_SYSTEMCTL_BIN:-/usr/bin/systemctl}
+busctl_bin=${RG_BUSCTL_BIN:-/usr/bin/busctl}
 curl_bin=${RG_CURL_BIN:-/usr/bin/curl}
 date_bin=${RG_DATE_BIN:-/usr/bin/date}
 sleep_bin=${RG_SLEEP_BIN:-/usr/bin/sleep}
@@ -313,7 +314,7 @@ for absolute_value in \
   "$repo_dir" "$systemd_dir" "$systemd_vendor_dir" "$credential_file" "$backup_root" "$tmp_root" "$disk_path" "$null_file" \
   "$monitoring_dir" "$monitor_env_file" "$fstab_file" "$sysctl_file" "$swappiness_metadata_file" \
   "$caddyfile" "$logrotate_file" "$git_bin" "$df_bin" "$free_bin" \
-  "$id_bin" "$ps_bin" "$systemctl_bin" "$curl_bin" "$date_bin" "$sleep_bin" \
+  "$id_bin" "$ps_bin" "$systemctl_bin" "$busctl_bin" "$curl_bin" "$date_bin" "$sleep_bin" \
   "$stat_bin" "$sha256_bin" "$find_bin" "$cp_bin" "$rm_bin" \
   "$mkdir_bin" "$chmod_bin" "$chown_bin" "$mktemp_bin" "$jq_bin" \
   "$provision_bin" "$swap_bin" "$python_bin" \
@@ -950,6 +951,7 @@ run_preflight() {
   safe_existing_path "$provision_bin" && [ -x "$provision_bin" ] \
     && safe_existing_path "$swap_bin" && [ -x "$swap_bin" ] \
     || { fail 'reviewed provision or swap executable is unsafe'; return 1; }
+  [ -x "$busctl_bin" ] || { fail 'typed systemd property client is unavailable'; return 1; }
   check_disk || { fail 'free disk is unavailable or below 8 GiB'; return 1; }
   check_ram || { fail 'MemAvailable is unavailable or below 6 GiB'; return 1; }
   uid=$(validate_hermes_inventory) || { fail 'Hermes UID or persistent inventory is unknown'; return 1; }
@@ -1409,7 +1411,10 @@ show_contract() { # unit property expected [property expected ...]
     expected_values+=("$2")
     shift 2
   done
-  output=$("$systemctl_bin" show "$unit" "${arguments[@]}" 2>"$null_file") || return 1
+  # Unit/property names come only from the fixed contracts below. Never print
+  # returned values: EnvironmentFiles and future properties may be sensitive.
+  output=$("$systemctl_bin" show "$unit" --all "${arguments[@]}" 2>"$null_file") \
+    || { fail "systemd contract query failed: $unit"; return 1; }
   for ((index = 0; index < ${#properties[@]}; index++)); do
     property=${properties[$index]}
     expected=${expected_values[$index]}
@@ -1419,11 +1424,25 @@ show_contract() { # unit property expected [property expected ...]
       value=${line#*=}
       if [ "$key" = "$property" ]; then
         count=$((count + 1))
-        [ "$value" = "$expected" ] || return 1
+        [ "$value" = "$expected" ] \
+          || { fail "systemd contract mismatch: $unit $property"; return 1; }
       fi
     done <<< "$output"
-    [ "$count" -eq 1 ] || return 1
+    [ "$count" -eq 1 ] \
+      || { fail "systemd contract missing or duplicated: $unit $property"; return 1; }
   done
+}
+
+verify_tracker_environment_files() {
+  local output
+  # systemctl show omits empty arrays even with --all on systemd 255.
+  # Ask the typed D-Bus property instead of accepting a missing show field.
+  output=$("$busctl_bin" --system get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1/unit/legaltech_2dresource_2dtracker_2eservice \
+    org.freedesktop.systemd1.Service EnvironmentFiles 2>"$null_file") \
+    || { fail 'tracker EnvironmentFiles query failed'; return 1; }
+  [ "$output" = 'a(sb) 0' ] \
+    || { fail 'tracker EnvironmentFiles is not an empty typed array'; return 1; }
 }
 
 show_runtime_contract() { # scope unit expected-active exact|hermes-prefix expected-cgroup
@@ -1551,15 +1570,16 @@ run_postflight() {
     StateDirectory legaltech-monitor StateDirectoryMode 0750 \
     LogsDirectory legaltech LogsDirectoryMode 0750 \
     ReadWritePaths '/var/lib/legaltech-monitor /var/log/legaltech' \
-    RestrictAddressFamilies '' Slice system.slice MemoryMax 134217728 \
+    RestrictAddressFamilies '~' Slice system.slice MemoryMax 134217728 \
     CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
   show_contract legaltech-resource-tracker.service \
-    Type oneshot User root PartOf '' EnvironmentFiles '' \
+    Type oneshot User root PartOf '' \
     WorkingDirectory /opt/legaltech-monitoring \
     NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
     StateDirectory '' LogsDirectory '' ReadWritePaths /var/log/legaltech/resources.csv \
     RestrictAddressFamilies AF_UNIX Slice system.slice MemoryMax 134217728 \
     CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
+  verify_tracker_environment_files || return 1
   for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
     case "$timer" in
       legaltech-monitor.timer) target=legaltech-monitor.service ;;
@@ -1747,7 +1767,19 @@ read_monitor_restore_activity() { # unit, captured enablement, restored-config c
     *) return 1 ;;
   esac
   output=$("$systemctl_bin" is-active "$unit" 2>"$null_file") || rc=$?
-  [ "$output" = failed ] && [ "$rc" -eq 3 ] || return 1
+  [ "$output" = failed ] || return 1
+  case "$rc" in
+    3) ;;
+    4)
+      # Removed running timers retain failed state after daemon-reload, with
+      # rc=4. Recover only the two originally absent timers, never services.
+      [ "$enabled" = absent ] || return 1
+      case "$unit" in legaltech-monitor.timer|legaltech-resource-tracker.timer) ;; *) return 1 ;; esac
+      show_contract "$unit" LoadState not-found FragmentPath '' || return 1
+      [ "$(read_unit_state system is-enabled "$unit")" = absent ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
   printf 'ROLLBACK: recovering failed monitoring unit %s\n' "$unit" >&2
   "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || return 1
   "$systemctl_bin" reset-failed "$unit" >"$null_file" 2>&1 || return 1
@@ -2127,11 +2159,13 @@ run_apply_steps() {
     || [ "$before_worker_dropin" != "$desired_worker_dropin" ]; then
     worker_will_change=1
   fi
+  apply_phase=backup
   create_backup "$uid" >"$null_file" || return 1
   validate_backup_dir "$backup_dir" && validate_manifest \
     && load_and_validate_unit_states && load_and_validate_worker_runtime \
     && load_and_validate_monitor_runtime || return 1
   check_git || return 1
+  apply_phase=worker-admission
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
     apply_maintenance_window_is_open || return 1
@@ -2141,6 +2175,7 @@ run_apply_steps() {
     worker_count=$(active_claim_count) || return 1
     [ "$worker_count" = 0 ] || return 1
   fi
+  apply_phase=worker-drain
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     stop_worker_for_change || return 1
     wait_for_zero_claims || return 1
@@ -2148,8 +2183,10 @@ run_apply_steps() {
   if [ "$monitor_will_change" -eq 1 ]; then record_change monitor || return 1; fi
   if [ "$tracker_will_change" -eq 1 ]; then record_change tracker || return 1; fi
   mutation_started=1
+  apply_phase=legacy-monitor-stop
   stop_legacy_monitor_if_changed "$monitor_will_change" 0 2 || return 1
   stop_legacy_monitor_if_changed "$tracker_will_change" 1 3 || return 1
+  apply_phase=provision
   PROV_ENABLE_PJUD_WORKER=0 PROV_SKIP_CADDY=1 "$provision_bin" >"$null_file" 2>&1 || provision_rc=1
   after_api=$(digest_path "$api_path") || return 1
   after_worker=$(digest_path "$worker_path") || return 1
@@ -2174,12 +2211,15 @@ run_apply_steps() {
   if [ "${swap_initial_state:-unknown}" = clean ]; then
     durable_replace_metadata "$backup_dir/swap-state" $'attempted\n' || return 1
   fi
+  apply_phase=swap
   run_swap_mutator apply >"$null_file" 2>&1 || return 1
   "$swap_bin" verify >"$null_file" 2>&1 || return 1
+  apply_phase=reload-and-migrate
   "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || return 1
   verify_monitor_migration "$monitor_will_change" 0 || return 1
   verify_monitor_migration "$tracker_will_change" 1 || return 1
   if [ "$before_api" != "$after_api" ]; then
+    apply_phase=api-runtime
     if [ "${desired_active_states[0]}" = active ]; then
       [ "$(read_unit_state system is-active estrado-pjud.service)" = active ] || return 1
       "$systemctl_bin" restart estrado-pjud.service >"$null_file" 2>&1 || return 1
@@ -2190,6 +2230,7 @@ run_apply_steps() {
     fi
   fi
   if [ "$before_hermes" != "$after_hermes" ]; then
+    apply_phase=hermes-runtime
     local hermes_index hermes_unit hermes_activity
     for ((hermes_index = system_unit_count; hermes_index < ${#tracked_units[@]}; hermes_index++)); do
       hermes_unit=${tracked_units[$hermes_index]}
@@ -2205,6 +2246,7 @@ run_apply_steps() {
     done
   fi
   if [ "$worker_will_change" -eq 1 ]; then
+    apply_phase=worker-runtime
     if [ "${desired_active_states[1]}" = active ]; then
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
       "$systemctl_bin" start estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
@@ -2215,14 +2257,18 @@ run_apply_steps() {
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
     fi
   fi
+  apply_phase=timers
   "$systemctl_bin" start legaltech-monitor.timer legaltech-resource-tracker.timer >"$null_file" 2>&1 || return 1
+  apply_phase=tracker-sample
   "$python_bin" "$monitoring_dir/resource-tracker.py" --once >"$null_file" 2>&1 || return 1
+  apply_phase=monitor-evaluation
   "$python_bin" "$monitoring_dir/monitor.py" --dry-run >"$null_file" 2>&1 || return 1
+  apply_phase=postflight
   run_postflight || return 1
 }
 
 run_apply() {
-  local uid
+  local uid apply_phase=initial-digests
   worker_restore_window_capability=0
   run_preflight || return 1
   uid=$(validate_hermes_inventory) || return 1
@@ -2230,6 +2276,7 @@ run_apply() {
   backup_dir=''
   mutation_started=0
   if ! run_apply_steps "$uid"; then
+    fail "apply failed in phase: $apply_phase" || true
     if [ -n "$backup_dir" ] && [ "$mutation_started" -eq 1 ]; then automatic_rollback || true; fi
     return 1
   fi

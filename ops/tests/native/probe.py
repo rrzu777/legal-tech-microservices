@@ -22,16 +22,19 @@ def main():
     print(version)
     source = Path('/mnt/payload/ops/resource-guards.sh').read_text()
     print('resource-guards sha256=' + hashlib.sha256(source.encode()).hexdigest())
-    names = ('show_contract', 'scoped_systemctl', 'read_unit_state',
+    names = ('fail', 'show_contract', 'scoped_systemctl', 'read_unit_state',
              'read_correlated_unit_activity', 'read_monitor_restore_activity')
     functions = []
     for name in names:
         match = re.search(r'^' + name + r'\(\) \{.*?^\}', source, re.M | re.S)
         assert match, name
         functions.append(match.group())
+    typed = re.search(r'^verify_tracker_environment_files\(\) \{.*?^\}', source, re.M | re.S)
+    if typed:
+        functions.append(typed.group())
     helper = Path('/run/native-contract-functions.sh')
     helper.write_text('systemctl_bin=/usr/bin/systemctl\nbusctl_bin=/usr/bin/busctl\n'
-                      'null_file=/dev/null\n' + '\n'.join(functions))
+                      'null_file=/dev/null\nEXIT_ERROR=1\n' + '\n'.join(functions))
     base = Path('/run/systemd/system')
     tracker = base / 'legaltech-resource-tracker.service'
     timer = base / 'legaltech-resource-tracker.timer'
@@ -44,7 +47,8 @@ def main():
               '/org/freedesktop/systemd1/unit/legaltech_2dresource_2dtracker_2eservice',
               'org.freedesktop.systemd1.Service', 'EnvironmentFiles').stdout.strip())
     checks = [
-        ('empty-environment', 'show_contract legaltech-resource-tracker.service EnvironmentFiles ""'),
+        ('empty-environment', 'verify_tracker_environment_files' if typed else
+         'show_contract legaltech-resource-tracker.service EnvironmentFiles ""'),
         ('unrestricted-address-families', 'show_contract legaltech-resource-tracker.service RestrictAddressFamilies "~"'),
     ]
     # Removing a running timer's unit file yields not-found + failed + rc=4.

@@ -520,13 +520,16 @@ if [ "${1:-}" = show ]; then
     legaltech-monitor.service:LogsDirectory) echo legaltech ;;
     legaltech-monitor.service:LogsDirectoryMode) echo 0750 ;;
     legaltech-monitor.service:ReadWritePaths) echo '/var/lib/legaltech-monitor /var/log/legaltech' ;;
-    legaltech-monitor.service:RestrictAddressFamilies) echo '' ;;
+    legaltech-monitor.service:RestrictAddressFamilies) echo '~' ;;
     legaltech-monitor.service:PartOf) echo '' ;;
     legaltech-monitor.service:EnvironmentFiles) echo '/etc/legaltech-monitoring.env (ignore_errors=yes)' ;;
     legaltech-resource-tracker.service:StateDirectory|legaltech-resource-tracker.service:LogsDirectory) echo '' ;;
     legaltech-resource-tracker.service:ReadWritePaths) echo /var/log/legaltech/resources.csv ;;
     legaltech-resource-tracker.service:RestrictAddressFamilies) echo AF_UNIX ;;
     legaltech-resource-tracker.service:PartOf|legaltech-resource-tracker.service:EnvironmentFiles) echo '' ;;
+    legaltech-monitor.timer:LoadState|legaltech-resource-tracker.timer:LoadState)
+      if [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = not-found ]; then echo not-found; else echo loaded; fi ;;
+    legaltech-monitor.timer:FragmentPath|legaltech-resource-tracker.timer:FragmentPath) echo '' ;;
     legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
     legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
     *.timer:TimersMonotonic)
@@ -584,7 +587,12 @@ case "${1:-}" in
     else
       case "$value" in
         active) exit 0 ;;
-        failed) exit 3 ;;
+        failed)
+          case "$unit" in
+            legaltech-monitor.timer|legaltech-resource-tracker.timer)
+              [ "$(cat "$(state_file "$unit" enabled)")" != not-found ] || exit 4 ;;
+          esac
+          exit 3 ;;
         inactive)
           if [ -f "$RG_TEST_STATE/unit-$unit-active-status" ]; then
             exit "$(cat "$RG_TEST_STATE/unit-$unit-active-status")"
@@ -805,6 +813,15 @@ printf '%s\n' "$health_calls" > "$health_calls_file"
 if [ -e "$RG_TEST_STATE/health-after-first" ] && [ "$health_calls" -gt 2 ]; then code=503; fi
 printf '%s' "$code"
 [ "$code" = 200 ]
+EOF
+  write_stub busctl <<'EOF'
+[ "$*" = '--system get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/legaltech_2dresource_2dtracker_2eservice org.freedesktop.systemd1.Service EnvironmentFiles' ] || exit 1
+if [ -f "$RG_TEST_STATE/property-bad" ] \
+  && [ "$(cat "$RG_TEST_STATE/property-bad")" = legaltech-resource-tracker.service:EnvironmentFiles ]; then
+  printf '%s\n' 'a(sb) 1 "/unexpected.env" true'
+else
+  printf '%s\n' 'a(sb) 0'
+fi
 EOF
   write_stub date <<'EOF'
 case "$*" in
@@ -1212,7 +1229,7 @@ run_guard() {
     RG_JURISTRACK_HEALTH_URL=https://juristrack.cl/ \
     RG_ESTRADO_HEALTH_URL=https://estrado.juristrack.cl/api/v1/health \
     RG_GIT_BIN="$BIN/git" RG_DF_BIN="$BIN/df" RG_FREE_BIN="$BIN/free" \
-    RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" \
+    RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" RG_BUSCTL_BIN="$BIN/busctl" \
     RG_CURL_BIN="$BIN/curl" RG_DATE_BIN="$BIN/date" RG_STAT_BIN="$BIN/stat" \
     RG_FLOCK_BIN="$BIN/flock" RG_READLINK_BIN="$BIN/readlink" \
     RG_LOCK_FILE="$FAKE/run/legaltech-resource-guards.lock" RG_FD_ROOT="$FAKE/fd" \
