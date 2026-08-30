@@ -11,7 +11,7 @@ SOURCE = Path(__file__).resolve().parents[1] / 'resource-guards.sh'
 def evaluate(command, **values):
     source = SOURCE.read_text()
     functions = []
-    for name in ('fail', 'show_contract', 'verify_tracker_environment_files',
+    for name in ('fail', 'show_contract', 'verify_tracker_environment_files', 'verify_monitor_configuration',
                  'scoped_systemctl', 'read_unit_state', 'read_correlated_unit_activity',
                  'read_monitor_restore_activity', 'run_apply'):
         match = re.search(r'^' + name + r'\(\) \{.*?^\}', source, re.M | re.S)
@@ -24,7 +24,14 @@ busctl_bin=fake_busctl
 null_file=/dev/null
 EXIT_ERROR=1
 recovered=0
-fake_busctl() { printf '%s\\n' "$BUS_OUTPUT"; return "$BUS_RC"; }
+fake_busctl() {
+  case "${@: -1}" in
+    DropInPaths) printf '%s\\n' "$DROPINS" ;;
+    NeedDaemonReload) printf '%s\\n' "$RELOAD" ;;
+    *) printf '%s\\n' "$BUS_OUTPUT" ;;
+  esac
+  return "$BUS_RC"
+}
 fake_systemctl() {
   case "$1" in
     show) printf '%s\\n' "$SHOW" ;;
@@ -40,13 +47,22 @@ fake_systemctl() {
 '''
     env = dict(PATH=os.environ['PATH'], BUS_OUTPUT='a(sb) 0', BUS_RC='0',
                SHOW='LoadState=not-found\nFragmentPath=', ACTIVE_RC='4',
-               STOP_RC='0', RESET_RC='0', RESET_EFFECT='1')
+               STOP_RC='0', RESET_RC='0', RESET_EFFECT='1', DROPINS='as 0', RELOAD='b false')
     env.update(values)
     return subprocess.run(['bash', '-c', stubs + '\n'.join(functions) + '\n' + command],
                           env=env, text=True, capture_output=True)
 
 
 class NativeContractTests(unittest.TestCase):
+    def test_monitor_override_gate_accepts_only_typed_empty_and_fresh_config(self):
+        self.assertEqual(evaluate('verify_monitor_configuration 0').returncode, 0)
+        for values in ({'DROPINS': 'as 1 "/private/override.conf"'}, {'DROPINS': ''},
+                       {'RELOAD': 'b true'}, {'RELOAD': ''}, {'BUS_RC': '1'}):
+            with self.subTest(values=values):
+                result = evaluate('verify_monitor_configuration 0', **values)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('/private', result.stderr)
+
     def test_empty_array_uses_typed_dbus_property(self):
         result = evaluate('verify_tracker_environment_files')
         self.assertEqual(result.returncode, 0, result.stderr)

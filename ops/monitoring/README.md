@@ -67,30 +67,44 @@ sudo /usr/bin/python3 /opt/legaltech-monitoring/resource-tracker.py --once
 Monitor dry-run, sin red ni mutación de estado:
 
 ```bash
-sudo /usr/bin/python3 /opt/legaltech-monitoring/monitor.py --dry-run
+sudo /usr/bin/python3 /opt/legaltech-monitoring/monitor.py --dry-run --delivery local
 ```
 
 Éxito: JSON con `"dry_run":true` y la lista de eventos evaluados.
 Este comando es diagnóstico: exit cero no implica que los eventos estén sanos y
 no sustituye el postflight exacto de `resource-guards.sh`.
 
-Evaluación live una vez, cargando el archivo protegido sin incluir sus valores en
-el comando ni en el historial:
-
-```bash
-sudo /bin/sh -c 'set -a; . /etc/legaltech-monitoring.env; exec /usr/bin/python3 /opt/legaltech-monitoring/monitor.py --once'
-```
-
-Éxito: JSON con `"dry_run":false`. Puede mutar estado y entregar los eventos
-pendientes. Un fallo de entrega sale no-cero con diagnóstico sanitizado. La unit
-equivalente, que ya carga el mismo `EnvironmentFile`, se puede ejecutar con:
+El timer instalado usa explícitamente `--once --delivery local`: registra los
+eventos en journald, sin leer variables de Telegram ni construir un transporte.
+No necesita credenciales. Para probar ese mismo modo una vez:
 
 ```bash
 sudo systemctl start legaltech-monitor.service
+sudo journalctl -u legaltech-monitor.service -n 10 --no-pager
 ```
 
+Éxito del comando: JSON con `"delivery_mode":"local"`. Hay que revisar los eventos:
+exit cero acredita evaluación/registro, no que todas las reglas estén sanas.
+El estado local vive en `state-local.json`, separado de `state.json` de Telegram.
+Los eventos quedan pendientes antes de escribir/flush de stdout y se reconocen
+después. Si falla la escritura o el estado, sale no-cero y no afirma entrega.
+Esto registra alertas locales; **no envía una notificación fuera del VPS**.
+
+Telegram sigue disponible sólo si se elige ese transporte (es el default de CLI
+por compatibilidad; no del timer instalado). Evaluación remota una vez, únicamente
+con autorización y credenciales rotadas:
+
+```bash
+sudo /bin/sh -c 'set -a; . /etc/legaltech-monitoring.env; exec /usr/bin/python3 /opt/legaltech-monitoring/monitor.py --once --delivery telegram'
+```
+
+Éxito: JSON con `"dry_run":false`. Puede mutar estado y entregar los eventos
+pendientes. Un fallo de entrega sale no-cero con diagnóstico sanitizado; nunca
+cambia automáticamente a local por falta de credenciales. Activar Telegram en
+el timer requiere un cambio explícito de configuración, no sólo agregar un token.
+
 `--once`, `--dry-run` y `--test-alert` son modos mutuamente excluyentes: usar uno
-por ejecución.
+por ejecución. `--test-alert --delivery local` se rechaza sin red ni cambios.
 
 ## Rotación y alerta sintética
 

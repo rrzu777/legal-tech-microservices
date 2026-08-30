@@ -506,6 +506,8 @@ if [ "${1:-}" = show ]; then
     estrado-pjud-worker.service:ActiveState|legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
     estrado-pjud-worker.service:Result|legaltech-monitor.service:Result|legaltech-resource-tracker.service:Result) cat "$RG_TEST_STATE/unit-$unit-result" ;;
     legaltech-monitor.service:Type|legaltech-resource-tracker.service:Type) echo oneshot ;;
+    legaltech-monitor.service:LoadState|legaltech-resource-tracker.service:LoadState) echo loaded ;;
+    legaltech-monitor.service:ExecMainStatus|legaltech-resource-tracker.service:ExecMainStatus) echo 0 ;;
     legaltech-monitor.service:User|legaltech-resource-tracker.service:User) echo root ;;
     legaltech-monitor.service:WorkingDirectory|legaltech-resource-tracker.service:WorkingDirectory) echo /opt/legaltech-monitoring ;;
     legaltech-monitor.service:NoNewPrivileges|legaltech-resource-tracker.service:NoNewPrivileges) echo yes ;;
@@ -529,7 +531,8 @@ if [ "${1:-}" = show ]; then
     legaltech-resource-tracker.service:PartOf|legaltech-resource-tracker.service:EnvironmentFiles) echo '' ;;
     legaltech-monitor.timer:LoadState|legaltech-resource-tracker.timer:LoadState)
       if [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = not-found ]; then echo not-found; else echo loaded; fi ;;
-    legaltech-monitor.timer:FragmentPath|legaltech-resource-tracker.timer:FragmentPath) echo '' ;;
+    legaltech-monitor.service:FragmentPath|legaltech-resource-tracker.service:FragmentPath|legaltech-monitor.timer:FragmentPath|legaltech-resource-tracker.timer:FragmentPath)
+      if [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = not-found ]; then echo ''; else echo "$RG_SYSTEMD_DIR/$unit"; fi ;;
     legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
     legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
     *.timer:TimersMonotonic)
@@ -815,6 +818,14 @@ printf '%s' "$code"
 [ "$code" = 200 ]
 EOF
   write_stub busctl <<'EOF'
+case "${@: -1}" in
+  DropInPaths)
+    if [ -e "$RG_TEST_STATE/monitor-override" ]; then echo 'as 1 "/private/override.conf"'; else echo 'as 0'; fi
+    exit 0 ;;
+  NeedDaemonReload)
+    if [ -e "$RG_TEST_STATE/monitor-needs-reload" ]; then echo 'b true'; else echo 'b false'; fi
+    exit 0 ;;
+esac
 [ "$*" = '--system get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/legaltech_2dresource_2dtracker_2eservice org.freedesktop.systemd1.Service EnvironmentFiles' ] || exit 1
 if [ -f "$RG_TEST_STATE/property-bad" ] \
   && [ "$(cat "$RG_TEST_STATE/property-bad")" = legaltech-resource-tracker.service:EnvironmentFiles ]; then
@@ -2799,6 +2810,31 @@ run_real_timer_contract_regressions() {
   expect_eq 'additional calendar schedule fails closed' "$RC" 1
 }
 
+run_monitor_sandbox_regression() {
+  local drift
+  for drift in monitor-override monitor-needs-reload; do
+    setup
+    : > "$STATE/$drift"
+    run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$drift is rejected at admission" "$RC" 1
+    expect_count "$drift never provisions" provision 0
+    expect_count "$drift never starts monitoring" 'systemctl start' 0
+  done
+  setup
+  printf '%s\n' 'start legaltech-monitor.service legaltech-resource-tracker.service' > "$STATE/fail-command"
+  TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'monitor sandbox failure aborts apply' "$RC" 1
+  expect_contains 'monitor sandbox failure identifies phase' "$OUT" 'phase: monitor-sandbox'
+  expect_contains 'monitor sandbox failure rolls back' "$OUT" 'ROLLBACK OK'
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = monitor-sandbox ]; then
+  run_monitor_sandbox_regression
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = real-timer-contract ]; then
   run_real_timer_contract_regressions
   echo "$PASS ok, $FAIL fail"
@@ -2976,6 +3012,7 @@ fi
 run_failed_monitor_restore_barriers
 run_failed_monitor_restore_regressions
 run_real_timer_contract_regressions
+run_monitor_sandbox_regression
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
@@ -3143,7 +3180,7 @@ expect_exact_count 'active Hermes gateway restarts once when drop-in changes' 's
 expect_exact_count 'active Hermes dashboard restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
 expect_before 'timers start before tracker invocation' 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer' 'python '
 monitor_invocations=$(grep -F "python $FAKE/monitoring/monitor.py" "$EVENTS" 2>/dev/null || true)
-expect_exact_count 'monitor is invoked exactly once in dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run" 1
+expect_exact_count 'monitor is invoked exactly once in local dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run --delivery local" 1
 expect_missing 'monitor dry-run invocation excludes once mode' "$monitor_invocations" '--once'
 expect_missing 'monitor dry-run invocation excludes synthetic alert mode' "$monitor_invocations" '--test-alert'
 expect_missing 'orchestration output contains no service credential' "$OUT$(cat "$EVENTS")" "$SECRET_SENTINEL"

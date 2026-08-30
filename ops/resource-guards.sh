@@ -952,6 +952,7 @@ run_preflight() {
     && safe_existing_path "$swap_bin" && [ -x "$swap_bin" ] \
     || { fail 'reviewed provision or swap executable is unsafe'; return 1; }
   [ -x "$busctl_bin" ] || { fail 'typed systemd property client is unavailable'; return 1; }
+  verify_monitor_configuration 0 || return 1
   check_disk || { fail 'free disk is unavailable or below 8 GiB'; return 1; }
   check_ram || { fail 'MemAvailable is unavailable or below 6 GiB'; return 1; }
   uid=$(validate_hermes_inventory) || { fail 'Hermes UID or persistent inventory is unknown'; return 1; }
@@ -1445,6 +1446,38 @@ verify_tracker_environment_files() {
     || { fail 'tracker EnvironmentFiles is not an empty typed array'; return 1; }
 }
 
+verify_monitor_configuration() { # 0=legacy admission, 1=installed fragments
+  local installed=$1 unit object property output
+  case "$installed" in 0|1) ;; *) return 1 ;; esac
+  for unit in legaltech-monitor.service legaltech-resource-tracker.service \
+    legaltech-monitor.timer legaltech-resource-tracker.timer; do
+    case "$unit" in
+      legaltech-monitor.service) object=legaltech_2dmonitor_2eservice ;;
+      legaltech-resource-tracker.service) object=legaltech_2dresource_2dtracker_2eservice ;;
+      legaltech-monitor.timer) object=legaltech_2dmonitor_2etimer ;;
+      legaltech-resource-tracker.timer) object=legaltech_2dresource_2dtracker_2etimer ;;
+    esac
+    # Load metadata for absent timers too; no start/reload or activation.
+    "$systemctl_bin" show "$unit" --property=LoadState >"$null_file" 2>&1 || return 1
+    for property in DropInPaths NeedDaemonReload; do
+      output=$("$busctl_bin" --system get-property org.freedesktop.systemd1 \
+        "/org/freedesktop/systemd1/unit/$object" org.freedesktop.systemd1.Unit \
+        "$property" 2>"$null_file") \
+        || { fail 'monitor configuration metadata is unavailable'; return 1; }
+      case "$property:$output" in
+        'DropInPaths:as 0'|'NeedDaemonReload:b false') ;;
+        *) fail 'monitor override or unreloaded configuration is not allowed'; return 1 ;;
+      esac
+    done
+    if [ "$installed" = 1 ]; then
+      # Alongside the source digest check, no overrides + fresh exact fragment
+      # proves the command is the declared local-only monitor, not an old
+      # ExecStart override inheriting optional Telegram credentials.
+      show_contract "$unit" FragmentPath "$systemd_dir/$unit" || return 1
+    fi
+  done
+}
+
 show_runtime_contract() { # scope unit expected-active exact|hermes-prefix expected-cgroup
   local scope=$1 unit=$2 expected_active=$3 match_mode=$4 expected_cgroup=$5
   local output line key value load_state='' active_state='' main_pid='' control_group=''
@@ -1563,7 +1596,7 @@ run_postflight() {
   show_contract "user-$uid.slice" MemoryHigh 2147483648 MemoryMax 2621440000 TasksMax 1024 CPUWeight 200 || return 1
   verify_runtime_postflight "$uid" || return 1
   show_contract legaltech-monitor.service \
-    Type oneshot User root PartOf '' \
+    Type oneshot User root PartOf '' Result success ExecMainStatus 0 \
     EnvironmentFiles '/etc/legaltech-monitoring.env (ignore_errors=yes)' \
     WorkingDirectory /opt/legaltech-monitoring \
     NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
@@ -1573,13 +1606,14 @@ run_postflight() {
     RestrictAddressFamilies '~' Slice system.slice MemoryMax 134217728 \
     CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
   show_contract legaltech-resource-tracker.service \
-    Type oneshot User root PartOf '' \
+    Type oneshot User root PartOf '' Result success ExecMainStatus 0 \
     WorkingDirectory /opt/legaltech-monitoring \
     NoNewPrivileges yes PrivateTmp yes ProtectSystem strict ProtectHome yes \
     StateDirectory '' LogsDirectory '' ReadWritePaths /var/log/legaltech/resources.csv \
     RestrictAddressFamilies AF_UNIX Slice system.slice MemoryMax 134217728 \
     CPUQuotaPerSecUSec 200ms TasksMax 64 || return 1
   verify_tracker_environment_files || return 1
+  verify_monitor_configuration 1 || return 1
   for timer in legaltech-monitor.timer legaltech-resource-tracker.timer; do
     case "$timer" in
       legaltech-monitor.timer) target=legaltech-monitor.service ;;
@@ -2258,11 +2292,16 @@ run_apply_steps() {
     fi
   fi
   apply_phase=timers
+  verify_monitor_configuration 1 || return 1
   "$systemctl_bin" start legaltech-monitor.timer legaltech-resource-tracker.timer >"$null_file" 2>&1 || return 1
   apply_phase=tracker-sample
   "$python_bin" "$monitoring_dir/resource-tracker.py" --once >"$null_file" 2>&1 || return 1
   apply_phase=monitor-evaluation
-  "$python_bin" "$monitoring_dir/monitor.py" --dry-run >"$null_file" 2>&1 || return 1
+  "$python_bin" "$monitoring_dir/monitor.py" --dry-run --delivery local >"$null_file" 2>&1 || return 1
+  # Exercise the real oneshot sandboxes, not only Python outside systemd.
+  # The declared monitor uses local delivery; this never sends Telegram.
+  apply_phase=monitor-sandbox
+  "$systemctl_bin" start legaltech-monitor.service legaltech-resource-tracker.service >"$null_file" 2>&1 || return 1
   apply_phase=postflight
   run_postflight || return 1
 }
