@@ -165,9 +165,12 @@ validate_mutation_lock_file() {
   local metadata kind mode size links uid gid extra
   [ -f "$lock_file" ] && [ ! -L "$lock_file" ] \
     && ! path_has_symlink_component "$lock_file" || return 1
-  metadata=$("$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$lock_file") || return 1
+  metadata=$(LC_ALL=C "$stat_bin" -c '%F|%a|%s|%h|%u|%g' "$lock_file") || return 1
   IFS='|' read -r kind mode size links uid gid extra <<< "$metadata" || return 1
-  [ "$kind" = 'regular file' ] && [ "$mode" = 600 ] && [ "$links" = 1 ] \
+  # GNU stat distinguishes empty regular files; opening the shared lock with
+  # '>' intentionally empties it, including the inherited parent descriptor.
+  case "$kind" in 'regular file'|'regular empty file') ;; *) return 1 ;; esac
+  [ "$mode" = 600 ] && [ "$links" = 1 ] \
     && [ "$uid" = "$root_uid" ] && [ "$gid" = "$root_gid" ] \
     && [ -z "$extra" ]
 }

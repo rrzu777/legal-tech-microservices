@@ -126,6 +126,7 @@ setup() {
   unset FLOCK_FAIL_AFTER_OUTPUT READLINK_FAIL_AFTER_OUTPUT
   unset CRASH_AFTER
   unset HANDOFF_FD
+  REAL_LOCK_TOOLS=0
   unset PHASE_WRITE_FAIL
   unset SYNC_FAIL_ON_CALL SYNC_EXTRA_OUTPUT
 
@@ -275,7 +276,7 @@ printf "stat %s\n" "$*" >> "$SWAP_TEST_CALL_LOG"
 path=${!#}
 metadata=$("$SWAP_TEST_PYTHON" -c '\''import os,stat,sys
 s=os.lstat(sys.argv[1])
-kind="regular file" if stat.S_ISREG(s.st_mode) else ("symbolic link" if stat.S_ISLNK(s.st_mode) else "other")
+kind=("regular empty file" if s.st_size == 0 else "regular file") if stat.S_ISREG(s.st_mode) else ("symbolic link" if stat.S_ISLNK(s.st_mode) else "other")
 print(f"{kind}|{stat.S_IMODE(s.st_mode):o}|{s.st_size}|{s.st_nlink}|{s.st_uid}|{s.st_gid}")'\'' "$path") || exit 8
 IFS="|" read -r kind mode size links uid gid <<< "$metadata" || exit 8
 if [ -n "${SWAP_TEST_STAT_OVERRIDE_PATH:-}" ] && [ "$path" = "$SWAP_TEST_STAT_OVERRIDE_PATH" ]; then
@@ -342,6 +343,14 @@ esac'
 }
 
 run_swap() {
+  local stat_command="$BIN_DIR/stat" flock_command="$BIN_DIR/flock"
+  local readlink_command="$BIN_DIR/readlink" descriptor_root="$ROOT/fd"
+  if [ "${REAL_LOCK_TOOLS:-0}" = 1 ]; then
+    stat_command=/usr/bin/stat
+    flock_command=/usr/bin/flock
+    readlink_command=/usr/bin/readlink
+    descriptor_root=/proc/self/fd
+  fi
   OUT=$(SWAP_TEST_MODE=1 \
     SWAP_FILE="$SWAP_FILE" SWAP_FSTAB_FILE="$FSTAB_FILE" \
     SWAP_SYSCTL_FILE="$SYSCTL_FILE" SWAP_SWAPPINESS_METADATA_FILE="$SWAPPINESS_METADATA_FILE" \
@@ -351,11 +360,11 @@ run_swap() {
     SWAP_MKSWAP_BIN="$BIN_DIR/mkswap" SWAP_SWAPON_BIN="$BIN_DIR/swapon" \
     SWAP_SWAPOFF_BIN="$BIN_DIR/swapoff" SWAP_SYSCTL_BIN="$BIN_DIR/sysctl" \
     SWAP_FREE_BIN="$BIN_DIR/free" SWAP_CP_BIN="$BIN_DIR/cp" \
-    SWAP_MV_BIN="$BIN_DIR/mv" SWAP_STAT_BIN="$BIN_DIR/stat" \
-    SWAP_RM_BIN="$BIN_DIR/rm" SWAP_FLOCK_BIN="$BIN_DIR/flock" \
-    SWAP_READLINK_BIN="$BIN_DIR/readlink" SWAP_PYTHON_BIN="$BIN_DIR/phase-python" \
+    SWAP_MV_BIN="$BIN_DIR/mv" SWAP_STAT_BIN="$stat_command" \
+    SWAP_RM_BIN="$BIN_DIR/rm" SWAP_FLOCK_BIN="$flock_command" \
+    SWAP_READLINK_BIN="$readlink_command" SWAP_PYTHON_BIN="$BIN_DIR/phase-python" \
     SWAP_LOCK_FILE="$LOCK_FILE" \
-    SWAP_FD_ROOT="$ROOT/fd" SWAP_TEST_FD_ROOT="$ROOT/fd" \
+    SWAP_FD_ROOT="$descriptor_root" SWAP_TEST_FD_ROOT="$descriptor_root" \
     SWAP_TEST_STATE="$STATE_DIR" SWAP_TEST_CALL_LOG="$CALL_LOG" \
     SWAP_TEST_SYNC_COUNT_FILE="$SYNC_COUNT_FILE" \
     SWAP_TEST_FSTAB="$FSTAB_FILE" SWAP_TEST_CRASH_AFTER="${CRASH_AFTER:-}" \
@@ -718,6 +727,78 @@ run_mutator_lock_regressions() {
   run_swap rollback
   expect_eq 'parent release permits later standalone rollback' "$RC" 0
 }
+
+run_linux_lock_regressions() {
+  local parent_fd variant contention_rc
+  if ! /usr/bin/stat --version >/dev/null 2>&1 || [ ! -x /usr/bin/flock ] \
+    || [ ! -d /proc/self/fd ]; then
+    if [ "${SWAP_FOCUS:-}" = linux-lock ]; then
+      bad 'linux-lock requires GNU stat, flock and procfs'
+    else
+      echo 'SKIP real Linux lock integration: Linux required'
+    fi
+    return
+  fi
+  echo '== real GNU stat/flock/readlink with fake swap effects'
+  for variant in empty nonempty; do
+    setup "linux-lock-$variant"
+    REAL_LOCK_TOOLS=1
+    ( umask 077; : > "$LOCK_FILE" )
+    if [ "$variant" = nonempty ]; then printf 'previous owner\n' > "$LOCK_FILE"; fi
+    run_swap apply
+    expect_eq "$variant regular lock permits standalone apply" "$RC" 0
+    run_swap verify
+    expect_eq "$variant lock apply creates valid managed fake state" "$RC" 0
+    run_swap rollback
+    expect_eq "$variant regular lock permits standalone rollback" "$RC" 0
+    expect_eq "$variant rollback removes managed artifacts" "$(managed_artifact_count)" 0
+  done
+
+  setup linux-lock-handoff
+  REAL_LOCK_TOOLS=1
+  ( umask 077; : > "$LOCK_FILE" )
+  # Same inherited-descriptor boundary used by resource-guards.sh; kernel lock,
+  # GNU metadata and procfs identity are real, only swap/system effects are fake.
+  exec {parent_fd}>"$LOCK_FILE"
+  /usr/bin/flock -n "$parent_fd"
+  HANDOFF_FD=$parent_fd run_swap apply
+  expect_eq 'real inherited lock permits child apply' "$RC" 0
+  HANDOFF_FD='' run_swap rollback
+  expect_eq 'standalone rollback cannot bypass inherited owner' "$RC" 1
+  HANDOFF_FD=$parent_fd run_swap rollback
+  expect_eq 'real inherited lock permits child compensation' "$RC" 0
+  /usr/bin/flock -n "$LOCK_FILE" /usr/bin/true
+  contention_rc=$?
+  expect_eq 'child exit does not release parent kernel lock' "$contention_rc" 1
+  /usr/bin/flock -u "$parent_fd"
+  exec {parent_fd}>&-
+  /usr/bin/flock -n "$LOCK_FILE" /usr/bin/true
+  expect_eq 'parent release allows another kernel owner' "$?" 0
+
+  for variant in mode hardlink symlink fifo; do
+    setup "linux-lock-unsafe-$variant"
+    REAL_LOCK_TOOLS=1
+    case "$variant" in
+      mode) ( umask 077; : > "$LOCK_FILE" ); chmod 644 "$LOCK_FILE" ;;
+      hardlink) ( umask 077; : > "$LOCK_FILE" ); ln "$LOCK_FILE" "$ROOT/other-lock" ;;
+      symlink) ( umask 077; : > "$ROOT/other-lock" ); ln -s "$ROOT/other-lock" "$LOCK_FILE" ;;
+      fifo) mkfifo "$LOCK_FILE" ;;
+    esac
+    run_swap apply
+    expect_eq "real $variant lock still refuses mutation" "$RC" 1
+    expect_eq "real $variant lock creates no swap artifact" "$(managed_artifact_count)" 0
+  done
+}
+
+if [ "${SWAP_FOCUS:-}" = linux-lock ]; then
+  run_linux_lock_regressions
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+if [ -z "${SWAP_FOCUS:-}" ]; then
+  run_linux_lock_regressions
+fi
 
 if [ "${SWAP_FOCUS:-}" = mutator-lock ]; then
   run_mutator_lock_regressions
