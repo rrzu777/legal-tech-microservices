@@ -117,6 +117,71 @@ def _patch_pool_deps(monkeypatch, sp, mint_side_effect=None, patch_sleep=True):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reuse_validation", [False, True])
+async def test_lazy_start_mints_only_borrowed_slots_and_preserves_checkout(monkeypatch, tmp_path, reuse_validation):
+    """An idle manual-import worker spends no proxy traffic on startup."""
+    from worker import session_pool as sp
+    from app.cookie_store import CookieStore
+
+    captured, _store = _patch_pool_deps(monkeypatch, sp)
+    _store.load_slot.return_value = None
+    config = _make_config(proxy_url="http://user:pass@proxy.test:1234")
+    config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = reuse_validation
+    pool = sp.SessionPool(config)
+    pool._store = CookieStore(str(tmp_path / "cookies.json"))
+    await pool.initialize(prewarm=False)
+    assert captured == []
+
+    first = await pool.acquire()
+    second = await pool.acquire()
+    assert first is not second
+    assert len(captured) == 2
+    await pool.release(first)
+    reused = await pool.acquire()
+    assert reused is first
+    assert len(captured) == 2
+    await pool.release(reused)
+    await pool.release(second)
+    await pool.close_all()
+    assert first.closed and second.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reuse_validation", [False, True])
+async def test_cancelled_lazy_acquisition_returns_capacity(monkeypatch, tmp_path, reuse_validation):
+    """A lost import lease cannot permanently consume the only free slot."""
+    from worker import session_pool as sp
+    from app.cookie_store import CookieStore
+
+    captured, _ = _patch_pool_deps(monkeypatch, sp, patch_sleep=False)
+    config = _make_config(proxy_url="http://user:pass@proxy.test:1234", proxy_pool_size=1)
+    config.WORKER_SESSION_REUSE_VALIDATION_ENABLED = reuse_validation
+    pool = sp.SessionPool(config)
+    pool._store = CookieStore(str(tmp_path / "cookies.json"))
+    await pool.initialize(prewarm=False)
+    entered = asyncio.Event()
+    method = "_prepare_reuse_slot" if reuse_validation else "_refresh_slot"
+    original = getattr(pool, method)
+
+    async def blocked_acquisition(_slot):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(pool, method, blocked_acquisition)
+    pending = asyncio.create_task(pool.acquire_familia_bundle())
+    await entered.wait()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert captured == []
+    monkeypatch.setattr(pool, method, original)
+    session = await asyncio.wait_for(pool.acquire(), timeout=0.3)
+    assert len(captured) == 1
+    await pool.release(session)
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
 async def test_slot_mint_persists_cookie_jar_after_initialize(monkeypatch):
     """Saving browser cookies after OJV initialize would discard the refreshed jar."""
     from worker import session_pool as sp

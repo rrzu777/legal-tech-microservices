@@ -872,8 +872,11 @@ class SessionPool:
 
     # -- Ciclo de vida ----------------------------------------------------
 
-    async def initialize(self):
+    async def initialize(self, *, prewarm: bool = True):
+        """Prepare capacity; lazy startup leaves minting to a real checkout."""
         self._slots = [_Slot(index=i) for i in range(self._pool_size)]
+        if not prewarm:
+            return
         for i, slot in enumerate(self._slots):
             if self._reuse_validation_enabled:
                 await self._within_reuse_acquisition_deadline(
@@ -942,19 +945,22 @@ class SessionPool:
             if needs_refresh:
                 try:
                     await self._refresh_slot(slot)
-                except Exception as exc:
-                    if self._is_cost_control_error(exc):
-                        await self._persist_cost_failure(exc)
+                except BaseException as exc:
+                    try:
+                        if isinstance(exc, Exception):
+                            if self._is_cost_control_error(exc):
+                                await self._persist_cost_failure(exc)
+                            else:
+                                self._enter_cooldown(slot)
+                                logger.exception(
+                                    "Refresh de slot %d falló; slot en cooldown",
+                                    slot.index,
+                                )
+                    finally:
+                        # Lease loss cancels acquisition before the caller owns
+                        # a slot. Return capacity without reminting on cancel.
                         slot.busy = False
                         self._sem.release()
-                        raise
-                    self._enter_cooldown(slot)
-                    logger.exception(
-                        "Refresh de slot %d falló; slot en cooldown",
-                        slot.index,
-                    )
-                    slot.busy = False
-                    self._sem.release()
                     raise
                 self._mark_slot_healthy(slot, reset_failures=True)
         return slot
