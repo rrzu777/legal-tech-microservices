@@ -641,7 +641,7 @@ worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-order
        .[0].metadata.process_outside_office_hours_enabled == false and
        (.[0].metadata.mint_attempts | type == "number" and . >= 0 and . == floor) and
        ($require_zero_mint == 0 or .[0].metadata.mint_attempts == 0) and
-       ($proxy_mode == false or (
+       ($proxy_mode == 0 or (
          .[0].metadata.proxy_control_status == "enabled" and
          .[0].metadata.proxy_control_reason == null
        ))

@@ -25,6 +25,16 @@ def write(path, body, mode=0o644):
     path.chmod(mode)
 
 
+def fixture_values(inventory):
+    values = {name: 'native-fixture-only' for name in inventory.splitlines()
+              if name and not name.startswith('#')}
+    values.update(SUPABASE_URL='http://127.0.0.1:9080', WORKER_ID='native-worker',
+                  COOKIE_STORE_PATH='/var/lib/estrado-pjud/cookies.json',
+                  OJV_PROXY_URL='', PJUD_PROCESS_OUTSIDE_OFFICE_HOURS='false',
+                  PJUD_OFF_HOURS_VALIDATION_ONCE='false')
+    return values
+
+
 def main():
     if os.geteuid() != 0 or Path('/etc/hostname').read_text().strip() != 'native-guards':
         raise SystemExit('Not the isolated validation guest')
@@ -40,19 +50,14 @@ def main():
     write(REPO / '.gitignore', 'estrado-pjud-service/\n')
     application = REPO / 'estrado-pjud-service'
     application.mkdir()
-    values = {name: 'native-fixture-only' for name in
-              (REPO / 'ops/env.inventory').read_text().splitlines()
-              if name and not name.startswith('#')}
-    values.update(SUPABASE_URL='http://127.0.0.1:9080', WORKER_ID='native-worker',
-                  OJV_PROXY_URL='', PJUD_PROCESS_OUTSIDE_OFFICE_HOURS='false',
-                  PJUD_OFF_HOURS_VALIDATION_ONCE='false')
+    values = fixture_values((REPO / 'ops/env.inventory').read_text())
     write(application / '.env', ''.join(f'{key}={value}\n' for key, value in values.items()), 0o640)
     run('chown', 'root:estrado', str(application / '.env'))
     (application / 'logs').mkdir()
     run('chown', 'estrado:estrado', str(application / 'logs'))
     # No application code/import, browser, RPC, proxy or real credential exists.
     write(application / '.venv/bin/python', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/worker.py\n', 0o755)
-    write(application / '.venv/bin/uvicorn', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/http.py 8000\n', 0o755)
+    write(application / '.venv/bin/uvicorn', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/fixture_http_server.py 8000\n', 0o755)
     write('/opt/estrado-cron/run-cron.sh', '#!/bin/sh\nexit 0\n', 0o755)
     write('/opt/native-fixture/worker.py', '''import datetime, json, os, socket, time
 from pathlib import Path
@@ -73,7 +78,7 @@ while True:
     if address: client.send(b'WATCHDOG=1')
     time.sleep(1)
 ''')
-    write('/opt/native-fixture/http.py', '''from http.server import BaseHTTPRequestHandler, HTTPServer
+    write('/opt/native-fixture/fixture_http_server.py', '''from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sys
 class Handler(BaseHTTPRequestHandler):
@@ -87,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
 ''')
-    write('/etc/systemd/system/native-http.service', '[Service]\nExecStart=/usr/bin/python3 /opt/native-fixture/http.py 9080\n')
+    write('/etc/systemd/system/native-http.service', '[Service]\nExecStart=/usr/bin/python3 /opt/native-fixture/fixture_http_server.py 9080\n')
     write('/etc/systemd/system/legaltech.slice', '[Slice]\nCPUWeight=1000\n')
     for unit in ('estrado-pjud.service', 'estrado-pjud-worker.service'):
         body = (REPO / 'ops/systemd' / unit).read_text()
@@ -132,7 +137,7 @@ HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
     names = re.search(r'readonly -a OVERRIDE_NAMES=\((.*?)\)', text, re.S).group(1).split()
     if set(names) - env.keys():
         raise RuntimeError('Incomplete native test boundary')
-    env.update(RG_JURISTRACK_HEALTH_URL='http://127.0.0.1:9080/',
+    env.update(RG_TEST_MODE='1', RG_JURISTRACK_HEALTH_URL='http://127.0.0.1:9080/',
                RG_ESTRADO_HEALTH_URL='http://127.0.0.1:8000/api/v1/health')
     write('/opt/native-fixture/environment.json', json.dumps(env), 0o600)
     print('NATIVE FIXTURE READY sha=' + run('git', '-C', str(REPO), 'rev-parse', 'HEAD'))

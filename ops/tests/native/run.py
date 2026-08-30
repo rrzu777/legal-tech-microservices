@@ -59,6 +59,7 @@ def main():
     global DOCKER
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', action='store_true', help='build the pinned Ubuntu/QEMU image')
+    parser.add_argument('--integral', action='store_true', help='also exercise real apply and both rollback paths')
     args = parser.parse_args()
     DOCKER = local_docker()
     if args.build:
@@ -88,6 +89,9 @@ def main():
         subprocess.run([*DOCKER, 'cp', '-', name + ':/payload'], input=archive.stdout,
                        capture_output=True, check=True, timeout=60)
         execute(*DOCKER, 'cp', str(HERE / 'probe.py'), name + ':/payload/probe.py')
+        if args.integral:
+            for fixture in ('fixture.py', 'exercise.py'):
+                execute(*DOCKER, 'cp', str(HERE / fixture), name + ':/payload/' + fixture)
         info = json.loads(execute(*DOCKER, 'inspect', name).stdout)[0]
         assert not info['HostConfig']['Privileged'] and not info['Mounts']
         assert not info['HostConfig']['PortBindings']
@@ -95,6 +99,8 @@ def main():
         ssh = [*DOCKER, 'exec', name, 'ssh', '-i', '/work/id_ed25519', '-p', '2222',
                '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
                '-o', 'StrictHostKeyChecking=accept-new',
+               '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60',
+               '-o', 'ControlPath=/work/ssh-control',
                '-o', 'UserKnownHostsFile=/work/known_hosts', 'ubuntu@127.0.0.1']
         deadline = time.monotonic() + 1500
         while time.monotonic() < deadline:
@@ -119,6 +125,15 @@ def main():
         result = execute(*ssh, 'sudo python3 /mnt/payload/probe.py', check=False, timeout=300)
         print(result.stdout, end='')
         print(result.stderr, end='')
+        if result.returncode == 0 and args.integral:
+            for script, timeout in (('fixture.py', 600), ('exercise.py', 1200)):
+                print('Native integral stage: ' + script, flush=True)
+                result = execute(*ssh, 'sudo python3 -u /mnt/payload/' + script,
+                                 check=False, timeout=timeout)
+                print(result.stdout, end='')
+                print(result.stderr, end='')
+                if result.returncode:
+                    break
         raise SystemExit(result.returncode)
     finally:
         original = sys.exc_info()[1]

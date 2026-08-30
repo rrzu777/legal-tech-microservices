@@ -18,6 +18,8 @@ def main():
         'ssh_genkeytypes': ['ed25519'],
         'disable_root': True,
         'ssh_authorized_keys': [(work / 'id_ed25519.pub').read_text().strip()],
+        # Avoid repeated expensive apt-check subprocesses on bootstrap SSH polls.
+        'bootcmd': [['sh', '-c', 'test ! -f /etc/update-motd.d/90-updates-available || chmod a-x /etc/update-motd.d/90-updates-available']],
         'package_update': True,
         'packages': ['git', 'jq', 'curl', 'cron', 'xvfb', 'xauth', 'dbus-user-session'],
         'runcmd': [

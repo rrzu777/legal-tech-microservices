@@ -4,6 +4,13 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/ops/resource-guards.sh"
+if [ ! -x /usr/bin/sha256sum ] && [ ! -x /usr/bin/shasum ]; then
+  printf '%s\n' 'Missing SHA256 test dependency' >&2
+  exit 2
+fi
+for dependency in /usr/bin/jq /usr/bin/python3; do
+  [ -x "$dependency" ] || { printf 'Missing test dependency: %s\n' "$dependency" >&2; exit 2; }
+done
 TMP_RAW="$(mktemp -d)"
 TMP="$(cd "$TMP_RAW" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
@@ -633,9 +640,16 @@ case "${1:-}" in
     ;;
   start|stop|restart)
     action=$1; shift
-    case "$action" in stop) value=inactive ;; *) value=active ;; esac
     for unit in "$@"; do
+      case "$action" in stop) value=inactive ;; *) value=active ;; esac
       [ "$unit" = -- ] && continue
+      case "$unit" in
+        legaltech-monitor.service|legaltech-resource-tracker.service)
+          if [ "$action" != stop ] && cmp -s "$RG_SYSTEMD_DIR/$unit" "$RG_REPO_DIR/ops/systemd/$unit"; then
+            # The installed declared services are synchronous oneshots.
+            value=inactive
+          fi ;;
+      esac
       if [ "$unit" = estrado-pjud-worker.service ] && [ "$action" = stop ] \
         && [ -e "$RG_TEST_STATE/worker-stop-keeps-active" ]; then
         continue
@@ -923,7 +937,11 @@ EOF
   write_stub sha256 <<'EOF'
 path=${@: -1}
 [ -f "$path" ] || exit 1
-digest=$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')
+if [ -x /usr/bin/sha256sum ]; then
+  digest=$(/usr/bin/sha256sum "$path" | awk '{print $1}')
+else
+  digest=$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')
+fi
 case "$(cat "$RG_TEST_STATE/sha-mode" 2>/dev/null || true)" in
   malformed) printf 'not-a-digest  %s\n' "$path" ;;
   wrong-path) printf '%s  %s.other\n' "$digest" "$path" ;;
