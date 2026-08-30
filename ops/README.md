@@ -222,6 +222,13 @@ No ejecutar `swapoff` manualmente bajo presión. El rollback de
 `ops/swap/configure-swap.sh` es quien valida memoria antes de retirar swap; en un
 rollout orquestado debe llamarlo `resource-guards.sh`, no el operador por fuera.
 
+Después de restaurar los archivos, el rollback puede detener y limpiar una vez
+el estado `failed` de los dos monitores y sus dos timers exactos. Luego verifica
+y recupera el estado activo/inactivo capturado; si falla el stop, reset o lectura,
+mantiene `ROLLBACK INCOMPLETO`. No usa reset global, no borra journals y no acepta
+unidades fallidas durante la admisión. No extiende esa recuperación a API,
+worker ni Hermes: sus controles de identidad y seguridad permanecen intactos.
+
 ## Gate operativo y siguiente ciclo hábil
 
 Tras aplicar, mantener el worker naturalmente idle durante la noche. Observar al

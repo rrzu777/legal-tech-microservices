@@ -20,11 +20,61 @@ from ops.monitoring.resource_metrics import (
     parse_meminfo,
     parse_systemctl_show,
     percent_used,
+    _collect_unit,
 )
 from ops.monitoring.alert_policy import advance_state, evaluate_rules
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def unit_fixture(command):
+    """Native systemd 255 shapes, independent of collector property lists."""
+    unit = command[4] if command[1] == "--user" else command[2]
+    suffix = unit.rsplit(".", 1)[-1]
+    filename = "systemctl-show.txt" if suffix == "service" else f"systemctl-show-{suffix}.txt"
+    return (FIXTURES / filename).read_text()
+
+
+@pytest.mark.parametrize("unit", ["legaltech.slice", "user-4242.slice", "legaltech-monitor.timer"])
+def test_native_unit_shape_is_collected_without_fabricating_process_metrics(unit):
+    snapshot = _collect_unit(unit, lambda command, timeout: unit_fixture(command))
+    assert snapshot.diagnostic is None
+    assert snapshot.active_state == "active"
+    assert snapshot.n_restarts is None
+    if unit.endswith(".timer"):
+        assert snapshot.control_group is None
+        assert snapshot.memory_current_bytes is None
+        assert snapshot.cpu_usage_ns is None
+        assert snapshot.result == "success"
+    else:
+        assert snapshot.memory_current_bytes == 1048576
+        assert snapshot.result == "not-applicable"
+
+
+@pytest.mark.parametrize("unit,property_name", [
+    ("legaltech.slice", "ControlGroup"),
+    ("legaltech.slice", "MemoryCurrent"),
+    ("legaltech-monitor.timer", "Result"),
+    ("legaltech-monitor.timer", "ActiveState"),
+    ("estrado-pjud.service", "NRestarts"),
+])
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "unknown"])
+def test_native_shape_still_rejects_missing_duplicate_or_unknown_properties(unit, property_name, damage):
+    def run(command, timeout):
+        lines = unit_fixture(command).splitlines()
+        matching = next(line for line in lines if line.startswith(property_name + "="))
+        if damage == "missing":
+            lines.remove(matching)
+        elif damage == "duplicate":
+            lines.append(matching)
+        else:
+            lines.append("Unexpected=secret-not-for-output")
+        return "\n".join(lines) + "\n"
+    snapshot = _collect_unit(unit, run)
+    assert snapshot.diagnostic == "systemctl show failed"
+    assert snapshot.active_state == "unknown"
+    assert "secret-not-for-output" not in repr(snapshot)
 
 
 def read_host_fixture(path):
@@ -110,7 +160,7 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
                 "app.slice/hermes-dashboard.service"
             ),
         }
-        return (FIXTURES / "systemctl-show.txt").read_text().replace(
+        return unit_fixture(command).replace(
             "/system.slice/legaltech.slice", control_groups[unit_name]
         )
 
@@ -149,10 +199,11 @@ def test_collect_uses_memavailable_and_normalizes_systemd_limits():
     }
     assert len(calls) == 10
     assert all(timeout == 5.0 for _, timeout in calls)
-    assert all("--property=ControlGroup" in command for command, _ in calls)
+    assert all("--property=ControlGroup" in command for command, _ in calls if not command[2].endswith(".timer"))
     assert all("--property=LoadState" in command for command, _ in calls)
     assert all("--property=UnitFileState" in command for command, _ in calls)
-    assert all("--property=Result" in command for command, _ in calls)
+    assert all("--property=Result" in command for command, _ in calls if not command[2].endswith(".slice"))
+    assert all(unit.diagnostic is None for unit in snapshot.units.values())
     assert snapshot.units["legaltech-monitor.service"].result == "success"
     assert snapshot.units["user-4242.slice"].control_group == (
         "/user.slice/user-4242.slice"
@@ -200,8 +251,6 @@ def test_managed_swap_proc_contract_reaches_policy_and_suppresses_heartbeat(
         f_files = 100
         f_ffree = 50
 
-    properties = (FIXTURES / "systemctl-show.txt").read_text()
-
     def run_command(command, timeout):
         unit_name = command[4] if command[1] == "--user" else command[2]
         control_group = {
@@ -218,7 +267,7 @@ def test_managed_swap_proc_contract_reaches_policy_and_suppresses_heartbeat(
                 "app.slice/hermes-dashboard.service"
             ),
         }.get(unit_name, f"/system.slice/{unit_name}")
-        return properties.replace("/system.slice/legaltech.slice", control_group)
+        return unit_fixture(command).replace("/system.slice/legaltech.slice", control_group)
 
     proc_swaps = "Filename\tType\tSize\tUsed\tPriority\n" + "".join(
         f"{target}\t{kind}\t{size}\t{used}\t{priority}\n"
@@ -304,7 +353,7 @@ def test_collector_wrong_hermes_cgroup_reaches_policy_and_suppresses_heartbeat()
                 "app.slice/hermes-dashboard.service"
             ),
         }.get(unit_name, f"/system.slice/{unit_name}")
-        return (FIXTURES / "systemctl-show.txt").read_text().replace(
+        return unit_fixture(command).replace(
             "/system.slice/legaltech.slice", expected
         )
 
@@ -343,7 +392,7 @@ def test_hermes_user_manager_failure_is_sanitized_and_fails_closed(failure_mode)
 
     def run_command(command, timeout):
         unit_name = command[4] if command[1] == "--user" else command[2]
-        output = (FIXTURES / "systemctl-show.txt").read_text()
+        output = unit_fixture(command)
         if unit_name == "hermes-gateway.service":
             if failure_mode == "producer":
                 raise RuntimeError(secret)
@@ -394,7 +443,7 @@ def test_collected_disabled_inactive_hermes_service_needs_no_live_cgroup():
                 "app.slice/hermes-gateway.service"
             ),
         }.get(unit_name, f"/system.slice/{unit_name}")
-        output = (FIXTURES / "systemctl-show.txt").read_text().replace(
+        output = unit_fixture(command).replace(
             "/system.slice/legaltech.slice", control_group
         )
         if unit_name == "hermes-dashboard.service":
@@ -441,7 +490,7 @@ def test_collect_keeps_host_metrics_when_one_unit_command_fails_without_leaking_
     def run_command(command, timeout):
         if command[2] == "user-999.slice":
             raise RuntimeError(f"systemctl denied {secret_value}")
-        return (FIXTURES / "systemctl-show.txt").read_text()
+        return unit_fixture(command)
 
     snapshot = collect_resource_snapshot(
         hermes_user_slice="user-999.slice",
@@ -522,7 +571,7 @@ def test_collect_wraps_statvfs_and_load_failures_as_sanitized_unavailable(
             hermes_user_slice="user-4242.slice",
             read_text=read_host_fixture,
             statvfs=statvfs,
-            run_command=lambda command, timeout: (FIXTURES / "systemctl-show.txt").read_text(),
+            run_command=lambda command, timeout: unit_fixture(command),
             loadavg=loadavg,
         )
 

@@ -1512,6 +1512,29 @@ verify_runtime_postflight() { # Hermes uid
   done
 }
 
+verify_timer_schedule() {
+  local unit=$1 output line boot=0 active=0 calendar=0
+  local schedule_pattern='^TimersMonotonic=\{ (OnBootUSec|OnUnitActiveUSec)=5min ; next_elapse=([[:alnum:].]+( [[:alnum:].]+)*|\[not set\]) \}$'
+  # systemd exposes a repeated composite property, not direct On* properties.
+  # Even --all omits empty arrays on systemd 255. Any nonempty calendar entry
+  # is forbidden; an omitted calendar property therefore means no schedule.
+  output=$(LC_ALL=C "$systemctl_bin" show "$unit" --all \
+    --property=TimersMonotonic --property=TimersCalendar 2>"$null_file") || return 1
+  while IFS= read -r line; do
+    if [ "$line" = 'TimersCalendar=' ]; then
+      calendar=$((calendar + 1))
+    elif [[ "$line" =~ $schedule_pattern ]]; then
+      case "${BASH_REMATCH[1]}" in
+        OnBootUSec) boot=$((boot + 1)) ;;
+        OnUnitActiveUSec) active=$((active + 1)) ;;
+      esac
+    else
+      return 1
+    fi
+  done <<< "$output"
+  [ "$boot" -eq 1 ] && [ "$active" -eq 1 ] && [ "$calendar" -le 1 ]
+}
+
 run_postflight() {
   local uid timer target enabled active
   uid=$(validate_hermes_inventory) || { fail 'postflight Hermes inventory is unknown'; return 1; }
@@ -1542,7 +1565,8 @@ run_postflight() {
       legaltech-monitor.timer) target=legaltech-monitor.service ;;
       legaltech-resource-tracker.timer) target=legaltech-resource-tracker.service ;;
     esac
-    show_contract "$timer" Unit "$target" OnBootUSec 5min OnUnitActiveUSec 5min Persistent yes RandomizedDelayUSec 1min || return 1
+    show_contract "$timer" Unit "$target" Persistent yes RandomizedDelayUSec 1min || return 1
+    verify_timer_schedule "$timer" || { fail 'timer schedule contract is invalid'; return 1; }
     enabled=$(read_unit_state system is-enabled "$timer") || return 1
     active=$(read_unit_state system is-active "$timer") || return 1
     [ "$enabled" = enabled ] && [ "$active" = active ] || return 1
@@ -1708,9 +1732,35 @@ worker_restoration_window_allows() { # 0=no capability, 1=admitted changed-worke
   [ "$worker_restore_capability" -eq 1 ]
 }
 
+read_monitor_restore_activity() { # unit, captured enablement, restored-config capability
+  local unit=$1 enabled=$2 recovery_allowed=$3 output rc=0
+  if output=$(read_correlated_unit_activity system "$unit" "$enabled"); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  [ "$recovery_allowed" = 1 ] || return 1
+  # Only after validated manifest restoration. Never treat failed as healthy
+  # during admission, or extend this recovery to API/worker/Hermes fences.
+  case "$unit" in
+    legaltech-monitor.service|legaltech-resource-tracker.service|\
+    legaltech-monitor.timer|legaltech-resource-tracker.timer) ;;
+    *) return 1 ;;
+  esac
+  output=$("$systemctl_bin" is-active "$unit" 2>"$null_file") || rc=$?
+  [ "$output" = failed ] && [ "$rc" -eq 3 ] || return 1
+  printf 'ROLLBACK: recovering failed monitoring unit %s\n' "$unit" >&2
+  "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || return 1
+  "$systemctl_bin" reset-failed "$unit" >"$null_file" 2>&1 || return 1
+  # reset-failed is not a success claim: re-read activity with the original
+  # strict rules, including absent/inactive correlation for these two timers.
+  read_correlated_unit_activity system "$unit" "$enabled"
+}
+
 restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
-  local worker_restore_capability=$1 index unit desired current rc=0 action
+  local worker_restore_capability=$1 monitor_recovery_allowed=${2:-0}
+  local index unit desired current rc=0 action
   case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
+  case "$monitor_recovery_allowed" in 0|1) ;; *) return 1 ;; esac
   for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_enabled_states[$index]}
@@ -1720,8 +1770,8 @@ restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
   for ((index = 0; index < system_unit_count; index++)); do
     unit=${tracked_units[$index]}
     desired=${desired_active_states[$index]}
-    current=$(read_correlated_unit_activity system "$unit" \
-      "${desired_enabled_states[$index]}") || { rc=1; continue; }
+    current=$(read_monitor_restore_activity "$unit" \
+      "${desired_enabled_states[$index]}" "$monitor_recovery_allowed") || { rc=1; continue; }
     if [ "$unit" = estrado-pjud.service ] && [ "$changed_api" -eq 1 ]; then
       if [ "$desired" = active ]; then
         "$systemctl_bin" restart "$unit" >"$null_file" 2>&1 || rc=1
@@ -1856,7 +1906,7 @@ validate_swap_rollback_authority() {
 }
 
 do_rollback() { # backup-dir worker-restore-capability automatic-compensation
-  local uid rollback_rc=0 swap_rc=0 swap_state
+  local uid rollback_rc=0 swap_rc=0 swap_state monitor_recovery_allowed=1
   local worker_restore_capability=${2:-0} automatic_compensation=${3:-0}
   case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
   case "$automatic_compensation" in 0|1) ;; *) return 1 ;; esac
@@ -1890,9 +1940,15 @@ do_rollback() { # backup-dir worker-restore-capability automatic-compensation
     not-attempted|preexisting) ;;
     *) return 1 ;;
   esac
-  restore_manifest "$swap_rc" || rollback_rc=1
-  "$systemctl_bin" daemon-reload >"$null_file" 2>&1 || rollback_rc=1
-  restore_unit_states "$worker_restore_capability" || rollback_rc=1
+  if ! restore_manifest "$swap_rc"; then
+    rollback_rc=1
+    monitor_recovery_allowed=0
+  fi
+  if ! "$systemctl_bin" daemon-reload >"$null_file" 2>&1; then
+    rollback_rc=1
+    monitor_recovery_allowed=0
+  fi
+  restore_unit_states "$worker_restore_capability" "$monitor_recovery_allowed" || rollback_rc=1
   restore_hermes_unit_states || rollback_rc=1
   if [ "$rollback_rc" -ne 0 ]; then
     if [ "$automatic_compensation" -eq 0 ]; then

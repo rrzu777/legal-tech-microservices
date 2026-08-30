@@ -13,7 +13,13 @@ Los oneshots corren cada cinco minutos, con hasta un minuto de jitter. Ambos
 permanecen en `system.slice`, no en `legaltech.slice`. El tracker sólo admite
 `AF_UNIX`; el monitor necesita red exclusivamente para entregar alertas.
 
-El collector valida propiedades systemd con cardinalidad exacta. Para workloads
+El collector valida propiedades systemd con cardinalidad exacta por tipo de unit:
+servicios, slices y timers. Las slices no tienen `Result` ni `NRestarts`;
+los timers no tienen cgroup ni métricas de proceso. Esos datos no aplicables
+se representan como `null` (campos vacíos en CSV), salvo `Result` de slices,
+que usa `not-applicable`; nunca se inventa consumo cero ni éxito. Una propiedad
+obligatoria ausente o duplicada sigue siendo un error de colección.
+Para workloads
 continuos activos, la policy exige estas identidades runtime:
 
 - `legaltech.slice`: `/legaltech.slice`;
