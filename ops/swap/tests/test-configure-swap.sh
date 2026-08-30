@@ -62,6 +62,10 @@ file_mode() {
 file_size() {
   "$(command -v python3)" -c 'import os,sys; print(os.lstat(sys.argv[1]).st_size)' "$1"
 }
+file_owner() {
+  "$(command -v python3)" -c \
+    'import os,sys; s=os.lstat(sys.argv[1]); print(s.st_uid if sys.argv[2] == "uid" else s.st_gid)' "$1" "$2"
+}
 mutation_count() {
   grep -Ec '^(fallocate|dd|chmod|mkswap|swapon|swapoff|cp|mv|sysctl -p|rm) ' \
     "$CALL_LOG" 2>/dev/null || true
@@ -1543,8 +1547,8 @@ run_swappiness_metadata_regressions() {
     "$(metadata_original)" 60
   expect_eq 'successful apply commits the exact final phase' "$(metadata_phase)" complete
   expect_eq 'metadata mode is 0600' "$(file_mode "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)" 600
-  metadata_uid=$(/usr/bin/stat -f '%u' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
-  metadata_gid=$(/usr/bin/stat -f '%g' "$SWAPPINESS_METADATA_FILE" 2>/dev/null || true)
+  metadata_uid=$(file_owner "$SWAPPINESS_METADATA_FILE" uid 2>/dev/null || true)
+  metadata_gid=$(file_owner "$SWAPPINESS_METADATA_FILE" gid 2>/dev/null || true)
   expect_eq 'metadata owner is exact injected root uid' "$metadata_uid" "$(/usr/bin/id -u)"
   expect_eq 'metadata group is exact injected root gid' "$metadata_gid" "$(/usr/bin/id -g)"
   run_swap apply
