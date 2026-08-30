@@ -1,5 +1,16 @@
 # tests/test_familia_models.py
 from app.familia.models import FamiliaSyncRequest, FamiliaSyncResponse
+import pytest
+from pydantic import ValidationError
+from tests.sync_claim_helpers import PAYLOAD
+
+
+@pytest.mark.parametrize("patch", [{"sync_claim": None}, {"credential_version": None},
+    {"cases": []}, {"cases": [{"rit": "1", "year": "2024"}] * 2},
+    {"auth_type": "clave_unica"}, {"extra": "forbidden"}])
+def test_sync_rejects_legacy_unfenced_or_batch_requests(patch):
+    with pytest.raises(ValidationError):
+        FamiliaSyncRequest.model_validate({**PAYLOAD, **patch})
 
 
 def test_blocked_is_a_valid_error_code():
@@ -10,7 +21,7 @@ def test_blocked_is_a_valid_error_code():
 
 
 def test_default_auth_type_is_clave_pj():
-    req = FamiliaSyncRequest(rut="11111111-1", password="x")
+    req = FamiliaSyncRequest.model_validate({**PAYLOAD, "password": "x"})
     assert req.auth_type == "clave_pj"
 
 
@@ -22,9 +33,7 @@ def test_secret_wrappers_preserve_the_existing_request_json_schema():
 
 
 def test_request_repr_and_dump_redact_rut_and_password():
-    request = FamiliaSyncRequest(
-        rut="11.111.111-1", password="synthetic-password"
-    )
+    request = FamiliaSyncRequest.model_validate({**PAYLOAD, "rut": "11.111.111-1"})
 
     rendered = f"{request!r} {request.model_dump()!r}"
     assert "11.111.111-1" not in rendered
@@ -52,4 +61,5 @@ def test_el_conjunto_de_error_code_esta_fijado():
         "no_cases",
         "parse_error",
         "blocked",
+        "sync_claim_stale",
     }

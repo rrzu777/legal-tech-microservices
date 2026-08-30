@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, WithJsonSchema, field_validator, model_validator
+from worker.sync_credentials import CredentialVersion, SyncCredentialClaim
 
 #: ⚠️ CONTRATO CROSS-REPO. Quien lo consume es `classifyFamiliaFailure`
 #: (`apps/web/src/lib/pjud/sync-error-patch.ts`, repo LegalTech), que traduce
@@ -11,9 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, WithJsonSchema, fi
 #: agregarlo alla no rompe nada visible — la app lo manda al default y la causa
 #: sigue su curso—, asi que el test de `tests/test_familia_models.py` fija el
 #: conjunto para que el cambio no pase inadvertido.
-FamiliaErrorCode = Literal["invalid_credentials", "session_error", "no_cases", "parse_error", "blocked"]
+FamiliaErrorCode = Literal["invalid_credentials", "session_error", "no_cases", "parse_error", "blocked", "sync_claim_stale"]
 
-_MAX_CASES = 10
 RedactedRequestString = Annotated[
     SecretStr,
     WithJsonSchema({"type": "string"}),
@@ -21,15 +21,25 @@ RedactedRequestString = Annotated[
 
 
 class FamiliaCaseFilter(BaseModel):
-    rit: str   # numeric part, e.g. "123"
-    year: str  # e.g. "2024"
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    rit: str = Field(pattern=r"^[0-9]+$", max_length=128)
+    year: str = Field(pattern=r"^[0-9]{4}$")
 
 
 class FamiliaSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     rut: RedactedRequestString        # "12345678-9" or "12345678"
     password: RedactedRequestString
-    auth_type: Literal["clave_pj", "clave_unica"] = "clave_pj"
-    cases: Annotated[list[FamiliaCaseFilter], Field(max_length=_MAX_CASES)] = []
+    auth_type: Literal["clave_pj"] = "clave_pj"
+    cases: Annotated[list[FamiliaCaseFilter], Field(min_length=1, max_length=1)]
+    sync_claim: SyncCredentialClaim
+    credential_version: CredentialVersion
+
+    @model_validator(mode="after")
+    def _web_claim_only(self):
+        if self.sync_claim.claim_kind not in ("manual", "lookup"):
+            raise ValueError("invalid_sync_credential_claim")
+        return self
 
     @field_validator("rut")
     @classmethod

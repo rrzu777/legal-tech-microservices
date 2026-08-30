@@ -7,6 +7,16 @@ from fastapi import HTTPException
 from app.cookie_store import CookieBundle
 from app.failure_kind import PoolUnavailableError
 from app.familia.models import FamiliaSyncRequest
+from tests.sync_claim_helpers import PAYLOAD, rpc_client
+from worker.sync_credentials import SyncCredentialClient
+
+
+def _sync_request(**overrides):
+    return FamiliaSyncRequest.model_validate({**PAYLOAD, **overrides})
+
+
+def _claims():
+    return SyncCredentialClient(rpc_client([True, True]))
 from app.ojv.errors import OjvTimeoutError, OjvUpstreamChangedError, SessionExpiredError
 from app.pool_guard import PUBLIC_POOL_UNAVAILABLE_DETAIL
 
@@ -105,8 +115,8 @@ async def test_run_sync_blocked_when_login_challenged(monkeypatch):
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(rut="11111111-1", password="p", auth_type="clave_pj")
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    req = _sync_request(rut="11111111-1", password="p", auth_type="clave_pj")
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
     assert resp.ok is False
     assert resp.error_code == "blocked"
@@ -125,11 +135,11 @@ async def test_run_sync_multicase_block_aborts_batch(monkeypatch):
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(
+    req = _sync_request(
         rut="11111111-1", password="p", auth_type="clave_pj",
         cases=[FamiliaCaseFilter(rit="100", year="2024")],
     )
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
     # No debe reportar ok=True ocultando el bloqueo.
     assert resp.ok is False
@@ -154,8 +164,8 @@ async def test_una_sesion_que_no_levanta_no_se_reporta_como_bloqueo(monkeypatch)
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(rut="11111111-1", password="p", auth_type="clave_pj")
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    req = _sync_request(rut="11111111-1", password="p", auth_type="clave_pj")
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
     assert resp.ok is False
     assert resp.error_code == "session_error"
@@ -173,9 +183,9 @@ async def test_unexpected_authenticated_login_never_serializes_secret_or_traceba
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
     resp = await mod._run_sync(
-        FamiliaSyncRequest(rut="11111111-1", password="synthetic-password", auth_type="clave_pj"),
+        _sync_request(rut="11111111-1", password="synthetic-password", auth_type="clave_pj"),
         rate_s=0.0,
-        bundle=_bundle(),
+        bundle=_bundle(), claims=_claims(),
     )
 
     assert resp.model_dump() == {
@@ -204,15 +214,16 @@ async def test_case_scoped_unknown_failure_logs_no_rit_or_upstream_message(monke
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
     response = await mod._run_sync(
-        FamiliaSyncRequest(
+        _sync_request(
             rut="11111111-1", password="synthetic-password", auth_type="clave_pj",
             cases=[FamiliaCaseFilter(rit="987654", year="2026")],
         ),
         rate_s=0.0,
-        bundle=_bundle(),
+        bundle=_bundle(), claims=_claims(),
     )
 
-    assert response.ok is True
+    assert response.ok is False
+    assert response.error_code == "session_error"
     rendered = caplog.text + response.model_dump_json()
     for forbidden in ("987654", "OJVID", "<html>", "PERSONA A", "PERSONA B"):
         assert forbidden not in rendered
@@ -241,11 +252,11 @@ async def test_un_fallo_de_red_en_el_rit_no_se_disfraza_de_causa_inexistente(mon
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(
+    req = _sync_request(
         rut="11111111-1", password="p", auth_type="clave_pj",
         cases=[FamiliaCaseFilter(rit="100", year="2024")],
     )
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
     assert resp.ok is False
     assert resp.error_code == "session_error"
@@ -274,14 +285,14 @@ async def test_common_session_failure_does_not_become_a_missing_familia_case(
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
     response = await mod._run_sync(
-        FamiliaSyncRequest(
+        _sync_request(
             rut="11111111-1",
             password="p",
             auth_type="clave_pj",
             cases=[FamiliaCaseFilter(rit="100", year="2024")],
         ),
         rate_s=0.0,
-        bundle=_bundle(),
+        bundle=_bundle(), claims=_claims(),
     )
 
     assert response.ok is False
@@ -306,14 +317,14 @@ async def test_familia_402_trips_control_and_never_returns_provider_detail(monke
     control = AsyncMock()
 
     resp = await mod._run_sync(
-        FamiliaSyncRequest(
+        _sync_request(
             rut="11111111-1",
             password="p",
             auth_type="clave_pj",
             cases=[FamiliaCaseFilter(rit="100", year="2024")],
         ),
         rate_s=0.0,
-        bundle=_bundle(),
+        bundle=_bundle(), claims=_claims(),
         proxy_control=control,
     )
 
@@ -338,11 +349,11 @@ async def test_un_5xx_de_ojv_en_el_rit_se_reporta_como_bloqueo(monkeypatch):
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(
+    req = _sync_request(
         rut="11111111-1", password="p", auth_type="clave_pj",
         cases=[FamiliaCaseFilter(rit="100", year="2024")],
     )
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
     assert resp.ok is False
     assert resp.error_code == "blocked"
@@ -362,13 +373,13 @@ async def test_un_error_de_parseo_del_rit_si_es_de_la_causa(monkeypatch):
     fake_session.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(mod, "FamiliaAuthSession", MagicMock(return_value=fake_session))
 
-    req = FamiliaSyncRequest(
+    req = _sync_request(
         rut="11111111-1", password="p", auth_type="clave_pj",
         cases=[FamiliaCaseFilter(rit="100", year="2024")],
     )
-    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle())
+    resp = await mod._run_sync(req, rate_s=0.0, bundle=_bundle(), claims=_claims())
 
-    # Se traga la excepcion y sigue, como siempre: `ok=True` sin casos es "no
-    # esta en el portal", que la app cuenta como falla de la causa.
-    assert resp.ok is True
+    # Unknown upstream failures must not masquerade as genuinely empty results.
+    assert resp.error_code == "session_error"
+    assert resp.ok is False
     assert resp.casos == []

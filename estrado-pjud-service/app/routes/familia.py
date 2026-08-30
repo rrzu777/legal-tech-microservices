@@ -8,7 +8,6 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.auth import verify_api_key
 from app.config import get_settings
-from app.errors import safe_error
 from app.failure_kind import classify_exception
 from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCredentialsError
 from app.familia.models import (
@@ -32,6 +31,10 @@ from app.pool_guard import familia_bundle_or_alert, record_blocked_and_alert
 from app.proxy_billing import is_proxy_billing_error
 from app.rate_limit import limiter
 from worker.proxy_usage import DISABLED_PROXY_USAGE
+from app.usage_context import current_usage_scope
+from worker.sync_credentials import (
+    SyncCredentialClient, SyncCredentialClaimStaleError, SyncCredentialInfrastructureError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,36 +197,34 @@ async def familia_sync(
     settings = get_settings()
     rate_s = settings.RATE_LIMIT_MS / 1000.0
 
-    # El bundle F5 se pide FUERA del `try` del timeout y antes de contar el
-    # request, igual que `acquire_or_alert` en search y detail: si el pool no
-    # tiene con qué salir, esto lanza 503 y no contesta 200 con `blocked`.
-    pool = request.app.state.session_pool
-    bundle = await familia_bundle_or_alert(pool, request)
-
-    api_metrics.record_request("familia")
-
+    scope = current_usage_scope()
+    if (scope.get("law_firm_id") != req.sync_claim.law_firm_id
+            or scope.get("case_id") != req.sync_claim.case_id
+            or scope.get("sync_run_id") != req.sync_claim.run_id
+            or scope.get("lookup_attempt_id") is not None):
+        raise HTTPException(status_code=403, detail="invalid_sync_credential_claim")
+    claims = SyncCredentialClient(getattr(request.app.state, "proxy_supabase", None))
     try:
+        # Check before resource acquisition, again after any pool wait before
+        # login, then immediately before search inside _run_sync.
+        await claims.check(req.sync_claim, req.credential_version)
+        bundle = await familia_bundle_or_alert(request.app.state.session_pool, request)
+        api_metrics.record_request("familia")
         async with asyncio.timeout(_SYNC_TIMEOUT_S):
             proxy_usage = getattr(request.app.state, "proxy_usage", DISABLED_PROXY_USAGE)
             async with proxy_usage.track(operation="search") as usage:
                 resp = await _run_sync(
-                    req,
-                    rate_s,
-                    bundle,
+                    req, rate_s, bundle, claims=claims,
                     proxy_control=getattr(request.app.state, "proxy_control", None),
                     proxy_usage_capture=usage,
                 )
                 if not resp.ok and resp.error_code == "blocked":
                     usage.status = "blocked"
                     usage.error_kind = "ojv"
-    except TimeoutError:
-        logger.warning("familia_sync: timed out after %ds", _SYNC_TIMEOUT_S)
-        api_metrics.record_error("familia")
-        return FamiliaSyncResponse(
-            ok=False, casos=[],
-            error_code="session_error",
-            error="La operación excedió el tiempo máximo permitido",
-        )
+    except SyncCredentialClaimStaleError:
+        return FamiliaSyncResponse(ok=False, casos=[], error_code="sync_claim_stale")
+    except (SyncCredentialInfrastructureError, TimeoutError):
+        raise HTTPException(status_code=503, detail="infra_unavailable") from None
 
     # Las métricas de esta ruta son nuevas: hasta acá `familia.py` no tenía UNA
     # sola llamada a `api_metrics`, así que el agujero que se cerró para search y
@@ -232,6 +233,8 @@ async def familia_sync(
         api_metrics.record_success("familia")
     else:
         api_metrics.record_error("familia")
+        if resp.error_code == "session_error":
+            raise HTTPException(status_code=503, detail="infra_unavailable")
         if resp.error_code == "blocked":
             await record_blocked_and_alert(request, "familia")
 
@@ -263,148 +266,58 @@ async def _proxy_billing_response(error: Exception, proxy_control) -> FamiliaSyn
 
 async def _run_sync(
     req: FamiliaSyncRequest, rate_s: float, bundle, proxy_control=None,
-    proxy_usage_capture=None,
+    proxy_usage_capture=None, *, claims: SyncCredentialClient,
 ) -> FamiliaSyncResponse:
     async with FamiliaAuthSession(
         bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=rate_s,
     ) as session:
+        await claims.check(req.sync_claim, req.credential_version)
         try:
             await session.login(req.rut, req.password, req.auth_type)
-        except FamiliaBlockedError:
-            return _blocked()
         except InvalidCredentialsError:
-            return FamiliaSyncResponse(
-                ok=False, casos=[],
-                error_code="invalid_credentials",
-                error="Las credenciales proporcionadas no son válidas",
-            )
-        except OjvSessionError as e:
-            logger.warning("familia_sync: session error: %s", safe_error(e))
-            return FamiliaSyncResponse(
-                ok=False, casos=[],
-                error_code="session_error",
-                error="No se pudo establecer sesión con OJV",
-            )
-        except Exception as e:
-            billing = await _proxy_billing_response(e, proxy_control)
-            if billing:
-                if proxy_usage_capture is not None:
-                    proxy_usage_capture.status = "error"
-                    proxy_usage_capture.error_kind = "billing"
-                return billing
-            emit_private_event(
-                logger, event="private_session", status="failed",
-                error_code="upstream_changed", stage="login",
-            )
-            return FamiliaSyncResponse(
-                ok=False, casos=[],
-                error_code="session_error",
-                error="No se pudo establecer sesión con OJV",
-            )
-
-        if req.cases:
-            all_casos = []
-            for case_filter in req.cases:
-                try:
-                    html = await session.search_familia(
-                        rut=req.rut, rit=case_filter.rit, year=case_filter.year,
-                    )
-                    casos, err = parse_familia_results(html)
-                    if err and err != "no_cases":
-                        logger.warning("familia_sync: parse error code=%s", err)
-                    all_casos.extend(casos)
-                except FamiliaBlockedError:
-                    # Un bloqueo F5 aborta el batch: no seguir martillando la
-                    # misma IP bloqueada ni reportar ok=True ocultando el bloqueo.
-                    return _blocked()
-                except OjvSessionError as e:
-                    logger.warning(
-                        "familia_sync: authenticated session failure code=%s",
-                        e.code.value,
-                    )
-                    return FamiliaSyncResponse(
-                        ok=False,
-                        casos=[],
-                        error_code="session_error",
-                        error="No se pudo consultar la causa en OJV",
-                    )
-                except Exception as e:
-                    billing = await _proxy_billing_response(e, proxy_control)
-                    if billing:
-                        if proxy_usage_capture is not None:
-                            proxy_usage_capture.status = "error"
-                            proxy_usage_capture.error_kind = "billing"
-                        return billing
-                    # El mismo criterio que el bloqueo, extendido a las otras
-                    # fallas que tampoco son de la causa. Este `except` se tragaba
-                    # TODO y seguía, y después devolvía `ok=True` con `casos=[]` y
-                    # sin `error_code` — indistinguible de "esa causa no está en
-                    # el portal". La app entonces le sumaba una falla a la causa, y
-                    # a las 10 la suspendía por un proxy que se cayó medio segundo.
-                    #
-                    # Y es el camino que importa: la app SIEMPRE manda `cases`
-                    # con un RIT, así que esta rama es la única que se ejecuta en
-                    # producción. La de abajo —consultar todas las causas del
-                    # RUT— hoy no la usa nadie.
-                    kind = classify_exception(e)
-                    if kind == "ojv":
-                        return _blocked()
-                    if kind == "infra":
-                        emit_private_event(
-                            logger, event="private_session", status="failed",
-                            error_code="upstream_changed", stage="detail",
-                        )
-                        return FamiliaSyncResponse(
-                            ok=False, casos=[],
-                            error_code="session_error",
-                            error="No se pudo consultar la causa en OJV",
-                        )
-                    emit_private_event(
-                        logger, event="private_session", status="failed",
-                        error_code="upstream_changed", stage="detail",
-                    )
-            return FamiliaSyncResponse(ok=True, casos=all_casos)
-
-        try:
-            html = await session.search_familia(rut=req.rut)
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="invalid_credentials",
+                                       error="Las credenciales proporcionadas no son válidas")
         except FamiliaBlockedError:
             return _blocked()
-        except OjvSessionError as e:
-            logger.warning(
-                "familia_sync: authenticated session failure code=%s",
-                e.code.value,
-            )
-            return FamiliaSyncResponse(
-                ok=False,
-                casos=[],
-                error_code="session_error",
-                error="No se pudo consultar OJV",
-            )
-        except Exception as e:
-            billing = await _proxy_billing_response(e, proxy_control)
+        except Exception as error:
+            billing = await _proxy_billing_response(error, proxy_control)
             if billing:
                 if proxy_usage_capture is not None:
                     proxy_usage_capture.status = "error"
                     proxy_usage_capture.error_kind = "billing"
                 return billing
-            emit_private_event(
-                logger, event="private_session", status="failed",
-                error_code="upstream_changed", stage="detail",
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="session_error",
+                                       error="No se pudo establecer sesión con OJV")
+
+        await claims.check(req.sync_claim, req.credential_version)
+        # The closed model enforces exactly one filter: there is no all-causes
+        # or legacy batch mode under a singular case reservation.
+        case_filter = req.cases[0]
+        try:
+            html = await session.search_familia(
+                rut=req.rut, rit=case_filter.rit, year=case_filter.year,
             )
-            return FamiliaSyncResponse(
-                ok=False, casos=[],
-                error_code="session_error",
-                error="No se pudo consultar OJV",
-            )
-
-        all_casos, error_code = parse_familia_results(html)
-
-    if error_code == "parse_error":
-        return FamiliaSyncResponse(
-            ok=False, casos=[],
-            error_code="parse_error",
-            error="No se pudo interpretar la respuesta de OJV",
-        )
-
-    # no_cases is a valid successful result (login OK, user has 0 Familia cases)
-    return FamiliaSyncResponse(ok=True, casos=all_casos)
+        except FamiliaBlockedError:
+            return _blocked()
+        except Exception as error:
+            billing = await _proxy_billing_response(error, proxy_control)
+            if billing:
+                if proxy_usage_capture is not None:
+                    proxy_usage_capture.status = "error"
+                    proxy_usage_capture.error_kind = "billing"
+                return billing
+            if classify_exception(error) == "ojv":
+                return _blocked()
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="session_error",
+                                       error="No se pudo consultar la causa en OJV")
+        try:
+            casos, error_code = parse_familia_results(html)
+        except Exception:
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="session_error")
+        finally:
+            html = ""
+        if error_code and casos:
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="session_error")
+        if error_code and error_code != "no_cases":
+            return FamiliaSyncResponse(ok=False, casos=[], error_code="parse_error")
+        return FamiliaSyncResponse(ok=True, casos=casos)
