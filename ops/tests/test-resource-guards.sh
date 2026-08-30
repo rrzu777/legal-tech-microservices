@@ -427,6 +427,19 @@ if [ "${1:-}" = show ]; then
   if [ -e "$RG_TEST_STATE/postflight-fail" ] && [ -e "$RG_TEST_STATE/postflight-armed" ]; then
     # Fail one postflight read, then let rollback prove the restored runtime.
     rm -f "$RG_TEST_STATE/postflight-armed"
+    if [ -e "$RG_TEST_STATE/restore-daemon-reload-fail" ]; then
+      printf '%s\n' daemon-reload > "$RG_TEST_STATE/fail-command"
+    fi
+    if [ -e "$RG_TEST_STATE/monitoring-fails-before-rollback" ]; then
+      for failed_unit in legaltech-monitor.service legaltech-resource-tracker.service legaltech-monitor.timer legaltech-resource-tracker.timer; do
+        printf '%s\n' failed > "$RG_TEST_STATE/unit-$failed_unit-active"
+        case "$failed_unit" in *.service)
+          printf '%s\n' 0 > "$RG_TEST_STATE/unit-$failed_unit-main-pid"
+          : > "$RG_TEST_STATE/unit-$failed_unit-control-group"
+          printf '%s\n' exit-code > "$RG_TEST_STATE/unit-$failed_unit-result" ;;
+        esac
+      done
+    fi
     if [ -e "$RG_TEST_STATE/worker-falls-before-postflight" ]; then
       old_pid=$(cat "$RG_TEST_STATE/unit-estrado-pjud-worker.service-main-pid") || exit 1
       case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
@@ -571,6 +584,7 @@ case "${1:-}" in
     else
       case "$value" in
         active) exit 0 ;;
+        failed) exit 3 ;;
         inactive)
           if [ -f "$RG_TEST_STATE/unit-$unit-active-status" ]; then
             exit "$(cat "$RG_TEST_STATE/unit-$unit-active-status")"
@@ -596,6 +610,16 @@ case "${1:-}" in
       [ "$current" = static ] || printf '%s\n' "$value" > "$(state_file "$unit" enabled)"
     done
     ;;
+  reset-failed)
+    shift
+    for unit in "$@"; do
+      if [ "$unit" = legaltech-monitor.timer ] && [ -e "$RG_TEST_STATE/reset-noop" ]; then continue; fi
+      if [ "$(cat "$(state_file "$unit" active)")" = failed ]; then
+        printf '%s\n' inactive > "$(state_file "$unit" active)"
+        printf '%s\n' success > "$(state_file "$unit" result)"
+      fi
+    done
+    ;;
   start|stop|restart)
     action=$1; shift
     case "$action" in stop) value=inactive ;; *) value=active ;; esac
@@ -605,7 +629,10 @@ case "${1:-}" in
         && [ -e "$RG_TEST_STATE/worker-stop-keeps-active" ]; then
         continue
       fi
-      printf '%s\n' "$value" > "$(state_file "$unit" active)"
+      # Failed units retain their failure after stop until reset-failed.
+      if [ "$action" != stop ] || [ "$(cat "$(state_file "$unit" active)")" != failed ]; then
+        printf '%s\n' "$value" > "$(state_file "$unit" active)"
+      fi
       case "$unit" in
         estrado-pjud-worker.service)
           old_pid=$(cat "$RG_TEST_STATE/unit-$unit-main-pid") || exit 1
@@ -664,7 +691,9 @@ case "${1:-}" in
     for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
       if [ ! -e "$RG_SYSTEMD_DIR/$unit" ]; then
         printf '%s\n' not-found > "$RG_TEST_STATE/unit-$unit-enabled"
-        printf '%s\n' inactive > "$RG_TEST_STATE/unit-$unit-active"
+        if [ "$(cat "$RG_TEST_STATE/unit-$unit-active")" != failed ]; then
+          printf '%s\n' inactive > "$RG_TEST_STATE/unit-$unit-active"
+        fi
       fi
     done
     exit 0
@@ -1118,6 +1147,9 @@ printf 'backup-copy %s\n' "${@: -1}" >> "$RG_TEST_STATE/events"
 destination=${@: -1}
 args=("$@")
 source=${args[$(( ${#args[@]} - 2 ))]}
+if [ -e "$RG_TEST_STATE/restore-monitor-copy-fail" ]; then
+  case "$source" in */entries/0005) exit 1 ;; esac
+fi
 if [ -d "$source" ]; then
   /bin/mkdir -p "$destination"
   /bin/chmod 755 "$destination"
@@ -2638,6 +2670,87 @@ run_explicit_daytime_maintenance_regressions() {
   run_rollback_worker_capability_regression --allow-daytime-maintenance
 }
 
+run_failed_monitor_restore_barriers() {
+  local scenario
+  echo '== failed monitor recovery requires restored files and a successful reload'
+  for scenario in restore-monitor-copy-fail restore-daemon-reload-fail; do
+    setup
+    configure_active_legacy_monitors
+    configure_absent_timer_base
+    : > "$STATE/postflight-fail"
+    : > "$STATE/monitoring-fails-before-rollback"
+    : > "$STATE/$scenario"
+    TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario keeps apply failed" "$RC" 1
+    expect_contains "$scenario reports incomplete rollback" "$OUT" 'ROLLBACK INCOMPLETO'
+    expect_count "$scenario forbids clearing failures" 'reset-failed' 0
+    expect_count "$scenario forbids restarting failed monitor" 'systemctl restart legaltech-monitor.service' 0
+  done
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = failed-monitor-restore-barriers ]; then
+  run_failed_monitor_restore_barriers
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
+run_failed_monitor_restore_regressions() {
+  local unit desired scenario
+  echo '== rollback recovers exact failed monitoring units without broad normalization'
+  for desired in active inactive; do
+    setup
+    configure_absent_timer_base
+    if [ "$desired" = active ]; then configure_active_legacy_monitors; fi
+    : > "$STATE/postflight-fail"
+    : > "$STATE/monitoring-fails-before-rollback"
+    TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$desired captured monitors keep apply failed" "$RC" 1
+    expect_contains "$desired failed monitor rollback completes" "$OUT" 'ROLLBACK OK'
+    for unit in legaltech-monitor.service legaltech-resource-tracker.service; do
+      expect_eq "$unit restores captured $desired" "$(cat "$STATE/unit-$unit-active")" "$desired"
+      expect_exact_count "$unit failure reset exactly once" "systemctl reset-failed $unit" 1
+    done
+    for unit in legaltech-monitor.timer legaltech-resource-tracker.timer; do
+      expect_eq "$unit returns absent" "$(cat "$STATE/unit-$unit-enabled")" not-found
+      expect_eq "$unit failure cleared to inactive" "$(cat "$STATE/unit-$unit-active")" inactive
+      expect_exact_count "$unit failure reset exactly once" "systemctl reset-failed $unit" 1
+      expect_before "$unit stopped before clearing failure" "systemctl stop $unit" "systemctl reset-failed $unit"
+    done
+    expect_count 'failed monitoring recovery never resets worker' 'reset-failed estrado-pjud-worker.service' 0
+    expect_count 'failed monitoring recovery never resets all units' 'systemctl reset-failed ' 4
+    expect_missing 'failure recovery keeps credential redacted' "$OUT" "$SECRET_SENTINEL"
+  done
+  for scenario in stop reset-failed reset-noop; do
+    setup
+    configure_absent_timer_base
+    : > "$STATE/postflight-fail"
+    : > "$STATE/monitoring-fails-before-rollback"
+    if [ "$scenario" = reset-noop ]; then
+      : > "$STATE/reset-noop"
+    else
+      printf '%s\n' "$scenario legaltech-monitor.timer" > "$STATE/fail-command"
+    fi
+    TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario failure keeps apply failed" "$RC" 1
+    expect_contains "$scenario failure remains audible" "$OUT" 'ROLLBACK INCOMPLETO'
+    expect_missing "$scenario failure never claims complete rollback" "$OUT" 'ROLLBACK OK'
+  done
+  setup
+  printf '%s\n' failed > "$STATE/unit-legaltech-monitor.service-active"
+  run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'failed monitor at admission is still refused' "$RC" 1
+  expect_count 'admission failure never resets units' 'reset-failed' 0
+  expect_count 'admission failure never provisions' provision 0
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = failed-monitor-restore ]; then
+  run_failed_monitor_restore_regressions
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 run_real_timer_contract_regressions() {
   local scenario value
   echo '== real systemd timer schedule contract'
@@ -2843,6 +2956,8 @@ if [ "${RESOURCE_GUARDS_FOCUS:-}" = swap-apply-compensation-retry ]; then
   exit
 fi
 
+run_failed_monitor_restore_barriers
+run_failed_monitor_restore_regressions
 run_real_timer_contract_regressions
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
