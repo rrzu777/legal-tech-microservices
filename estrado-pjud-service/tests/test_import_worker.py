@@ -800,6 +800,62 @@ def test_import_budget_is_not_reserved_while_import_flag_is_disabled():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["https://app.test", "https://app.test/", "https://app.test///"])
+async def test_import_credential_url_has_one_path_separator(monkeypatch, base_url):
+    import httpx
+    from worker.engine import SyncEngine
+
+    seen = []
+    path = f"/api/internal/pjud-import/credentials/{JOB['credential_id']}/decrypt"
+
+    def respond(request):
+        seen.append(request)
+        # Match Next's normalization redirect for double slash paths.
+        status = 404 if request.url.path == path else 308
+        return httpx.Response(status, json={"error": "unavailable"})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client_class(
+        transport=httpx.MockTransport(respond), **kw,
+    ))
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._config = SimpleNamespace(VERCEL_APP_URL=base_url, INTERNAL_CREDENTIALS_API_KEY="test-only")
+    result = await engine._get_import_credential(
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"], JOB["claim_token"], "import-worker",
+    )
+    assert result is None
+    assert len(seen) == 1
+    assert str(seen[0].url) == "https://app.test" + path
+    assert seen[0].headers["authorization"] == "Bearer test-only"
+    assert seen[0].headers["x-pjud-import-claim-token"] == JOB["claim_token"]
+
+
+@pytest.mark.asyncio
+async def test_import_credential_never_follows_redirect_with_internal_key(monkeypatch):
+    import httpx
+    from worker.engine import ImportCredentialInfrastructureError, SyncEngine
+
+    seen = []
+
+    def respond(request):
+        seen.append(str(request.url))
+        return httpx.Response(308, headers={"location": "https://other.test/credential"})
+
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client_class(
+        transport=httpx.MockTransport(respond), **kw,
+    ))
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._config = SimpleNamespace(VERCEL_APP_URL="https://app.test", INTERNAL_CREDENTIALS_API_KEY="test-only")
+    with pytest.raises(ImportCredentialInfrastructureError):
+        await engine._get_import_credential(
+            JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"], JOB["claim_token"], "import-worker",
+        )
+    assert len(seen) == 1
+    assert seen[0].startswith("https://app.test/")
+
+
+@pytest.mark.asyncio
 async def test_import_credential_fetch_treats_internal_outage_as_retryable():
     from worker.engine import ImportCredentialInfrastructureError, SyncEngine
 
