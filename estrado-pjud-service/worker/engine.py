@@ -10,7 +10,6 @@ import uuid
 from datetime import datetime, timedelta, date
 
 import httpx
-from pydantic import SecretStr
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
@@ -56,6 +55,51 @@ from worker.proxy_usage import (
     ProxyUsageTracker,
 )
 from worker.session_pool import ReleaseDisposition
+from worker.sync_credentials import (
+    SyncCredentialClaim, SyncCredentialClient,
+    SyncCredentialClaimStaleError, SyncCredentialInfrastructureError,
+)
+
+
+def _select_exact_familia_sync_case(casos, case_number, court) -> dict | None:
+    """Mirror the web selector: full RIT, exact persisted court, Unicode marks."""
+    def trim(value):
+        pattern = _CANONICAL_WHITESPACE_RE.pattern
+        return re.sub(f"^{pattern}|{pattern}$", "", value)
+
+    def normalize(value):
+        return _CANONICAL_WHITESPACE_RE.sub(" ", trim("".join(
+            char for char in unicodedata.normalize("NFD", value)
+            if not unicodedata.category(char).startswith("M")
+        ))).upper()
+
+    if not isinstance(case_number, str) or not isinstance(court, str) or not trim(court):
+        return None
+    parts = trim(case_number).split("-")
+    if (len(parts) != 3 or not parts[0] or not all(
+            unicodedata.category(char)[0] in "LN" for char in parts[0]
+        ) or not re.fullmatch(r"[0-9]+", parts[1]) or not re.fullmatch(r"[0-9]{4}", parts[2])):
+        return None
+    matches = []
+    for item in casos:
+        if not hasattr(item, "model_dump"):
+            return None
+        row = item.model_dump()
+        limits = {"rit": (1, 128), "tribunal": (1, 500), "estado": (1, 200),
+                  "materia": (0, 500), "caratulado": (0, 1000)}
+        for key, (minimum, maximum) in limits.items():
+            value = row.get(key)
+            if key == "estado" and isinstance(value, str):
+                value = trim(value)
+                row[key] = value
+            if not isinstance(value, str) or not minimum <= len(value.encode("utf-16-le")) // 2 <= maximum:
+                return None
+        filed = row.get("fecha_ingreso")
+        if filed is not None and (not isinstance(filed, str) or len(filed.encode("utf-16-le")) // 2 > 40):
+            return None
+        if normalize(row["rit"]) == normalize(case_number) and normalize(row["tribunal"]) == normalize(court):
+            matches.append({key: row.get(key) for key in ("estado", "materia", "tribunal", "caratulado", "fecha_ingreso")})
+    return matches[0] if len(matches) == 1 else None
 
 logger = logging.getLogger(__name__)
 _BLOCK_DURATION_S = 3600  # 1 hour
@@ -923,6 +967,21 @@ class SyncEngine:
                 "status": "sync_run_unavailable",
             }
 
+        # Private work must never enter the public catch/finalization writers,
+        # including if local accounting fails after an atomic publication.
+        if case.get("matter") == "familia":
+            result = await self._sync_familia_case(case, sync_run_id, started_at)
+            try:
+                if result["success"]:
+                    self._backoff.record_success()
+                    self._metrics.record_sync()
+                elif result.get("status") != "proxy_billing_exhausted":
+                    self._backoff.record_failure()
+                    self._metrics.record_error()
+            except Exception:
+                logger.warning("Private sync local accounting unavailable")
+            return result
+
         session = None
         release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
@@ -934,21 +993,6 @@ class SyncEngine:
                 parsed = parse_case_identifier(case["case_number"])
             except ValueError:
                 parsed = None
-
-            if case.get("matter") == "familia":
-                if parsed is None:
-                    await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-                    await self._update_case_error(case, "Identificador invalido")
-                    self._metrics.record_error()
-                    return {"success": False, "new_movements": 0}
-                result = await self._sync_familia_case(case, sync_run_id, started_at)
-                if result["success"]:
-                    self._backoff.record_success()
-                    self._metrics.record_sync()
-                elif result.get("status") != "proxy_billing_exhausted":
-                    self._backoff.record_failure()
-                    self._metrics.record_error()
-                return result
 
             competencia = MATTER_TO_COMPETENCIA.get(case.get("matter", ""))
             if not competencia:
@@ -1407,17 +1451,6 @@ class SyncEngine:
             logger.exception("%s failed (%s)", what, path)
             return None
 
-    async def _get_decrypted_credential(
-        self, credential_id: str, law_firm_id: str
-    ) -> dict | None:
-        """Fetch decrypted credential from Vercel internal endpoint."""
-        resp = await self._call_app_internal(
-            "GET",
-            f"/api/internal/credentials/{credential_id}/decrypt",
-            "Decrypt endpoint",
-            law_firm_id=law_firm_id,
-        )
-        return resp.json() if resp is not None and resp.status_code == 200 else None
 
     async def _get_import_credential(
         self, credential_id: str, law_firm_id: str, job_id: str,
@@ -1459,292 +1492,150 @@ class SyncEngine:
             raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
         return data
 
-    async def _report_invalid_credential(self, credential_id: str) -> None:
-        """Tell the app that OJV rejected this credential.
-
-        El worker es el que ve el veredicto y el unico que puede reportarlo: la
-        app no reintenta la causa (queda `suspended`, que es terminal), asi que
-        su propio camino no vuelve a pasar por aca nunca. Sin este aviso la
-        credencial se quedaba con badge verde "Activa" mientras N causas
-        quedaban suspendidas sin motivo visible.
-
-        No devuelve nada y no cambia el destino de la causa: la causa ya se
-        marco terminal antes de llamar. Un fallo de red aca no puede convertir
-        un veredicto en un reintento — por eso `_call_app_internal` se traga sus
-        propias excepciones.
-        """
-        await self._call_app_internal(
-            "POST",
-            f"/api/internal/credentials/{credential_id}/invalidate",
-            "Invalidate endpoint",
-        )
+    async def _record_private_failure(self, client, claim, version, kind, code) -> dict:
+        # Only SQL may resolve ambiguous read/finalize outcomes; never fall back
+        # to a generic writer if this boundary itself is unavailable.
+        status = code
+        try:
+            if await client.failure(claim, version, kind, code) == "stale":
+                status = "sync_claim_stale"
+        except SyncCredentialClaimStaleError:
+            status = "sync_claim_stale"
+        except Exception:
+            status = "infra_unavailable"
+            logger.warning("Private sync failure boundary unavailable")
+        return {"success": False, "new_movements": 0, "status": status}
 
     async def _sync_familia_case(self, case: dict, sync_run_id: str | None, started_at: datetime) -> dict:
-        credential_id = case.get("ojv_credential_id")
-        if not credential_id:
-            await self._finish_run(sync_run_id, started_at, "error", 0, "Missing ojv_credential_id")
-            await self._terminal_error(case["id"], "Causa Familia sin credencial OJV configurada")
-            return {"success": False, "new_movements": 0}
-
-        cred = await self._get_decrypted_credential(
-            credential_id, case["law_firm_id"]
-        )
-        if not cred:
-            await self._finish_run(sync_run_id, started_at, "error", 0, "Credential inactive or missing")
-            await self._terminal_error(case["id"], "Credencial OJV inactiva o no encontrada")
-            return {"success": False, "new_movements": 0}
-
+        client = SyncCredentialClient(self._sb, self._config)
         try:
-            parsed = parse_case_identifier(case["case_number"])
-        except ValueError:
-            await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid identifier")
-            await self._terminal_error(case["id"], "Identificador invalido")
-            return {"success": False, "new_movements": 0}
+            claim = SyncCredentialClaim.model_validate({
+                "law_firm_id": case.get("law_firm_id"),
+                "credential_id": case.get("ojv_credential_id"),
+                "case_id": case.get("id"), "run_id": sync_run_id,
+                "claim_kind": "scheduled",
+                "claim_owner": getattr(self._config, "WORKER_ID", None),
+                "claim_token": case.get("sync_claim_token"),
+                "case_binding_version": case.get("ojv_credential_binding_version"),
+            })
+        except Exception:
+            return {"success": False, "new_movements": 0, "status": "infra_unavailable"}
 
-        # Solo Clave PJ (Clave Única quedó dormida). Cualquier otro password_type
-        # es terminal — no crashea ni penaliza en loop (Gap #5).
-        if cred.get("password_type") != "clave_poder_judicial":
-            await self._finish_run(sync_run_id, started_at, "error", 0, "auth_type no soportado")
-            await self._terminal_error(case["id"], "Método de credencial no soportado — reingresá con Clave Poder Judicial")
-            return {"success": False, "new_movements": 0}
-        auth_type = "clave_pj"
-
-        # Bundle F5 del pool, FUERA del timeout de 90s: el minteo no es culpa de
-        # la causa (Gap #6). El slot queda busy hasta release_familia_bundle.
-        bundle, slot = await self._pool.acquire_familia_bundle()
-        if bundle is None:
-            await self._pool.release_familia_bundle(
-                slot, disposition="healthy",
-            )
-            await self._finish_run(sync_run_id, started_at, "blocked", 0, "Pool sin bundle F5")
-            await self._handle_blocked(case["id"], "infra", "Pool sin bundle F5")
-            self._metrics.record_error("infra")
-            return {"success": False, "new_movements": 0}
-
+        cred = None
+        version = None
+        slot = None
+        acquired = False
+        html = ""
         release_disposition: ReleaseDisposition = "healthy"
         remint_on_release = True
         try:
+            # Pool acquisition may be slow. Never fetch plaintext before it.
+            bundle, slot = await self._pool.acquire_familia_bundle()
+            acquired = True
+            if bundle is None:
+                raise SyncCredentialInfrastructureError()
+            cred = await client.decrypt(claim)
+            version = cred.credential_version
             try:
-                async with self._proxy_usage.track(
-                    operation="search",
-                    law_firm_id=case["law_firm_id"],
-                    case_id=case["id"],
-                    sync_run_id=sync_run_id,
-                    transaction_key=f"{sync_run_id}:familia-search",
-                ):
-                    async with asyncio.timeout(90):
-                        async with FamiliaAuthSession(
-                            bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
-                        ) as session:
-                            try:
-                                await session.login(
-                                    SecretStr(cred["rut"]),
-                                    SecretStr(cred["password"]),
-                                    auth_type,
-                                )
-                            except InvalidCredentialsError:
-                                # Credencial inválida = terminal (no reintenta en loop);
-                                # la IP está sana, se libera healthy=True.
-                                await self._finish_run(sync_run_id, started_at, "error", 0, "Invalid credentials")
-                                await self._terminal_error(case["id"], "Credencial OJV invalida — verifica en Configuracion")
-                                # El veredicto va TAMBIEN a la credencial, no solo a
-                                # la causa: es lo que el abogado tiene que arreglar,
-                                # y la app no tiene otra forma de enterarse.
-                                await self._report_invalid_credential(credential_id)
-                                return {"success": False, "new_movements": 0}
-
-                            html = await session.search_familia(
-                                rut=SecretStr(cred["rut"]),
-                                rit=str(parsed["numero"]),
-                                year=str(parsed["anno"]),
-                            )
-            # Bloqueo F5 / sesión / timeout / transporte = transitorio: NO penaliza
-            # consecutive_sync_failures (_handle_blocked), y marca el slot para re-mint
-            # (healthy=False en el finally). str(e) preserva el detalle (los
-            # FamiliaBlockedError ya dicen "login"/"search"); TimeoutError es vacío.
-            # `httpx.HTTPStatusError` en la lista y no solo `TransportError`:
-            # son hermanos, no padre e hijo, asi que un 503 de OJV durante el
-            # login de Familia se caia al `except Exception` de mas afuera y
-            # terminaba penalizando la causa.
-            except (
-                FamiliaBlockedError,
-                OjvSessionError,
-                ProxyBillingExhaustedError,
-                TimeoutError,
-                httpx.TransportError,
-                httpx.HTTPStatusError,
-            ) as e:
-                mapped_disposition = _release_disposition_for_error(
-                    e,
-                    transport_revalidation_enabled=(
-                        getattr(
-                            self._config,
-                            "WORKER_TRANSPORT_REVALIDATION_ENABLED",
-                            False,
-                        )
-                        is True
-                    ),
+                parsed = parse_case_identifier(case["case_number"])
+            except (ValueError, KeyError):
+                return await self._record_private_failure(
+                    client, claim, version, "case", "identity_invalid",
                 )
-                release_disposition = mapped_disposition
-                if is_proxy_billing_error(e):
+
+            async with self._proxy_usage.track(
+                operation="search", law_firm_id=claim.law_firm_id,
+                case_id=claim.case_id, sync_run_id=claim.run_id,
+                transaction_key=f"{claim.run_id}:familia-search",
+            ):
+                async with asyncio.timeout(90):
+                    async with FamiliaAuthSession(
+                        bundle.proxy_url, bundle.cookies, bundle.user_agent, rate_limit_s=2.5,
+                    ) as session:
+                        await client.check(claim, version)
+                        try:
+                            await session.login(cred.rut, cred.password, "clave_pj")
+                        except InvalidCredentialsError:
+                            outcome = await client.invalidate(claim, version)
+                            return {"success": False, "new_movements": 0, "status": outcome}
+                        await client.check(claim, version)
+                        html = await session.search_familia(
+                            rut=cred.rut, rit=str(parsed["numero"]), year=str(parsed["anno"]),
+                        )
+            casos, err = parse_familia_results(html)
+            if err and casos:
+                raise SyncCredentialInfrastructureError()
+            if err and err != "no_cases":
+                return await self._record_private_failure(client, claim, version, "case", "parse_failed")
+            if not casos:
+                return await self._record_private_failure(client, claim, version, "case", "case_not_found")
+            result = _select_exact_familia_sync_case(casos, case.get("case_number"), case.get("court"))
+            if result is None:
+                raise SyncCredentialInfrastructureError()
+            outcome = await client.finalize(claim, version, result)
+            count = outcome["new_movements"]
+            if outcome["status"] == "published" and count > 0:
+                try:
+                    await self._notifier.notify_new_movements(case, count)
+                except Exception:
+                    logger.warning("Private sync notification unavailable")
+            return {"success": outcome["status"] != "stale", "new_movements": count, "status": outcome["status"]}
+        except SyncCredentialClaimStaleError:
+            return {"success": False, "new_movements": 0, "status": "sync_claim_stale"}
+        except Exception as error:
+            # Infrastructure and credential-boundary failures never count as
+            # wrong credentials or case failures.
+            release_disposition = "healthy" if isinstance(error, SyncCredentialInfrastructureError) else _release_disposition_for_error(
+                error, transport_revalidation_enabled=(
+                    getattr(self._config, "WORKER_TRANSPORT_REVALIDATION_ENABLED", False) is True
+                ),
+            )
+            kind = "ojv" if isinstance(error, FamiliaBlockedError) else "infra"
+            code = "ojv_blocked" if kind == "ojv" else "infra_unavailable"
+            billing = is_proxy_billing_error(error)
+            try:
+                if billing:
                     remint_on_release = False
-                    await self._finish_run(
-                        sync_run_id, started_at, "blocked", 0, "infra_unavailable",
-                    )
                     await self._proxy_control.trip_billing_exhausted()
                     self._backoff.open_permanently("billing_exhausted")
-                    await self._update_case_blocked(case["id"], "infra", None)
                     self._metrics.record_error("infra")
+                elif isinstance(error, ProxyUsagePersistenceError):
+                    await self._proxy_control.pause_telemetry_unavailable()
+                    self._backoff.open_permanently("proxy_cost_control")
+                elif isinstance(error, ProxyBudgetExceededError) and error.blocking_scope == "global":
+                    await self._proxy_control.refresh()
+                    self._backoff.open_permanently("proxy_cost_control")
+            except Exception:
+                logger.warning("Private sync proxy control unavailable")
+            if billing:
+                # The persistent stop precedes notification. A broken alert
+                # channel cannot undo it or skip the fenced failure writer.
+                try:
                     await send_ops_alert(
                         getattr(self._config, "TELEGRAM_BOT_TOKEN", ""),
                         getattr(self._config, "TELEGRAM_CHAT_ID", ""),
                         "proxy_billing_exhausted",
                         "Proxy residencial detenido por facturacion; requiere reactivacion explicita en ops.",
                     )
-                    return {
-                        "success": False,
-                        "new_movements": 0,
-                        "status": "proxy_billing_exhausted",
-                    }
-                msg = str(e) or "Timeout Familia sync"
-                # El unico `except` de los call sites que mezcla las dos causas:
-                # `FamiliaBlockedError` ES el portal cortandonos, y las otras
-                # (sesion que no levanta, timeout, transporte) son nuestras.
-                # Agruparlas para el retry esta bien —todas son transitorias y
-                # ninguna penaliza a la causa—; agruparlas para el mensaje seria
-                # volver a inventar la culpa.
-                #
-                # `FamiliaBlockedError` va explicito y no dentro de
-                # `block_cause`: es una excepcion de dominio de Familia, y meter
-                # `app.familia.auth` dentro del clasificador le arrastraria ese
-                # grafo entero a las rutas de search y detail, que no lo usan.
-                cause = "ojv" if isinstance(e, FamiliaBlockedError) else block_cause(e)
-                await self._finish_run(
-                    sync_run_id,
-                    started_at,
-                    "blocked",
-                    0,
-                    msg,
-                    error_code=_sync_run_error_code(e, failure_kind=cause),
-                )
-                await self._handle_blocked(case["id"], cause, msg)
-                self._metrics.record_error("infra")
-                return {"success": False, "new_movements": 0}
+                except Exception:
+                    logger.warning("Private sync billing alert unavailable")
+            result = await self._record_private_failure(client, claim, version, kind, code)
+            if billing and result["status"] != "sync_claim_stale":
+                result["status"] = "proxy_billing_exhausted"
+            return result
         finally:
-            if remint_on_release:
-                await self._pool.release_familia_bundle(
-                    slot, disposition=release_disposition,
-                )
-            else:
-                await self._pool.release_familia_bundle(
-                    slot, disposition=release_disposition, remint=False,
-                )
-
-        casos, err = parse_familia_results(html)
-        if err and err != "no_cases":
-            await self._finish_run(
-                sync_run_id,
-                started_at,
-                "error",
-                0,
-                f"Parse error: {err}",
-                error_code="parse_failed",
-            )
-            await self._update_case_error(case, "Error al interpretar respuesta OJV Familia")
-            return {"success": False, "new_movements": 0}
-
-        if not casos:
-            await self._finish_run(sync_run_id, started_at, "error", 0, "Case not found in Familia portal")
-            await self._update_case_error(case, "Causa no encontrada en portal Familia")
-            return {"success": False, "new_movements": 0}
-
-        caso = casos[0]
-
-        prev_payload = case.get("external_payload") or {}
-        prev_estado = prev_payload.get("estado")
-        estado_changed = prev_estado != caso.estado
-
-        new_count = 0
-        if estado_changed or not prev_estado:
-            mov_title = (
-                f"Estado actualizado: {prev_estado} → {caso.estado}"
-                if prev_estado
-                else f"Estado: {caso.estado}"
-            )
-            ext_key = f"familia:{case['case_number']}:{caso.estado}"
-            try:
-                await run_query(
-                    self._sb.from_("case_movements").upsert(
-                        {
-                            "law_firm_id": case["law_firm_id"],
-                            "case_id": case["id"],
-                            "date": datetime.now(TZ_SANTIAGO).date().isoformat(),
-                            "title": mov_title,
-                            "description": f"Tribunal: {caso.tribunal} | Materia: {caso.materia}",
-                            "movement_type": "resolution",
-                            "source": "sync",
-                            "include_in_report": True,
-                            "external_movement_key": ext_key,
-                            "raw_payload": caso.model_dump(),
-                        },
-                        on_conflict="case_id,external_movement_key",
-                        ignore_duplicates=False,
-                    )
-                )
-                # Only notify on a genuine estado change, not the initial registration
-                if estado_changed and prev_estado:
-                    new_count = 1
-            except Exception:
-                logger.warning("Failed to upsert familia movement for case %s", case["id"], exc_info=True)
-
-        await run_query(
-            self._sb.from_("cases").update({
-                "tracking_status": "active",
-                "last_sync_at": datetime.now(TZ_SANTIAGO).isoformat(),
-                "last_sync_status": "success",
-                "last_sync_error": None,
-                # Se resetea en el éxito, igual que el path PJUD de sync_case.
-                "consecutive_sync_failures": 0,
-                "sync_blocked_until": None,
-                "court": caso.tribunal or case.get("court", ""),
-                "title": caso.caratulado or case.get("title", ""),
-                "external_payload": {
-                    "estado": caso.estado,
-                    "materia": caso.materia,
-                    "tribunal": caso.tribunal,
-                    "caratulado": caso.caratulado,
-                    "fecha_ingreso": caso.fecha_ingreso,
-                },
-            }).eq("id", case["id"])
-        )
-        await run_query(self._sb.rpc("schedule_pjud_case_after_sync", {
-            "p_case_id": case["id"],
-            # Familia no trae movimientos públicos en este flujo. Preservar la
-            # fecha importada/existente evita borrarla y permite clasificar una
-            # causa realmente inactiva como semanal.
-            "p_latest_movement_date": case.get("latest_movement_date"),
-        }))
-
-        await self._finish_run(sync_run_id, started_at, "success", new_count)
-
-        if new_count > 0:
-            try:
-                await self._notifier.notify_new_movements(case, new_count)
-            except Exception:
-                logger.warning("Failed to notify for familia case %s", case["id"], exc_info=True)
-
-        logger.info("Familia sync OK for case %s — estado: %s", case["case_number"], caso.estado)
-        return {"success": True, "new_movements": new_count}
-
-    async def _terminal_error(self, case_id: str, error: str):
-        """Keep terminal failures alertable; ``paused`` is reserved for user pauses."""
-        await run_query(
-            self._sb.from_("cases").update({
-                "tracking_status": "suspended",
-                "last_sync_status": "error",
-                "last_sync_error": error,
-            }).eq("id", case_id)
-        )
+            # Drop references; Python cannot promise physical zeroization.
+            cred = None
+            html = ""
+            if acquired:
+                try:
+                    if remint_on_release:
+                        await self._pool.release_familia_bundle(slot, disposition=release_disposition)
+                    else:
+                        await self._pool.release_familia_bundle(slot, disposition=release_disposition, remint=False)
+                except Exception:
+                    # Never escape into the public generic failure writers.
+                    logger.warning("Private sync bundle release unavailable")
 
     async def _upsert_movements(self, case: dict, detail: dict) -> int:
         movements = detail.get("movements", [])

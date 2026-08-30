@@ -5,6 +5,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -23,6 +24,32 @@ from app.session_pool import APISessionPool
 from supabase import create_client
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import ProxyUsageTracker
+
+
+class PrivateSyncHttpMiddleware:
+    """Cover private errors emitted before routing, auth and body validation."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "").rstrip("/") != "/api/v1/familia/sync":
+            await self.app(scope, receive, send)
+            return
+        started = False
+        async def private_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                headers = MutableHeaders(scope=message)
+                headers["Cache-Control"] = "private, no-store"
+                headers["Vary"] = "Authorization, X-JurisTrack-Law-Firm-ID, X-JurisTrack-Case-ID, X-JurisTrack-Sync-Run-ID"
+            await send(message)
+        try:
+            await self.app(scope, receive, private_send)
+        except Exception:
+            if started:
+                raise
+            await JSONResponse(status_code=503, content={"detail": "infra_unavailable"})(scope, receive, private_send)
 
 
 async def _redacted_request_validation_handler(
@@ -63,6 +90,7 @@ async def lifespan(app: FastAPI):
         proxy_usage=proxy_usage,
     )
     app.state.session_pool = pool
+    app.state.proxy_supabase = proxy_supabase
     app.state.proxy_control = proxy_control
     app.state.proxy_usage = proxy_usage
     app.state.proxy_control_required = proxy_control_required
@@ -154,6 +182,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(PjudUsageContextMiddleware)
     app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(PrivateSyncHttpMiddleware)
 
     app.include_router(health.router)
     app.include_router(search.router)

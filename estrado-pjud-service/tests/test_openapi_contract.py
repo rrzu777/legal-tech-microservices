@@ -99,3 +99,27 @@ def test_cobranza_documents_canonical_rit_and_legacy_rol_alias():
     response_case_type = schemas["SearchResponse"]["properties"]["case_type"]
     assert "rit" in response_case_type["description"].lower()
     assert "rol" in response_case_type["description"].lower()
+
+
+def test_private_sync_documents_mandatory_closed_claim_and_one_case_filter():
+    schemas = json.loads(OUT.read_text())["components"]["schemas"]
+    request = schemas["FamiliaSyncRequest"]
+    assert set(request["required"]) == {"rut", "password", "cases", "sync_claim", "credential_version"}
+    assert request["additionalProperties"] is False
+    assert request["properties"]["cases"]["minItems"] == 1
+    assert request["properties"]["cases"]["maxItems"] == 1
+    assert request["properties"]["auth_type"]["const"] == "clave_pj"
+    assert schemas["SyncCredentialClaim"]["additionalProperties"] is False
+    assert set(schemas["SyncCredentialClaim"]["required"]) == {
+        "law_firm_id", "credential_id", "case_id", "run_id", "claim_kind", "claim_owner", "claim_token", "case_binding_version",
+    }
+
+
+def test_sync_uuid_patterns_export_the_ecmascript_safe_explicit_ranges():
+    # OpenAPI consumers use JavaScript RegExp: Python's inline (?i) cannot
+    # appear here. Keep this narrow Python gate free of a Node runtime dependency;
+    # the consuming web suite also compiles the vendored schema patterns.
+    properties = json.loads(spec_json())["components"]["schemas"]["SyncCredentialClaim"]["properties"]
+    expected = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    for field in ("law_firm_id", "credential_id", "case_id", "run_id"):
+        assert properties[field]["pattern"] == expected

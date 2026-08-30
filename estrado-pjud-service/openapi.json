@@ -471,12 +471,16 @@
         "type": "object"
       },
       "FamiliaCaseFilter": {
+        "additionalProperties": false,
         "properties": {
           "rit": {
+            "maxLength": 128,
+            "pattern": "^[0-9]+$",
             "title": "Rit",
             "type": "string"
           },
           "year": {
+            "pattern": "^[0-9]{4}$",
             "title": "Year",
             "type": "string"
           }
@@ -533,24 +537,26 @@
         "type": "object"
       },
       "FamiliaSyncRequest": {
+        "additionalProperties": false,
         "properties": {
           "auth_type": {
+            "const": "clave_pj",
             "default": "clave_pj",
-            "enum": [
-              "clave_pj",
-              "clave_unica"
-            ],
             "title": "Auth Type",
             "type": "string"
           },
           "cases": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/FamiliaCaseFilter"
             },
-            "maxItems": 10,
+            "maxItems": 1,
+            "minItems": 1,
             "title": "Cases",
             "type": "array"
+          },
+          "credential_version": {
+            "title": "Credential Version",
+            "type": "string"
           },
           "password": {
             "title": "Password",
@@ -559,11 +565,17 @@
           "rut": {
             "title": "Rut",
             "type": "string"
+          },
+          "sync_claim": {
+            "$ref": "#/components/schemas/SyncCredentialClaim"
           }
         },
         "required": [
           "rut",
-          "password"
+          "password",
+          "cases",
+          "sync_claim",
+          "credential_version"
         ],
         "title": "FamiliaSyncRequest",
         "type": "object"
@@ -596,7 +608,8 @@
                   "session_error",
                   "no_cases",
                   "parse_error",
-                  "blocked"
+                  "blocked",
+                  "sync_claim_stale"
                 ],
                 "type": "string"
               },
@@ -1725,6 +1738,68 @@
           "error"
         ],
         "title": "SearchResponse",
+        "type": "object"
+      },
+      "SyncCredentialClaim": {
+        "additionalProperties": false,
+        "properties": {
+          "case_binding_version": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Case Binding Version",
+            "type": "integer"
+          },
+          "case_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "claim_kind": {
+            "enum": [
+              "scheduled",
+              "manual",
+              "lookup"
+            ],
+            "title": "Claim Kind",
+            "type": "string"
+          },
+          "claim_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Claim Owner",
+            "type": "string"
+          },
+          "claim_token": {
+            "title": "Claim Token",
+            "type": "string"
+          },
+          "credential_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Credential Id",
+            "type": "string"
+          },
+          "law_firm_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Law Firm Id",
+            "type": "string"
+          },
+          "run_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "law_firm_id",
+          "credential_id",
+          "case_id",
+          "run_id",
+          "claim_kind",
+          "claim_owner",
+          "claim_token",
+          "case_binding_version"
+        ],
+        "title": "SyncCredentialClaim",
         "type": "object"
       },
       "ValidationError": {
