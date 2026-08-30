@@ -30,6 +30,7 @@ from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.session import OJVSession
 from worker.config import WorkerConfig
+from worker.maintenance import has_active_operation, mark_uncertain, track_auxiliary
 from worker.proxy_usage import SessionReason
 
 logger = logging.getLogger(__name__)
@@ -538,34 +539,45 @@ class SessionPool:
         )
 
     async def _close_candidate(self, candidate: OJVSession) -> None:
+        has_active_operation()
         try:
             await asyncio.wait_for(
                 candidate.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
             )
         except Exception:
+            if has_active_operation():
+                mark_uncertain()
             logger.debug("No se pudo cerrar candidato de revalidacion")
 
     async def _close_retired_session(
         self, session: OJVSession, slot_index: int,
     ) -> None:
+        has_active_operation()
         try:
             await asyncio.wait_for(
                 session.close(), timeout=_CANDIDATE_CLOSE_TIMEOUT_S,
             )
         except TimeoutError:
+            if has_active_operation():
+                mark_uncertain()
             logger.debug(
                 "Timeout cerrando la sesion retirada del slot %d", slot_index,
             )
         except Exception:
+            if has_active_operation():
+                mark_uncertain()
             logger.debug(
                 "No se pudo cerrar la sesion retirada del slot %d", slot_index,
             )
 
     def _retire_session(self, session: OJVSession, slot_index: int) -> None:
         """Close an already-replaced session without delaying its committed swap."""
+        admitted = has_active_operation()
         task = asyncio.create_task(
             self._close_retired_session(session, slot_index),
         )
+        if admitted:
+            track_auxiliary(task)
         self._retired_cleanup_tasks.add(task)
         task.add_done_callback(self._retired_cleanup_tasks.discard)
 

@@ -26,6 +26,8 @@ from worker.backoff import CircuitBreaker
 from worker.sd_notify import notify_ready, notify_status, notify_stopping
 from worker.proxy_control import ProxyControl, ProxyControlSnapshot
 from worker.proxy_usage import ProxyUsageTracker
+from worker.maintenance import WorkerMaintenance, has_active_operation, mark_uncertain, track_auxiliary
+from worker.maintenance_store import MaintenanceError, MaintenanceStore, ProcessIdentity
 
 logger = logging.getLogger("worker")
 
@@ -87,6 +89,8 @@ async def process_batch(
             try:
                 await engine.sync_case(case)
             except Exception:
+                if has_active_operation():
+                    mark_uncertain()
                 logger.exception("Unhandled error syncing case %s", case.get("id"))
 
     if (
@@ -96,7 +100,13 @@ async def process_batch(
     ):
         raise ValueError("invalid_shutdown_grace_seconds")
 
-    case_tasks = [asyncio.create_task(_run_one(case)) for case in batch]
+    admitted = has_active_operation()
+    case_tasks = []
+    for case in batch:
+        task = asyncio.create_task(_run_one(case))
+        if admitted:
+            track_auxiliary(task)
+        case_tasks.append(task)
     batch_future = asyncio.gather(*case_tasks, return_exceptions=True)
     shutdown_wait = asyncio.create_task(shutdown_event.wait())
     try:
@@ -116,6 +126,13 @@ async def process_batch(
                     task.cancel()
             await batch_future
     finally:
+        # External parent cancellation must not orphan a case task or let the
+        # caller release the batch before its case cleanup has joined. A hold
+        # never sets shutdown_event or cancels any of these tasks.
+        for task in case_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*case_tasks, return_exceptions=True)
         if not shutdown_wait.done():
             shutdown_wait.cancel()
         await asyncio.gather(shutdown_wait, return_exceptions=True)
@@ -227,6 +244,8 @@ async def safe_get_next_batch(scheduler, metrics, backoff):
     try:
         return await scheduler.get_next_batch()
     except Exception:
+        if has_active_operation():
+            mark_uncertain()
         logger.exception("Failed to claim PJUD sync batch; keeping pool alive")
         metrics.record_error("infra")
         backoff.record_failure()
@@ -238,6 +257,8 @@ async def safe_process_import_job(engine, metrics) -> bool:
     try:
         return await engine.process_import_job()
     except Exception as exc:
+        if has_active_operation():
+            mark_uncertain()
         logger.error(
             "Failed to process PJUD import discovery job (error_class=%s)",
             type(exc).__name__,
@@ -260,11 +281,18 @@ async def run_import_discovery_loop(
     *,
     poll_interval: float = 5.0,
     traffic_allowed=lambda: True,
+    maintenance: WorkerMaintenance | None = None,
 ) -> None:
     """Independent one-at-a-time discovery loop with structured cancellation."""
     while not shutdown_event.is_set():
         if traffic_allowed():
-            processed = await safe_process_import_job(engine, metrics)
+            try:
+                processed = (
+                    await maintenance.run(lambda: safe_process_import_job(engine, metrics))
+                    if maintenance is not None else await safe_process_import_job(engine, metrics)
+                )
+            except MaintenanceError:
+                processed = False
             if processed:
                 continue
         try:
@@ -284,6 +312,8 @@ async def safe_reconcile_stale_runs(scheduler, metrics, backoff) -> bool:
         await scheduler.reconcile_stale_runs()
         return True
     except Exception:
+        if has_active_operation():
+            mark_uncertain()
         logger.exception("Failed to reconcile stale PJUD sync runs; traffic blocked")
         metrics.record_error("infra")
         backoff.record_failure()
@@ -322,6 +352,81 @@ async def refresh_proxy_gate(
     return snapshot
 
 
+async def watch_maintenance(
+    maintenance: WorkerMaintenance, shutdown_event: asyncio.Event, *, poll_interval: float = 1.0,
+) -> None:
+    """Independent ACK publisher, including while the main loop is gated."""
+    try:
+        while not shutdown_event.is_set():
+            try:
+                maintenance.publish_ack()
+            except Exception:
+                maintenance.mark_uncertain()
+                logger.error("Maintenance acknowledgement unavailable; admission closed")
+            try:
+                async with asyncio.timeout(poll_interval):
+                    await shutdown_event.wait()
+            except TimeoutError:
+                pass
+    except BaseException:
+        if not shutdown_event.is_set():
+            maintenance.mark_uncertain()
+        raise
+
+
+async def initialize_worker_attempt(
+    pool, scheduler, metrics, backoff, proxy_control, config, *,
+    validation_once: bool, process_outside_office_hours: bool, imports_enabled: bool,
+) -> str:
+    """One bounded startup operation; idle/retry waits belong outside admission."""
+    if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+        return "reconcile_unavailable"
+    snapshot = await refresh_proxy_gate(proxy_control, backoff)
+    if not snapshot.allowed:
+        return "paused"
+    prewarm = can_initialize_paid_pool(
+        validation_once=validation_once,
+        process_outside_office_hours=process_outside_office_hours,
+    )
+    if not prewarm and not imports_enabled:
+        return "idle_off_hours"
+    if not await scheduler_contract_ready(scheduler, metrics, backoff):
+        return "contract_unavailable"
+    if not prewarm:
+        # Manual imports still claim/authorize before lazy paid checkout.
+        await pool.initialize(prewarm=False)
+        return "ready"
+    metrics.set_status("starting")
+    notify_status("initializing proxy pool")
+    initialized = await safe_initialize_pool(
+        pool, max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
+        proxy_control=proxy_control, backoff=backoff,
+    )
+    return "ready" if initialized else "mint_failed"
+
+
+async def reconcile_and_refresh(scheduler, metrics, backoff, proxy_control):
+    if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+        return None
+    return await refresh_proxy_gate(proxy_control, backoff)
+
+
+async def claim_process_release_batch(
+    scheduler, metrics, backoff, engine, concurrency, shutdown_event, *,
+    proxy_control=None, processing_window=is_scheduled_processing_window,
+):
+    """The caller admits before claim and retains ownership through release."""
+    batch = await safe_get_next_batch(scheduler, metrics, backoff)
+    if not batch:
+        return batch
+    await process_batch(
+        batch, engine, concurrency, shutdown_event, backoff,
+        proxy_control=proxy_control, processing_window=processing_window,
+    )
+    await scheduler.release_batch([case["id"] for case in batch])
+    return batch
+
+
 async def main():
     config = WorkerConfig()
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
@@ -352,6 +457,9 @@ async def main():
         ))),
     )
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
+
+    # Mandatory local protocol; no environment switch or legacy-open fallback.
+    maintenance = WorkerMaintenance(MaintenanceStore.production(), ProcessIdentity.current())
 
     supabase = create_supabase(config)
     proxy_usage = ProxyUsageTracker(
@@ -386,75 +494,41 @@ async def main():
     notify_status("starting")
     bandwidth_alert_state = BandwidthAlertState()
     import_task: asyncio.Task | None = None
+    maintenance_task = asyncio.create_task(watch_maintenance(maintenance, shutdown_event),
+                                          name="pjud-maintenance-ack")
 
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
-            if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
-                metrics.set_status("backoff")
-                notify_status("sync-run reconciliation unavailable; traffic blocked")
-                if not await wait_before_retry(
-                    shutdown_event, 30, validation_once=validation_once,
-                ):
-                    return
-                continue
-
-            # Never mint a paid-proxy session before the persistent control
-            # allows traffic. Missing control/DB is intentionally fail-closed.
-            snapshot = await refresh_proxy_gate(proxy_control, backoff)
-            if not snapshot.allowed:
+            try:
+                outcome = await maintenance.run(lambda: initialize_worker_attempt(
+                    pool, scheduler, metrics, backoff, proxy_control, config,
+                    validation_once=validation_once,
+                    process_outside_office_hours=process_outside_office_hours,
+                    imports_enabled=imports_enabled,
+                ))
+            except MaintenanceError:
                 metrics.set_status("paused")
-                notify_status("paused")
-                logger.warning(
-                    "Proxy control denies startup traffic (status=%s reason=%s revision=%s)",
-                    snapshot.status, snapshot.reason_code, snapshot.revision,
-                )
-                if not await wait_before_retry(
-                    shutdown_event, 30, validation_once=validation_once,
-                ):
-                    return
+                notify_status("maintenance admission closed")
+                # A held one-shot must also remain alive and acknowledge hold.
+                await wait_before_retry(shutdown_event, 1, validation_once=False)
                 continue
-
-            prewarm = can_initialize_paid_pool(
-                validation_once=validation_once,
-                process_outside_office_hours=process_outside_office_hours,
-            )
-            if not prewarm and not imports_enabled:
-                metrics.set_status("idle_off_hours")
-                notify_status("idle outside PJUD office hours")
-                if not await wait_before_retry(
-                    shutdown_event, 30, validation_once=validation_once,
-                ):
-                    return
-                continue
-
-            if not await scheduler_contract_ready(scheduler, metrics, backoff):
-                metrics.set_status("backoff")
-                notify_status("scheduler migration unavailable; mint blocked")
-                if not await wait_before_retry(
-                    shutdown_event, 30, validation_once=validation_once,
-                ):
-                    return
-                continue
-
-            if not prewarm:
-                # Manual discovery claims and authorizes credentials before
-                # checkout. Preparing empty slots does not mint/pay for idle
-                # capacity; normal acquisition retains proxy/cost controls.
-                await pool.initialize(prewarm=False)
+            if outcome == "ready":
                 initialized = True
                 break
 
-            metrics.set_status("starting")
-            notify_status("initializing proxy pool")
-            initialized = await safe_initialize_pool(
-                pool,
-                max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
-                proxy_control=proxy_control,
-                backoff=backoff,
-            )
-            if initialized:
-                break
+            if outcome != "mint_failed":
+                status, message = {
+                    "reconcile_unavailable": ("backoff", "sync-run reconciliation unavailable; traffic blocked"),
+                    "paused": ("paused", "paused"),
+                    "idle_off_hours": ("idle_off_hours", "idle outside PJUD office hours"),
+                    "contract_unavailable": ("backoff", "scheduler migration unavailable; mint blocked"),
+                }[outcome]
+                metrics.set_status(status)
+                notify_status(message)
+                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                    return
+                continue
 
             logger.error(
                 "No se pudo inicializar el pool tras %d reintentos; worker queda inactivo pero vivo",
@@ -495,6 +569,7 @@ async def main():
                     metrics,
                     shutdown_event,
                     traffic_allowed=lambda: not backoff.is_open,
+                    maintenance=maintenance,
                 ),
                 name="pjud-import-discovery",
             )
@@ -511,7 +586,16 @@ async def main():
             )
 
         while not shutdown_event.is_set():
-            if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+            try:
+                snapshot = await maintenance.run(lambda: reconcile_and_refresh(
+                    scheduler, metrics, backoff, proxy_control,
+                ))
+            except MaintenanceError:
+                metrics.set_status("paused")
+                notify_status("maintenance admission closed")
+                await wait_before_retry(shutdown_event, 1, validation_once=False)
+                continue
+            if snapshot is None:
                 metrics.set_status("backoff")
                 notify_status("sync-run reconciliation unavailable; traffic blocked")
                 if not await wait_before_retry(
@@ -520,7 +604,6 @@ async def main():
                     return
                 continue
 
-            snapshot = await refresh_proxy_gate(proxy_control, backoff)
             if not snapshot.allowed:
                 metrics.set_status("paused")
                 notify_status("paused")
@@ -563,7 +646,23 @@ async def main():
             metrics.set_status("running")
             notify_status("running")
 
-            batch = await safe_get_next_batch(scheduler, metrics, backoff)
+            concurrency = public_sync_concurrency(
+                session_capacity, imports_enabled=import_task is not None,
+            )
+            try:
+                batch = await maintenance.run(lambda: claim_process_release_batch(
+                    scheduler, metrics, backoff, engine, concurrency, shutdown_event,
+                    proxy_control=proxy_control,
+                    processing_window=lambda: is_processing_allowed(
+                        validation_once=validation_once,
+                        process_outside_office_hours=process_outside_office_hours,
+                    ),
+                ))
+            except MaintenanceError:
+                metrics.set_status("paused")
+                notify_status("maintenance admission closed")
+                await wait_before_retry(shutdown_event, 1, validation_once=False)
+                continue
 
             if batch is None:
                 metrics.set_status("backoff")
@@ -589,31 +688,6 @@ async def main():
                     pass
                 continue
 
-            case_ids = [c["id"] for c in batch]
-
-            session_capacity = (
-                config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
-            )
-            concurrency = public_sync_concurrency(
-                session_capacity,
-                imports_enabled=import_task is not None,
-            )
-            await process_batch(
-                batch,
-                engine,
-                concurrency,
-                shutdown_event,
-                backoff,
-                proxy_control=proxy_control,
-                processing_window=(
-                    lambda: is_processing_allowed(
-                        validation_once=validation_once,
-                        process_outside_office_hours=process_outside_office_hours,
-                    )
-                ),
-            )
-
-            await scheduler.release_batch(case_ids)
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
             if validation_once:
                 logger.info("One-shot validation completed one batch")
@@ -623,6 +697,7 @@ async def main():
         notify_stopping()
         logger.info("Shutting down...")
         shutdown_event.set()
+        await asyncio.gather(maintenance_task, return_exceptions=True)
         if 'engine' in locals():
             engine.stop_accepting_work()
         if import_task is not None:

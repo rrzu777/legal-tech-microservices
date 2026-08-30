@@ -1,4 +1,5 @@
 import asyncio
+from contextvars import copy_context
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -7,12 +8,20 @@ from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 from app.proxy import sticky_lifetime_seconds
+from worker.maintenance import has_active_operation, track_auxiliary
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 
 
 async def run_query(query):
     """Run a Supabase query chain in a thread to avoid blocking the event loop."""
+    if has_active_operation():
+        # Register the executor's real completion, not a cancellable to_thread
+        # wrapper. No await may separate the pre-creation probe and registration.
+        future = asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, query.execute,
+        )
+        return await track_auxiliary(future)
     return await asyncio.to_thread(query.execute)
 
 

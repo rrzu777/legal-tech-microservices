@@ -15,6 +15,84 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 
+@pytest.fixture(autouse=True)
+def _local_maintenance(monkeypatch, worker_maintenance):
+    from worker import __main__ as worker_main
+    from worker.maintenance_store import MaintenanceStore, ProcessIdentity
+    monkeypatch.setattr(MaintenanceStore, "production", lambda: worker_maintenance.store)
+    monkeypatch.setattr(ProcessIdentity, "current", lambda: worker_maintenance.identity)
+    monkeypatch.setattr(worker_main, "WorkerMaintenance", lambda store, identity: worker_maintenance)
+
+
+@pytest.mark.asyncio
+async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatch, worker_maintenance):
+    from worker import __main__ as worker_main
+    from worker.metrics import Metrics
+    from worker.maintenance import has_active_operation
+    from worker.proxy_control import ProxyControlSnapshot
+    from tests.test_maintenance_wiring import hold, assert_quiescent
+    from dataclasses import replace
+
+    config = _entrypoint_config()
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = True
+    config.HEARTBEAT_INTERVAL_S = 0.001
+    scheduler, pool = AsyncMock(), MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
+    heartbeat_db = MagicMock()
+    metrics = Metrics(config, heartbeat_db)
+    _patch_entrypoint(monkeypatch, worker_main, config=config, scheduler=scheduler,
+                      pool=pool, metrics=metrics, backoff=MagicMock(is_open=False))
+    handlers = {}
+    monkeypatch.setattr(worker_main.signal, "signal", lambda sig, fn: handlers.update({sig: fn}))
+    ready, heartbeat, reopen = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(worker_main, "notify_ready", ready.set)
+    watchdog_count = []
+    def watchdog():
+        assert not has_active_operation()
+        watchdog_count.append(1)
+        if len(watchdog_count) >= 2:
+            heartbeat.set()
+    monkeypatch.setattr("worker.metrics.notify_watchdog", watchdog)
+    gate = AsyncMock(return_value=ProxyControlSnapshot(True, "enabled", None, 1, "database"))
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", gate)
+    monkeypatch.setattr(worker_main, "can_initialize_paid_pool", lambda **kw: False)
+    engine_factory = MagicMock()
+    monkeypatch.setattr(worker_main, "SyncEngine", engine_factory)
+    async def retry(*args, **kwargs):
+        await reopen.wait()
+        return True
+    monkeypatch.setattr(worker_main, "wait_before_retry", retry)
+    async def initialize(**kwargs):
+        assert has_active_operation()
+        handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
+    pool.initialize.side_effect = initialize
+    hold(worker_maintenance)
+    running = asyncio.create_task(worker_main.main())
+    try:
+        await asyncio.wait_for(ready.wait(), 1)
+        pool.initialize.assert_not_awaited()
+        scheduler.reconcile_stale_runs.assert_not_awaited()
+        await asyncio.wait_for(heartbeat.wait(), 1)
+        assert ready.is_set()
+        assert_quiescent(worker_maintenance)
+        pool.initialize.assert_not_awaited()
+        scheduler.reconcile_stale_runs.assert_not_awaited()
+        scheduler.verify_claim_contract.assert_not_awaited()
+        scheduler.get_next_batch.assert_not_awaited()
+        gate.assert_not_awaited()
+        engine_factory.assert_not_called()
+        control = worker_maintenance.store.read_control()
+        worker_maintenance.store.transition(control.operation_id, "hold", replace(control, state="open"))
+        reopen.set()
+        await asyncio.wait_for(running, 1)
+        pool.initialize.assert_awaited_once_with(prewarm=False)
+        scheduler.reconcile_stale_runs.assert_awaited_once()
+        scheduler.verify_claim_contract.assert_awaited_once()
+    finally:
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
 def _entrypoint_config(*, validation_once=False):
     config = MagicMock()
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = validation_once
@@ -117,6 +195,83 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
     else:
         pool.initialize.assert_awaited_once_with(prewarm=False)
     pool.close_all.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["startup_reconcile", "proxy_refresh", "contract", "initialize",
+                                      "recurrent_reconcile", "batch_claim", "batch_release"])
+async def test_main_holds_complete_operation_at_each_effect_boundary(monkeypatch, worker_maintenance, boundary):
+    from worker import __main__ as worker_main
+    from worker.maintenance import has_active_operation
+    from worker.proxy_control import ProxyControlSnapshot
+    from tests.test_maintenance_wiring import hold, assert_held, assert_quiescent
+
+    config = _entrypoint_config(validation_once=True)
+    scheduler = AsyncMock()
+    pool = MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
+    engine = MagicMock(sync_case=AsyncMock(), drain_work=AsyncMock())
+    _patch_entrypoint(monkeypatch, worker_main, config=config, scheduler=scheduler,
+                      pool=pool, metrics=MagicMock(stop=AsyncMock()), backoff=MagicMock(is_open=False))
+    monkeypatch.setattr(worker_main, "SyncEngine", lambda **kw: engine)
+    monkeypatch.setattr(worker_main, "can_initialize_paid_pool", lambda **kw: True)
+    monkeypatch.setattr(worker_main, "is_processing_allowed", lambda **kw: True)
+    monkeypatch.setattr(worker_main, "maybe_alert_bandwidth", AsyncMock())
+    handlers = {}
+    monkeypatch.setattr(worker_main.signal, "signal", lambda sig, fn: handlers.update({sig: fn}))
+    started, finish = asyncio.Event(), asyncio.Event()
+    phases = []
+    async def phase(name):
+        assert has_active_operation(), f"unadmitted {name}"
+        phases.append(name)
+        if name == boundary:
+            started.set()
+            await finish.wait()
+    async def reconcile():
+        await phase("startup_reconcile" if not phases else "recurrent_reconcile")
+    async def proxy(*args):
+        await phase("proxy_refresh")
+        return ProxyControlSnapshot(True, "enabled", None, 1, "database")
+    async def contract():
+        await phase("contract")
+    async def initialize():
+        await phase("initialize")
+    async def claim():
+        await phase("batch_claim")
+        return [{"id": "case"}]
+    async def release(ids):
+        assert ids == ["case"]
+        await phase("batch_release")
+    async def sync(case):
+        await phase("sync_case")
+    scheduler.reconcile_stale_runs.side_effect = reconcile
+    scheduler.verify_claim_contract.side_effect = contract
+    scheduler.get_next_batch.side_effect = claim
+    scheduler.release_batch.side_effect = release
+    engine.sync_case.side_effect = sync
+    pool.initialize.side_effect = initialize
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", proxy)
+    async def retry(*a, **kw):
+        handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
+        return True
+    monkeypatch.setattr(worker_main, "wait_before_retry", retry)
+    running = asyncio.create_task(worker_main.main())
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        hold(worker_maintenance)
+        assert_held(worker_maintenance)
+        finish.set()
+        await asyncio.wait_for(running, 1)
+        assert_quiescent(worker_maintenance)
+        if boundary in {"batch_claim", "batch_release"}:
+            assert phases[-1] == "batch_release"
+            engine.sync_case.assert_awaited_once()
+        else:
+            scheduler.get_next_batch.assert_not_awaited()
+    finally:
+        finish.set()
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
 
 
 def test_one_shot_validation_can_initialize_outside_office_window():

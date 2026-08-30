@@ -8,6 +8,7 @@ from app.bandwidth import record_proxy_request, record_proxy_response_increment
 from app.cookie_scope import CookieRecord, legacy_cookie_records, playwright_cookie_records
 from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
+from worker.maintenance import has_active_operation, mark_uncertain, track_auxiliary
 
 logger = logging.getLogger(__name__)
 
@@ -61,21 +62,27 @@ class CookieMinter:
 
     async def _close_playwright_resource(self, resource, label: str) -> None:
         """Close a browser resource without allowing cleanup to extend PJUD traffic."""
+        has_active_operation()  # Reject inherited closed contexts before work.
         close = getattr(resource, "close", None)
         if close is None:
             return
         try:
             await asyncio.wait_for(close(), timeout=_CLEANUP_TIMEOUT_S)
         except (asyncio.TimeoutError, PlaywrightError):
+            if has_active_operation():
+                mark_uncertain()
             logger.warning("pjud_mint_%s_cleanup_unavailable", label)
 
     async def _detach_cdp_session(self, session) -> None:
+        has_active_operation()
         try:
             await asyncio.wait_for(
                 session.detach(),
                 timeout=_CLEANUP_TIMEOUT_S,
             )
         except Exception:
+            if has_active_operation():
+                mark_uncertain()
             logger.warning("pjud_mint_cdp_cleanup_unavailable")
 
     async def _create_cdp_meter(self, context, page):
@@ -119,6 +126,7 @@ class CookieMinter:
             logger.warning("pjud_mint_cdp_fence_unavailable")
 
     async def mint(self) -> MintResult:
+        has_active_operation()
         launch_kwargs = {"headless": False, "args": _ANTIBOT_ARGS}
         if self._proxy:
             # Playwright rechaza credenciales embebidas en `server`
@@ -178,7 +186,27 @@ class CookieMinter:
                 try:
                     await self._fence_cdp_callbacks(cdp_session)
                 finally:
+                    admitted = has_active_operation()
                     cleanup = [self._close_playwright_resource(browser, "browser")]
                     if cdp_session is not None:
                         cleanup.append(self._detach_cdp_session(cdp_session))
-                    await asyncio.gather(*cleanup)
+                    completed = asyncio.gather(*cleanup, return_exceptions=admitted)
+                    if not admitted:
+                        await completed
+                    else:
+                        try:
+                            results = await track_auxiliary(completed)
+                            for result in results:
+                                if isinstance(result, BaseException):
+                                    mark_uncertain()
+                                    raise result
+                        except asyncio.CancelledError:
+                            mark_uncertain()
+                            # Keep the Playwright driver alive until its bounded
+                            # browser/CDP cleanup settles, including repeat cancel.
+                            while not completed.done():
+                                try:
+                                    await asyncio.shield(completed)
+                                except asyncio.CancelledError:
+                                    mark_uncertain()
+                            raise
