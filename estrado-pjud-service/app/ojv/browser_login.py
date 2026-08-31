@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -36,6 +37,7 @@ _OFFICIAL_HOST = "oficinajudicialvirtual.pjud.cl"
 _LOGIN_TIMEOUT_S = 45.0
 _CLEANUP_TIMEOUT_S = 1.0
 _RUT_PLACEHOLDER = "Ingrese su Rut sin dígito verificador, Ej: 12345678"
+logger = logging.getLogger(__name__)
 
 
 def _rut_body(rut: str) -> str:
@@ -267,22 +269,31 @@ async def login_official_ojv(
     manager_entered = False
     rut_value = password_value = rut_digits = ""
     launch_kwargs: dict[str, object] = {"headless": False, "args": _ANTIBOT_ARGS}
+    # Only literals assigned locally: never attach URLs, exception objects,
+    # browser state, credentials or cookie contents to diagnostic records.
+    stage = "proxy_config"
     try:
         if proxy_url:
             launch_kwargs["proxy"] = split_proxy_for_playwright(proxy_url)
         proxy_url = None
+        stage = "playwright_enter"
         playwright = await _within_deadline(manager.__aenter__(), deadline)
         manager_entered = True
         try:
+            stage = "browser_launch"
             browser = await _within_deadline(playwright.chromium.launch(**launch_kwargs), deadline)
             launch_kwargs.clear()
+            stage = "context_create"
             context = await _within_deadline(browser.new_context(user_agent=user_agent), deadline)
+            stage = "page_create"
             page = await _within_deadline(context.new_page(), deadline)
             page.on("request", _record_request)
+            stage = "cdp_enable"
             cdp_session = await _within_deadline(_create_cdp_meter(context, page), deadline)
             if cdp_session is None:
                 failure = OjvUpstreamChangedError()
             if failure is None:
+                stage = "entry_goto"
                 response = await _within_deadline(page.goto(
                     _OFFICIAL_ENTRY, wait_until="domcontentloaded", timeout=_remaining_timeout_ms(deadline),
                 ), deadline)
@@ -294,16 +305,21 @@ async def login_official_ojv(
                 elif status >= 400 or not _is_trusted_official_url(page.url):
                     failure = OjvUpstreamChangedError()
             if failure is None:
+                stage = "services_visible"
                 services = page.get_by_role("button", name="Todos los servicios", exact=True)
                 if not await _wait_visible(services, deadline):
                     failure = OjvUpstreamChangedError()
             if failure is None:
+                stage = "services_click"
                 await _within_deadline(services.click(timeout=_remaining_timeout_ms(deadline)), deadline)
+                stage = "clave_visible"
                 clave = page.get_by_role("link", name="Clave Poder Judicial", exact=True)
                 if not await _wait_visible(clave, deadline):
                     failure = OjvUpstreamChangedError()
             if failure is None:
+                stage = "clave_click"
                 await _within_deadline(clave.click(timeout=_remaining_timeout_ms(deadline)), deadline)
+                stage = "form_visible"
                 modal = page.locator("#segunda-clave-access")
                 form = modal.locator("#fSGN")
                 rut_input = form.locator("input[type=text]")
@@ -314,6 +330,7 @@ async def login_official_ojv(
                 elif await _within_deadline(rut_input.get_attribute("placeholder"), deadline) != _RUT_PLACEHOLDER:
                     failure = OjvUpstreamChangedError()
             if failure is None:
+                stage = "rut_fill"
                 rut_value = rut.get_secret_value()
                 password_value = password.get_secret_value()
                 rut_digits = _rut_body(rut_value)
@@ -324,15 +341,19 @@ async def login_official_ojv(
                     if not _is_trusted_official_url(page.url):
                         failure = OjvUpstreamChangedError()
                     else:
+                        stage = "password_fill"
                         await _within_deadline(password_input.fill(password_value, timeout=_remaining_timeout_ms(deadline)), deadline)
                         if not _is_trusted_official_url(page.url):
                             failure = OjvUpstreamChangedError()
                         else:
+                            stage = "submit"
                             await _within_deadline(submit.click(timeout=_remaining_timeout_ms(deadline)), deadline)
                             submitted = True
             if failure is None and submitted:
+                stage = "post_submit"
                 failure = await _resolve_post_submit(page, deadline)
             if failure is None and submitted:
+                stage = "landing"
                 if not _is_trusted_official_url(page.url, landing=True):
                     failure = OjvUpstreamChangedError()
                 else:
@@ -341,6 +362,7 @@ async def login_official_ojv(
                     if not await _wait_visible(account, deadline) or not await _wait_visible(my_causes, deadline):
                         failure = OjvUpstreamChangedError()
             if failure is None and submitted:
+                stage = "cookie_snapshot"
                 result = BrowserLoginResult(
                     playwright_cookie_records(await _within_deadline(context.cookies(), deadline)), user_agent=user_agent,
                 )
@@ -356,6 +378,8 @@ async def login_official_ojv(
             cancelled = await _cleanup_all((cdp_session, "cdp"), (page, "resource"), (context, "resource"), (browser, "resource")) or cancelled
             cdp_session = page = context = browser = None
             try:
+                if failure is None:
+                    stage = "runtime_exit"
                 await asyncio.wait_for(manager.__aexit__(None, None, None), timeout=_CLEANUP_TIMEOUT_S)
             except asyncio.CancelledError:
                 cancelled = True
@@ -388,6 +412,7 @@ async def login_official_ojv(
     if cancelled:
         raise asyncio.CancelledError()
     if failure is not None:
+        logger.warning("pjud_private_login_failed stage=%s outcome=%s", stage, failure.code.value)
         raise failure from None
     if result is None:
         raise OjvUpstreamChangedError()

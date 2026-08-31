@@ -630,3 +630,83 @@ async def test_expired_landing_resolves_timeout_without_any_ui_lookup() -> None:
 
     result = await _resolve_post_submit(LandingAtExpiry(), time.monotonic() - 0.001)
     assert isinstance(result, OjvTimeoutError)
+
+
+@pytest.mark.parametrize("boundary", [
+    "browser_launch", "context_create", "page_create", "entry_goto",
+    "rut_fill", "password_fill", "cookie_snapshot", "runtime_exit",
+])
+async def test_failure_diagnostic_identifies_boundary_without_provider_secrets(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, boundary: str,
+) -> None:
+    import app.ojv.browser_login as adapter
+
+    page = _Page()
+    context = _Context(page)
+    browser = _Browser(context)
+    chromium = _Chromium(browser)
+    manager = _PlaywrightManager(chromium)
+    targets = {
+        "browser_launch": (chromium, "launch"),
+        "context_create": (browser, "new_context"),
+        "page_create": (context, "new_page"),
+        "entry_goto": (page, "goto"),
+        "rut_fill": (page.form.rut, "fill"),
+        "password_fill": (page.form.password, "fill"),
+        "cookie_snapshot": (context, "cookies"),
+        "runtime_exit": (manager, "__aexit__"),
+    }
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError("password=synthetic-sensitive https://private.invalid/?token=secret")
+
+    target, method = targets[boundary]
+    monkeypatch.setattr(target, method, fail)
+    monkeypatch.setattr(adapter, "async_playwright", lambda: manager)
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("synthetic-sensitive"), proxy_url=None, user_agent="official-test-agent")
+    records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+    assert len(records) == 1
+    assert records[0].getMessage() == f"pjud_private_login_failed stage={boundary} outcome=upstream_changed"
+    assert records[0].exc_info is None
+    assert records[0].stack_info is None
+    assert "synthetic-sensitive" not in repr(records[0].__dict__)
+    assert "private.invalid" not in repr(records[0].__dict__)
+
+
+async def test_cdp_failure_diagnostic_preserves_original_stage_through_exit_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import app.ojv.browser_login as adapter
+
+    context = _Context(_Page())
+    manager = _PlaywrightManager(_Chromium(_Browser(context)))
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError("sensitive-provider-details")
+
+    monkeypatch.setattr(context, "new_cdp_session", fail)
+    monkeypatch.setattr(manager, "__aexit__", fail)
+    monkeypatch.setattr(adapter, "async_playwright", lambda: manager)
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+    assert [record.getMessage() for record in records] == [
+        "pjud_private_login_failed stage=cdp_enable outcome=upstream_changed",
+    ]
+
+
+async def test_success_and_cancellation_do_not_emit_login_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    page = _Page()
+    _install_fake_browser(monkeypatch, page)
+    await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(page, "goto", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert not [record for record in caplog.records if record.name == "app.ojv.browser_login"]
