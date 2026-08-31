@@ -39,7 +39,6 @@ class RealWorkerFixtureTests(unittest.TestCase):
                                      StorePolicy(os.getuid(), os.getgid(), os.getuid(), os.getgid()),
                                      allow_control_writes=True)
             initial = store.initialize_hold(str(uuid.uuid4()))
-            store.transition(initial.operation_id, 'hold', replace(initial, state='open'))
             identity = (ProcessIdentity.current() if sys.platform == 'linux' else
                         ProcessIdentity(str(uuid.uuid4()), os.getpid(), 42, str(uuid.uuid4())))
             worker = WorkerMaintenance(store, identity)
@@ -58,6 +57,15 @@ class RealWorkerFixtureTests(unittest.TestCase):
                                     return value
                             await asyncio.sleep(0.01)
                 try:
+                    async with asyncio.timeout(2):
+                        while not (root / 'logs/heartbeat.json').is_file():
+                            await asyncio.sleep(0.01)
+                    cold = json.loads((root / 'logs/heartbeat.json').read_text())[0]
+                    self.assertEqual(cold['status'], 'paused')
+                    self.assertTrue(cold['metadata']['maintenance']['startup_blocked'])
+                    self.assertEqual(cold['metadata']['maintenance']['operation_id'], initial.operation_id)
+                    self.assertEqual(worker.inflight, 0)
+                    store.transition(initial.operation_id, 'hold', replace(initial, state='open'))
                     self.assertEqual((await command('start'))['outcome'], 'started')
                     current = store.read_control()
                     held = replace(current, state='hold', operation_id=str(uuid.uuid4()))
@@ -69,12 +77,19 @@ class RealWorkerFixtureTests(unittest.TestCase):
                         pass
                     self.assertEqual((await command('release'))['outcome'], 'released')
                     async with asyncio.timeout(2):
-                        while worker.inflight:
+                        while worker.inflight or json.loads((root / 'logs/heartbeat.json').read_text())[0]['status'] != 'paused':
                             await asyncio.sleep(0.01)
                     with store.exclusive_lease():
                         self.assertEqual(worker.publish_ack().state, 'quiescent')
                     self.assertFalse(worker.uncertain)
-                    self.assertEqual(json.loads((root / 'logs/heartbeat.json').read_text())[0]['status'], 'maintenance')
+                    heartbeat = json.loads((root / 'logs/heartbeat.json').read_text())[0]
+                    self.assertEqual(heartbeat['status'], 'paused')
+                    proof = heartbeat['metadata']['maintenance']
+                    self.assertEqual(proof, {
+                        'version': 1, 'operation_id': held.operation_id,
+                        'identity': f'{identity.boot_id}:{identity.pid}:{identity.start_ticks}:{identity.instance_id}',
+                        'state': 'quiescent', 'inflight': 0, 'startup_blocked': False,
+                    })
                 finally:
                     shutdown.set()
                     await asyncio.wait_for(running, 2)

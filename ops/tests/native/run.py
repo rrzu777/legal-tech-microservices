@@ -78,7 +78,7 @@ def main():
                 '--memory', '3g', '--memory-swap', '3g', '--cpus', '2', '--pids-limit', '128',
                 '--entrypoint', '/usr/bin/timeout', image_id,
                 '3600', 'python3', '/usr/local/bin/native-vm-boot.py')
-        # Tracked ops + explicit fixtures + four stdlib worker modules only.
+        # Tracked ops + explicit fixtures + five stdlib worker modules only.
         # Never copy the workspace,
         # .env files, SSH agent, Docker socket or a host filesystem mount.
         listing = '\0'.join(payload_files(ROOT)) + '\0'

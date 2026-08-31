@@ -379,6 +379,9 @@ async def initialize_worker_attempt(
     validation_once: bool, process_outside_office_hours: bool, imports_enabled: bool,
 ) -> str:
     """One bounded startup operation; idle/retry waits belong outside admission."""
+    # Only reached after admission. A forbidden initializer must not refresh
+    # proxy control merely to manufacture an idle heartbeat on closed startup.
+    metrics.initialization_started = True
     if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
         return "reconcile_unavailable"
     snapshot = await refresh_proxy_gate(proxy_control, backoff)
@@ -473,7 +476,7 @@ async def main():
     )
     scheduler = Scheduler(config, supabase)
     notifier = Notifier(supabase)
-    metrics = Metrics(config, supabase, pool=pool, proxy_control=proxy_control)
+    metrics = Metrics(config, supabase, pool=pool, proxy_control=proxy_control, maintenance=maintenance)
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors

@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, '/opt/legal-tech-microservices/estrado-pjud-service')
 from worker.maintenance import WorkerMaintenance
+from worker.maintenance_heartbeat import maintenance_proof
 from worker.maintenance_store import AdmissionClosed, MaintenanceStore, ProcessIdentity
 from worker.sd_notify import notify_ready, notify_watchdog
 
@@ -30,12 +31,15 @@ async def serve(worker, logs, shutdown, *, poll_seconds=0.05):
     worker.publish_ack()
     notify_ready()
     next_watchdog = 0
+    initialization_started = False
 
     def result(request, outcome):
         write_json(logs / 'result.json', {'id': request, 'outcome': outcome, 'pid': os.getpid()})
 
     async def admitted(request):
         async def body():
+            nonlocal initialization_started
+            initialization_started = True
             result(request, 'started')
             await release.wait()
         try:
@@ -44,15 +48,21 @@ async def serve(worker, logs, shutdown, *, poll_seconds=0.05):
             result(request, 'blocked')
 
     async def no_effect():
+        nonlocal initialization_started
+        initialization_started = True
         return None
 
     try:
         while not shutdown.is_set():
             worker.publish_ack()
+            proof = maintenance_proof(worker, initialization_started=initialization_started)
             write_json(logs / 'heartbeat.json', [{
-                'status': 'maintenance' if worker.store.read_control().state == 'hold' else 'idle_off_hours',
+                'status': 'paused' if proof is not None else ('running' if worker.inflight else 'idle_off_hours'),
                 'last_heartbeat_at': datetime.now(timezone.utc).isoformat(),
-                'metadata': {'process_outside_office_hours_enabled': False, 'mint_attempts': 0},
+                'metadata': {'process_outside_office_hours_enabled': False, 'mint_attempts': 0,
+                             'maintenance': proof, 'proxy_control_status': 'unavailable',
+                             'proxy_control_reason': 'not_configured', 'proxy_control_revision': None,
+                             'proxy_control_source': 'local'},
             }])
             if asyncio.get_running_loop().time() >= next_watchdog:
                 notify_watchdog()

@@ -3,6 +3,17 @@
 Estado: diseño aprobado; implementación local en curso, no desplegada.
 Base inspeccionada: `38b92bd3a53fff791a3ddd02a01e9c2c8fd08d34` (PR #105 y #106).
 
+Integración posterior: rama local rebased sobre
+`1443c9509c3f7202868849b06b5118c9135c0dc4`, preservando PR #107–#110 de login
+oficial. El ensayo nativo del protocolo pasó; la revisión global exige además
+cerrar la propiedad del runtime de navegador y alinear el heartbeat real bajo
+hold. Ninguno de esos resultados implica despliegue productivo.
+
+Verificación posterior de esos tres ajustes: suite completa1799pass/1skip previo
+y nuevo ensayo nativo PASS (payload86, cinco módulos stdlib) en
+`/private/tmp/resource-guards-hvf-evidence-wpmowowc/`. Resta revisión focalizada
+final e integración; no bootstrap, rollout productivo ni acceso de invitados.
+
 En criollo: al iniciar mantenimiento no entra trabajo nuevo; lo que ya empezó
 termina antes del reinicio. Si el instalador se cae, el worker queda esperando
 una recuperación explícita en vez de volver a trabajar por su cuenta.
@@ -121,6 +132,21 @@ El worker entra al gate antes de inicializar pool, reconciliar/claimar trabajos
 o crear loops de trabajo. Si está cerrado mantiene heartbeat/notify/watchdog y
 publica ACK con su nueva identidad, sin iniciar ni mintear sesiones. Los
 controles de seguridad existentes de proxy/costo no se relajan al salir del gate.
+
+El heartbeat conserva el estado persistido existente `paused`; un contrato
+explícito de metadata distingue mantenimiento de otras pausas. `paused` genérico
+no acredita quiescencia. Guards debe exigir además hold/ACK/EX autenticados y sus
+controles de frescura, claims y mint. El estado de proxy intencionalmente todavía
+no inicializado durante arranque cerrado debe distinguirse de telemetría
+genuinamente desconocida, inválida o no disponible: ésta sigue bloqueando.
+No se agrega un estado de base de datos ni se autoriza una migración.
+
+La propiedad de las operaciones comprende también el runtime Playwright completo,
+no sólo page/context/browser. Enter parcial, launch y salida/cancelación de su
+driver deben quedar resueltos o marcar incertidumbre antes de que un consumidor
+convierta el error en un resultado de negocio. El cierre desconocido conserva SH
+y no publica quiescent, aunque el consumidor absorba la excepción. Los callers
+fuera de admisión mantienen su comportamiento previo.
 
 Se prueba expresamente hold durante startup, durante await de un claim y con
 jobs esperando capacidad. El ACK no puede adelantarse al fin de esas operaciones.

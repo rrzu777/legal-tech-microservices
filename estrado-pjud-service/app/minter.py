@@ -8,6 +8,7 @@ from app.bandwidth import record_proxy_request, record_proxy_response_increment
 from app.cookie_scope import CookieRecord, legacy_cookie_records, playwright_cookie_records
 from app.failure_kind import MintUnavailableError
 from app.proxy import split_proxy_for_playwright
+from app.playwright_runtime import owned_playwright
 from worker.maintenance import has_active_operation, mark_uncertain, track_auxiliary
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ class CookieMinter:
             # Deben ir separadas en username/password.
             launch_kwargs["proxy"] = split_proxy_for_playwright(self._proxy)
 
-        async with async_playwright() as pw:
+        async with owned_playwright(async_playwright, cleanup_timeout=_CLEANUP_TIMEOUT_S) as pw:
             try:
                 browser = await pw.chromium.launch(**launch_kwargs)
             except PlaywrightError:

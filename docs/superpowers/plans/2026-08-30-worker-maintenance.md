@@ -14,6 +14,9 @@
 
 - Local worktree only; no VPS, publishing, DB migrations, secrets, proxy controls, Telegram or paid PJUD traffic.
 - Preserve main PR #105 and #106; base `38b92bd3a53fff791a3ddd02a01e9c2c8fd08d34`.
+- Preserve subsequent upstream PR #107–#110 as well; local branch rebased on
+  `1443c9509c3f7202868849b06b5118c9135c0dc4`. Final integration fixes must keep
+  official-login behavior and redacted diagnostics, and cover its runtime ownership.
 - Control `/var/lib/worker-maintenance`: root:estrado 0750; `control.json` and stable `admission.lock`: root:estrado 0640, regular, nlink=1, no symlink components.
 - ACK directory `/run/worker-maintenance`: worker UID, 0700, recreated by systemd each start. ACK maximum 8192 bytes and no judicial data.
 - No absent/invalid-state fallback to open; no expiry/TTL auto-release; no manual import feature flag change.
@@ -135,3 +138,25 @@ stop_worker_for_change
 - [ ] Exercise operation admitted before hold, blocked new operation, safe drain, real guards apply/postflight, manual rollback and injected-failure automatic rollback while closed; explicit validated release. Add stale ACK/PID/nonce, helper death, closed restart and rejected legacy legs. Keep host 2 CPU/4 GiB VM, watchdog/lifetime/net isolation from existing harness; RAM admission exclusion remains explicit.
 - [ ] Run focused tests then one fresh integral HVF trial; on unexpected failure capture redacted evidence and correct local implementation, not production gates. No paid calls or external credentials.
 - [ ] Write exact completed vs pending bootstrap/production/observation/access gates; run final broad review of branch. Address findings, verify clean tree, retain local commits. Ask integration authority at handoff, not between local tasks.
+
+## Final review integration follow-up
+
+Tasks 1–4 were implemented, independently reviewed and locally committed; the
+corrected native trial passed. After preserving PR #107–#110 by rebase, the final
+whole-branch review identified three coupled gaps. One final fix wave addresses:
+
+- Full Playwright runtime ownership across minter and official-login consumers,
+  including swallowed failure and repeated cancellation; no false quiescence.
+- The real producer/guards/native-fixture heartbeat contract for closed startup
+  in direct and proxy modes. Keep persisted `paused` plus explicit maintenance
+  metadata; no schema migration, generic pause acceptance or unknown-telemetry bypass.
+- Frozen incoming/rollback coverage of the new login/session ownership boundary
+  and necessary participating modules, with change/removal negative cases.
+
+Fresh covering tests and a scoped final re-review precede the final local commit.
+Fresh final verification: service1799passed/1preexisting skip; Linux183passed;
+guards1134ok/0fail; deploy184ok/0fail plus API-only focus81ok/0fail. The corrected
+86-file native trial passed at `/private/tmp/resource-guards-hvf-evidence-wpmowowc/`,
+including apply/postflight and both exact rollback paths with hold until release.
+Production/bootstrap/capacity/real-traffic/guest-access gates remain separate.
+The controller ledger records exact SHAs and evidence; scoped review is pending.

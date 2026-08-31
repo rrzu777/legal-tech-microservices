@@ -23,7 +23,8 @@ QEMU = '/opt/homebrew/opt/qemu/bin/qemu-system-aarch64'
 BASE_HASH = 'afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f'
 CANCELLED = False
 WORKER_PAYLOAD = tuple('estrado-pjud-service/worker/' + name for name in
-                       ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py'))
+                       ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py',
+                        'maintenance_heartbeat.py'))
 
 
 def run(*args, check=True, timeout=60):

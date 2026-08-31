@@ -25,20 +25,24 @@ def _local_maintenance(monkeypatch, worker_maintenance):
 
 
 @pytest.mark.asyncio
-async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatch, worker_maintenance):
+@pytest.mark.parametrize("proxy_mode", [False, True])
+async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatch, worker_maintenance, proxy_mode):
     from worker import __main__ as worker_main
     from worker.metrics import Metrics
     from worker.maintenance import has_active_operation
-    from worker.proxy_control import ProxyControlSnapshot
+    from worker.proxy_control import ProxyControl, ProxyControlSnapshot
+    from tests.test_maintenance_heartbeat import guard_accepts
     from tests.test_maintenance_wiring import hold, assert_quiescent
     from dataclasses import replace
 
     config = _entrypoint_config()
+    config.OJV_PROXY_URL = "http://proxy.invalid" if proxy_mode else ""
     config.ENABLE_PJUD_MY_CAUSES_IMPORT = True
     config.HEARTBEAT_INTERVAL_S = 0.001
     scheduler, pool = AsyncMock(), MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
     heartbeat_db = MagicMock()
-    metrics = Metrics(config, heartbeat_db)
+    control = ProxyControl(heartbeat_db) if proxy_mode else None
+    metrics = Metrics(config, heartbeat_db, proxy_control=control, maintenance=worker_maintenance)
     _patch_entrypoint(monkeypatch, worker_main, config=config, scheduler=scheduler,
                       pool=pool, metrics=metrics, backoff=MagicMock(is_open=False))
     handlers = {}
@@ -72,6 +76,10 @@ async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatc
         pool.initialize.assert_not_awaited()
         scheduler.reconcile_stale_runs.assert_not_awaited()
         await asyncio.wait_for(heartbeat.wait(), 1)
+        assert metrics.initialization_started is False
+        assert guard_accepts(metrics.heartbeat_payload(), worker_maintenance, proxy_mode=proxy_mode)
+        if proxy_mode:
+            assert control.snapshot.reason_code == "not_loaded"
         assert ready.is_set()
         assert_quiescent(worker_maintenance)
         pool.initialize.assert_not_awaited()
@@ -84,6 +92,8 @@ async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatc
         worker_maintenance.store.transition(control.operation_id, "hold", replace(control, state="open"))
         reopen.set()
         await asyncio.wait_for(running, 1)
+        assert metrics.initialization_started is True
+        assert metrics.heartbeat_payload()["metadata"]["maintenance"] is None
         pool.initialize.assert_awaited_once_with(prewarm=False)
         scheduler.reconcile_stale_runs.assert_awaited_once()
         scheduler.verify_claim_contract.assert_awaited_once()

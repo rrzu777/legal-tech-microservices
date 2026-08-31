@@ -68,22 +68,44 @@ El mismo UUID abierto con journal succeeded es idempotente. El CLI de bajo nivel
 también expone `status`, `begin`, `verify-ack`, `finish`, pero su health check no
 reemplaza el postflight integral de guards. No usarlo para eludir ese gate.
 
-Deploy compara bytes de los once archivos de contrato contra una copia confiable
-capturada antes de mutación: inicializadores worker/app, entrypoint, coordinator,
-store, metrics, sd_notify, config, session_pool, r2 y minter. Tanto la revisión
+Deploy compara bytes de los 17 archivos de contrato contra una copia confiable
+capturada antes de mutación: inicializadores worker/app/app.ojv, entrypoint,
+coordinator, store, metrics, sd_notify, config, session_pool, proxy_control,
+maintenance_heartbeat, r2, minter, playwright_runtime y sesión/login oficial OJV. Tanto la revisión
 entrante como rollback deben coincidir. Esto permite cambios API/ops fuera de ese
 contrato, pero **no** sirve para instalar por primera vez otro contrato/worker.
+
+El runtime Playwright completo pertenece a la admisión, incluido enter parcial.
+Su tarea de salida original queda registrada y no se cancela al vencer el waiter
+ni ante cancelaciones repetidas. Mientras siga pendiente se conserva SH; si falla
+o no puede confirmarse a tiempo, la incertidumbre queda marcada antes de que un
+consumidor convierta el error en resultado de negocio. Un cierre posterior no
+borra esa incertidumbre. Callers API fuera de admisión conservan el manager original.
+
+El heartbeat conserva el status persistido `paused`. Solo `metadata.maintenance`
+con versión1, operación e identidad actuales, state `quiescent`, inflight0 y
+`startup_blocked` booleano identifica mantenimiento. La proyección comparte código
+con el fixture nativo y requiere ACK local válido; no sustituye ACK/EX/identidad,
+frescura, claims ni mint del operador. `paused` genérico no es prueba.
+En proxy, únicamente un startup aún no intentado bajo ese hold admite
+`unavailable/not_loaded`, revision null presente y source `local`: no se consulta
+proxy ni inicializa para construir la prueba. Cualquier otro estado desconocido
+continúa rechazado. Al ejecutar el inicializador se pierde esa excepción.
 
 ## Completado localmente vs pendiente
 
 - Implementación y pruebas focalizadas reales de archivos/locks/admisión,
   seguimiento de auxiliares, CLI, delegación y errores de publicación.
-- Ensayo HVF corregido: MainPID/ACK real, helper muerto con hold persistente,
+- Ensayo HVF previo a la ola final I1–I3: MainPID/ACK real, helper muerto con hold persistente,
   cinco campos stale rechazados, restart cerrado, rechazos legacy, preflight/
   apply/postflight, alertas locales `[]`, rollback manual y automático exactos
   con hold y liberación validada. Transporte de83 archivos sin `.env`, app,
   navegador, proxy o credenciales reales. Ver evidencia en el laboratorio nativo.
-- Pendiente: revisión global final de la rama y rebase/integración del controller.
+- Ensayo nativo posterior a I1–I3 también PASS: payload86 y cinco módulos stdlib,
+  en `/private/tmp/resource-guards-hvf-evidence-wpmowowc/`; apply/postflight,
+  restart cerrado y ambas recuperaciones exactas con hold hasta release explícito.
+  VM/clave/disco temporales eliminados, evidencia conservada. No prueba capacidad
+  ni tráfico real. Pendiente: revisión focalizada final e integración.
 - Pendiente: diseño/autorización de cutover seguro desde un worker legacy,
   detenido con evidencia independiente. No se ha implementado ese bootstrap.
 - Pendiente: rollout productivo exact-head, diff/checks/telemetría/gates y

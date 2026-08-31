@@ -70,6 +70,13 @@ setup() { # setup <nombre> — deja stubs y logs del deploy
   cp "$OPS_DIR/../estrado-pjud-service/app/__init__.py" \
     "$OPS_DIR/../estrado-pjud-service/app/r2.py" \
     "$OPS_DIR/../estrado-pjud-service/app/minter.py" "$ORIGIN/estrado-pjud-service/app/"
+  mkdir -p "$ORIGIN/estrado-pjud-service/app/ojv"
+  cp "$OPS_DIR/../estrado-pjud-service/app/ojv/__init__.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/ojv/session.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/ojv/browser_login.py" "$ORIGIN/estrado-pjud-service/app/ojv/"
+  cp "$OPS_DIR/../estrado-pjud-service/app/playwright_runtime.py" "$ORIGIN/estrado-pjud-service/app/"
+  cp "$OPS_DIR/../estrado-pjud-service/worker/maintenance_heartbeat.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/proxy_control.py" "$ORIGIN/estrado-pjud-service/worker/"
   cp "$OPS_DIR/worker-maintenance.py" "$OPS_DIR/worker-maintenance.sh" "$ORIGIN/ops/"
   git -C "$ORIGIN" init -q -b main
   git -C "$ORIGIN" config user.email t@t
@@ -131,7 +138,12 @@ sha_repo()   { git -C "$REPO" rev-parse HEAD; }
 restarts()   { grep -c '^restart ' "$LOG_SYSCTL" || true; }
 
 run_maintenance_review_regressions() {
-  local scenario new_identity path
+  local scenario new_identity path change
+  setup api-only-maintenance; avanza_origin estrado-pjud-service/app/api_only.py; health_ok
+  run_deploy
+  expect_eq 'unrelated API-only change remains deployable' "$RC" 0
+  expect_eq 'API-only change merges expected revision' "$(sha_repo)" "$(sha_origin)"
+  expect_eq 'API-only compatible change restarts normally' "$(restarts)" 1
   for scenario in pid nonce; do
     setup "drift-$scenario"; avanza_origin; health_ok
     case "$scenario" in
@@ -153,6 +165,24 @@ run_maintenance_review_regressions() {
     expect_eq "$path target hook rejected before merge" "$(sha_repo)" "$PREV"
     expect_eq "$path target hook never restarts worker" "$(restarts)" 0
     expect_eq "$path target hook retains hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+  done
+  for path in app/ojv/__init__.py app/ojv/session.py app/ojv/browser_login.py \
+    app/playwright_runtime.py worker/maintenance_heartbeat.py worker/proxy_control.py; do
+    for change in edit remove; do
+      setup "ownership-$change-${path//\//-}"; health_ok
+      if [ "$change" = edit ]; then
+        avanza_origin "estrado-pjud-service/$path"
+      else
+        git -C "$ORIGIN" rm -q -- "estrado-pjud-service/$path"
+        git -C "$ORIGIN" commit -q -m 'fixture removes ownership boundary'
+      fi
+      PREV=$(sha_repo)
+      run_deploy
+      expect_eq "$path $change rejected" "$RC" 1
+      expect_eq "$path $change rejected before merge" "$(sha_repo)" "$PREV"
+      expect_eq "$path $change never restarts worker" "$(restarts)" 0
+      expect_eq "$path $change retains hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+    done
   done
 }
 

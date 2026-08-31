@@ -78,8 +78,10 @@ wm_pin_worker_contract() {
   wm_pin_runtime || return 1
   wm_contract_paths=(worker/__init__.py worker/__main__.py worker/maintenance.py
     worker/maintenance_store.py worker/metrics.py worker/sd_notify.py worker/config.py
-    worker/session_pool.py app/__init__.py app/r2.py app/minter.py)
-  mkdir -p "$wm_runtime_snapshot/contract/worker" "$wm_runtime_snapshot/contract/app" || return 1
+    worker/session_pool.py worker/maintenance_heartbeat.py worker/proxy_control.py
+    app/__init__.py app/r2.py app/minter.py app/playwright_runtime.py
+    app/ojv/__init__.py app/ojv/session.py app/ojv/browser_login.py)
+  mkdir -p "$wm_runtime_snapshot/contract/worker" "$wm_runtime_snapshot/contract/app/ojv" || return 1
   for path in "${wm_contract_paths[@]}"; do
     [ -f "$repo/estrado-pjud-service/$path" ] && [ ! -L "$repo/estrado-pjud-service/$path" ] || return 1
     cp "$repo/estrado-pjud-service/$path" "$wm_runtime_snapshot/contract/$path" || return 1

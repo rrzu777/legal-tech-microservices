@@ -5,18 +5,21 @@ from datetime import datetime, timezone
 
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 from worker.sd_notify import notify_watchdog
+from worker.maintenance_heartbeat import maintenance_proof
 
 logger = logging.getLogger(__name__)
 
 
 class Metrics:
-    def __init__(self, config: WorkerConfig, supabase, pool=None, proxy_control=None):
+    def __init__(self, config: WorkerConfig, supabase, pool=None, proxy_control=None, maintenance=None):
         self._config = config
         self._sb = supabase
         # El pool es opcional para no romper a quien construya Metrics sin el,
         # pero sin el no hay ni tamaño real del pool ni metricas de minteo.
         self._pool = pool
         self._proxy_control = proxy_control
+        self._maintenance = maintenance
+        self.initialization_started = False
         self.current_status = "starting"
         self.cases_synced_total: int = 0
         self.cases_synced_today: int = 0
@@ -65,6 +68,10 @@ class Metrics:
         """Fila del heartbeat. Una sola fuente para el latido y para el apagado —
         estaban duplicadas y era cuestion de tiempo que divergieran."""
         self._maybe_reset_daily()
+        current_status = status or self.current_status
+        proof = maintenance_proof(self._maintenance, initialization_started=self.initialization_started)
+        if current_status == "stopped":
+            proof = None
         attempts = getattr(self._pool, "mint_attempts", 0) if self._pool else 0
         failures = getattr(self._pool, "mint_failures", 0) if self._pool else 0
         raw_slot_counts = (
@@ -98,7 +105,7 @@ class Metrics:
         )
         return {
             "worker_id": self._config.WORKER_ID,
-            "status": status or self.current_status,
+            "status": "paused" if proof is not None else current_status,
             "last_heartbeat_at": datetime.now(TZ_SANTIAGO).isoformat(),
             "cases_synced_total": self.cases_synced_total,
             "cases_synced_today": self.cases_synced_today,
@@ -109,6 +116,7 @@ class Metrics:
                 self._pool.effective_pool_size if self._pool else self._config.POOL_SIZE
             ),
             "metadata": {
+                "maintenance": proof,
                 "mint_attempts": attempts,
                 "mint_failures": failures,
                 "mint_failure_rate": round(failures / attempts, 4) if attempts else 0.0,

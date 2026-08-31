@@ -53,6 +53,7 @@ class HvfTests(unittest.TestCase):
                 'estrado-pjud-service/worker/maintenance.py',
                 'estrado-pjud-service/worker/maintenance_store.py',
                 'estrado-pjud-service/worker/sd_notify.py',
+                'estrado-pjud-service/worker/maintenance_heartbeat.py',
                 'ops/tests/native/fixture.py', 'ops/tests/native/fixture_worker.py',
                 'ops/tests/native/exercise.py', 'ops/tests/native/probe.py',
                 'ops/tracked.py',
@@ -129,6 +130,32 @@ class HvfTests(unittest.TestCase):
                 archive.extractall(root / 'roundtrip', filter='data')
             self.assertEqual((root / 'roundtrip' / relative).read_bytes(), original.read_bytes())
             self.assertTrue((root / 'roundtrip' / 'README.md').is_file())
+
+    def test_heartbeat_payload_roundtrips_hashed_and_imports_without_site_packages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload, media = root / 'payload', root / 'media'
+            payload.mkdir(); media.mkdir()
+            for relative in self.hvf.WORKER_PAYLOAD:
+                original = self.hvf.ROOT / relative
+                target = payload / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(original.read_bytes())
+            self.hvf.validate_payload(payload, list(self.hvf.WORKER_PAYLOAD))
+            self.hvf.make_payload_media(payload, media)
+            relative = 'estrado-pjud-service/worker/maintenance_heartbeat.py'
+            manifest = json.loads((media / 'manifest.json').read_text())
+            expected = (self.hvf.ROOT / relative).read_bytes()
+            self.assertEqual(manifest[relative]['sha256'], hashlib.sha256(expected).hexdigest())
+            with tarfile.open(media / 'payload.tar') as archive:
+                archive.extractall(root / 'roundtrip', filter='data')
+            self.assertEqual((root / 'roundtrip' / relative).read_bytes(), expected)
+            result = subprocess.run([sys.executable, '-I', '-S', '-c',
+                'import sys; sys.path.insert(0, sys.argv[1]); '
+                'from worker.maintenance_heartbeat import maintenance_proof; '
+                'assert maintenance_proof(None, initialization_started=False) is None',
+                str(root / 'roundtrip/estrado-pjud-service')], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

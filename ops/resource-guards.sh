@@ -638,12 +638,27 @@ worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-order
   if ! http=$("$curl_bin" --config "$config" --write-out '%{http_code}' 2>"$null_file"); then return 1; fi
   [ "$http" = 200 ] || return 1
   if ! timestamp=$("$jq_bin" -er \
+    --arg maintenance_operation "${wm_operation_id:-}" \
+    --arg maintenance_identity "${wm_identity:-}" \
     --argjson proxy_mode "$worker_proxy_mode" \
     --argjson require_zero_mint "$require_zero_mint" '
+    def maintenance_hold:
+       .[0].status == "paused" and
+       (.[0].metadata.maintenance | type == "object") and
+       (.[0].metadata.maintenance | keys | sort) ==
+         ["identity", "inflight", "operation_id", "startup_blocked", "state", "version"] and
+       .[0].metadata.maintenance.version == 1 and
+       ($maintenance_operation | length) > 0 and
+       ($maintenance_identity | length) > 0 and
+       .[0].metadata.maintenance.operation_id == $maintenance_operation and
+       .[0].metadata.maintenance.identity == $maintenance_identity and
+       .[0].metadata.maintenance.state == "quiescent" and
+       .[0].metadata.maintenance.inflight == 0 and
+       (.[0].metadata.maintenance.startup_blocked | type == "boolean");
     if type == "array" and length == 1 and
        (.[0] | type == "object") and
        (.[0] | keys | sort) == ["last_heartbeat_at", "metadata", "status"] and
-       (.[0].status == "idle_off_hours" or .[0].status == "maintenance") and
+       (.[0].status == "idle_off_hours" or maintenance_hold) and
        (.[0].last_heartbeat_at | type == "string") and
        (.[0].metadata | type == "object") and
        .[0].metadata.process_outside_office_hours_enabled == false and
@@ -652,6 +667,13 @@ worker_heartbeat_is_idle() { # require-zero-mint minimum-exclusive-order
        ($proxy_mode == 0 or (
          .[0].metadata.proxy_control_status == "enabled" and
          .[0].metadata.proxy_control_reason == null
+       ) or (
+         maintenance_hold and .[0].metadata.maintenance.startup_blocked == true and
+         .[0].metadata.proxy_control_status == "unavailable" and
+         .[0].metadata.proxy_control_reason == "not_loaded" and
+         (.[0].metadata | has("proxy_control_revision")) and
+         .[0].metadata.proxy_control_revision == null and
+         .[0].metadata.proxy_control_source == "local"
        ))
     then .[0].last_heartbeat_at else empty end
   ' "$body" 2>"$null_file"); then return 1; fi

@@ -81,7 +81,8 @@ def main():
     run('usermod', '-aG', 'estrado', 'www-data')
     REPO.mkdir()
     shutil.copytree('/mnt/payload/ops', REPO / 'ops')
-    modules = ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py')
+    modules = ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py',
+               'maintenance_heartbeat.py')
     write(REPO / '.gitignore', 'estrado-pjud-service/*\n!estrado-pjud-service/worker/\n'
           'estrado-pjud-service/worker/*\n' + ''.join(
               '!estrado-pjud-service/worker/' + name + '\n' for name in modules))

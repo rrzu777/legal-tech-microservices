@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 import time
+import re
+import shutil
 
 import pytest
 
@@ -13,6 +15,8 @@ from test_worker_maintenance_cli import host, ROOT, BOOT, INSTANCE
 from worker.maintenance_store import Ack
 
 LIB = ROOT / "ops/worker-maintenance.sh"
+NEW_BOUNDARIES = ("app/ojv/__init__.py", "app/ojv/session.py", "app/ojv/browser_login.py",
+                  "app/playwright_runtime.py", "worker/maintenance_heartbeat.py", "worker/proxy_control.py")
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="production GNU flock and fdinfo")
 
 
@@ -130,9 +134,9 @@ def test_rollback_contract_checks_bytes_not_module_presence(host):
     worker.mkdir(parents=True)
     for filename in ("__main__.py", "maintenance.py", "maintenance_store.py", "metrics.py", "sd_notify.py"):
         (worker / filename).write_text("original compatible bytes\n")
-    for relative in ("worker/__init__.py", "worker/config.py", "worker/session_pool.py", "app/__init__.py", "app/r2.py", "app/minter.py"):
+    for relative in ("worker/__init__.py", "worker/config.py", "worker/session_pool.py", "app/__init__.py", "app/r2.py", "app/minter.py", *NEW_BOUNDARIES):
         target = repo / "estrado-pjud-service" / relative
-        target.parent.mkdir(exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("original compatible bytes\n")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
@@ -143,6 +147,54 @@ def test_rollback_contract_checks_bytes_not_module_presence(host):
     (worker / "__main__.py").write_text("legacy worker without admission\n")
     result = shell(host, f'wm_pin_runtime; wm_pin_worker_contract "{repo}"; wm_check_worker_contract "{repo}" "{revision}"')
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("relative", NEW_BOUNDARIES)
+@pytest.mark.parametrize("change", ["edit", "remove"])
+@pytest.mark.parametrize("boundary", ["incoming", "rollback"])
+def test_each_runtime_dependency_rejected_before_merge_or_restore(host, relative, change, boundary):
+    repo = host[0] / "contract-repo"
+    service = repo / "estrado-pjud-service"
+    for path in ("worker/__init__.py", "worker/__main__.py", "worker/maintenance.py",
+                 "worker/maintenance_store.py", "worker/metrics.py", "worker/sd_notify.py",
+                 "worker/config.py", "worker/session_pool.py", "app/__init__.py", "app/r2.py",
+                 "app/minter.py", *NEW_BOUNDARIES):
+        target = service / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / "estrado-pjud-service" / path, target)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    def commit():
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-qm", "fixture"], check=True)
+        return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    commit()
+    installed = host[0] / "installed"
+    shutil.copytree(service, installed / "estrado-pjud-service")
+    changed = service / relative
+    if change == "edit":
+        changed.write_text(changed.read_text() + "\n# incompatible ownership\n")
+    else:
+        changed.unlink()
+    incompatible = commit()
+    if boundary == "rollback":
+        # Invoke the actual deploy rollback function. Its byte check must fail
+        # before reset or dependency work; the incompatible ref is the target.
+        source = (ROOT / "ops/deploy.sh").read_text()
+        function = re.search(r"^rollback_code_and_dependencies\(\) \{.*?^\}", source, re.S | re.M).group(0)
+        code = function + f'\nrepo_dir="{repo}"; cd "$repo_dir"; prev="{incompatible}"; deps_changed=0; rollback_code_and_dependencies'
+        # Make rollback observable: current HEAD differs from its bad target.
+        (service / "api-only.txt").write_text("safe unrelated API change")
+        current = commit()
+    else:
+        # The target ref is compared against the captured installed bytes.
+        current = incompatible
+        code = f'wm_check_worker_contract "{repo}" "{incompatible}"'
+    marker = host[0] / "lifecycle-started"
+    result = shell(host, f'wm_pin_worker_contract "{installed}"; {code}; touch "{marker}"')
+    assert "maintenance" in result.stderr, result.stderr
+    assert result.returncode != 0, (relative, change, boundary)
+    assert not marker.exists()
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == current
 
 
 @pytest.mark.parametrize("script", ["deploy.sh", "provision.sh"])

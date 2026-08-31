@@ -22,7 +22,7 @@ cleanup are tested against real child processes, including a child ignoring alar
 
 Only reviewed `ops/` source plus the exact stdlib worker allowlist enter a TAR
 inside a readonly ISO: `worker/__init__.py`, `maintenance.py`,
-`maintenance_store.py`, and `sd_notify.py`. The fixture, its isolated
+`maintenance_store.py`, `sd_notify.py`, and `maintenance_heartbeat.py`. The fixture, its isolated
 `fixture_worker.py` helper, exercise and probe are explicitly included even before
 commit. No blanket service copy, `.env`, application client or real venv enters
 the payload. Host validation and guest extraction enforce the same allowlist.
@@ -122,7 +122,7 @@ claimed from these local operation doubles.
 Task 4 host/Linux regressions cover the real fixture coordinator, actual Unix
 datagram, payload boundary, identity comparisons and CLI publication failures.
 
-The corrected fresh controller-owned HVF integral trial **PASSED** on systemd
+The prior corrected controller-owned HVF integral trial **PASSED** on systemd
 255.4-1ubuntu8.17. Evidence is retained at
 `/private/tmp/resource-guards-hvf-evidence-ixpgrme8/`:
 
@@ -142,7 +142,19 @@ The corrected fresh controller-owned HVF integral trial **PASSED** on systemd
 The controller reports runner exit0 and cleanup of its owned guest disk/seed/key.
 This proves the enumerated local fixture contracts, not RAM admission/capacity,
 stress isolation, business E2E/remote effects or a full host reboot during hold.
-Final whole-branch review and rebase/integration remain controller-owned;
+That trial predates the final I1–I3 fixes. The current payload has86files and five
+stdlib worker modules; the fixture now publishes `paused` plus the same exact
+maintenance proof as production Metrics, including a cold-start phase marker.
+Host tests exercise that projection and its hashed stdlib-only transport. A fresh
+controller-owned trial of those final bytes also **PASSED**, runner exit0, in
+`/private/tmp/resource-guards-hvf-evidence-wpmowowc/`. Its86-file payload used
+guard SHA256 `58c9bdc3d296ab723a990014cae1a696cce20ef32a244a135dfb812ec687c380`
+on the same systemd version. It revalidated the enumerated identity, closed
+restart, apply/postflight, manual rollback and injected-failure automatic rollback
+legs, with local active alerts `[]`; both recoveries retained hold until explicit
+release. Restricted host TCP was refused and owned VM disk/seed/key were removed.
+The same capacity/business/full-host-reboot exclusions apply. Focused final
+review and integration remain controller-owned;
 production rollout, legacy bootstrap, natural observation and access authorization
 remain separate gates.
 
