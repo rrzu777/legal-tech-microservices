@@ -208,6 +208,62 @@ async def _wait_visible(locator: object, deadline: float) -> bool:
         return False
 
 
+@dataclass(slots=True)
+class _LandingProbe:
+    """Closed diagnostic values only; samples are advisory, not auth evidence."""
+
+    main_http: int = 0
+    ready: str = "unavailable"
+    location: str = "unknown"
+    account: tuple[int, int] = (-1, -1)
+    my_causes: tuple[int, int] = (-1, -1)
+
+
+def _record_landing_response(page: object, probe: _LandingProbe, response: object) -> None:
+    try:
+        request = response.request
+        if (
+            request.is_navigation_request() and request.frame == page.main_frame
+            and _is_trusted_official_url(response.url, landing=True)
+            and type(response.status) is int and 100 <= response.status <= 599
+        ):
+            probe.main_http = response.status
+    except Exception:
+        pass  # Never expose response/URL/exception objects in diagnostics.
+
+
+async def _sample_landing(page: object, probe: _LandingProbe, deadline: float) -> None:
+    """Best-effort sample under the existing login deadline, capped at 500ms."""
+    sample_deadline = min(deadline, time.monotonic() + 0.5)
+    try:
+        if not _is_trusted_official_url(page.url, landing=True):
+            return
+        for field, locator in (
+            ("account", page.locator('a[href="#infousuario"]')),
+            ("my_causes", page.get_by_role("link", name="Mis Causas", exact=True)),
+        ):
+            counts = []
+            for target in (locator, locator.filter(visible=True)):
+                count = await _within_deadline(target.count(), sample_deadline)
+                counts.append(min(count, 9) if type(count) is int and count >= 0 else -1)
+            setattr(probe, field, tuple(counts))
+        ready = await _within_deadline(page.evaluate("() => document.readyState"), sample_deadline)
+        probe.ready = ready if ready in {"loading", "interactive", "complete"} else "other"
+    except Exception:
+        # Retain the last known partial sample. Sampling cannot accept/reject a
+        # session, but its bounded initial read consumes existing deadline time.
+        pass
+
+
+async def _watch_landing(page: object, probe: _LandingProbe, deadline: float) -> None:
+    try:
+        while time.monotonic() < deadline:
+            await _within_deadline(asyncio.sleep(0.5), deadline)
+            await _sample_landing(page, probe, deadline)
+    except (asyncio.TimeoutError, PlaywrightTimeoutError):
+        return
+
+
 def _record_request(request: object) -> None:
     """Count request bytes only; never retain a request body."""
     body = b""
@@ -308,6 +364,8 @@ async def login_official_ojv(
     error_kind, network_code = "contract", "none"
     entry_http = 0
     entry_origin = "unknown"
+    landing_probe = _LandingProbe()
+    landing_observer = None
     try:
         if proxy_url:
             launch_kwargs["proxy"] = split_proxy_for_playwright(proxy_url)
@@ -324,6 +382,7 @@ async def login_official_ojv(
             stage = "page_create"
             page = await _within_deadline(context.new_page(), deadline)
             page.on("request", _record_request)
+            page.on("response", lambda response: _record_landing_response(page, landing_probe, response))
             stage = "cdp_enable"
             cdp_session = await _within_deadline(_create_cdp_meter(context, page), deadline)
             if cdp_session is None:
@@ -411,14 +470,25 @@ async def login_official_ojv(
                 stage = "post_submit"
                 failure = await _resolve_post_submit(page, deadline)
             if failure is None and submitted:
-                stage = "landing"
+                stage = "landing_url"
                 if not _is_trusted_official_url(page.url, landing=True):
                     failure = OjvUpstreamChangedError()
                 else:
                     account = page.locator('a[href="#infousuario"]')
                     my_causes = page.get_by_role("link", name="Mis Causas", exact=True)
-                    if not await _wait_visible(account, deadline) or not await _wait_visible(my_causes, deadline):
+                    await _sample_landing(page, landing_probe, deadline)
+                    landing_observer = asyncio.create_task(_watch_landing(page, landing_probe, deadline))
+                    stage = "landing_account"
+                    if not await _wait_visible(account, deadline):
                         failure = OjvUpstreamChangedError()
+                    else:
+                        stage = "landing_my_causes"
+                        if not await _wait_visible(my_causes, deadline):
+                            failure = OjvUpstreamChangedError()
+            if failure is None and submitted:
+                stage = "landing_final_url"
+                if not _is_trusted_official_url(page.url, landing=True):
+                    failure = OjvUpstreamChangedError()
             if failure is None and submitted:
                 stage = "cookie_snapshot"
                 result = BrowserLoginResult(
@@ -435,6 +505,24 @@ async def login_official_ojv(
             error_kind, network_code = _exception_diagnostic(error)
             failure = OjvUpstreamChangedError()
         finally:
+            if submitted and page is not None:
+                try:
+                    landing_probe.location = (
+                        "trusted_landing" if _is_trusted_official_url(page.url, landing=True)
+                        else "trusted_other" if _is_trusted_official_url(page.url)
+                        else "untrusted"
+                    )
+                except Exception:
+                    pass
+            if landing_observer is not None:
+                landing_observer.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.gather(landing_observer, return_exceptions=True), timeout=_CLEANUP_TIMEOUT_S)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    pass
+                landing_observer = None
             cancelled = await _cleanup_all((cdp_session, "cdp"), (page, "resource"), (context, "resource"), (browser, "resource")) or cancelled
             cdp_session = page = context = browser = None
             try:
@@ -477,8 +565,11 @@ async def login_official_ojv(
         raise asyncio.CancelledError()
     if failure is not None:
         logger.warning(
-            "pjud_private_login_failed stage=%s outcome=%s kind=%s network=%s entry_http=%s entry_origin=%s",
+            "pjud_private_login_failed stage=%s outcome=%s kind=%s network=%s entry_http=%s entry_origin=%s "
+            "landing_http=%s landing_ready=%s landing_location=%s account_shape=%s my_causes_shape=%s",
             stage, failure.code.value, error_kind, network_code, entry_http, entry_origin,
+            landing_probe.main_http, landing_probe.ready, landing_probe.location,
+            ",".join(map(str, landing_probe.account)), ",".join(map(str, landing_probe.my_causes)),
         )
         raise failure from None
     if result is None:
