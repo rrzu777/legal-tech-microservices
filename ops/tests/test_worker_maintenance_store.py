@@ -77,6 +77,163 @@ def acknowledgement(module, **changes):
     return module.Ack(**values)
 
 
+def test_ack_candidate_is_validated_but_not_identity_proof(protocol):
+    m, store, _, ack_dir = protocol
+    value = acknowledgement(m)
+    store.write_ack(value)
+    assert hasattr(store, "read_ack_candidate"), "operator needs a validated nonce candidate"
+    assert store.read_ack_candidate() == value
+    with pytest.raises(m.MaintenanceError):
+        store.read_ack(expected_operation_id=NEXT_OPERATION, expected_identity=identity(m))
+    (ack_dir / "ack.json").chmod(0o644)
+    with pytest.raises(m.MaintenanceError):
+        store.read_ack_candidate()
+
+
+def test_operator_deferred_ack_does_not_weaken_worker_or_pin(protocol):
+    m, store, control, ack_dir = protocol
+    store.initialize_hold(OPERATION)
+    ack_dir.rmdir()
+    with pytest.raises(m.MaintenanceError):
+        m.MaintenanceStore(control, ack_dir, store.policy)
+    assert "defer_ack" in __import__("inspect").signature(m.MaintenanceStore).parameters, \
+        "stopped operator needs explicit deferred ACK validation"
+    operator = m.MaintenanceStore(control, ack_dir, store.policy,
+                                  allow_control_writes=True, defer_ack=True)
+    assert operator.read_control().state == "hold"
+    with operator.exclusive_lease():
+        pass
+    with pytest.raises(m.MaintenanceError):
+        operator.read_ack_candidate()
+    ack_dir.mkdir(mode=0o755)
+    with pytest.raises(m.MaintenanceError):
+        operator.read_ack_candidate()
+    ack_dir.chmod(0o700)
+    operator.write_ack(acknowledgement(m))
+    assert operator.read_ack_candidate().pid == 512
+    ack_dir.rename(ack_dir.with_name("old-ack"))
+    ack_dir.mkdir(mode=0o700)
+    with pytest.raises(m.MaintenanceError):
+        operator.write_ack(acknowledgement(m))
+    with pytest.raises(m.MaintenanceError):
+        m.MaintenanceStore(control, ack_dir, store.policy, defer_ack=True)
+
+
+def test_atomic_control_replacement_reads_new_hold_without_poisoning_worker(protocol, monkeypatch):
+    from worker.maintenance import WorkerMaintenance
+    m, store, control, _ = protocol
+    store.initialize_hold(OPERATION)
+    store.transition(OPERATION, "hold", m.Control(1, "open", OPERATION, CREATED))
+    original_read = os.read
+    replaced = False
+    def read_during_replace(fd, size):
+        nonlocal replaced
+        if not replaced and os.fstat(fd).st_ino == (control / "control.json").stat().st_ino:
+            replaced = True
+            store.transition(OPERATION, "open", m.Control(1, "hold", NEXT_OPERATION, CREATED))
+        return original_read(fd, size)
+    monkeypatch.setattr(os, "read", read_during_replace)
+    worker = WorkerMaintenance(store, identity(m))
+    ack = worker.publish_ack()
+    assert ack.operation_id == NEXT_OPERATION
+    assert ack.state == "quiescent"
+    assert worker.uncertain is False
+
+
+def test_json_snapshot_retry_never_hides_stable_lock_replacement(protocol, monkeypatch):
+    m, store, control, _ = protocol
+    store.initialize_hold(OPERATION)
+    original_read = os.read
+    replaced = False
+    def replace_both(fd, size):
+        nonlocal replaced
+        if not replaced and os.fstat(fd).st_ino == (control / "control.json").stat().st_ino:
+            replaced = True
+            replacement = control / "replacement.json"
+            replacement.write_text(json.dumps(control_payload()))
+            replacement.chmod(0o640)
+            os.replace(replacement, control / "control.json")
+            (control / "admission.lock").rename(control / "old.lock")
+            (control / "admission.lock").touch(mode=0o640)
+        return original_read(fd, size)
+    monkeypatch.setattr(os, "read", replace_both)
+    with pytest.raises(m.MaintenanceError):
+        store.read_control()
+
+
+@pytest.mark.parametrize("kind", ["control", "ack"])
+@pytest.mark.parametrize("invalid", ["mode", "links"])
+def test_atomic_retry_rejects_observed_invalid_b_between_valid_a_and_c(protocol, monkeypatch, kind, invalid):
+    m, store, control, ack = protocol
+    store.initialize_hold(OPERATION)
+    store.write_ack(acknowledgement(m))
+    directory, name, mode = (control, "control.json", 0o640) if kind == "control" else (ack, "ack.json", 0o600)
+    target = directory / name
+    bad, good = directory / "bad.json", directory / "good.json"
+    for candidate in (bad, good):
+        candidate.write_bytes(target.read_bytes())
+        candidate.chmod(mode)
+    if invalid == "mode":
+        bad.chmod(0o666)
+    else:
+        # Removing its named link leaves two links: still demonstrably invalid.
+        os.link(bad, directory / "link-one")
+        os.link(bad, directory / "link-two")
+    original_open = os.open
+    replaced = False
+    def open_b_after_stat_a(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if path == name and not replaced:
+            replaced = True
+            os.replace(bad, target)
+            fd = original_open(path, flags, *args, **kwargs)
+            os.replace(good, target)
+            return fd
+        return original_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", open_b_after_stat_a)
+    with pytest.raises(m.MaintenanceError):
+        store.read_control() if kind == "control" else store.read_ack_candidate()
+
+
+def test_atomic_retry_allows_only_unlink_of_the_already_validated_inode(protocol, monkeypatch):
+    m, store, control, _ = protocol
+    store.initialize_hold(OPERATION)
+    replacement = control / "replacement.json"
+    replacement.write_text(json.dumps(dict(control_payload(), operation_id=NEXT_OPERATION)))
+    replacement.chmod(0o640)
+    original_open = os.open
+    replaced = False
+    def unlink_after_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        fd = original_open(path, flags, *args, **kwargs)
+        if path == "control.json" and not replaced:
+            replaced = True
+            os.replace(replacement, control / "control.json")
+        return fd
+    monkeypatch.setattr(os, "open", unlink_after_open)
+    assert store.read_control().operation_id == NEXT_OPERATION
+
+
+def test_atomic_retry_does_not_hide_metadata_change_on_validated_reader(protocol, monkeypatch):
+    m, store, control, _ = protocol
+    store.initialize_hold(OPERATION)
+    replacement = control / "replacement.json"
+    replacement.write_bytes((control / "control.json").read_bytes())
+    replacement.chmod(0o640)
+    original_read = os.read
+    replaced = False
+    def chmod_then_unlink(fd, size):
+        nonlocal replaced
+        if not replaced and os.fstat(fd).st_ino == (control / "control.json").stat().st_ino:
+            replaced = True
+            os.fchmod(fd, 0o666)
+            os.replace(replacement, control / "control.json")
+        return original_read(fd, size)
+    monkeypatch.setattr(os, "read", chmod_then_unlink)
+    with pytest.raises(m.MaintenanceError):
+        store.read_control()
+
+
 def test_bootstrap_hold_cas_and_no_automatic_reopening(protocol):
     m, store, control, ack = protocol
     with pytest.raises(m.MaintenanceError):
@@ -348,10 +505,11 @@ def test_production_uses_named_estrado_group_and_root_only_operator(protocol, mo
     monkeypatch.setattr(grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=4321))
     monkeypatch.setattr(m.os, "geteuid", lambda: 1234)
     class Capture(m.MaintenanceStore):
-        def __init__(self, control_dir, ack_dir, policy, *, allow_control_writes=False):
+        def __init__(self, control_dir, ack_dir, policy, *, allow_control_writes=False, defer_ack=False):
             self.paths = (control_dir, ack_dir)
             self.policy = policy
             self.writable = allow_control_writes
+            self.deferred = defer_ack
     worker = Capture.production()
     assert worker.paths == ("/var/lib/worker-maintenance", "/run/worker-maintenance")
     assert worker.policy.control_uid == 0

@@ -164,3 +164,106 @@ Desde la raíz del repositorio, usando la venv disponible del producto:
 PYTHONPATH=. estrado-pjud-service/.venv/bin/pytest -q ops/monitoring/tests
 python3 -m py_compile ops/monitoring/*.py
 ```
+
+## Mantenimiento del worker: protocolo local v1
+
+`resource-guards.sh`, `deploy.sh` y `provision.sh` comparten una transacción de
+mantenimiento. Primero toman `/run/lock/legaltech-resource-guards.lock`; antes de
+mutar código, unidades o parar el worker publican un `hold` durable, esperan ACK
+del proceso exacto y conservan el lock exclusivo de admisión. El trabajo admitido
+termina normalmente; el drenaje no cancela jobs, threads ni RPC y nunca llama
+proxy, mint, sync ni retry. El límite de drenaje es 900 segundos monotónicos;
+timeout deja el servicio activo y el hold vigente.
+
+La ventana de mutación es estricta: Santiago 20:00–03:59, revalidada después del
+drenaje, después de provision y antes de cada start/stop del worker. El rollback
+también vuelve a verificarla después de detener al worker y antes de restaurar:
+haber comenzado dentro de la ventana no autoriza terminar la recuperación fuera
+de ella. Si cruza las 04:00, conserva hold y requiere recuperación explícita en
+una ventana posterior. El flag histórico `--allow-daytime-maintenance`
+no permite eludirla. `idle_off_hours` o claims cero son evidencia adicional, no
+autoridad de inactividad; también se exigen capacidad v1, nonce, MainPID, cgroup,
+boot y start ticks exactos, ACK quiescent/inflight cero y exclusivo real.
+
+Control durable: `/var/lib/worker-maintenance`, root:estrado 0750, con
+`control.json` y el inode estable `admission.lock`, root:estrado 0640. ACK efímero:
+`/run/worker-maintenance`, estrado:estrado 0700, `ack.json` 0600. Nunca restaurar,
+borrar ni reemplazar control/lock con un backup de guards. El journal de cada UUID
+vive separado en `/var/lib/worker-maintenance-operations` (root:root 0700, JSON
+0600), registra intención antes de hold y conserva identidad y evidencia de
+drenaje. El UUID también queda en el backup de guards.
+
+### Operación y recuperación explícita
+
+Inspección root, sin mutar admisión:
+
+```bash
+sudo /usr/bin/python3 /opt/legal-tech-microservices/ops/worker-maintenance.py status
+```
+
+La salida es exclusivamente `estado UUID boot:pid:start_ticks:instance_uuid`.
+Ausencia, metadata inválida, worker legacy, identidad desconocida o ACK de otra
+instancia son errores; no significan `open` ni autorizan un restart.
+
+Apply exitoso registra el resultado durable y ejecuta postflight completo antes
+de finalizar su propio UUID. Desde la publicación de `open` pueden comenzar
+trabajos reales pendientes. Fallos anteriores a ese commit, timeout, crash y
+rollback dejan hold; volver a ejecutar deploy/apply no es recuperación.
+Un rollback manual desde open también publica hold y drena antes de restaurar
+el primer archivo. Nunca abre tráfico automáticamente al terminar.
+
+Tras diagnosticar el fallo y comprobar que el estado instalado es el deseado,
+la recuperación independiente verifica contratos, salud, identidad y ACK y sólo
+entonces libera el UUID exacto:
+
+```bash
+sudo /opt/legal-tech-microservices/ops/resource-guards.sh finish --operation-id <UUID-exacto>
+```
+
+No reinstala, restaura, inicia, para ni reintenta trabajo. Un UUID ajeno se rechaza;
+repetir un release ya completado del mismo UUID es inocuo. Si los contratos o
+telemetría siguen siendo desconocidos, no liberar: se requiere diagnóstico y
+una acción separada autorizada.
+
+El helper bajo nivel ofrece `begin --operation-id <UUID-nuevo> --identity
+<identidad-exacta>`, `verify-ack --operation-id <UUID> --identity <identidad>` y
+`finish --operation-id <UUID> --identity <identidad>`. Begin persiste intención y
+hold; por sí solo no autoriza mutar ni conserva locks después de salir. Finish
+valida worker/API y salud; el comando de guards anterior añade el postflight de
+recursos completo. No usar estos comandos para reemplazar la transacción del
+script ni para reintentar un apply.
+
+Si falla fsync/publicación **después** del éxito durable, finish sale **3**:
+finalización incierta, admisión posiblemente ya abierta. No se afirma hold ni se
+ejecuta rollback posterior. Inspeccionar estado; no volver a mutar suponiendo
+que el worker sigue detenido. Esta condición difiere de un fallo previo al commit.
+
+Los hijos de guards reciben `WM_GLOBAL_FD`, `WM_ADMISSION_FD`, `WM_OPERATION_ID`
+y `WM_IDENTITY` juntos. El helper verifica inode, metadata y flock WRITE de la
+descripción heredada; los hijos sólo cierran sus referencias, nunca hacen unlock
+ni finalizan el UUID del padre. Deploy fija una copia temporal root-only del
+helper antes de cambiar Git para que la finalización no importe código nuevo.
+Antes del merge y de cualquier rollback de código, deploy compara bytes de
+los inicializadores `worker/__init__.py` y `app/__init__.py`, entrypoint,
+store/coordinator, métricas, `sd_notify.py` y los hooks de seguimiento en
+`worker/config.py`, `worker/session_pool.py`, `app/r2.py` y `app/minter.py` con un
+snapshot tomado tras el drenaje. Antes del restart vuelve a probar la identidad
+y ACK exactos: PID/nonce sustituidos durante tests/install impiden el restart.
+Cambios de ese contrato se rechazan aunque existan los archivos:
+requieren revisión/cutover separado. Esta restricción conservadora permite
+actualizaciones de API/ops que no cambien el contrato del worker; no hay flag de
+bypass ni aceptación por un marker declarado por la versión candidata.
+
+### Gates no resueltos por el script
+
+El primer rollout sobre un worker legacy sigue necesitando un cutover detenido
+y autorizado con evidencia independiente de drenaje. Los scripts no crean un
+control open, simulan ACK ni aceptan PID0 como bootstrap. Un worker ya parado
+sólo se admite dentro de una transacción propia/delegada con prueba previa de
+drenaje y los dos descriptores exclusivos todavía retenidos.
+
+La unidad con `xvfb-run` requiere el handoff MAINPID del proceso Python y su
+verificación bajo systemd nativo (Task 4); no se relaja la igualdad MainPID/ACK.
+Las pruebas locales no acreditan tráfico PJUD, capacidad del VPS ni telemetría
+de producción. La observación natural posterior y el bootstrap siguen siendo
+gates operacionales separados.

@@ -19,7 +19,7 @@
 - No absent/invalid-state fallback to open; no expiry/TTL auto-release; no manual import feature flag change.
 - One shared open-file description per admitted operation; exclusive guard lease plus current identity/nonce ACK required before lifecycle mutation.
 - Keep admitted work alive while draining. Unknown remote outcome/auxiliary work or identity drift prevents quiescence.
-- Guard drain bound 900 seconds; stop/restart only inside Santiago 20:00–03:59. Failure leaves durable hold for explicit recovery.
+- Guard drain bound 900 seconds; stop/restart only inside Santiago 20:00–03:59. Precommit failure leaves durable hold; postcommit finalization uncertainty is reported distinctly and never triggers rollback.
 - No claim that bootstrap of an incompatible legacy worker is solved. Refuse it before mutation.
 - Tests before code, task review and fixes before commit. Agents do not spawn other agents or commit; controller owns review and commit.
 
@@ -98,7 +98,7 @@ except AdmissionClosed:
 
 ### Task 3: Operator helper, guards and deploy serialization
 
-**Files:** Create `ops/worker-maintenance.py`, its focused `ops/tests/test_worker_maintenance_cli.py`; modify `ops/resource-guards.sh`, `ops/deploy.sh`, associated shell suites, provision/systemd contract checks only where required, `ops/monitoring/README.md`.
+**Files:** Create `ops/worker-maintenance.py`, shared `ops/worker-maintenance.sh`, its focused `ops/tests/test_worker_maintenance_cli.py`; modify `ops/resource-guards.sh`, `ops/deploy.sh`, `ops/provision.sh`, associated shell suites, systemd contract checks where required, `ops/monitoring/README.md`. Minimal reviewed store API extensions below belong here with core tests.
 
 **Consumes:** Store control/ACK schemas, process identity, v1 coordinator. **Produces:** validated operator commands `status`, `begin`, `verify-ack`, `finish` with explicit UUID/identity; lock FD owned continuously by guard, safe journal and resume semantics. CLI is root-only except complete test boundary; sanitized errors.
 
@@ -113,18 +113,25 @@ maintenance_window_is_open || return 1
 stop_worker_for_change
 ```
 
-- [ ] Integrate manual rollback admission before first restore/stop. Any apply failure leaves hold until explicit operator finalization; rollback code must not restore/delete protocol directory. Only successful apply finalization opens, after durable success marker and full postflight. Crash/unknown state never auto-releases.
+- [ ] Integrate manual rollback admission before first restore/stop. Any precommit apply failure leaves hold until explicit operator finalization; rollback code must not restore/delete protocol directory. Only successful apply finalization opens, after durable success marker and full postflight. Crash/unknown state never initiates auto-release; possible postcommit open publication has the separate uncertainty outcome below.
 - [ ] Deploy obtains same global mutation lock before its first git/code/unit mutation and holds through health/rollback; rejects foreign hold even if lock free. Mutator delegation must validate inherited FD to avoid deadlock/releasing parent's lease. No direct new bypass option.
+- [ ] Standalone deploy/provision also use the shared hold/drain/EX orchestration before mutating an active worker's code or lifecycle. Global serialization alone does not protect admitted operations. Require strict window and compatible runtime; no legacy stop fallback. Success finalizes only own UUID after health; failure/rollback keeps hold. Delegated scripts validate inherited global/admission FDs and UUID but never unlock/open their parent's transaction.
+- [ ] Expose secure `read_ack_candidate()` in the store for CLI capability discovery, explicitly not identity/quiescence proof; retain exact identity/nonce validation in `read_ack`. Add explicit root-operator-only deferred ACK-directory validation so control/locks can be validated while systemd has removed RuntimeDirectory during stop. Worker defaults remain strict; actual ACK access always validates/pins the directory and rejects missing/invalid/replaced state. Cover these consumer-driven extensions with core regressions.
+- [ ] Separate durable installation commit from admission finalization. After verified postflight/health/ACK/EX, persist success before opening. A finish failure after possible open publication returns distinct code3/finalization-uncertain, never automatic rollback or a false hold claim. Test post-rename fsync failure and confirm no lifecycle mutation after commit; failures before commit keep hold.
+- [ ] Handle legitimate atomic JSON replacement during reads with at most three fully validated snapshots, only when a different valid inode proves replacement. Never retry or relax stable-lock identity, directory replacement, links or invalid metadata; exhaustion stays closed. Add deterministic open→hold-during-read regression without poisoning the worker, plus adversarial cases. This is local read retry only, never operation/apply/traffic retry.
 - [ ] Propagate explicit fake-root paths/tool overrides through shell suite and native fixture; preserve validation of partial override rejection. Add independent recovery command documented as verification/release only, not retry.
 - [ ] Run CLI pytest, full shell guards/provision/deploy/systemd suites, syntax/ShellCheck. Review/fix/re-review/commit.
 
 ### Task 4: Native integration, documentation and final review
 
-**Files:** `ops/tests/native/{fixture.py,exercise.py,run_hvf.py,test_*.py,README.md}` as needed; `ops/monitoring/README.md`, new `ops/worker-maintenance.md`.
+**Files:** `ops/tests/native/{fixture.py,exercise.py,run_hvf.py,test_*.py,README.md}` as needed; `ops/monitoring/README.md`, new `ops/worker-maintenance.md`; `estrado-pjud-service/tests/test_maintenance_wiring.py` for the deferred R2 contrast regression below; `estrado-pjud-service/worker/sd_notify.py` and focused notification tests for the exact MainPID handoff below.
 
 **Consumes:** Tasks 1–3 exact source; existing authorized local QEMU/HVF and pinned image. **Produces:** evidence of native real admission module during apply/rollback; no production claims.
 
 - [ ] Add red native fixture assertions using real maintenance module, not a dummy ACK producer. Host-side tests validate exact payload transport includes needed worker stdlib modules only (no .env).
+- [ ] Add the Task2 review's non-blocking R2 AccessDenied/500 regression: public API returns False, admitted coordinator remains uncertain, and EX stays blocked; contrast with the existing safe-404 case. This adds coverage, not a new behavior.
+- [ ] Address Task3's non-blocking publication-output diagnostic regression in `ops/worker-maintenance.py` and its CLI tests: an stdout error after successful open must return the distinct post-publication outcome, never falsely claim hold remains. No lifecycle mutation or rollback follows it.
+- [ ] Close the real xvfb-run wrapper identity contract: `notify_ready` sends `MAINPID=os.getpid()` with `READY=1` in the same datagram, using the existing NotifyAccess=all. Keep the operator's exact ACK/MainPID/kernel/cgroup checks; do not accept an arbitrary child. Red/green test the actual Unix datagram, then prove systemd selects the Python worker under xvfb-run and revalidates it after restart. Whitelist the production stdlib sd_notify module in the native payload; the fixture must call it rather than synthesize this handoff.
 - [ ] Exercise operation admitted before hold, blocked new operation, safe drain, real guards apply/postflight, manual rollback and injected-failure automatic rollback while closed; explicit validated release. Add stale ACK/PID/nonce, helper death, closed restart and rejected legacy legs. Keep host 2 CPU/4 GiB VM, watchdog/lifetime/net isolation from existing harness; RAM admission exclusion remains explicit.
 - [ ] Run focused tests then one fresh integral HVF trial; on unexpected failure capture redacted evidence and correct local implementation, not production gates. No paid calls or external credentials.
 - [ ] Write exact completed vs pending bootstrap/production/observation/access gates; run final broad review of branch. Address findings, verify clean tree, retain local commits. Ask integration authority at handoff, not between local tasks.

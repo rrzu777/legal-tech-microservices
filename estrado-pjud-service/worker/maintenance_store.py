@@ -39,6 +39,10 @@ class AdmissionClosed(MaintenanceError):
         Exception.__init__(self, "maintenance admission closed")
 
 
+class _ReplacedSnapshot(MaintenanceError):
+    """Only a validated atomic replacement of a replaceable JSON file."""
+
+
 def _require(condition: bool) -> None:
     if not condition:
         raise MaintenanceError()
@@ -190,8 +194,9 @@ class MaintenanceStore:
     """
 
     def __init__(self, control_dir: str | Path, ack_dir: str | Path, policy: StorePolicy,
-                 *, allow_control_writes: bool = False) -> None:
+                 *, allow_control_writes: bool = False, defer_ack: bool = False) -> None:
         _require(type(policy) is StorePolicy and type(allow_control_writes) is bool)
+        _require(type(defer_ack) is bool and (not defer_ack or allow_control_writes))
         self.policy = policy
         self._writable = allow_control_writes
         self._paths = {"control": Path(control_dir), "ack": Path(ack_dir)}
@@ -200,6 +205,8 @@ class MaintenanceStore:
         for kind in self._paths:
             path = self._paths[kind]
             _require(path.is_absolute() and ".." not in path.parts)
+            if kind == "ack" and defer_ack:
+                continue
             with self._directory(kind) as fd:
                 self._directory_ids[kind] = _inode(os.fstat(fd))
         with self._directory("control") as directory:
@@ -216,7 +223,7 @@ class MaintenanceStore:
             _require(not operator or os.geteuid() == 0)
             return cls("/var/lib/worker-maintenance", "/run/worker-maintenance",
                        StorePolicy(0, estrado_gid, estrado.pw_uid, estrado_gid),
-                       allow_control_writes=operator)
+                       allow_control_writes=operator, defer_ack=operator)
         except (KeyError, OSError):
             raise MaintenanceError() from None
 
@@ -248,6 +255,7 @@ class MaintenanceStore:
                      and stat.S_IMODE(metadata.st_mode) == mode)
             previous = self._directory_ids.get(kind)
             _require(previous is None or previous == _inode(metadata))
+            self._directory_ids[kind] = _inode(metadata)
         except (OSError, ValueError):
             if fd is not None:
                 os.close(fd)
@@ -267,14 +275,33 @@ class MaintenanceStore:
                  and metadata.st_uid == uid and metadata.st_gid == gid
                  and stat.S_IMODE(metadata.st_mode) == mode)
 
+    def _validate_observed_file(self, before: os.stat_result, after: os.stat_result, kind: str) -> None:
+        # Only unlink/ctime may change on the SAME previously validated inode.
+        # A different opened inode has no prior evidence and must validate fully.
+        if after.st_nlink == 0:
+            _require(before.st_nlink == 1 and _inode(before) == _inode(after)
+                     and (before.st_mode, before.st_uid, before.st_gid, before.st_size, before.st_mtime_ns)
+                     == (after.st_mode, after.st_uid, after.st_gid, after.st_size, after.st_mtime_ns))
+        else:
+            self._validate_file(after, kind)
+
     @contextmanager
-    def _file(self, directory: int, name: str, kind: str) -> Iterator[int]:
+    def _file(self, directory: int, name: str, kind: str, *, with_snapshot: bool = False):
         fd = None
         try:
             before = os.stat(name, dir_fd=directory, follow_symlinks=False)
             self._validate_file(before, kind)
             fd = os.open(name, _READ_FLAGS, dir_fd=directory)
             after = os.fstat(fd)
+            self._validate_observed_file(before, after, kind)
+            if name in ("control.json", "ack.json") and (
+                    _inode(before) != _inode(after) or after.st_nlink == 0):
+                named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                self._validate_file(named, kind)
+                _require(_inode(before) != _inode(named))
+                with self._directory(kind):
+                    pass
+                raise _ReplacedSnapshot()
             self._validate_file(after, kind)
             _require(_snapshot(before) == _snapshot(after))
             if name == "admission.lock":
@@ -288,7 +315,7 @@ class MaintenanceStore:
                 os.close(fd)
             raise
         try:
-            yield fd
+            yield (fd, after) if with_snapshot else fd
         finally:
             os.close(fd)
 
@@ -298,10 +325,20 @@ class MaintenanceStore:
                 pass
 
     def _read(self, kind: str, name: str, schema):
+        # Retry only a confirmed replacement with a fully valid next inode.
+        # Never retry a malformed schema, unsafe metadata, path or stable lock.
+        for attempt in range(3):
+            self._check_lock()
+            try:
+                return self._read_snapshot(kind, name, schema)
+            except _ReplacedSnapshot:
+                if attempt == 2:
+                    raise MaintenanceError() from None
+
+    def _read_snapshot(self, kind: str, name: str, schema):
         try:
             with self._directory(kind) as directory:
-                with self._file(directory, name, kind) as fd:
-                    before = os.fstat(fd)
+                with self._file(directory, name, kind, with_snapshot=True) as (fd, before):
                     _require(before.st_size <= MAX_JSON_BYTES)
                     raw = bytearray()
                     while len(raw) <= MAX_JSON_BYTES:
@@ -311,10 +348,14 @@ class MaintenanceStore:
                         raw.extend(chunk)
                     _require(len(raw) <= MAX_JSON_BYTES)
                     after = os.fstat(fd)
+                    self._validate_observed_file(before, after, kind)
                     named = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                    _require(_snapshot(before) == _snapshot(after) == _snapshot(named))
                     with self._directory(kind) as current:
                         _require(_inode(os.fstat(current)) == _inode(os.fstat(directory)))
+                    if _inode(before) != _inode(named):
+                        self._validate_file(named, kind)
+                        raise _ReplacedSnapshot()
+                    _require(_snapshot(before) == _snapshot(after) == _snapshot(named))
                     return _decode(bytes(raw), schema)
         except OSError:
             raise MaintenanceError() from None
@@ -429,8 +470,18 @@ class MaintenanceStore:
         """Identity/nonce validation only; guard must ALSO require hold and EX lease."""
         _canonical_uuid(expected_operation_id)
         _require(type(expected_identity) is ProcessIdentity)
-        self._check_lock()
-        ack = self._read("ack", "ack.json", Ack)
+        ack = self.read_ack_candidate()
         _require(ack.operation_id == expected_operation_id and
                  ProcessIdentity(ack.boot_id, ack.pid, ack.start_ticks, ack.instance_id) == expected_identity)
         return ack
+
+    def read_ack_candidate(self) -> Ack:
+        """Validated nonce candidate, never identity or quiescence proof.
+
+        Operator consumers must authenticate MainPID/cgroup/kernel identity and
+        call read_ack with that exact expected identity. Deferred operator ACK
+        directories are validated and pinned on first access; replacement requires
+        a fresh store after an independently verified restart.
+        """
+        self._check_lock()
+        return self._read("ack", "ack.json", Ack)

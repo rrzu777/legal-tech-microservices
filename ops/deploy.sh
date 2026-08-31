@@ -32,6 +32,13 @@ set -euo pipefail
 # está parseado antes de ejecutar nada; la versión nueva recién rige en la
 # próxima corrida.
 main() {
+  # Parsed/sourced before git can replace the checkout. Shared root-only gate;
+  # no standalone deploy may race guards or restart admitted work.
+  # shellcheck source=worker-maintenance.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/worker-maintenance.sh"
+  wm_init || exit $?
+  trap wm_close EXIT
+  wm_acquire_global || exit 1
   local repo_dir="${DEPLOY_REPO_DIR:-/opt/legal-tech-microservices}"
   local service_dir="$repo_dir/estrado-pjud-service"
   # Mismo default que API_HEALTH_URL en ops/cron/estrado-watchdog.sh; si el
@@ -55,6 +62,7 @@ main() {
   local playwright_changed=0
   local services=(estrado-pjud.service)
   local worker_enabled=0
+  local -a finalization_args=()
   local worker_enabled_state worker_active_state
   if [ "$keep_worker_stopped" != "1" ]; then
     worker_enabled_state=$("$systemctl_bin" is-enabled estrado-pjud-worker.service 2>/dev/null || true)
@@ -78,6 +86,11 @@ main() {
     exit 1
   fi
 
+  wm_prepare || { wm_error; exit 1; }
+  # Capture trusted runtime contract only after authenticating/draining current
+  # instance, before any checkout mutation. Do not execute candidate code.
+  wm_pin_worker_contract "$repo_dir" || exit 1
+
   # API (www-data:estrado) y worker (estrado:estrado) comparten estos dos
   # archivos. Una versión anterior los dejó 0640: el creador podía escribir,
   # pero el otro proceso sólo leer, convirtiendo una alerta en un 500. Sanar
@@ -93,6 +106,7 @@ main() {
   done
 
   if [ "$keep_worker_stopped" = "1" ]; then
+    wm_window && wm_verify_current || exit 1
     if ! "$systemctl_bin" disable --now estrado-pjud-worker.service; then
       echo "ABORTA: no se pudo deshabilitar/detener estrado-pjud-worker.service" >&2
       exit 1
@@ -105,9 +119,11 @@ main() {
       exit 1
     fi
     echo "Gate activo: el worker permanece detenido; se desplegará sólo la API."
+    finalization_args=(--stopped)
   elif [ "$worker_enabled" = "0" ]; then
     worker_active_state=$("$systemctl_bin" is-active estrado-pjud-worker.service 2>/dev/null || true)
     if [ "$worker_active_state" = "active" ]; then
+      wm_window && wm_verify_current || exit 1
       if ! "$systemctl_bin" stop estrado-pjud-worker.service \
         || [ "$("$systemctl_bin" is-active estrado-pjud-worker.service 2>/dev/null || true)" != "inactive" ]; then
         echo "ABORTA: worker disabled pero no se pudo detener" >&2
@@ -118,6 +134,7 @@ main() {
       exit 1
     fi
     echo "Gate persistente: worker disabled; el deploy normal no lo reiniciará."
+    finalization_args=(--stopped)
   fi
 
   local prev
@@ -125,10 +142,12 @@ main() {
 
   git fetch origin main
   if [ "$(git rev-parse origin/main)" = "$prev" ]; then
+    wm_finish "${finalization_args[@]}" || exit $?
     echo "Ya al día ($(git rev-parse --short HEAD)); nada que desplegar."
     exit 0
   fi
 
+  wm_check_worker_contract "$repo_dir" origin/main || exit 1
   git merge --ff-only origin/main
 
   # requirements.txt cambió → instalar ANTES de los tests, que ya importan lo
@@ -170,12 +189,20 @@ main() {
   # El restart también va guardado: puede fallar él mismo (ExecStartPre, env
   # que falta, StartLimitBurst ya gastado) y con set -e eso se salteaba el
   # rollback entero — justo la red de seguridad que este script promete.
+  wm_cli verify-ack "${finalization_args[@]}" \
+    --operation-id "$wm_operation_id" --identity "$wm_identity" \
+    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >/dev/null \
+    && wm_window || exit 1
   if ! "$systemctl_bin" restart "${services[@]}"; then
     rollback_and_exit "systemctl restart FALLÓ"
   fi
 
   if ! wait_health "$health_url" "$health_retries" "$health_sleep"; then
     rollback_and_exit "HEALTH FALLÓ tras el restart"
+  fi
+
+  if [ "$worker_enabled" = 1 ]; then
+    wm_verify_restarted || rollback_and_exit "WORKER ACK FALLÓ"
   fi
 
   local unit
@@ -185,6 +212,10 @@ main() {
       exit 1
     fi
   done
+
+  # Finalization is outside the rollback transaction. A publication error after
+  # durable success can mean admission is already open; never mutate afterwards.
+  wm_finish "${finalization_args[@]}" || exit $?
 
   # El trap que ya mordió una vez ("mergear crontab.snapshot no cambia nada en
   # el VPS"): este deploy avanza las FUENTES de ops/cron/ pero los instalados
@@ -208,17 +239,33 @@ main() {
 rollback_and_exit() { # rollback_and_exit <motivo>
   echo "$1: rollback a $prev" >&2
   local rollback_ready=1
-  if ! rollback_code_and_dependencies; then
+  # Authenticate the current held process (or our proven drained stopped state)
+  # before any rollback mutation/restart. A health failure is not drain proof.
+  if ! { wm_verify_current || wm_verify_restarted \
+    || wm_cli verify-ack --stopped --operation-id "$wm_operation_id" --identity "$wm_identity" \
+      --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >/dev/null; }; then
+    rollback_ready=0
+  elif ! rollback_code_and_dependencies; then
     rollback_ready=0
   fi
-  if [ "$rollback_ready" = "1" ] \
+  if [ "$rollback_ready" = "1" ] && wm_window \
     && "$systemctl_bin" restart "${services[@]}" \
-    && wait_health "$health_url" "$health_retries" "$health_sleep"; then
+    && wait_health "$health_url" "$health_retries" "$health_sleep" \
+    && verify_rollback_worker; then
     echo "Rollback OK: el VPS quedó en $prev y sano. El deploy NO entró." >&2
   else
     echo "El rollback TAMPOCO sana — intervención manual YA (journalctl -u ${services[0]})" >&2
   fi
   exit 1
+}
+
+verify_rollback_worker() {
+  if [ "$worker_enabled" = 1 ]; then
+    wm_verify_restarted
+  else
+    wm_cli verify-ack --stopped --operation-id "$wm_operation_id" --identity "$wm_identity" \
+      --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >/dev/null
+  fi
 }
 
 install_and_verify_playwright() {
@@ -280,6 +327,9 @@ validate_browser_cache_permissions() {
 }
 
 rollback_code_and_dependencies() {
+  # The restored checkout must still implement the same local protocol. A
+  # legacy rollback is not an authorized stopped bootstrap.
+  wm_check_worker_contract "$repo_dir" "$prev" || return 1
   git reset --hard "$prev"
   if [ "$deps_changed" != "1" ]; then
     return 0
@@ -297,8 +347,8 @@ rollback_code_and_dependencies() {
 }
 
 wait_health() {
-  local url="$1" retries="$2" sleep_s="$3" i
-  for i in $(seq 1 "$retries"); do
+  local url="$1" retries="$2" sleep_s="$3" _attempt
+  for _attempt in $(seq 1 "$retries"); do
     if curl -fsS -m 5 "$url" >/dev/null 2>&1; then
       return 0
     fi

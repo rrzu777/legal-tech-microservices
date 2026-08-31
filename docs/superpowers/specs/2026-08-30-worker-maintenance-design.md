@@ -1,6 +1,6 @@
 # Coordinación segura entre worker y resource guards
 
-Estado: propuesta para aprobación; no implementada ni desplegada.
+Estado: diseño aprobado; implementación local en curso, no desplegada.
 Base inspeccionada: `38b92bd3a53fff791a3ddd02a01e9c2c8fd08d34` (PR #105 y #106).
 
 En criollo: al iniciar mantenimiento no entra trabajo nuevo; lo que ya empezó
@@ -150,7 +150,7 @@ parar y no se inicia mutación si cerró. No se amplía por conveniencia.
 
 - Hold y lock no pertenecen al manifest restaurable: restaurar archivos no puede
   borrar la barrera ni reabrir tráfico. El journal registra su dueño/UUID aparte.
-- Un fallo de apply mantiene hold durante la recuperación. Rollback valida el
+- Un fallo de apply anterior al commit mantiene hold durante la recuperación. Rollback valida el
   mismo protocolo y nuevo ACK antes de declarar recuperación de servicios.
 - Rollback manual desde open también adquiere el lock global, publica hold y
   obtiene drenaje/ACK/exclusivo antes del primer stop o restauración. No se
@@ -160,7 +160,9 @@ parar y no se inicia mutación si cerró. No se amplía por conveniencia.
   y se aborta sin parar servicios ni afirmar quiescence. Un contador local cero
   no convierte una RPC de resultado desconocido en trabajo terminado. Requiere
   diagnóstico explícito; no se generan retries de trabajo para despejarlo.
-- Rollback fallido/incierto, kill del guard, reboot o pérdida del lock dejan hold.
+- Antes de finalizar admisión, rollback fallido/incierto, kill del guard, reboot
+  o pérdida del lock dejan hold (salvo publicación de open posterior al commit,
+  cuya incertidumbre se distingue abajo).
   Al arrancar, el worker compatible sigue sin admitir trabajo. No hay TTL de
   reapertura ni trap EXIT que cambie a open sin validar el resultado.
 - Rollback correcto conserva hold hasta finalización explícita del operador;
@@ -170,6 +172,15 @@ parar y no se inicia mutación si cerró. No se amplía por conveniencia.
   reintentos PJUD ni controles de proxy.
 - Release duplicado con UUID ya completado es inocuo; UUID distinto/estado
   desconocido devuelve error y no escribe.
+- El commit de la instalación ocurre sólo tras postflight, salud, identidad y
+  exclusivo correctos, registrando éxito durable antes de intentar `open`.
+  La finalización de admisión es una fase posterior y nunca dispara rollback
+  automático. Si el rename a `open` sucede pero falla el fsync posterior, no es
+  posible afirmar que siga `hold`: se devuelve estado/código distinto de
+  finalización incierta, sin reintentar mutaciones ni restaurar unidades. Puede
+  haber trabajo natural si `open` ya es visible; las mutaciones ya terminaron y
+  su éxito durable precede esa visibilidad. Todos los fallos anteriores al commit
+  conservan hold; la incertidumbre posterior requiere inspección explícita.
 - Deploy y cualquier mutador autorizado de código/unidades deben compartir el
   lock global de guards desde antes de su primera mutación hasta finalizar
   restart, health y eventual rollback. Chequear hold una sola vez no basta:

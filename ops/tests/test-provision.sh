@@ -13,6 +13,8 @@ set -uo pipefail
 
 OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROV="${1:-$OPS_DIR/provision.sh}"
+# shellcheck source=maintenance-fixture.sh
+source "$OPS_DIR/tests/maintenance-fixture.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -163,6 +165,7 @@ EOF
 }
 
 run_prov() {
+  maintenance_fixture "$(dirname "$LOG_SYSCTL")" "$OPS_DIR"
   OUT=$(PROV_REPO_DIR="$REPO" PROV_SYSTEMD_DIR="$SYSD" PROV_SYSTEMCTL="$SYSCTL" \
         PROV_ENV_FILE="$ENVF" PROV_REQUIRED_USERS="${REQUIRED_USERS:-$(id -un)}" \
         PROV_ENV_OWNER="${ENV_OWNER:-$(id -un)}" PROV_ENV_GROUP="${ENV_GROUP:-$(id -gn)}" \
@@ -185,13 +188,13 @@ run_prov() {
 reloads() { grep -c '^daemon-reload' "$LOG_SYSCTL" || true; }
 caddy_reloads() { grep -c '^reload caddy' "$LOG_SYSCTL" || true; }
 file_mode() {
-  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+  if stat --version >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi
 }
 file_owner() {
-  stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1"
+  if stat --version >/dev/null 2>&1; then stat -c '%U' "$1"; else stat -f '%Su' "$1"; fi
 }
 file_group() {
-  stat -f '%Sg' "$1" 2>/dev/null || stat -c '%G' "$1"
+  if stat --version >/dev/null 2>&1; then stat -c '%G' "$1"; else stat -f '%Sg' "$1"; fi
 }
 expect_not_group_other_writable() {
   local name="$1" mode
