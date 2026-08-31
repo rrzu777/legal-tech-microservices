@@ -57,6 +57,7 @@ setup() { # setup <nombre> — deja stubs y logs del deploy
   ORIGIN="$base/origin"; REPO="$base/repo"
   LOG_SYSCTL="$base/systemctl.log"; LOG_PIP="$base/pip.log"; LOG_PYTHON="$base/python.log"
   LOG_XVFB="$base/xvfb.log"; LOG_RUNUSER="$base/runuser.log"
+  LOG_RUNTIME="$base/runtime.log"; LOG_NET="$base/network.log"
   mkdir -p "$ORIGIN/estrado-pjud-service"
   mkdir -p "$ORIGIN/estrado-pjud-service/worker" "$ORIGIN/estrado-pjud-service/app" "$ORIGIN/ops"
   cp "$OPS_DIR/../estrado-pjud-service/worker/maintenance.py" \
@@ -89,15 +90,19 @@ setup() { # setup <nombre> — deja stubs y logs del deploy
 
   local venv="$REPO/estrado-pjud-service/.venv/bin"
   mkdir -p "$venv"
-  printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = -m ] && [ "$2" = playwright ]; then exit "${FAKE_PLAYWRIGHT_INSTALL_EXIT:-0}"; fi\nif [ "$1" = -c ]; then exit "${FAKE_PLAYWRIGHT_VERIFY_EXIT:-0}"; fi\nexit "${FAKE_PYTEST_EXIT:-0}"\n' "$LOG_PYTHON" > "$venv/python"
+  printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = -m ] && [ "$2" = playwright ]; then echo "install gc=${PLAYWRIGHT_SKIP_BROWSER_GC:-unset}" >> "%s"; exit "${FAKE_PLAYWRIGHT_INSTALL_EXIT:-0}"; fi\nif [ "$1" = -c ]; then echo "verify user=${FAKE_SMOKE_USER:-unset} $(grep playwright "$DEPLOY_REPO_DIR/estrado-pjud-service/requirements.txt")" >> "%s"; [ "${FAKE_SMOKE_USER:-}" != "${FAKE_FAIL_USER:-none}" ] || { echo "secret-url-must-not-leak" >&2; exit 1; }; if [ "${FAKE_FAIL_OLD_RUNTIME:-0}" = 1 ] && grep -q 1.61.0 "$DEPLOY_REPO_DIR/estrado-pjud-service/requirements.txt"; then exit 1; fi; exit "${FAKE_PLAYWRIGHT_VERIFY_EXIT:-0}"; fi\nexit "${FAKE_PYTEST_EXIT:-0}"\n' "$LOG_PYTHON" "$LOG_RUNTIME" "$LOG_RUNTIME" > "$venv/python"
   printf '#!/bin/bash\necho "$@" >> "%s"\nexit "${FAKE_PIP_EXIT:-0}"\n' "$LOG_PIP" > "$venv/pip"
   printf '#!/bin/bash\necho "$@" >> "%s"\n[ "${FAKE_XVFB_EXIT:-0}" = 0 ] || exit "$FAKE_XVFB_EXIT"\n[ "$1" = -a ] && shift\nexec "$@"\n' "$LOG_XVFB" > "$base/xvfb-run"
-  printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = -u ] || exit 64\nshift 2\n[ "$1" = -- ] || exit 64\nshift\nexec "$@"\n' "$LOG_RUNUSER" > "$base/runuser"
+  printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = -u ] || exit 64\nexport FAKE_SMOKE_USER="$2"\nshift 2\nif [ "$1" = -g ]; then [ "$2" = estrado ] || exit 64; shift 2; fi\n[ "$1" = -- ] || exit 64\nshift\nexec "$@"\n' "$LOG_RUNUSER" > "$base/runuser"
+  printf '#!/bin/bash\necho "$@" >> "%s"\n[ "$1" = --net ] && [ "$2" = --pid ] && [ "$3" = --fork ] && [ "$4" = --kill-child=KILL ] && [ "$5" = -- ] || exit 64\nshift 5\n[ "${FAKE_UNSHARE_EXIT:-0}" = 0 ] || exit "$FAKE_UNSHARE_EXIT"\nexec "$@"\n' "$LOG_NET" > "$base/unshare"
+  printf '#!/bin/bash\n[ "$1" = --kill-after=5s ] && [ "$2" = 60s ] || exit 64\nshift 2\nexec "$@"\n' > "$base/timeout"
   printf '#!/bin/bash\n[ "${FAKE_FIND_EXIT:-0}" = 0 ] || exit "$FAKE_FIND_EXIT"\nexec /usr/bin/find "$@"\n' > "$base/find"
   printf '#!/bin/bash\necho "$@" >> "%s"\nSTATE="%s/worker-disabled"\nFORCE_ACTIVE="%s/worker-force-active"\nif [ "${FAKE_SYSTEMCTL_STATE_UNKNOWN:-0}" = 1 ] && { [ "$1" = is-enabled ] || [ "$1" = is-active ]; }; then exit 4; fi\nif [ "$1" = disable ]; then touch "$STATE"; rm -f "$FORCE_ACTIVE"; exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = stop ] && [ "$2" = estrado-pjud-worker.service ]; then rm -f "$FORCE_ACTIVE"; exit 0; fi\nif [ "$1" = is-active ] && { [ "$2" = estrado-pjud-worker.service ] || [ "${3:-}" = estrado-pjud-worker.service ]; }; then [ -f "$FORCE_ACTIVE" ] && { echo active; exit 0; }; [ -f "$STATE" ] && { echo inactive; exit 3; }; echo active; exit 0; fi\nif [ "$1" = is-enabled ]; then [ -f "$STATE" ] && { echo disabled; exit 1; }; echo enabled; exit 0; fi\nif [ "$1" = restart ]; then exit "${FAKE_SYSTEMCTL_EXIT:-0}"; fi\nif [ "$1" = is-active ]; then echo active; exit 0; fi\nexit 0\n' "$LOG_SYSCTL" "$base" "$base" > "$base/systemctl"
-  chmod +x "$venv/python" "$venv/pip" "$base/systemctl" "$base/xvfb-run" "$base/runuser" "$base/find"
+  chmod +x "$venv/python" "$venv/pip" "$base/systemctl" "$base/xvfb-run" "$base/runuser" "$base/find" "$base/unshare" "$base/timeout"
   : > "$LOG_SYSCTL"; : > "$LOG_PIP"; : > "$LOG_PYTHON"; : > "$LOG_XVFB"; : > "$LOG_RUNUSER"
   SYSCTL="$base/systemctl"; XVFB="$base/xvfb-run"; RUNUSER="$base/runuser"; FIND="$base/find"
+  : > "$LOG_RUNTIME"; : > "$LOG_NET"
+  UNSHARE="$base/unshare"; TIMEOUT="$base/timeout"
 }
 
 avanza_origin() { # avanza_origin [archivo] — commit B en origin
@@ -126,6 +131,7 @@ run_deploy() { # run_deploy — usa REPO/SYSCTL/HEALTH; deja RC y OUT
         DEPLOY_ALLOW_TEST_BROWSER_PATH="${ALLOW_TEST_BROWSER_PATH:-1}" \
         DEPLOY_BROWSER_OWNER_UID="$(id -u)" DEPLOY_BROWSER_OWNER_GID="$(id -g)" \
         DEPLOY_XVFB_RUN="$XVFB" DEPLOY_RUNUSER="$RUNUSER" DEPLOY_FIND="$FIND" \
+        DEPLOY_UNSHARE="$UNSHARE" DEPLOY_TIMEOUT="$TIMEOUT" \
         DEPLOY_KEEP_WORKER_STOPPED="${KEEP_WORKER_STOPPED:-0}" \
         DEPLOY_HEALTH_RETRIES=2 DEPLOY_HEALTH_SLEEP=0 bash "$DEPLOY" 2>&1)
   RC=$?
@@ -305,6 +311,59 @@ run_deploy
 expect_eq "exit 0" "$RC" "0"
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "lo dice" "$OUT" "Ya al día"
+expect_eq "smoke verifica ambos usuarios en no-op" "$(grep -c '^verify ' "$LOG_RUNTIME" || true)" "2"
+expect_eq "no-op válido finaliza mantenimiento" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" "open"
+expect_missing "no-op no descarga" "$(cat "$LOG_RUNTIME")" "install"
+expect_contains "red y árbol PID aislados en no-op" "$(cat "$LOG_NET")" "--net --pid --fork --kill-child=KILL --"
+
+echo "== no-op con runtime ausente: no informa al día ni repara"
+setup aldiabroken; health_ok
+FAKE_PLAYWRIGHT_VERIFY_EXIT=1 run_deploy
+expect_eq "runtime ausente bloquea no-op" "$RC" "1"
+expect_eq "no-op roto conserva hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" "hold"
+expect_missing "no falso éxito" "$OUT" "Ya al día"
+expect_eq "no reinicio por diagnóstico" "$(restarts)" "0"
+expect_eq "no pip por diagnóstico" "$(cat "$LOG_PIP")" ""
+expect_missing "no reparación de browser" "$(cat "$LOG_RUNTIME")" "install"
+
+echo "== runtime incompatible sin diff deps: rollback antes de restart"
+setup drift; avanza_origin; health_ok
+PREV=$(sha_repo)
+FAKE_PLAYWRIGHT_VERIFY_EXIT=1 run_deploy
+expect_eq "bloquea drift" "$RC" "1"
+expect_eq "restaura código previo" "$(sha_repo)" "$PREV"
+expect_eq "no reinicia incompatible" "$(restarts)" "0"
+expect_eq "verifica nuevamente tras rollback sin deps" "$(grep -c '^verify ' "$LOG_RUNTIME" || true)" "2"
+expect_missing "no instala sin diff" "$(cat "$LOG_RUNTIME")" "install"
+
+echo "== sólo worker no puede ejecutar browser: bloquea y no filtra excepción"
+setup userfailure; avanza_origin; health_ok
+PREV=$(sha_repo)
+FAKE_FAIL_USER=estrado run_deploy
+expect_eq "gate incluye segundo usuario" "$RC" "1"
+expect_eq "restaura código" "$(sha_repo)" "$PREV"
+expect_eq "sin restart" "$(restarts)" "0"
+expect_missing "diagnóstico cerrado" "$OUT" "secret-url-must-not-leak"
+
+echo "== aislamiento de red no disponible: falla cerrado"
+setup networkfailure; health_ok
+FAKE_UNSHARE_EXIT=1 run_deploy
+expect_eq "no smoke sin namespace" "$RC" "1"
+expect_eq "no alcanza Python" "$(cat "$LOG_RUNTIME")" ""
+
+echo "== Xvfb no disponible: falla cerrado antes de Python"
+setup displayfailure; health_ok
+FAKE_XVFB_EXIT=1 run_deploy
+expect_eq "display roto bloquea no-op" "$RC" "1"
+expect_eq "no alcanza Python sin display" "$(cat "$LOG_RUNTIME")" ""
+expect_eq "no reinicia sin display" "$(restarts)" "0"
+
+echo "== no-op no modifica permisos de cache inseguros"
+setup readonlycache; health_ok
+chmod 0775 "$TMP/ms-playwright"
+run_deploy
+expect_eq "cache inseguro bloquea diagnóstico" "$RC" "1"
+expect_eq "verificar no hace chmod" "$(file_mode "$TMP/ms-playwright")" "775"
 
 echo "== requirements cambió: pip install antes de los tests"
 setup deps; avanza_playwright; health_ok
@@ -312,11 +371,13 @@ run_deploy
 expect_eq "exit 0" "$RC" "0"
 expect_contains "instaló deps" "$(cat "$LOG_PIP")" "install"
 expect_contains "instaló Chromium compatible" "$(cat "$LOG_PYTHON")" "-m playwright install chromium"
+expect_contains "instala conservando revisiones previas" "$(cat "$LOG_RUNTIME")" "install gc=1"
 expect_contains "verificó que Chromium abre" "$(cat "$LOG_PYTHON")" "from playwright.sync_api import sync_playwright"
 expect_contains "smoke usa headed y flags productivos" "$(cat "$LOG_PYTHON")" "headless=False"
 expect_contains "smoke corre dentro de Xvfb" "$(cat "$LOG_XVFB")" "-a env"
-expect_contains "smoke valida usuario API" "$(cat "$LOG_RUNUSER")" "-u www-data --"
-expect_contains "smoke valida usuario worker" "$(cat "$LOG_RUNUSER")" "-u estrado --"
+expect_contains "smoke valida usuario API y grupo real" "$(cat "$LOG_RUNUSER")" "-u www-data -g estrado --"
+expect_contains "smoke valida usuario worker y grupo real" "$(cat "$LOG_RUNUSER")" "-u estrado -g estrado --"
+expect_missing "no redefine HOME" "$(cat "$LOG_XVFB")" "HOME="
 expect_eq "normaliza sólo la raíz del cache a 0755" \
   "$(file_mode "$TMP/ms-playwright")" "755"
 
@@ -344,6 +405,13 @@ expect_eq "no instala siguiendo symlink" "$(grep -c -- '-m playwright install ch
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "rechaza el symlink" "$OUT" "symlink"
 
+echo "== symlink interior del cache: diagnóstico no sigue ni repara"
+setup browserinnermlink; health_ok
+ln -s /bin/sh "$TMP/ms-playwright/browser-link"
+run_deploy
+expect_eq "symlink interior bloquea no-op" "$RC" "1"
+expect_eq "no instala ni ejecuta cache inseguro" "$(cat "$LOG_RUNTIME")" ""
+
 echo "== contenido del cache escribible por grupo: falla cerrado"
 setup browserpermissions; avanza_playwright; health_ok
 PREV=$(sha_repo)
@@ -368,11 +436,14 @@ unset FAKE_FIND_EXIT
 echo "== Chromium no se instala: revierte código, no reinicia y falla cerrado"
 setup browserfail; avanza_playwright; health_ok
 PREV=$(sha_repo)
+touch "$TMP/ms-playwright/previous-browser"
 FAKE_PLAYWRIGHT_INSTALL_EXIT=1 run_deploy
 expect_eq "exit 1" "$RC" "1"
 expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "nombra la causa" "$OUT" "CHROMIUM FALLÓ"
+expect_eq "conserva revisión anterior si install falla" "$(test -f "$TMP/ms-playwright/previous-browser" && echo retained)" "retained"
+expect_missing "ningún install hace GC" "$(cat "$LOG_RUNTIME")" "gc=unset"
 unset FAKE_PLAYWRIGHT_INSTALL_EXIT
 
 echo "== Chromium no abre: revierte código, no reinicia y falla cerrado"
@@ -393,8 +464,47 @@ expect_eq "exit 1" "$RC" "1"
 expect_eq "HEAD volvió al previo" "$(sha_repo)" "$PREV"
 expect_eq "reinstala requirements previos" "$(grep -c '^install ' "$LOG_PIP" || true)" "2"
 expect_eq "reinstala Chromium compatible con el rollback" "$(grep -c -- '-m playwright install chromium' "$LOG_PYTHON" || true)" "2"
+expect_contains "verifica runtime nuevo" "$(cat "$LOG_RUNTIME")" "verify user=www-data playwright==1.62.0"
+expect_contains "verifica runtime restaurado" "$(cat "$LOG_RUNTIME")" "verify user=www-data playwright==1.61.0"
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 unset FAKE_PYTEST_EXIT
+
+echo "== runtime previo inválido impide restart de rollback aunque health esté sano"
+setup rollbackruntime; avanza_playwright; health_ok
+FAKE_SYSTEMCTL_EXIT=1 FAKE_FAIL_OLD_RUNTIME=1 run_deploy
+expect_eq "deploy falla" "$RC" "1"
+expect_eq "no reinicia runtime inválido de rollback" "$(restarts)" "1"
+expect_contains "pide intervención" "$OUT" "TAMPOCO sana"
+
+echo "== rollback sin diff deps revisa runtime previo antes del segundo restart"
+setup rollbacknodeps; avanza_origin; health_ok
+FAKE_SYSTEMCTL_EXIT=1 run_deploy
+expect_eq "ida y rollback verifican ambos usuarios" "$(grep -c '^verify ' "$LOG_RUNTIME" || true)" "4"
+expect_missing "rollback sin deps nunca instala" "$(cat "$LOG_RUNTIME")" "install"
+
+echo "== rollback borra helper y script candidatos, pero el smoke retenido sigue"
+setup retainedhelper; health_ok
+PREV=$(sha_repo)
+mkdir -p "$ORIGIN/ops" "$REPO/ops"
+cp "$DEPLOY" "$ORIGIN/ops/deploy.sh"
+cp "$(dirname "$DEPLOY")/playwright-runtime-smoke.py" "$ORIGIN/ops/playwright-runtime-smoke.py"
+git -C "$ORIGIN" add ops
+git -C "$ORIGIN" commit -q -m candidate-runtime
+# Bootstrap the candidate orchestration over base A, then FF tracks these
+# files; rollback to A will really remove them. They are ignored ONLY in this
+# disposable fixture, never in the real deployment's dirty-tree guard.
+printf '/ops/deploy.sh\n/ops/playwright-runtime-smoke.py\n' >> "$REPO/.git/info/exclude"
+cp "$ORIGIN/ops/deploy.sh" "$REPO/ops/deploy.sh"
+cp "$ORIGIN/ops/playwright-runtime-smoke.py" "$REPO/ops/playwright-runtime-smoke.py"
+ORIGINAL_DEPLOY="$DEPLOY"
+DEPLOY="$REPO/ops/deploy.sh"
+FAKE_PYTEST_EXIT=1 run_deploy
+DEPLOY="$ORIGINAL_DEPLOY"
+expect_eq "rollback del candidato falla deploy y restaura base" "$RC/$(sha_repo)" "1/$PREV"
+expect_eq "helper fue realmente eliminado" "$(test ! -e "$REPO/ops/playwright-runtime-smoke.py" && echo removed)" "removed"
+expect_eq "script fue realmente eliminado" "$(test ! -e "$REPO/ops/deploy.sh" && echo removed)" "removed"
+expect_eq "retuvo helper para ambos smokes de rollback" "$(grep -c '^verify ' "$LOG_RUNTIME" || true)" "4"
+expect_eq "ningún restart durante fallo pre-release" "$(restarts)" "0"
 
 echo "== pip falla: código vuelve, sin restarts; hold bloquea reintento automático"
 setup pipfail; avanza_origin estrado-pjud-service/requirements.txt; health_ok
