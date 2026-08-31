@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import SecretStr
 
 from app.bandwidth import record_proxy_request, record_proxy_response_increment
@@ -38,6 +39,32 @@ _LOGIN_TIMEOUT_S = 45.0
 _CLEANUP_TIMEOUT_S = 1.0
 _RUT_PLACEHOLDER = "Ingrese su Rut sin dígito verificador, Ej: 12345678"
 logger = logging.getLogger(__name__)
+
+
+def _exception_diagnostic(error: BaseException) -> tuple[str, str]:
+    """Map browser failures to finite labels; never return upstream text."""
+    if isinstance(error, (asyncio.TimeoutError, PlaywrightTimeoutError)):
+        return "timeout", "timeout"
+    if isinstance(error, PlaywrightError):
+        message = ""
+        match = None
+        try:
+            message = error.message
+            match = re.search(r"\bnet::(ERR_[A-Z_]+)\b", message) if isinstance(message, str) else None
+            return "browser_error", {
+                "ERR_TUNNEL_CONNECTION_FAILED": "tunnel_connection_failed",
+                "ERR_PROXY_CONNECTION_FAILED": "proxy_connection_failed",
+                "ERR_CONNECTION_RESET": "connection_reset",
+                "ERR_NAME_NOT_RESOLVED": "name_not_resolved",
+            }.get(match.group(1) if match else "", "other")
+        except Exception:
+            return "browser_error", "other"
+        finally:
+            message = ""
+            match = None
+    if isinstance(error, TypeError):
+        return "type_error", "none"
+    return "internal", "none"
 
 
 def _rut_body(rut: str) -> str:
@@ -272,6 +299,9 @@ async def login_official_ojv(
     # Only literals assigned locally: never attach URLs, exception objects,
     # browser state, credentials or cookie contents to diagnostic records.
     stage = "proxy_config"
+    error_kind, network_code = "contract", "none"
+    entry_http = 0
+    entry_origin = "unknown"
     try:
         if proxy_url:
             launch_kwargs["proxy"] = split_proxy_for_playwright(proxy_url)
@@ -298,12 +328,18 @@ async def login_official_ojv(
                     _OFFICIAL_ENTRY, wait_until="domcontentloaded", timeout=_remaining_timeout_ms(deadline),
                 ), deadline)
                 status = response.status if response is not None else 200
+                if type(status) is int and 100 <= status <= 599:
+                    entry_http = status
                 if status in {403, 429}:
                     failure = FamiliaBlockedError()
                 elif status == 408 or status >= 500:
                     failure = OjvTimeoutError()
-                elif status >= 400 or not _is_trusted_official_url(page.url):
+                elif status >= 400:
                     failure = OjvUpstreamChangedError()
+                else:
+                    entry_origin = "trusted" if _is_trusted_official_url(page.url) else "untrusted"
+                    if entry_origin == "untrusted":
+                        failure = OjvUpstreamChangedError()
             if failure is None:
                 stage = "services_visible"
                 services = page.get_by_role("button", name="Todos los servicios", exact=True)
@@ -377,9 +413,11 @@ async def login_official_ojv(
             cancelled = True
         except ProxyBillingExhaustedError:
             raise
-        except (asyncio.TimeoutError, PlaywrightTimeoutError):
+        except (asyncio.TimeoutError, PlaywrightTimeoutError) as error:
+            error_kind, network_code = _exception_diagnostic(error)
             failure = OjvTimeoutError()
-        except BaseException:
+        except BaseException as error:
+            error_kind, network_code = _exception_diagnostic(error)
             failure = OjvUpstreamChangedError()
         finally:
             cancelled = await _cleanup_all((cdp_session, "cdp"), (page, "resource"), (context, "resource"), (browser, "resource")) or cancelled
@@ -390,8 +428,9 @@ async def login_official_ojv(
                 await asyncio.wait_for(manager.__aexit__(None, None, None), timeout=_CLEANUP_TIMEOUT_S)
             except asyncio.CancelledError:
                 cancelled = True
-            except BaseException:
+            except BaseException as error:
                 if failure is None:
+                    error_kind, network_code = _exception_diagnostic(error)
                     failure = OjvUpstreamChangedError()
             if failure is not None or cancelled:
                 result = None
@@ -399,9 +438,11 @@ async def login_official_ojv(
         cancelled = True
     except ProxyBillingExhaustedError:
         raise
-    except (asyncio.TimeoutError, PlaywrightTimeoutError):
+    except (asyncio.TimeoutError, PlaywrightTimeoutError) as error:
+        error_kind, network_code = _exception_diagnostic(error)
         failure = OjvTimeoutError()
-    except BaseException:
+    except BaseException as error:
+        error_kind, network_code = _exception_diagnostic(error)
         failure = OjvUpstreamChangedError()
     finally:
         if not manager_entered:
@@ -409,8 +450,9 @@ async def login_official_ojv(
                 await asyncio.wait_for(manager.__aexit__(None, None, None), timeout=_CLEANUP_TIMEOUT_S)
             except asyncio.CancelledError:
                 cancelled = True
-            except BaseException:
+            except BaseException as error:
                 if failure is None:
+                    error_kind, network_code = _exception_diagnostic(error)
                     failure = OjvUpstreamChangedError()
         rut_value = password_value = rut_digits = ""
         proxy_url = None
@@ -419,7 +461,10 @@ async def login_official_ojv(
     if cancelled:
         raise asyncio.CancelledError()
     if failure is not None:
-        logger.warning("pjud_private_login_failed stage=%s outcome=%s", stage, failure.code.value)
+        logger.warning(
+            "pjud_private_login_failed stage=%s outcome=%s kind=%s network=%s entry_http=%s entry_origin=%s",
+            stage, failure.code.value, error_kind, network_code, entry_http, entry_origin,
+        )
         raise failure from None
     if result is None:
         raise OjvUpstreamChangedError()

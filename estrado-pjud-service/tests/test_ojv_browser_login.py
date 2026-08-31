@@ -5,7 +5,7 @@ import httpx
 import time
 import pytest
 from pydantic import SecretStr
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 from app.bandwidth import capture_proxy_usage
 from app.cookie_scope import CookieRecord
@@ -667,7 +667,7 @@ async def test_failure_diagnostic_identifies_boundary_without_provider_secrets(
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("synthetic-sensitive"), proxy_url=None, user_agent="official-test-agent")
     records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
     assert len(records) == 1
-    assert records[0].getMessage() == f"pjud_private_login_failed stage={boundary} outcome=upstream_changed"
+    assert records[0].getMessage().startswith(f"pjud_private_login_failed stage={boundary} outcome=upstream_changed")
     assert records[0].exc_info is None
     assert records[0].stack_info is None
     assert "synthetic-sensitive" not in repr(records[0].__dict__)
@@ -691,9 +691,8 @@ async def test_cdp_failure_diagnostic_preserves_original_stage_through_exit_fail
     with pytest.raises(OjvUpstreamChangedError):
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
     records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
-    assert [record.getMessage() for record in records] == [
-        "pjud_private_login_failed stage=cdp_enable outcome=upstream_changed",
-    ]
+    assert len(records) == 1
+    assert records[0].getMessage().startswith("pjud_private_login_failed stage=cdp_enable outcome=upstream_changed")
 
 
 async def test_success_and_cancellation_do_not_emit_login_failure(
@@ -734,6 +733,61 @@ async def test_form_diagnostic_identifies_missing_requirement_before_filling(
     assert page.form.password.filled == []
     assert context.closed and browser.closed
     records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
-    assert [record.getMessage() for record in records] == [
-        f"pjud_private_login_failed stage={missing} outcome=upstream_changed",
-    ]
+    assert len(records) == 1
+    assert records[0].getMessage().startswith(f"pjud_private_login_failed stage={missing} outcome=upstream_changed")
+
+
+@pytest.mark.parametrize("error,kind,network,outcome", [
+    (PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED secret-token"), "browser_error", "tunnel_connection_failed", "upstream_changed"),
+    (PlaywrightError("net::ERR_PROXY_CONNECTION_FAILED secret-token"), "browser_error", "proxy_connection_failed", "upstream_changed"),
+    (PlaywrightError("net::ERR_CONNECTION_RESET secret-token"), "browser_error", "connection_reset", "upstream_changed"),
+    (PlaywrightError("net::ERR_NAME_NOT_RESOLVED secret-token"), "browser_error", "name_not_resolved", "upstream_changed"),
+    (PlaywrightError("net::ERR_UNKNOWN secret-token"), "browser_error", "other", "upstream_changed"),
+    (PlaywrightTimeoutError("secret-token"), "timeout", "timeout", "timeout"),
+    (TypeError("secret-token"), "type_error", "none", "upstream_changed"),
+    (RuntimeError("net::ERR_CONNECTION_RESET secret-token"), "internal", "none", "upstream_changed"),
+])
+async def test_entry_failure_logs_only_closed_exception_and_network_details(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    error: Exception, kind: str, network: str, outcome: str,
+) -> None:
+    page = _Page()
+    async def fail(*_args, **_kwargs):
+        raise error
+    monkeypatch.setattr(page, "goto", fail)
+    _install_fake_browser(monkeypatch, page)
+    with pytest.raises((OjvTimeoutError, OjvUpstreamChangedError)):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret-token"), proxy_url=None, user_agent="official-test-agent")
+    records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        f"pjud_private_login_failed stage=entry_goto outcome={outcome} "
+        f"kind={kind} network={network} entry_http=0 entry_origin=unknown"
+    )
+    assert "secret-token" not in repr(records[0].__dict__)
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize("status,origin,expected_origin,error_type", [
+    (404, "https://oficinajudicialvirtual.pjud.cl/home/index.php", "unknown", OjvUpstreamChangedError),
+    (403, "https://oficinajudicialvirtual.pjud.cl/home/index.php", "unknown", FamiliaBlockedError),
+    (200, "https://unexpected.invalid/?secret-token", "untrusted", OjvUpstreamChangedError),
+])
+async def test_entry_http_and_origin_failures_are_distinguishable_without_urls(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    status: int, origin: str, expected_origin: str, error_type: type[Exception],
+) -> None:
+    from types import SimpleNamespace
+    page = _Page()
+    async def response(*_args, **_kwargs):
+        page.url = origin
+        return SimpleNamespace(status=status)
+    monkeypatch.setattr(page, "goto", response)
+    _install_fake_browser(monkeypatch, page)
+    with pytest.raises(error_type):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret-token"), proxy_url=None, user_agent="official-test-agent")
+    records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+    assert len(records) == 1
+    assert f"kind=contract network=none entry_http={status} entry_origin={expected_origin}" in records[0].getMessage()
+    assert "secret-token" not in repr(records[0].__dict__)
+    assert "unexpected.invalid" not in repr(records[0].__dict__)
