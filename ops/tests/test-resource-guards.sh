@@ -4,6 +4,15 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/ops/resource-guards.sh"
+# shellcheck source=maintenance-fixture.sh
+source "$ROOT/ops/tests/maintenance-fixture.sh"
+if [ ! -x /usr/bin/sha256sum ] && [ ! -x /usr/bin/shasum ]; then
+  printf '%s\n' 'Missing SHA256 test dependency' >&2
+  exit 2
+fi
+for dependency in /usr/bin/jq /usr/bin/python3; do
+  [ -x "$dependency" ] || { printf 'Missing test dependency: %s\n' "$dependency" >&2; exit 2; }
+done
 TMP_RAW="$(mktemp -d)"
 TMP="$(cd "$TMP_RAW" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
@@ -71,7 +80,7 @@ write_stub() { # name, body on stdin
 }
 
 setup() {
-  CASE_DIR="$TMP/case-$RANDOM-$RANDOM"
+  CASE_DIR=$(mktemp -d "$TMP/case.XXXXXXXXXX") || return 1
   FAKE="$CASE_DIR/root"
   STATE="$CASE_DIR/state"
   BIN="$CASE_DIR/bin"
@@ -506,6 +515,8 @@ if [ "${1:-}" = show ]; then
     estrado-pjud-worker.service:ActiveState|legaltech-monitor.service:ActiveState|legaltech-resource-tracker.service:ActiveState) cat "$RG_TEST_STATE/unit-$unit-active" ;;
     estrado-pjud-worker.service:Result|legaltech-monitor.service:Result|legaltech-resource-tracker.service:Result) cat "$RG_TEST_STATE/unit-$unit-result" ;;
     legaltech-monitor.service:Type|legaltech-resource-tracker.service:Type) echo oneshot ;;
+    legaltech-monitor.service:LoadState|legaltech-resource-tracker.service:LoadState) echo loaded ;;
+    legaltech-monitor.service:ExecMainStatus|legaltech-resource-tracker.service:ExecMainStatus) echo 0 ;;
     legaltech-monitor.service:User|legaltech-resource-tracker.service:User) echo root ;;
     legaltech-monitor.service:WorkingDirectory|legaltech-resource-tracker.service:WorkingDirectory) echo /opt/legaltech-monitoring ;;
     legaltech-monitor.service:NoNewPrivileges|legaltech-resource-tracker.service:NoNewPrivileges) echo yes ;;
@@ -520,13 +531,17 @@ if [ "${1:-}" = show ]; then
     legaltech-monitor.service:LogsDirectory) echo legaltech ;;
     legaltech-monitor.service:LogsDirectoryMode) echo 0750 ;;
     legaltech-monitor.service:ReadWritePaths) echo '/var/lib/legaltech-monitor /var/log/legaltech' ;;
-    legaltech-monitor.service:RestrictAddressFamilies) echo '' ;;
+    legaltech-monitor.service:RestrictAddressFamilies) echo '~' ;;
     legaltech-monitor.service:PartOf) echo '' ;;
     legaltech-monitor.service:EnvironmentFiles) echo '/etc/legaltech-monitoring.env (ignore_errors=yes)' ;;
     legaltech-resource-tracker.service:StateDirectory|legaltech-resource-tracker.service:LogsDirectory) echo '' ;;
     legaltech-resource-tracker.service:ReadWritePaths) echo /var/log/legaltech/resources.csv ;;
     legaltech-resource-tracker.service:RestrictAddressFamilies) echo AF_UNIX ;;
     legaltech-resource-tracker.service:PartOf|legaltech-resource-tracker.service:EnvironmentFiles) echo '' ;;
+    legaltech-monitor.timer:LoadState|legaltech-resource-tracker.timer:LoadState)
+      if [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = not-found ]; then echo not-found; else echo loaded; fi ;;
+    legaltech-monitor.service:FragmentPath|legaltech-resource-tracker.service:FragmentPath|legaltech-monitor.timer:FragmentPath|legaltech-resource-tracker.timer:FragmentPath)
+      if [ "$(cat "$RG_TEST_STATE/unit-$unit-enabled")" = not-found ]; then echo ''; else echo "$RG_SYSTEMD_DIR/$unit"; fi ;;
     legaltech-monitor.timer:Unit) echo legaltech-monitor.service ;;
     legaltech-resource-tracker.timer:Unit) echo legaltech-resource-tracker.service ;;
     *.timer:TimersMonotonic)
@@ -584,7 +599,12 @@ case "${1:-}" in
     else
       case "$value" in
         active) exit 0 ;;
-        failed) exit 3 ;;
+        failed)
+          case "$unit" in
+            legaltech-monitor.timer|legaltech-resource-tracker.timer)
+              [ "$(cat "$(state_file "$unit" enabled)")" != not-found ] || exit 4 ;;
+          esac
+          exit 3 ;;
         inactive)
           if [ -f "$RG_TEST_STATE/unit-$unit-active-status" ]; then
             exit "$(cat "$RG_TEST_STATE/unit-$unit-active-status")"
@@ -622,9 +642,16 @@ case "${1:-}" in
     ;;
   start|stop|restart)
     action=$1; shift
-    case "$action" in stop) value=inactive ;; *) value=active ;; esac
     for unit in "$@"; do
+      case "$action" in stop) value=inactive ;; *) value=active ;; esac
       [ "$unit" = -- ] && continue
+      case "$unit" in
+        legaltech-monitor.service|legaltech-resource-tracker.service)
+          if [ "$action" != stop ] && cmp -s "$RG_SYSTEMD_DIR/$unit" "$RG_REPO_DIR/ops/systemd/$unit"; then
+            # The installed declared services are synchronous oneshots.
+            value=inactive
+          fi ;;
+      esac
       if [ "$unit" = estrado-pjud-worker.service ] && [ "$action" = stop ] \
         && [ -e "$RG_TEST_STATE/worker-stop-keeps-active" ]; then
         continue
@@ -637,6 +664,9 @@ case "${1:-}" in
         estrado-pjud-worker.service)
           old_pid=$(cat "$RG_TEST_STATE/unit-$unit-main-pid") || exit 1
           if [ "$action" = stop ]; then
+            if [ -e "$RG_TEST_STATE/clock-crosses-after-worker-stop" ]; then
+              printf '04\n' > "$RG_TEST_STATE/local-hour"
+            fi
             if [ ! -e "$RG_TEST_STATE/worker-residual-runtime" ]; then
               case "$old_pid" in 0) ;; *) rm -f "$RG_TEST_STATE/pid-$old_pid-unit" ;; esac
               printf '%s\n' 0 > "$RG_TEST_STATE/unit-$unit-main-pid"
@@ -806,6 +836,23 @@ if [ -e "$RG_TEST_STATE/health-after-first" ] && [ "$health_calls" -gt 2 ]; then
 printf '%s' "$code"
 [ "$code" = 200 ]
 EOF
+  write_stub busctl <<'EOF'
+case "${@: -1}" in
+  DropInPaths)
+    if [ -e "$RG_TEST_STATE/monitor-override" ]; then echo 'as 1 "/private/override.conf"'; else echo 'as 0'; fi
+    exit 0 ;;
+  NeedDaemonReload)
+    if [ -e "$RG_TEST_STATE/monitor-needs-reload" ]; then echo 'b true'; else echo 'b false'; fi
+    exit 0 ;;
+esac
+[ "$*" = '--system get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/legaltech_2dresource_2dtracker_2eservice org.freedesktop.systemd1.Service EnvironmentFiles' ] || exit 1
+if [ -f "$RG_TEST_STATE/property-bad" ] \
+  && [ "$(cat "$RG_TEST_STATE/property-bad")" = legaltech-resource-tracker.service:EnvironmentFiles ]; then
+  printf '%s\n' 'a(sb) 1 "/unexpected.env" true'
+else
+  printf '%s\n' 'a(sb) 0'
+fi
+EOF
   write_stub date <<'EOF'
 case "$*" in
   '-u +%s') cat "$RG_TEST_STATE/now" ;;
@@ -844,6 +891,10 @@ EOF
   write_stub flock <<'EOF'
 case "${1:-}" in
   -n)
+    if [ -d "$RG_TEST_STATE/resource-lock-held" ] \
+      && ! kill -0 "$(cat "$RG_TEST_STATE/resource-lock-held/owner")" 2>/dev/null; then
+      rm -rf "$RG_TEST_STATE/resource-lock-held"
+    fi
     if [ -e "$RG_TEST_STATE/flock-fail-after-output" ]; then
       printf '%s\n' acquired
       exit 7
@@ -895,7 +946,11 @@ EOF
   write_stub sha256 <<'EOF'
 path=${@: -1}
 [ -f "$path" ] || exit 1
-digest=$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')
+if [ -x /usr/bin/sha256sum ]; then
+  digest=$(/usr/bin/sha256sum "$path" | awk '{print $1}')
+else
+  digest=$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')
+fi
 case "$(cat "$RG_TEST_STATE/sha-mode" 2>/dev/null || true)" in
   malformed) printf 'not-a-digest  %s\n' "$path" ;;
   wrong-path) printf '%s  %s.other\n' "$digest" "$path" ;;
@@ -949,6 +1004,7 @@ esac
 if [ -e "$RG_TEST_STATE/mutate-outside" ]; then printf 'outside changed\n' > "$RG_TEST_OUTSIDE"; fi
 if [ -e "$RG_TEST_STATE/create-sysctl" ]; then printf 'new sysctl\n' > "$RG_SYSCTL_FILE"; fi
 if [ -e "$RG_TEST_STATE/mutate-credential" ]; then printf 'changed protected config\n' > "$RG_CREDENTIAL_FILE"; fi
+if [ -e "$RG_TEST_STATE/clock-crosses-after-provision" ]; then printf '04\n' > "$RG_TEST_STATE/local-hour"; fi
 [ ! -e "$RG_TEST_STATE/provision-fail" ] || exit 1
 EOF
   write_stub swap <<'EOF'
@@ -1177,6 +1233,8 @@ EOF
 }
 
 run_guard() {
+  maintenance_fixture "$STATE" "$ROOT/ops"
+  export WM_FLOCK="$BIN/flock" WM_DATE="$BIN/date"
   local monitor_unit
   for monitor_unit in legaltech-monitor.service legaltech-resource-tracker.service; do
     cp "$FAKE/systemd/$monitor_unit" "$FAKE/repo/ops/systemd/$monitor_unit"
@@ -1212,7 +1270,7 @@ run_guard() {
     RG_JURISTRACK_HEALTH_URL=https://juristrack.cl/ \
     RG_ESTRADO_HEALTH_URL=https://estrado.juristrack.cl/api/v1/health \
     RG_GIT_BIN="$BIN/git" RG_DF_BIN="$BIN/df" RG_FREE_BIN="$BIN/free" \
-    RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" \
+    RG_ID_BIN="$BIN/id" RG_PS_BIN="$BIN/ps" RG_SYSTEMCTL_BIN="$BIN/systemctl" RG_BUSCTL_BIN="$BIN/busctl" \
     RG_CURL_BIN="$BIN/curl" RG_DATE_BIN="$BIN/date" RG_STAT_BIN="$BIN/stat" \
     RG_FLOCK_BIN="$BIN/flock" RG_READLINK_BIN="$BIN/readlink" \
     RG_LOCK_FILE="$FAKE/run/legaltech-resource-guards.lock" RG_FD_ROOT="$FAKE/fd" \
@@ -1319,7 +1377,8 @@ run_legacy_monitor_migration_regression() {
     expect_eq "rollback restores $unit active" "$(cat "$STATE/unit-$unit-active")" active
     expect_exact_count "rollback restarts restored legacy $unit once" "systemctl restart $unit" 1
   done
-  expect_contains 'legacy monitor rollback reports complete' "$OUT" 'ROLLBACK OK'
+  expect_contains 'legacy monitor restore retains failed-health diagnostic' "$OUT" 'ROLLBACK INCOMPLETO'
+  expect_missing 'legacy monitor persistent outage never claims healthy rollback' "$OUT" 'ROLLBACK OK'
 }
 
 run_activity_preservation_regressions() {
@@ -1406,7 +1465,8 @@ run_absent_timer_regressions() {
     expect_count "rollback never disables absent $timer" "systemctl disable $timer" 0
     expect_count "rollback never stops absent $timer" "systemctl stop $timer" 0
   done
-  expect_contains 'absent timer rollback reports complete' "$OUT" 'ROLLBACK OK'
+  expect_contains 'absent timer restore retains failed-health diagnostic' "$OUT" 'ROLLBACK INCOMPLETO'
+  expect_missing 'absent timer persistent outage never claims healthy rollback' "$OUT" 'ROLLBACK OK'
 
   setup
   configure_absent_timer_base
@@ -1872,7 +1932,8 @@ run_worker_pre_target_cgroup_regressions() {
   TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'later failure keeps legacy-worker apply failed' "$RC" 1
   expect_count 'legacy-worker rollback happens only after provisioning the target' provision 1
-  expect_contains 'legacy-worker rollback completes' "$OUT" 'ROLLBACK OK'
+  expect_contains 'worker restore retains failed-health diagnostic' "$OUT" 'ROLLBACK INCOMPLETO'
+  expect_missing 'worker persistent outage never claims healthy rollback' "$OUT" 'ROLLBACK OK'
   expect_eq 'rollback restores legacy effective slice' \
     "$(cat "$STATE/unit-estrado-pjud-worker.service-slice")" system.slice
   expect_eq 'rollback restores legacy cgroup identity' \
@@ -2021,7 +2082,13 @@ run_runtime_cgroup_regressions() {
     TEST_MUTATE=$mutate run_guard apply --expected-sha "$EXPECTED_SHA"
     expect_eq "$scenario wrong valid cgroup refuses apply" "$RC" 1
     rollback_count=$(grep -c -x -F 'swap rollback' "$EVENTS" 2>/dev/null || true)
-    expect_eq "$scenario mismatch triggers one rollback" "$rollback_count" 1
+    if [ "$scenario" = worker ]; then
+      expect_eq 'untrusted worker cgroup prevents rollback mutation' "$rollback_count" 0
+      expect_exact_count 'untrusted restarted worker is not stopped' 'systemctl stop estrado-pjud-worker.service' 1
+      expect_contains 'untrusted worker refuses file restoration explicitly' "$OUT" 'no files restored'
+    else
+      expect_eq "$scenario mismatch triggers one rollback" "$rollback_count" 1
+    fi
   done
 
   echo '== runtime parser rejects missing duplicate malformed and extra properties'
@@ -2318,7 +2385,9 @@ run_rollback_maintenance_window_regressions() {
   printf '%s\n' 19 > "$STATE/local-hour"
   : > "$EVENTS"
   run_guard rollback --backup-dir "$backup_path"
-  expect_eq 'outside-window captured-inactive rollback still converges' "$RC" 0
+  expect_eq 'captured-inactive rollback cannot bypass the maintenance window' "$RC" 1
+  expect_exact_count 'captured-inactive outside-window rollback mutates no swap' 'swap rollback' 0
+  expect_count 'captured-inactive outside-window rollback restores no files' 'backup-copy ' 0
   expect_count 'captured-inactive rollback performs no worker start' \
     'systemctl start estrado-pjud-worker.service' 0
   expect_count 'captured-inactive rollback performs no worker stop' \
@@ -2337,13 +2406,13 @@ run_rollback_window_crossing_regressions() {
   : > "$STATE/postflight-fail"
   TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'cross-window postflight failure keeps apply failed' "$RC" 1
-  expect_exact_count 'cross-window automatic compensation delegates swap once' \
-    'swap rollback' 1
-  expect_contains 'cross-window automatic compensation converges' "$OUT" 'ROLLBACK OK'
+  expect_exact_count 'window closed before drain cannot mutate swap' \
+    'swap rollback' 0
+  expect_missing 'window closed before drain never invokes rollback' "$OUT" 'ROLLBACK OK'
   expect_eq 'cross-window compensation restores the captured active worker' \
     "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
-  expect_eq 'compensation observes 03 for apply and 04 for both rollback gates' \
-    "$(cat "$STATE/local-hour-calls")" 3
+  expect_eq 'window is rechecked before publishing hold' \
+    "$(cat "$STATE/local-hour-calls")" 2
   backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
 
   : > "$EVENTS"
@@ -2367,9 +2436,9 @@ run_rollback_window_crossing_regressions() {
     | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
   expect_eq 'early failed cross-window compensation keeps apply failed' "$RC" 1
   expect_eq 'early failed cross-window compensation reports the exact retry authority once' \
-    "$retry_path" "$backup_path"
+    "$retry_path" ''
   expect_eq 'early failed cross-window compensation emits one retry diagnostic' \
-    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 1
+    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 0
   expect_exact_count 'early failed compensation never reaches swap mutation' \
     'swap rollback' 0
 }
@@ -2391,8 +2460,8 @@ run_rollback_worker_capability_regression() {
     | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
 
   expect_eq 'daytime later failure keeps apply failed' "$RC" 1
-  expect_eq 'daytime fixture leaves originally unchanged worker inactive' \
-    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" inactive
+  expect_eq 'daytime refusal leaves worker untouched and active' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
   expect_count 'daytime compensation never starts the unchanged worker' \
     'systemctl start estrado-pjud-worker.service' 0
   expect_count 'daytime compensation never restarts the unchanged worker' \
@@ -2404,7 +2473,7 @@ run_rollback_worker_capability_regression() {
   expect_eq 'daytime incomplete compensation reports exact retry authority' \
     "$retry_path" "$backup_path"
   expect_eq 'daytime incomplete compensation emits one retry diagnostic' \
-    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 1
+    "$(printf '%s\n' "$OUT" | grep -c '^ROLLBACK INCOMPLETO:' || true)" 0
   expect_missing 'daytime compensation emits no paid sync action' "$OUT" '/api/v1/sync'
   expect_missing 'daytime compensation emits no proxy action' "$OUT" '/proxy'
   expect_missing 'daytime compensation emits no session mint action' "$OUT" '/session/mint'
@@ -2631,14 +2700,14 @@ run_explicit_daytime_maintenance_regressions() {
   configure_active_worker
   printf '%s\n' 09 > "$STATE/local-hour"
   TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
-  expect_eq 'explicit daytime authorization admits safe idle worker' "$RC" 0
-  expect_exact_count 'authorized daytime stops worker once' 'systemctl stop estrado-pjud-worker.service' 1
-  expect_exact_count 'authorized daytime starts worker once' 'systemctl start estrado-pjud-worker.service' 1
-  expect_contains 'explicit authorization is visible in safe output' "$OUT" 'DAYTIME MAINTENANCE AUTHORIZED'
+  expect_eq 'legacy daytime flag cannot bypass v1 window' "$RC" 1
+  expect_exact_count 'refused daytime never stops worker' 'systemctl stop estrado-pjud-worker.service' 0
+  expect_exact_count 'refused daytime never starts worker' 'systemctl start estrado-pjud-worker.service' 0
+  expect_contains 'strict window refusal is visible' "$OUT" 'outside the Santiago maintenance window'
   backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
   : > "$EVENTS"
   run_guard rollback --backup-dir "$backup_path"
-  expect_eq 'daytime approval is not persisted into manual rollback' "$RC" 1
+  expect_eq 'no backup exists after daytime refusal' "$RC" 2
   expect_count 'manual rollback outside window does not stop worker' 'systemctl stop estrado-pjud-worker.service' 0
 
   for scenario in hour-missing hour-multiline hour-nondecimal hour-producer-fail \
@@ -2665,7 +2734,7 @@ run_explicit_daytime_maintenance_regressions() {
   : > "$STATE/postflight-fail"
   TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
   expect_eq 'daytime failure keeps apply failed' "$RC" 1
-  expect_contains 'daytime failure automatically restores captured worker' "$OUT" 'ROLLBACK OK'
+  expect_missing 'daytime refusal never starts rollback' "$OUT" 'ROLLBACK OK'
   expect_eq 'daytime automatic rollback leaves worker active' "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
   run_rollback_worker_capability_regression --allow-daytime-maintenance
 }
@@ -2782,11 +2851,134 @@ run_real_timer_contract_regressions() {
   expect_eq 'additional calendar schedule fails closed' "$RC" 1
 }
 
+run_monitor_sandbox_regression() {
+  local drift
+  for drift in monitor-override monitor-needs-reload; do
+    setup
+    : > "$STATE/$drift"
+    run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$drift is rejected at admission" "$RC" 1
+    expect_count "$drift never provisions" provision 0
+    expect_count "$drift never starts monitoring" 'systemctl start' 0
+  done
+  setup
+  printf '%s\n' 'start legaltech-monitor.service legaltech-resource-tracker.service' > "$STATE/fail-command"
+  TEST_MUTATE=monitors run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'monitor sandbox failure aborts apply' "$RC" 1
+  expect_contains 'monitor sandbox failure identifies phase' "$OUT" 'phase: monitor-sandbox'
+  expect_contains 'monitor sandbox failure rolls back' "$OUT" 'ROLLBACK OK'
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = monitor-sandbox ]; then
+  run_monitor_sandbox_regression
+  echo "$PASS ok, $FAIL fail"
+  [ "$FAIL" -eq 0 ]
+  exit
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = real-timer-contract ]; then
   run_real_timer_contract_regressions
   echo "$PASS ok, $FAIL fail"
   [ "$FAIL" -eq 0 ]
   exit
+fi
+
+run_late_window_review_regressions() {
+  local stage backup_path
+  for stage in worker-stop provision; do
+    setup
+    configure_active_worker
+    printf '03\n' > "$STATE/local-hour"
+    touch "$STATE/clock-crosses-after-$stage"
+    if [ "$stage" = worker-stop ]; then touch "$STATE/provision-fail"; fi
+    TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "window closes after $stage refuses apply" "$RC" 1
+    expect_exact_count "window closes after $stage allows initial stop only" 'systemctl stop estrado-pjud-worker.service' 1
+    expect_exact_count "window closes after $stage never starts worker" 'systemctl start estrado-pjud-worker.service' 0
+    expect_eq "window closes after $stage keeps hold" "$(cat "$STATE/maintenance-state")" hold
+    expect_missing "window closes after $stage never claims healthy rollback" "$OUT" 'ROLLBACK OK'
+    expect_contains "window closes after $stage diagnoses incomplete recovery" "$OUT" 'ROLLBACK INCOMPLETO'
+  done
+  setup
+  configure_active_worker
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'manual window-crossing fixture applies' "$RC" 0
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  printf '03\n' > "$STATE/local-hour"
+  touch "$STATE/clock-crosses-after-worker-stop"
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$backup_path"
+  expect_eq 'manual rollback stops recovery after window closes' "$RC" 1
+  expect_exact_count 'manual crossing permits one already-admitted stop' 'systemctl stop estrado-pjud-worker.service' 1
+  expect_exact_count 'manual crossing never starts worker' 'systemctl start estrado-pjud-worker.service' 0
+  expect_count 'manual crossing restores no file after closure' 'backup-copy ' 0
+  expect_eq 'manual crossing keeps hold' "$(cat "$STATE/maintenance-state")" hold
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = maintenance-window-review ]; then
+  run_late_window_review_regressions
+  printf '\n%s ok, %s fail\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
+run_protocol_regressions() {
+  local scenario
+  setup
+  configure_active_worker
+  touch "$STATE/maintenance-incompatible-current-unit"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'incompatible rollback unit rejects apply' "$RC" 1
+  expect_exact_count 'incompatible rollback unit never publishes hold' 'maintenance begin' 0
+  expect_exact_count 'incompatible rollback unit never stops worker' 'systemctl stop estrado-pjud-worker.service' 0
+  expect_count 'incompatible rollback unit never provisions' 'provision ' 0
+  expect_contains 'incompatible rollback unit has explicit diagnostic' "$OUT" 'current worker unit cannot be restored safely'
+  for scenario in legacy busy wrong-identity; do
+    setup
+    configure_active_worker
+    touch "$STATE/maintenance-$scenario"
+    TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+    expect_eq "$scenario protocol prevents apply" "$RC" 1
+    expect_count "$scenario never stops worker" 'systemctl stop estrado-pjud-worker.service' 0
+    expect_count "$scenario never provisions" 'provision ' 0
+  done
+  setup
+  configure_active_worker
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'compatible protocol applies' "$RC" 0
+  expect_before 'hold before worker stop' 'maintenance begin' 'systemctl stop estrado-pjud-worker.service'
+  expect_before 'ack and exclusive before worker stop' 'maintenance verify-ack' 'systemctl stop estrado-pjud-worker.service'
+  expect_before 'postflight before reopen' 'python ' 'maintenance finish'
+  BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | head -1)
+  : > "$EVENTS"
+  run_guard rollback --backup-dir "$BACKUP_DIR"
+  expect_eq 'manual rollback stays held' "$(cat "$STATE/maintenance-state" 2>/dev/null)" hold
+  expect_before 'manual hold before restoration' 'maintenance begin' 'backup-copy '
+
+  setup
+  configure_active_worker
+  touch "$STATE/maintenance-finish-uncertain"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'publication uncertainty is distinct exit 3' "$RC" 3
+  expect_eq 'uncertain publication honestly permits visible open' "$(cat "$STATE/maintenance-state")" open
+  BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | head -1)
+  expect_eq 'success marker precedes uncertain publication' "$(cat "$BACKUP_DIR/apply-result")" succeeded
+  expect_before 'durable success before publication' 'durable-write apply-result' 'maintenance finish'
+  expect_exact_count 'no rollback after possibly open publication' 'swap rollback' 0
+
+  setup
+  configure_active_worker
+  touch "$STATE/postflight-fail"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'postflight failure preserves hold' "$(cat "$STATE/maintenance-state")" hold
+  expect_exact_count 'failed postflight never attempts release' 'maintenance finish' 0
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = maintenance ]; then
+  run_protocol_regressions
+  printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
 fi
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = explicit-daytime-maintenance ]; then
@@ -2959,6 +3151,7 @@ fi
 run_failed_monitor_restore_barriers
 run_failed_monitor_restore_regressions
 run_real_timer_contract_regressions
+run_monitor_sandbox_regression
 run_legacy_monitor_migration_regression
 run_activity_preservation_regressions
 run_absent_timer_regressions
@@ -3126,7 +3319,7 @@ expect_exact_count 'active Hermes gateway restarts once when drop-in changes' 's
 expect_exact_count 'active Hermes dashboard restarts once when drop-in changes' 'systemctl --user --machine=hermes@.host restart hermes-dashboard.service' 1
 expect_before 'timers start before tracker invocation' 'systemctl start legaltech-monitor.timer legaltech-resource-tracker.timer' 'python '
 monitor_invocations=$(grep -F "python $FAKE/monitoring/monitor.py" "$EVENTS" 2>/dev/null || true)
-expect_exact_count 'monitor is invoked exactly once in dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run" 1
+expect_exact_count 'monitor is invoked exactly once in local dry-run mode' "python $FAKE/monitoring/monitor.py --dry-run --delivery local" 1
 expect_missing 'monitor dry-run invocation excludes once mode' "$monitor_invocations" '--once'
 expect_missing 'monitor dry-run invocation excludes synthetic alert mode' "$monitor_invocations" '--test-alert'
 expect_missing 'orchestration output contains no service credential' "$OUT$(cat "$EVENTS")" "$SECRET_SENTINEL"
@@ -3550,6 +3743,7 @@ for forbidden in '/api/v1/sync' '/proxy' '/session/mint' '/retry'; do
 done
 
 run_explicit_daytime_maintenance_regressions
+run_late_window_review_regressions
 
 echo
 echo "$PASS ok, $FAIL fail"

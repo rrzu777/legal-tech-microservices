@@ -7,7 +7,7 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/legaltech-monitoring
 EnvironmentFile=-/etc/legaltech-monitoring.env
-ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/monitor.py --once
+ExecStart=/usr/bin/python3 /opt/legaltech-monitoring/monitor.py --once --delivery local
 
 NoNewPrivileges=true
 PrivateTmp=true

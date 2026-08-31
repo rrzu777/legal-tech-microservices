@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate persistent resource alerts and deliver them through Telegram."""
+"""Evaluate persistent resource alerts with explicit local or Telegram delivery."""
 
 from __future__ import annotations
 
@@ -149,6 +149,10 @@ def main(
         help="send one clearly labeled synthetic alert",
     )
     parser.add_argument(
+        "--delivery", choices=("local", "telegram"), default="telegram",
+        help="local writes sanitized events to stdout; telegram sends remote alerts",
+    )
+    parser.add_argument(
         "--state-dir",
         type=Path,
         default=Path("/var/lib/legaltech-monitor"),
@@ -164,11 +168,17 @@ def main(
         stderr.write("Invalid monitoring arguments\n")
         return 2
 
-    environment = os.environ if environ is None else environ
-    token = environment.get("LEGALTECH_TELEGRAM_BOT_TOKEN")
-    chat_id = environment.get("LEGALTECH_TELEGRAM_CHAT_ID")
+    local_delivery = arguments.delivery == "local"
+    token = chat_id = None
+    if not local_delivery:
+        environment = os.environ if environ is None else environ
+        token = environment.get("LEGALTECH_TELEGRAM_BOT_TOKEN")
+        chat_id = environment.get("LEGALTECH_TELEGRAM_CHAT_ID")
 
     if arguments.test_alert:
+        if local_delivery:
+            stderr.write("Synthetic Telegram alert requires telegram delivery mode\n")
+            return 2
         if not token or not chat_id:
             stderr.write("Telegram credentials are required\n")
             return 2
@@ -183,7 +193,9 @@ def main(
         return 0
 
     now = clock()
-    state_path = arguments.state_dir / "state.json"
+    # Independent acknowledgement/cooldown state: local journal observations
+    # must never suppress a later Telegram notification when delivery changes.
+    state_path = arguments.state_dir / ("state-local.json" if local_delivery else "state.json")
     try:
         state = state_loader(state_path)
     except Exception:
@@ -205,17 +217,44 @@ def main(
         return 1
 
     if arguments.dry_run:
-        _write_json(
-            stdout,
-            {"dry_run": True, "events": [asdict(event) for event in events]},
-        )
+        try:
+            _write_json(
+                stdout,
+                {"dry_run": True, "delivery_mode": arguments.delivery,
+                 "events": [asdict(event) for event in events]},
+            )
+            stdout.flush()
+        except Exception:
+            stderr.write("Monitoring output failed\n")
+            return 1
         return 0
 
+    if local_delivery:
+        candidate["delivery_mode"] = "local"
     try:
         state_writer(state_path, candidate)
     except Exception:
         stderr.write("Monitoring state write failed\n")
         return 1
+
+    if local_delivery:
+        # Persist pending first, then emit/flush, then acknowledge. A process
+        # crash may duplicate a journal event, but cannot silently lose one.
+        try:
+            _write_json(stdout, {"dry_run": False, "delivery_mode": "local",
+                                 "events": [asdict(event) for event in events]})
+            stdout.flush()
+        except Exception:
+            stderr.write("Local monitoring output failed\n")
+            return 1
+        try:
+            for event in events:
+                candidate = record_delivery_success(candidate, event, now)
+            state_writer(state_path, candidate)
+        except Exception:
+            stderr.write("Monitoring state write failed\n")
+            return 1
+        return 0
 
     delivery_failed = False
     transport = None

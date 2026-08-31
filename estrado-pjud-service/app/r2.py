@@ -2,14 +2,26 @@
 
 import asyncio
 import logging
+from contextvars import copy_context
+from functools import partial
 from typing import NamedTuple
 
 import boto3
 from botocore.config import Config as BotoConfig
+from worker.maintenance import has_active_operation, track_auxiliary
 
 logger = logging.getLogger(__name__)
 
 MAX_DOC_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+async def _run_s3(call, **kwargs):
+    if has_active_operation():
+        future = asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, partial(call, **kwargs),
+        )
+        return await track_auxiliary(future)
+    return await asyncio.to_thread(call, **kwargs)
 
 
 class UploadResult(NamedTuple):
@@ -42,7 +54,7 @@ class R2Client:
         if len(data) > MAX_DOC_SIZE:
             raise ValueError(f"Document too large: {len(data)} bytes (max {MAX_DOC_SIZE})")
 
-        await asyncio.to_thread(
+        await _run_s3(
             self._s3.put_object,
             Bucket=self._bucket,
             Key=key,
@@ -57,8 +69,19 @@ class R2Client:
 
         Runs boto3 sync call in a thread to avoid blocking the async event loop.
         """
-        try:
-            await asyncio.to_thread(self._s3.head_object, Bucket=self._bucket, Key=key)
+        def head_exists():
+            try:
+                self._s3.head_object(Bucket=self._bucket, Key=key)
+            except self._s3.exceptions.ClientError as exc:
+                # A confirmed missing object is an ordinary outcome, not an
+                # uncertain auxiliary. Other errors retain their real failed
+                # future even though the legacy public API returns False.
+                code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+                if code in {"404", "NoSuchKey", "NotFound"}:
+                    return False
+                raise
             return True
+        try:
+            return await _run_s3(head_exists)
         except self._s3.exceptions.ClientError:
             return False

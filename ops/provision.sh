@@ -34,6 +34,11 @@
 set -euo pipefail
 
 main() {
+  # shellcheck source=worker-maintenance.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/worker-maintenance.sh"
+  wm_init || exit $?
+  trap wm_close EXIT
+  wm_acquire_global || exit 1
   local repo_dir="${PROV_REPO_DIR:-/opt/legal-tech-microservices}"
   local systemd_dir="${PROV_SYSTEMD_DIR:-/etc/systemd/system}"
   local systemctl_bin="${PROV_SYSTEMCTL:-systemctl}"
@@ -242,6 +247,12 @@ main() {
         ;;
     esac
   done <<< "$enabled_user_units"
+
+  # Drain before the FIRST unit/runtime mutation, not only before a restart.
+  # Delegated guards supply both validated descriptors and their exact UUID.
+  wm_prepare || { wm_error; exit 1; }
+  wm_cli status --unit-file "$src/estrado-pjud-worker.service" \
+    --dropin-file "$src/estrado-pjud-worker.service.d/xvfb.conf" >/dev/null || exit 1
 
   # --- units: instalar solo lo que difiere -------------------------------
   while IFS= read -r rel; do
@@ -468,6 +479,7 @@ main() {
   "$systemctl_bin" enable "${enable_units[@]}"
 
   if [ "$rc" -eq 0 ]; then
+    wm_finish || exit $?
     echo "OK: units y timers instalados; worker sólo habilitado con PROV_ENABLE_PJUD_WORKER=1; monitoreo, .env, venv y usuarios presentes."
   else
     echo "INCOMPLETO: resolver lo listado arriba y volver a correr (es idempotente)." >&2

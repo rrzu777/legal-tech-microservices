@@ -15,6 +15,9 @@
 set -uo pipefail
 
 DEPLOY="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy.sh}"
+OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=maintenance-fixture.sh
+source "$OPS_DIR/tests/maintenance-fixture.sh"
 TMP=$(mktemp -d)
 PASS=0; FAIL=0
 
@@ -40,6 +43,9 @@ expect_contains() {
 expect_missing() {
   printf '%s' "$2" | grep -qF -- "$3" && bad "$1 (contiene '$3' y no debería)" || ok "$1"
 }
+file_mode() {
+  if stat --version >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi
+}
 
 # Cada test estrena un par origin/clone. El clone es DEPLOY_REPO_DIR; los stubs
 # viven como untracked adentro (sobreviven al reset --hard, igual que el .venv
@@ -52,12 +58,32 @@ setup() { # setup <nombre> — deja stubs y logs del deploy
   LOG_SYSCTL="$base/systemctl.log"; LOG_PIP="$base/pip.log"; LOG_PYTHON="$base/python.log"
   LOG_XVFB="$base/xvfb.log"; LOG_RUNUSER="$base/runuser.log"
   mkdir -p "$ORIGIN/estrado-pjud-service"
+  mkdir -p "$ORIGIN/estrado-pjud-service/worker" "$ORIGIN/estrado-pjud-service/app" "$ORIGIN/ops"
+  cp "$OPS_DIR/../estrado-pjud-service/worker/maintenance.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/maintenance_store.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/__main__.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/sd_notify.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/metrics.py" "$ORIGIN/estrado-pjud-service/worker/"
+  cp "$OPS_DIR/../estrado-pjud-service/worker/__init__.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/config.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/session_pool.py" "$ORIGIN/estrado-pjud-service/worker/"
+  cp "$OPS_DIR/../estrado-pjud-service/app/__init__.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/r2.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/minter.py" "$ORIGIN/estrado-pjud-service/app/"
+  mkdir -p "$ORIGIN/estrado-pjud-service/app/ojv"
+  cp "$OPS_DIR/../estrado-pjud-service/app/ojv/__init__.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/ojv/session.py" \
+    "$OPS_DIR/../estrado-pjud-service/app/ojv/browser_login.py" "$ORIGIN/estrado-pjud-service/app/ojv/"
+  cp "$OPS_DIR/../estrado-pjud-service/app/playwright_runtime.py" "$ORIGIN/estrado-pjud-service/app/"
+  cp "$OPS_DIR/../estrado-pjud-service/worker/maintenance_heartbeat.py" \
+    "$OPS_DIR/../estrado-pjud-service/worker/proxy_control.py" "$ORIGIN/estrado-pjud-service/worker/"
+  cp "$OPS_DIR/worker-maintenance.py" "$OPS_DIR/worker-maintenance.sh" "$ORIGIN/ops/"
   git -C "$ORIGIN" init -q -b main
   git -C "$ORIGIN" config user.email t@t
   git -C "$ORIGIN" config user.name t
   printf 'httpx==0.27\nplaywright==1.61.0\n' > "$ORIGIN/estrado-pjud-service/requirements.txt"
   printf '.venv/\n' > "$ORIGIN/estrado-pjud-service/.gitignore"
-  git -C "$ORIGIN" add estrado-pjud-service/requirements.txt estrado-pjud-service/.gitignore
+  git -C "$ORIGIN" add estrado-pjud-service ops
   git -C "$ORIGIN" commit -q -m base
   git clone -q "$ORIGIN" "$REPO"
 
@@ -92,6 +118,7 @@ avanza_playwright() {
 
 # Sin set -e en este archivo: RC se captura a mano y los asserts guardan solos.
 run_deploy() { # run_deploy — usa REPO/SYSCTL/HEALTH; deja RC y OUT
+  maintenance_fixture "$(dirname "$LOG_SYSCTL")" "$OPS_DIR"
   mkdir -p "$TMP/state" "$TMP/ms-playwright"
   OUT=$(DEPLOY_REPO_DIR="$REPO" DEPLOY_SYSTEMCTL="$SYSCTL" DEPLOY_HEALTH_URL="$HEALTH" \
         DEPLOY_STATE_DIR="$TMP/state" \
@@ -110,6 +137,62 @@ sha_repo()   { git -C "$REPO" rev-parse HEAD; }
 # "restart a b" por ronda.
 restarts()   { grep -c '^restart ' "$LOG_SYSCTL" || true; }
 
+run_maintenance_review_regressions() {
+  local scenario new_identity path change
+  setup api-only-maintenance; avanza_origin estrado-pjud-service/app/api_only.py; health_ok
+  run_deploy
+  expect_eq 'unrelated API-only change remains deployable' "$RC" 0
+  expect_eq 'API-only change merges expected revision' "$(sha_repo)" "$(sha_origin)"
+  expect_eq 'API-only compatible change restarts normally' "$(restarts)" 1
+  for scenario in pid nonce; do
+    setup "drift-$scenario"; avanza_origin; health_ok
+    case "$scenario" in
+      pid) new_identity='f784c8bd-67c3-448e-ae1c-55ac6feab947:514:9014:bf763d76-b99c-464d-80d8-bcbd9520b923' ;;
+      nonce) new_identity='f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:ab763d76-b99c-464d-80d8-bcbd9520b923' ;;
+    esac
+    printf '#!/bin/bash\nif [ "$1" = -m ] && [ "$2" = pytest ]; then printf "%%s\\n" "%s" > "%s/maintenance-identity"; fi\nexit 0\n' \
+      "$new_identity" "$(dirname "$LOG_SYSCTL")" > "$REPO/estrado-pjud-service/.venv/bin/python"
+    run_deploy
+    expect_eq "$scenario drift during tests rejects deploy" "$RC" 1
+    expect_eq "$scenario drift never stops replacement via restart" "$(restarts)" 0
+    expect_eq "$scenario drift retains hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+  done
+  for path in worker/__init__.py worker/config.py worker/session_pool.py app/__init__.py app/r2.py app/minter.py; do
+    setup "hook-${path//\//-}"; avanza_origin "estrado-pjud-service/$path"; health_ok
+    PREV=$(sha_repo)
+    run_deploy
+    expect_eq "$path target hook changed rejects deploy" "$RC" 1
+    expect_eq "$path target hook rejected before merge" "$(sha_repo)" "$PREV"
+    expect_eq "$path target hook never restarts worker" "$(restarts)" 0
+    expect_eq "$path target hook retains hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+  done
+  for path in app/ojv/__init__.py app/ojv/session.py app/ojv/browser_login.py \
+    app/playwright_runtime.py worker/maintenance_heartbeat.py worker/proxy_control.py; do
+    for change in edit remove; do
+      setup "ownership-$change-${path//\//-}"; health_ok
+      if [ "$change" = edit ]; then
+        avanza_origin "estrado-pjud-service/$path"
+      else
+        git -C "$ORIGIN" rm -q -- "estrado-pjud-service/$path"
+        git -C "$ORIGIN" commit -q -m 'fixture removes ownership boundary'
+      fi
+      PREV=$(sha_repo)
+      run_deploy
+      expect_eq "$path $change rejected" "$RC" 1
+      expect_eq "$path $change rejected before merge" "$(sha_repo)" "$PREV"
+      expect_eq "$path $change never restarts worker" "$(restarts)" 0
+      expect_eq "$path $change retains hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+    done
+  done
+}
+
+if [ "${DEPLOY_TEST_FOCUS:-}" = maintenance-review ]; then
+  run_maintenance_review_regressions
+  printf '\n%s ok, %s fail\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 echo "== deploy feliz: avanza HEAD, una ronda de restart, exit 0"
 setup feliz; avanza_origin; health_ok
 mkdir -p "$TMP/state"
@@ -123,8 +206,8 @@ expect_contains "las dos units en la misma invocación" "$(cat "$LOG_SYSCTL")" "
 expect_contains "verifica is-active" "$(cat "$LOG_SYSCTL")" "is-active"
 expect_eq "no instala deps sin cambio de requirements" "$(cat "$LOG_PIP")" ""
 expect_missing "no avisa de ops/cron si no cambió" "$OUT" "ops/cron"
-expect_eq "repara permisos del estado compartido" "$(stat -f '%Lp' "$TMP/state/alert-cooldowns.json" 2>/dev/null || stat -c '%a' "$TMP/state/alert-cooldowns.json")" "660"
-expect_eq "repara permisos del lock compartido" "$(stat -f '%Lp' "$TMP/state/alert-cooldowns.json.lock" 2>/dev/null || stat -c '%a' "$TMP/state/alert-cooldowns.json.lock")" "660"
+expect_eq "repara permisos del estado compartido" "$(file_mode "$TMP/state/alert-cooldowns.json")" "660"
+expect_eq "repara permisos del lock compartido" "$(file_mode "$TMP/state/alert-cooldowns.json.lock")" "660"
 
 echo "== deploy seguro: actualiza API y mantiene worker detenido"
 setup workerstop; avanza_origin; health_ok
@@ -177,6 +260,20 @@ run_deploy
 expect_eq "exit 1 igual: el deploy NO entró" "$RC" "1"
 expect_contains "reporta rollback OK" "$OUT" "Rollback OK"
 
+echo "== rollback health sano sin ACK no acredita recuperación"
+setup rollbackack; avanza_origin; health_bad
+printf '#!/bin/bash\necho "$@" >> "%s"\nif [ "$1" = is-enabled ]; then echo enabled; exit 0; fi\nif [ "$1" = is-active ]; then echo active; exit 0; fi\nif [ "$(grep -c "^restart" "%s")" -ge 2 ]; then echo ok > "%s"; fi\nexit 0\n' \
+  "$LOG_SYSCTL" "$LOG_SYSCTL" "$TMP/www/health.json" > "$SYSCTL"
+chmod +x "$SYSCTL"
+touch "$(dirname "$LOG_SYSCTL")/maintenance-fail-after-initial-drain"
+printf '3\n' > "$(dirname "$LOG_SYSCTL")/maintenance-fail-after-drain-count"
+run_deploy
+expect_eq "rollback sin ACK falla" "$RC" 1
+expect_missing "rollback sin ACK jamás dice OK" "$OUT" 'Rollback OK'
+expect_contains "rollback sin ACK requiere intervención" "$OUT" 'TAMPOCO sana'
+expect_eq "rollback sin ACK conserva hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+expect_eq "ACK restaurado se exige después del restart rollback" "$(restarts)" 2
+
 echo "== árbol sucio: aborta sin tocar nada"
 setup sucio; avanza_origin; health_ok
 echo hack >> "$REPO/estrado-pjud-service/requirements.txt"
@@ -221,7 +318,7 @@ expect_contains "smoke corre dentro de Xvfb" "$(cat "$LOG_XVFB")" "-a env"
 expect_contains "smoke valida usuario API" "$(cat "$LOG_RUNUSER")" "-u www-data --"
 expect_contains "smoke valida usuario worker" "$(cat "$LOG_RUNUSER")" "-u estrado --"
 expect_eq "normaliza sólo la raíz del cache a 0755" \
-  "$(stat -f '%Lp' "$TMP/ms-playwright" 2>/dev/null || stat -c '%a' "$TMP/ms-playwright")" "755"
+  "$(file_mode "$TMP/ms-playwright")" "755"
 
 echo "== path de browsers demasiado amplio: falla antes de instalar"
 setup browserpath; avanza_playwright; health_ok
@@ -299,7 +396,7 @@ expect_eq "reinstala Chromium compatible con el rollback" "$(grep -c -- '-m play
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 unset FAKE_PYTEST_EXIT
 
-echo "== pip falla: código vuelve, sin restarts, y el reintento sí entra"
+echo "== pip falla: código vuelve, sin restarts; hold bloquea reintento automático"
 setup pipfail; avanza_origin estrado-pjud-service/requirements.txt; health_ok
 PREV=$(sha_repo)
 FAKE_PIP_EXIT=1 run_deploy
@@ -308,8 +405,8 @@ expect_eq "HEAD volvió al previo (sin esto la corrida siguiente diría Ya al d�
 expect_eq "cero rondas de restart" "$(restarts)" "0"
 expect_contains "lo dice" "$OUT" "PIP FALLÓ"
 run_deploy
-expect_eq "el reintento despliega (exit 0)" "$RC" "0"
-expect_eq "y avanza HEAD" "$(sha_repo)" "$(sha_origin)"
+expect_eq "el reintento queda bloqueado por hold (exit 1)" "$RC" "1"
+expect_eq "sin finalización explícita HEAD permanece previo" "$(sha_repo)" "$PREV"
 
 echo "== systemctl restart falla: rollback igual, con diagnóstico y no un stacktrace de set -e"
 setup restartfail; avanza_origin; health_ok
@@ -327,6 +424,16 @@ run_deploy
 expect_eq "exit 0 (es aviso, no error)" "$RC" "0"
 expect_contains "avisa correr deploy-cron.sh" "$OUT" "deploy-cron.sh"
 
+echo "== target con contrato worker diferente se rechaza antes de merge/restart"
+setup legacytarget; avanza_origin estrado-pjud-service/worker/__main__.py; health_ok
+PREV=$(sha_repo)
+run_deploy
+expect_eq "contrato target incompatible falla" "$RC" "1"
+expect_eq "target rechazado no mueve HEAD" "$(sha_repo)" "$PREV"
+expect_eq "target rechazado nunca reinicia worker" "$(restarts)" "0"
+expect_eq "target rechazado conserva hold" "$(cat "$WM_FIXTURE_ROOT/maintenance-state")" hold
+
 echo
+run_maintenance_review_regressions
 echo "$PASS ok, $FAIL fail"
 [ "$FAIL" -eq 0 ]

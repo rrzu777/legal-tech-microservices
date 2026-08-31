@@ -156,6 +156,122 @@ def fixed_clock():
     return datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
 
+def local_options(output, errors, **overrides):
+    options = dict(
+        environ={}, collect=lambda **kwargs: sample(api_active="inactive"),
+        clock=fixed_clock, slice_resolver=lambda: "user-4242.slice",
+        stdout=output, stderr=errors,
+        transport_factory=lambda *args: pytest.fail("local mode touched Telegram"),
+    )
+    options.update(overrides)
+    return options
+
+
+def test_local_once_persists_separate_state_without_reading_credentials(tmp_path):
+    class ForbiddenCredentials(dict):
+        def get(self, *args):
+            pytest.fail("local mode read credential environment")
+
+    output, errors = io.StringIO(), io.StringIO()
+    result = main(["--once", "--delivery", "local", "--state-dir", str(tmp_path)],
+                  **local_options(output, errors, environ=ForbiddenCredentials()))
+    assert result == 0
+    assert errors.getvalue() == ""
+    assert json.loads(output.getvalue())["delivery_mode"] == "local"
+    state = json.loads((tmp_path / "state-local.json").read_text())
+    assert state["delivery_mode"] == "local"
+    assert state["rules"]["unit.inactive:estrado-pjud.service"]["pending"] is None
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_local_ack_never_suppresses_later_telegram_delivery(tmp_path):
+    options = local_options(io.StringIO(), io.StringIO())
+    assert main(["--once", "--delivery", "local", "--state-dir", str(tmp_path)], **options) == 0
+    sent = []
+    options.update(environ={"LEGALTECH_TELEGRAM_BOT_TOKEN": "fixture-token",
+                            "LEGALTECH_TELEGRAM_CHAT_ID": "fixture-chat"},
+                   transport_factory=lambda *args: FakeTransport(sent), stdout=io.StringIO())
+    assert main(["--once", "--delivery", "telegram", "--state-dir", str(tmp_path)], **options) == 0
+    assert len(sent) == 1
+    assert (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_local_output_failure_retains_pending_event_and_returns_failure(tmp_path, failure):
+    class BrokenOutput(io.StringIO):
+        def write(self, value):
+            if failure == "write":
+                raise OSError("sensitive-output-detail")
+            return super().write(value)
+
+        def flush(self):
+            if failure == "flush":
+                raise OSError("sensitive-output-detail")
+
+    errors = io.StringIO()
+    assert main(["--once", "--delivery", "local", "--state-dir", str(tmp_path)],
+                **local_options(BrokenOutput(), errors)) == 1
+    state = json.loads((tmp_path / "state-local.json").read_text())
+    entry = state["rules"]["unit.inactive:estrado-pjud.service"]
+    assert entry["pending"] is not None
+    assert entry["last_sent_at"] is None
+    assert errors.getvalue() == "Local monitoring output failed\n"
+
+
+def test_local_dry_run_has_no_state_or_delivery_effect(tmp_path):
+    output, errors = io.StringIO(), io.StringIO()
+    assert main(["--dry-run", "--delivery", "local", "--state-dir", str(tmp_path)],
+                **local_options(output, errors)) == 0
+    assert json.loads(output.getvalue())["delivery_mode"] == "local"
+    assert not list(tmp_path.iterdir())
+
+
+def test_local_dry_run_output_error_is_sanitized_without_state(tmp_path):
+    class BrokenOutput(io.StringIO):
+        def write(self, value):
+            raise OSError("private-path-detail")
+
+    errors = io.StringIO()
+    assert main(["--dry-run", "--delivery", "local", "--state-dir", str(tmp_path)],
+                **local_options(BrokenOutput(), errors)) == 1
+    assert errors.getvalue() == "Monitoring output failed\n"
+    assert not list(tmp_path.iterdir())
+
+
+def test_local_rejects_external_test_alert(tmp_path):
+    output, errors = io.StringIO(), io.StringIO()
+    assert main(["--test-alert", "--delivery", "local", "--state-dir", str(tmp_path)],
+                **local_options(output, errors)) == 2
+    assert errors.getvalue() == "Synthetic Telegram alert requires telegram delivery mode\n"
+    assert not list(tmp_path.iterdir())
+
+
+def test_local_output_precedes_ack_and_ack_failure_is_reported(tmp_path):
+    output, errors = io.StringIO(), io.StringIO()
+    writes = []
+
+    def writer(path, state):
+        if writes:
+            assert json.loads(output.getvalue())["delivery_mode"] == "local"
+            raise OSError("private storage detail")
+        assert output.getvalue() == ""
+        writes.append(json.loads(json.dumps(state)))
+
+    assert main(["--once", "--delivery", "local", "--state-dir", str(tmp_path)],
+                **local_options(output, errors, state_writer=writer)) == 1
+    assert writes[0]["rules"]["unit.inactive:estrado-pjud.service"]["pending"] is not None
+    assert errors.getvalue() == "Monitoring state write failed\n"
+
+
+def test_local_cooldown_is_persistent_and_empty_evaluation_still_visible(tmp_path):
+    for expected in (1, 0):
+        output, errors = io.StringIO(), io.StringIO()
+        assert main(["--once", "--delivery", "local", "--state-dir", str(tmp_path)],
+                    **local_options(output, errors)) == 0
+        assert len(json.loads(output.getvalue())["events"]) == expected
+        assert errors.getvalue() == ""
+
+
 def test_once_persists_candidate_before_delivery_then_records_success(tmp_path):
     writes = []
     sent = []

@@ -30,6 +30,7 @@ from app.ojv.errors import (
 )
 from app.proxy import split_proxy_for_playwright
 from app.proxy_billing import ProxyBillingExhaustedError
+from app.playwright_runtime import owned_playwright
 
 
 _OFFICIAL_ENTRY = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
@@ -349,7 +350,7 @@ async def login_official_ojv(
         raise ValueError("user_agent must be a non-empty string")
 
     deadline = time.monotonic() + _LOGIN_TIMEOUT_S
-    manager = async_playwright()
+    manager = owned_playwright(async_playwright, cleanup_timeout=_CLEANUP_TIMEOUT_S)
     browser = context = page = cdp_session = None
     result: BrowserLoginResult | None = None
     failure: OjvSessionError | None = None
