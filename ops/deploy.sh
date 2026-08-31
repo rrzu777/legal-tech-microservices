@@ -56,6 +56,8 @@ main() {
   local browser_owner_gid="${DEPLOY_BROWSER_OWNER_GID:-0}"
   local xvfb_run_bin="${DEPLOY_XVFB_RUN:-/usr/bin/xvfb-run}"
   local runuser_bin="${DEPLOY_RUNUSER:-/usr/sbin/runuser}"
+  local unshare_bin="${DEPLOY_UNSHARE:-/usr/bin/unshare}"
+  local timeout_bin="${DEPLOY_TIMEOUT:-/usr/bin/timeout}"
   local find_bin="${DEPLOY_FIND:-find}"
   local keep_worker_stopped="${DEPLOY_KEEP_WORKER_STOPPED:-0}"
   local deps_changed=0
@@ -90,6 +92,16 @@ main() {
   # Capture trusted runtime contract only after authenticating/draining current
   # instance, before any checkout mutation. Do not execute candidate code.
   wm_pin_worker_contract "$repo_dir" || exit 1
+
+  # Like this script's functions, retain the probe BEFORE merge/reset: the
+  # previous revision may predate the helper. Always import app.minter from
+  # the deployed/restored service, not from this retained orchestration code.
+  local runtime_smoke_code
+  if ! runtime_smoke_code=$(cat "$(dirname "${BASH_SOURCE[0]}")/playwright-runtime-smoke.py" 2>/dev/null) \
+    || [ -z "$runtime_smoke_code" ]; then
+    echo "CHROMIUM FALLÓ: browser_unavailable; helper de runtime no disponible." >&2
+    exit 1
+  fi
 
   # API (www-data:estrado) y worker (estrado:estrado) comparten estos dos
   # archivos. Una versión anterior los dejó 0640: el creador podía escribir,
@@ -142,6 +154,8 @@ main() {
 
   git fetch origin main
   if [ "$(git rev-parse origin/main)" = "$prev" ]; then
+    # Diagnosis only: never install/download, chmod the cache or restart here.
+    verify_playwright_runtime || exit 1
     wm_finish "${finalization_args[@]}" || exit $?
     echo "Ya al día ($(git rev-parse --short HEAD)); nada que desplegar."
     exit 0
@@ -156,6 +170,10 @@ main() {
   # volver a levantar servicios, para no mezclar código y runtime incompatibles.
   if ! git diff --quiet "$prev"..HEAD -- estrado-pjud-service/requirements.txt; then
     deps_changed=1
+    if git diff "$prev"..HEAD -- estrado-pjud-service/requirements.txt \
+      | grep -qE '^[+-]playwright(==|>=|<=|~=|>|<)'; then
+      playwright_changed=1
+    fi
     echo "==> requirements.txt cambió: pip install"
     # Guardado: sin esto, un pip fallido (red, conflicto de versiones) moría
     # por set -e con HEAD ya avanzado, y la corrida siguiente veía
@@ -167,16 +185,19 @@ main() {
       exit 1
     fi
 
-    if ! git diff "$prev"..HEAD -- estrado-pjud-service/requirements.txt \
-      | grep -qE '^[+-]playwright(==|>=|<=|~=|>|<)'; then
-      playwright_changed=0
-    else
-      playwright_changed=1
-      if ! install_and_verify_playwright; then
+    if [ "$playwright_changed" = "1" ]; then
+      if ! install_playwright; then
         rollback_code_and_dependencies || true
         exit 1
       fi
     fi
+  fi
+
+  # A requirements diff is not evidence of runtime compatibility: a venv or
+  # cache can drift independently. Gate every release before tests/restarts.
+  if ! verify_playwright_runtime; then
+    rollback_code_and_dependencies || true
+    exit 1
   fi
 
   echo "==> pytest en el VPS"
@@ -268,23 +289,27 @@ verify_rollback_worker() {
   fi
 }
 
-install_and_verify_playwright() {
+validate_browser_cache_path() {
   if [ "$allow_test_browser_path" != "1" ] \
     && [ "$playwright_browsers_path" != "/opt/ms-playwright" ]; then
-    echo "CHROMIUM FALLÓ: producción exige el path canónico /opt/ms-playwright." >&2
+    echo "CHROMIUM FALLÓ: browser_unavailable; producción exige el path canónico /opt/ms-playwright." >&2
     return 1
   fi
   if [ -L "$playwright_browsers_path" ]; then
-    echo "CHROMIUM FALLÓ: el directorio de browsers no puede ser un symlink." >&2
+    echo "CHROMIUM FALLÓ: browser_unavailable; el directorio de browsers no puede ser un symlink." >&2
     return 1
   fi
+}
+
+install_playwright() {
+  validate_browser_cache_path || return 1
   if ! (umask 022 && mkdir -p "$playwright_browsers_path"); then
-    echo "CHROMIUM FALLÓ: no se pudo preparar el directorio canónico de browsers." >&2
+    echo "CHROMIUM FALLÓ: browser_unavailable; no se pudo preparar el directorio canónico de browsers." >&2
     return 1
   fi
   if ! chown "$browser_owner_uid:$browser_owner_gid" "$playwright_browsers_path" \
     || ! chmod 0755 "$playwright_browsers_path"; then
-    echo "CHROMIUM FALLÓ: no se pudo fijar owner/mode seguros en el cache." >&2
+    echo "CHROMIUM FALLÓ: browser_unavailable; no se pudo fijar owner/mode seguros en el cache." >&2
     return 1
   fi
   if ! validate_browser_cache_permissions; then
@@ -292,36 +317,54 @@ install_and_verify_playwright() {
   fi
 
   if ! (umask 022 && env PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
-    "$service_dir/.venv/bin/python" -m playwright install chromium); then
-    echo "CHROMIUM FALLÓ: no se pudo instalar la revisión compatible; no se reinició ningún servicio." >&2
+    PLAYWRIGHT_SKIP_BROWSER_GC=1 \
+    "$service_dir/.venv/bin/python" -m playwright install chromium) >/dev/null 2>&1; then
+    echo "CHROMIUM FALLÓ: browser_unavailable; no se pudo instalar la revisión compatible." >&2
     return 1
   fi
   if ! validate_browser_cache_permissions; then
     return 1
   fi
+}
+
+verify_playwright_runtime() {
+  validate_browser_cache_path || return 1
+  validate_browser_cache_permissions || return 1
 
   local smoke_user
   for smoke_user in www-data estrado; do
-    if ! "$runuser_bin" -u "$smoke_user" -- "$xvfb_run_bin" -a \
+    # unshare must happen before dropping root. No network, including loopback
+    # to the running API; Xvfb/Playwright communicate over local sockets/pipes.
+    # Chromium starts a detached process group, so timeout's group alone is
+    # insufficient. Kill the namespace init when unshare dies; Linux then kills
+    # ALL its descendants, including detached browser groups. No /proc remount.
+    if ! "$timeout_bin" --kill-after=5s 60s "$unshare_bin" \
+      --net --pid --fork --kill-child=KILL -- \
+      "$runuser_bin" -u "$smoke_user" -g estrado -- "$xvfb_run_bin" -a \
       env PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
-      HOME=/tmp TMPDIR=/tmp PYTHONPATH="$service_dir" \
-      "$service_dir/.venv/bin/python" -c \
-        'from app.minter import _ANTIBOT_ARGS; from playwright.sync_api import sync_playwright; playwright = sync_playwright().start(); browser = playwright.chromium.launch(headless=False, args=_ANTIBOT_ARGS); page = browser.new_page(); page.set_content("<title>juristrack-playwright-smoke</title>"); assert page.title() == "juristrack-playwright-smoke"; browser.close(); playwright.stop()'; then
-      echo "CHROMIUM NO ABRE: el smoke headed falló como $smoke_user bajo Xvfb; no se reinició ningún servicio." >&2
+      TMPDIR=/tmp PYTHONPATH="$service_dir" PYTHONDONTWRITEBYTECODE=1 \
+      "$service_dir/.venv/bin/python" -c "$runtime_smoke_code" >/dev/null 2>&1; then
+      echo "CHROMIUM NO ABRE: browser_unavailable; smoke headed aislado falló como $smoke_user (binario/librerías/permisos/Xvfb/namespace)." >&2
       return 1
     fi
   done
+  echo "Runtime Chromium OK: smoke headed aislado como www-data y estrado."
 }
 
 validate_browser_cache_permissions() {
   local unsafe_entry
-  if ! unsafe_entry=$("$find_bin" "$playwright_browsers_path" -mindepth 1 \
-    \( ! -user "$browser_owner_uid" -o -perm -0020 -o -perm -0002 \) -print -quit); then
-    echo "CHROMIUM FALLÓ: no se pudo inspeccionar owner/permisos del cache." >&2
+  if [ ! -d "$playwright_browsers_path" ]; then
+    echo "CHROMIUM FALLÓ: browser_unavailable; cache no disponible." >&2
+    return 1
+  fi
+  if ! unsafe_entry=$("$find_bin" "$playwright_browsers_path" \
+    \( -type l -o ! -user "$browser_owner_uid" -o ! -group "$browser_owner_gid" \
+    -o -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null); then
+    echo "CHROMIUM FALLÓ: browser_unavailable; no se pudo inspeccionar owner/permisos del cache." >&2
     return 1
   fi
   if [ -n "$unsafe_entry" ]; then
-    echo "CHROMIUM FALLÓ: el cache tiene owner o permisos inseguros." >&2
+    echo "CHROMIUM FALLÓ: browser_unavailable; el cache tiene owner o permisos inseguros." >&2
     return 1
   fi
 }
@@ -330,17 +373,20 @@ rollback_code_and_dependencies() {
   # The restored checkout must still implement the same local protocol. A
   # legacy rollback is not an authorized stopped bootstrap.
   wm_check_worker_contract "$repo_dir" "$prev" || return 1
-  git reset --hard "$prev"
-  if [ "$deps_changed" != "1" ]; then
-    return 0
-  fi
+  git reset --hard "$prev" || return 1
 
-  echo "==> restaurando dependencias de $prev"
-  if ! "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"; then
-    echo "ROLLBACK DE DEPS FALLÓ: el código volvió a $prev pero la venv requiere intervención manual." >&2
-    return 1
+  if [ "$deps_changed" = "1" ]; then
+    echo "==> restaurando dependencias de $prev"
+    if ! "$service_dir/.venv/bin/pip" install -q -r "$service_dir/requirements.txt"; then
+      echo "ROLLBACK DE DEPS FALLÓ: el código volvió a $prev pero la venv requiere intervención manual." >&2
+      return 1
+    fi
+    if [ "$playwright_changed" = "1" ] && ! install_playwright; then
+      echo "ROLLBACK DE CHROMIUM FALLÓ: el código volvió a $prev pero browser/venv requieren intervención manual." >&2
+      return 1
+    fi
   fi
-  if [ "$playwright_changed" = "1" ] && ! install_and_verify_playwright; then
+  if ! verify_playwright_runtime; then
     echo "ROLLBACK DE CHROMIUM FALLÓ: el código volvió a $prev pero browser/venv requieren intervención manual." >&2
     return 1
   fi
