@@ -95,7 +95,7 @@ class _Form(_Counted):
     def locator(self, selector: str) -> _Counted:
         return {"input[type=text]": self.rut, "input[type=password]": self.password}[selector]
 
-    def get_by_role(self, role: str, *, name: str, exact: bool) -> "_Action":
+    def get_by_role(self, role: str, *, name: str, exact: bool, include_hidden: bool = False) -> "_Action":
         assert (role, name, exact) == ("button", "Ingresar", True)
         return _Action(self.page, "submit")
 
