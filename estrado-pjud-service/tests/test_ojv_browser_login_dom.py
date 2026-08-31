@@ -152,21 +152,27 @@ async def test_landing_probe_reads_real_dom_without_exposing_page_contents(
             await browser.close()
 
 
-@pytest.mark.parametrize('mode', ['success', 'no_transition', 'xhr_failure', 'js_failure'])
+@pytest.mark.parametrize('mode', [
+    'success', 'no_transition', 'xhr_failure', 'js_failure',
+    'pre_request_pending', 'pre_request_resolved',
+])
 async def test_synthetic_async_submit_observes_counts_without_assuming_provider_protocol(monkeypatch, caplog, mode):
     # Deliberately synthetic: unnamed inputs, no form action/method, asynchronous
-    # JS handler. Every request is fulfilled/aborted before leaving Chromium.
+    # click handler, like the type=button in fixtures/cu_ojv_home.html. A pending
+    # prerequisite is NOT a reproduction of the provider's CAPTCHA/protocol.
+    # Catch skipping the real click or inventing a request/error before it exists.
+    # Every request is fulfilled/aborted before leaving Chromium.
     sentinel = 'SYNTHETIC_PRIVATE_NEVER_LOG'
     html = '''<meta charset="utf-8"><button>Todos los servicios</button>
       <a href="#" onclick="document.querySelector('#segunda-clave-access').style.display='block';return false">Clave Poder Judicial</a>
       <div id="segunda-clave-access" aria-hidden="true" style="display:none">
         <form id="fSGN">
           <input type="text" placeholder="Ingrese su Rut sin dígito verificador, Ej: 12345678">
-          <input type="password"><button>Ingresar</button>
+          <input type="password"><button type="button">Ingresar</button>
         </form>
       </div><script>
-      document.querySelector('#fSGN').addEventListener('submit', event => {
-        event.preventDefault();
+      document.querySelector('#fSGN button').addEventListener('click', () => {
+        console.log('synthetic-click');
         setTimeout(async () => {
           MODE_HANDLER
         }, 50);
@@ -176,9 +182,15 @@ async def test_synthetic_async_submit_observes_counts_without_assuming_provider_
         'no_transition': "await fetch('/synthetic-submit');",
         'xhr_failure': "try { await fetch('/synthetic-submit'); } catch (_) {}",
         'js_failure': f"throw new Error('{sentinel}');",
+        'pre_request_pending': "await new Promise(() => {}); await fetch('/synthetic-submit');",
+        'pre_request_resolved': """await new Promise(resolve => setTimeout(resolve, 50));
+            console.log('synthetic-ready');
+            await (await fetch('/synthetic-submit')).text(); location.href='/indexN.php';""",
     }
     html = html.replace('MODE_HANDLER', handlers[mode])
     counts = {'fetches': 0, 'unexpected': 0}
+    phases = []
+    succeeds = mode in {'success', 'pre_request_resolved'}
     observed = []
     original_stop = browser_login._SubmitProbe.stop
 
@@ -198,17 +210,26 @@ async def test_synthetic_async_submit_observes_counts_without_assuming_provider_
             async def new_context(**kwargs):
                 context = await original_context(**kwargs, service_workers='block')
 
+                def record_phase(message):
+                    phase = {'synthetic-click': 'clicked', 'synthetic-ready': 'ready'}.get(message.text)
+                    if phase is not None:
+                        phases.append(phase)
+
+                context.on('console', record_phase)
+
                 async def route_request(route):
                     request = route.request
                     if request.url == browser_login._OFFICIAL_ENTRY:
                         await route.fulfill(status=200, content_type='text/html', body=html)
                     elif request.url == 'https://oficinajudicialvirtual.pjud.cl/synthetic-submit':
+                        phases.append('request')
                         counts['fetches'] += 1
                         if mode == 'xhr_failure':
                             await route.abort('connectionreset')
                         else:
-                            await route.fulfill(status=200 if mode == 'success' else 503, body=sentinel)
+                            await route.fulfill(status=200 if succeeds else 503, body=sentinel)
                     elif request.url == browser_login._OFFICIAL_LANDING:
+                        phases.append('landing')
                         await route.fulfill(status=200, headers={
                             'Content-Type': 'text/html', 'Set-Cookie': 'AUTH=synthetic; Secure; Path=/; HttpOnly',
                         }, body='<a href="#infousuario">Cuenta</a><a href="#">Mis Causas</a>')
@@ -233,7 +254,7 @@ async def test_synthetic_async_submit_observes_counts_without_assuming_provider_
         monkeypatch.setattr(browser_login, 'async_playwright', BorrowedRuntime)
         monkeypatch.setattr(browser_login, '_LOGIN_TIMEOUT_S', 3.0)
         start = time.monotonic()
-        if mode == 'success':
+        if succeeds:
             result = await browser_login.login_official_ojv(
                 SecretStr('11.111.111-1'), SecretStr(sentinel), proxy_url=None, user_agent='offline-regression',
             )
@@ -254,13 +275,27 @@ async def test_synthetic_async_submit_observes_counts_without_assuming_provider_
             assert 'submit_inspection_attempts=0 ' not in records[0].getMessage()
             assert 'submit_location=official_entry' in records[0].getMessage()
         assert time.monotonic() - start < 5
-        assert counts == {'fetches': 0 if mode == 'js_failure' else 1, 'unexpected': 0}
+        assert phases.count('clicked') == 1
+        assert counts == {'fetches': 0 if mode in {'js_failure', 'pre_request_pending'} else 1, 'unexpected': 0}
         assert len(observed) == 1
         expected = {
             'success': ['submit_started_fetch=1', 'submit_finished_fetch=1', 'submit_started_navigation=1'],
             'no_transition': ['submit_started_fetch=1', 'submit_finished_fetch=1', 'submit_http_5xx=1'],
             'xhr_failure': ['submit_started_fetch=1', 'submit_failed_fetch=1', 'submit_transport_reset=1'],
             'js_failure': ['submit_started_fetch=0', 'submit_js_errors=1'],
+            'pre_request_pending': [
+                'submit_started_fetch=0', 'submit_started_navigation=0',
+                'submit_started_other=0', 'submit_js_errors=0',
+                'submit_failed_fetch=0', 'submit_observer_errors=0',
+            ],
+            'pre_request_resolved': [
+                'submit_started_fetch=1', 'submit_finished_fetch=1',
+                'submit_started_navigation=1', 'submit_js_errors=0',
+            ],
         }
         for field in expected[mode]:
             assert field in observed[0]
+        if mode == 'pre_request_pending':
+            assert phases == ['clicked']
+        elif mode == 'pre_request_resolved':
+            assert phases == ['clicked', 'ready', 'request', 'landing']
