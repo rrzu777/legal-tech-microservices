@@ -240,7 +240,13 @@ async def _page_has_visible_credential_rejection(page: object) -> bool:
 
 async def _page_has_visible_challenge(page: object) -> bool:
     try:
-        challenge = page.locator('iframe[title*="captcha" i]:visible, .g-recaptcha:visible, [data-sitekey]:visible')
+        # The official entry page displays a reCAPTCHA badge even before login.
+        # Its logo iframe is not an interactive challenge. Keep stopping for
+        # visible challenge frames outside that badge and for challenge widgets.
+        challenge = page.locator(
+            'iframe[title*="captcha" i]:visible:not(.grecaptcha-badge iframe), '
+            '.g-recaptcha:visible, [data-sitekey]:visible'
+        )
         return await challenge.count() > 0
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
