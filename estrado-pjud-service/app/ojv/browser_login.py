@@ -363,7 +363,7 @@ async def login_official_ojv(
                 submit = form.get_by_role("button", name="Ingresar", exact=True)
                 for stage, item in (
                     ("modal", modal), ("form", form), ("rut_input", rut_input),
-                    ("password_input", password_input), ("submit_button", submit),
+                    ("password_input", password_input),
                 ):
                     if not await _wait_visible(item, deadline):
                         failure = OjvUpstreamChangedError()
@@ -389,9 +389,13 @@ async def login_official_ojv(
                         if not _is_trusted_official_url(page.url):
                             failure = OjvUpstreamChangedError()
                         else:
-                            stage = "submit"
-                            await _within_deadline(submit.click(timeout=_remaining_timeout_ms(deadline)), deadline)
-                            submitted = True
+                            stage = "submit_button"
+                            if not await _wait_visible(submit, deadline) or not _is_trusted_official_url(page.url):
+                                failure = OjvUpstreamChangedError()
+                            else:
+                                stage = "submit"
+                                await _within_deadline(submit.click(timeout=_remaining_timeout_ms(deadline)), deadline)
+                                submitted = True
             if failure is None and submitted:
                 stage = "post_submit"
                 failure = await _resolve_post_submit(page, deadline)

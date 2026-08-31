@@ -712,7 +712,7 @@ async def test_success_and_cancellation_do_not_emit_login_failure(
 
 
 @pytest.mark.parametrize("missing", ["modal", "form", "rut_input", "password_input", "submit_button", "rut_placeholder"])
-async def test_form_diagnostic_identifies_missing_requirement_before_filling(
+async def test_form_diagnostic_identifies_missing_requirement_before_submit(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, missing: str,
 ) -> None:
     page = _Page()
@@ -729,8 +729,9 @@ async def test_form_diagnostic_identifies_missing_requirement_before_filling(
     context, browser = _install_fake_browser(monkeypatch, page)
     with pytest.raises(OjvUpstreamChangedError):
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
-    assert page.form.rut.filled == []
-    assert page.form.password.filled == []
+    assert page.form.rut.filled == (["11111111"] if missing == "submit_button" else [])
+    assert page.form.password.filled == (["secret"] if missing == "submit_button" else [])
+    assert "submit" not in page.actions
     assert context.closed and browser.closed
     records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
     assert len(records) == 1
@@ -791,3 +792,38 @@ async def test_entry_http_and_origin_failures_are_distinguishable_without_urls(
     assert f"kind=contract network=none entry_http={status} entry_origin={expected_origin}" in records[0].getMessage()
     assert "secret-token" not in repr(records[0].__dict__)
     assert "unexpected.invalid" not in repr(records[0].__dict__)
+
+
+async def test_submit_can_appear_after_verified_credentials_are_filled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _Page()
+
+    class ProgressiveSubmit(_Action):
+        async def count(self) -> int:
+            return 1 if page.form.rut.filled and page.form.password.filled else 0
+
+    submit = ProgressiveSubmit(page, "submit")
+    monkeypatch.setattr(page.form, "get_by_role", lambda *_args, **_kwargs: submit)
+    _install_fake_browser(monkeypatch, page)
+    result = await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert result.cookies[0].name == "AUTH"
+    assert page.actions.count("submit") == 1
+
+
+async def test_origin_change_while_waiting_for_submit_prevents_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _Page()
+
+    class RedirectingSubmit(_Action):
+        async def wait_for(self, **_kwargs):
+            page.url = "https://unexpected.invalid/"
+
+    submit = RedirectingSubmit(page, "submit")
+    monkeypatch.setattr(page.form, "get_by_role", lambda *_args, **_kwargs: submit)
+    _install_fake_browser(monkeypatch, page)
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert page.form.password.filled == ["secret"]
+    assert "submit" not in page.actions
