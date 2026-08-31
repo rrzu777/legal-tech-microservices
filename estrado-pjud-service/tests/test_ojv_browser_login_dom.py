@@ -12,7 +12,7 @@ from playwright.async_api import async_playwright
 from pydantic import SecretStr
 
 from app.ojv import browser_login
-from app.ojv.errors import OjvTimeoutError, OjvUpstreamChangedError
+from app.ojv.errors import FamiliaBlockedError, OjvTimeoutError, OjvUpstreamChangedError
 
 
 pytestmark = pytest.mark.skipif(
@@ -21,15 +21,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("aria_hidden,buttons,success", [
-    ("true", '<button>Ingresar</button>', True),
-    ("false", '<button>Ingresar</button>', True),
-    ("true", '<button style="display:none">Ingresar</button>', False),
-    ("true", '<button>Ingresar</button><button>Ingresar</button>', False),
-    ("true", '<button>Ingresar</button><button style="display:none">Ingresar</button>', True),
+@pytest.mark.parametrize("aria_hidden,buttons,success,captcha", [
+    ("true", '<button>Ingresar</button>', True, ""),
+    ("false", '<button>Ingresar</button>', True, ""),
+    ("true", '<button style="display:none">Ingresar</button>', False, ""),
+    ("true", '<button>Ingresar</button><button>Ingresar</button>', False, ""),
+    ("true", '<button>Ingresar</button><button style="display:none">Ingresar</button>', True, ""),
+    ("true", '<button>Ingresar</button>', True, "badge"),
+    ("true", '<button>Ingresar</button>', False, "challenge"),
 ])
 async def test_official_login_requires_one_physically_visible_submit_in_own_form(
-    monkeypatch: pytest.MonkeyPatch, aria_hidden: str, buttons: str, success: bool,
+    monkeypatch: pytest.MonkeyPatch, aria_hidden: str, buttons: str, success: bool, captcha: str,
 ) -> None:
     # Regression: default role queries exclude descendants of aria-hidden="true",
     # even when their CSS visibility is normal. Mock locators missed this in OJV.
@@ -44,6 +46,18 @@ async def test_official_login_requires_one_physically_visible_submit_in_own_form
           <input type="password" name="password">{buttons}
         </form>
       </div>"""
+    if captcha:
+        # A visible badge is present on the real entry page before authentication.
+        # Delay navigation to exercise the actual post-submit classifier.
+        html += '''<div class="grecaptcha-badge"><div class="grecaptcha-logo">
+          <iframe title="reCAPTCHA" srcdoc="" width="256" height="60"></iframe>
+          </div></div><script>
+          document.querySelector('#fSGN').addEventListener('submit', event => {
+            event.preventDefault();
+            setTimeout(() => document.querySelector('#fSGN').submit(), 350);
+          });</script>'''
+        if captcha == "challenge":
+            html += '<iframe title="recaptcha challenge" srcdoc="" width="300" height="300"></iframe>'
     submissions: list[str | None] = []
     unexpected: list[str] = []
 
@@ -97,7 +111,8 @@ async def test_official_login_requires_one_physically_visible_submit_in_own_form
             assert [(cookie.name, cookie.value) for cookie in result.cookies] == [("AUTH", "synthetic")]
             assert submissions == ["rut=11111111&password=synthetic-password"]
         else:
-            with pytest.raises((OjvTimeoutError, OjvUpstreamChangedError)):
+            expected_errors = (FamiliaBlockedError,) if captcha == "challenge" else (OjvTimeoutError, OjvUpstreamChangedError)
+            with pytest.raises(expected_errors):
                 await browser_login.login_official_ojv(
                     SecretStr("11.111.111-1"), SecretStr("synthetic-password"),
                     proxy_url=None, user_agent="offline-regression",
