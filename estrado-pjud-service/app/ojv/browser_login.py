@@ -325,10 +325,17 @@ async def login_official_ojv(
                 rut_input = form.locator("input[type=text]")
                 password_input = form.locator("input[type=password]")
                 submit = form.get_by_role("button", name="Ingresar", exact=True)
-                if not all([await _wait_visible(item, deadline) for item in (modal, form, rut_input, password_input, submit)]):
-                    failure = OjvUpstreamChangedError()
-                elif await _within_deadline(rut_input.get_attribute("placeholder"), deadline) != _RUT_PLACEHOLDER:
-                    failure = OjvUpstreamChangedError()
+                for stage, item in (
+                    ("modal", modal), ("form", form), ("rut_input", rut_input),
+                    ("password_input", password_input), ("submit_button", submit),
+                ):
+                    if not await _wait_visible(item, deadline):
+                        failure = OjvUpstreamChangedError()
+                        break
+                if failure is None:
+                    stage = "rut_placeholder"
+                    if await _within_deadline(rut_input.get_attribute("placeholder"), deadline) != _RUT_PLACEHOLDER:
+                        failure = OjvUpstreamChangedError()
             if failure is None:
                 stage = "rut_fill"
                 rut_value = rut.get_secret_value()

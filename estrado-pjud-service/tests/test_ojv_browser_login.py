@@ -710,3 +710,30 @@ async def test_success_and_cancellation_do_not_emit_login_failure(
     with pytest.raises(asyncio.CancelledError):
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
     assert not [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+
+
+@pytest.mark.parametrize("missing", ["modal", "form", "rut_input", "password_input", "submit_button", "rut_placeholder"])
+async def test_form_diagnostic_identifies_missing_requirement_before_filling(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, missing: str,
+) -> None:
+    page = _Page()
+    submit = page.form.get_by_role("button", name="Ingresar", exact=True)
+    monkeypatch.setattr(page.form, "get_by_role", lambda *_args, **_kwargs: submit)
+    targets = {
+        "modal": page.modal, "form": page.form, "rut_input": page.form.rut,
+        "password_input": page.form.password, "submit_button": submit,
+    }
+    if missing == "rut_placeholder":
+        page.form.rut._placeholder = "private unexpected placeholder must not be logged"
+    else:
+        targets[missing]._count = 0
+    context, browser = _install_fake_browser(monkeypatch, page)
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert page.form.rut.filled == []
+    assert page.form.password.filled == []
+    assert context.closed and browser.closed
+    records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+    assert [record.getMessage() for record in records] == [
+        f"pjud_private_login_failed stage={missing} outcome=upstream_changed",
+    ]
