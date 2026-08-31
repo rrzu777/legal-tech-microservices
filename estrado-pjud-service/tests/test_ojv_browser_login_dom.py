@@ -6,6 +6,7 @@ All requests are intercepted; no provider, credentials, or existing profile is u
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 from playwright.async_api import async_playwright
@@ -119,3 +120,33 @@ async def test_official_login_requires_one_physically_visible_submit_in_own_form
                 )
             assert submissions == []
         assert unexpected == []
+
+
+@pytest.mark.parametrize("account_html,menu_html,account_shape,menu_shape", [
+    ('<a href="#infousuario">Synthetic account</a>', '<a href="#">Mis Causas</a>', (1, 1), (1, 1)),
+    ('<a href="#infousuario" style="display:none">Synthetic account</a>', '<a href="#">Mis Causas</a>', (1, 0), (1, 1)),
+    ('', '<a href="#">Mis Causas</a><a href="#">Mis Causas</a>', (0, 0), (2, 2)),
+])
+async def test_landing_probe_reads_real_dom_without_exposing_page_contents(
+    account_html, menu_html, account_shape, menu_shape,
+) -> None:
+    async with async_playwright() as runtime:
+        browser = await runtime.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            context = await browser.new_context(service_workers="block")
+            page = await context.new_page()
+            probe = browser_login._LandingProbe()
+            page.on("response", lambda response: browser_login._record_landing_response(page, probe, response))
+            await context.route("**/*", lambda route: route.fulfill(
+                status=200, content_type="text/html", body=account_html + menu_html,
+            ))
+            await page.goto("https://oficinajudicialvirtual.pjud.cl/indexN.php")
+            await browser_login._sample_landing(page, probe, time.monotonic() + 2)
+            assert probe.main_http == 200
+            assert probe.ready == "complete"
+            assert probe.account == account_shape
+            assert probe.my_causes == menu_shape
+            assert "Synthetic account" not in repr(probe)
+            assert "https" not in repr(probe)
+        finally:
+            await browser.close()

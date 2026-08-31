@@ -270,7 +270,7 @@ async def test_official_adapter_uses_observed_ui_and_returns_owned_typed_cookies
     assert result.user_agent == "official-test-agent"
     # The launch arguments were cleared after use, which also drops proxy credentials.
     # Context/user-agent and UI calls above prove the requested browser configuration.
-    assert page.events == ["request"]
+    assert page.events == ["request", "response"]
     assert browser.closed is True
     assert context.closed is True
     assert context.cdp.detached is True
@@ -304,6 +304,126 @@ async def test_official_adapter_requires_authenticated_account_and_mis_causas_ma
     _install_fake_browser(monkeypatch, page)
     with pytest.raises(OjvUpstreamChangedError):
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+
+
+@pytest.mark.parametrize("missing", ["account", "my_causes"])
+async def test_landing_failure_identifies_marker_with_redacted_counts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, missing: str,
+) -> None:
+    class LandingPage(_Page):
+        def locator(self, selector: str) -> _Counted:
+            if selector == 'a[href="#infousuario"]':
+                return _Counted(0 if missing == "account" else 1)
+            return super().locator(selector)
+
+        def get_by_role(self, role: str, *, name: str, exact: bool) -> _Counted:
+            if name == "Mis Causas":
+                return _Counted(0 if missing == "my_causes" else 1)
+            return super().get_by_role(role, name=name, exact=exact)
+
+        async def evaluate(self, _script: str) -> str:
+            return "complete"
+
+    _install_fake_browser(monkeypatch, LandingPage())
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("never-log-password"), proxy_url=None, user_agent="official-test-agent")
+    message = next(record.getMessage() for record in caplog.records if record.name == "app.ojv.browser_login")
+    assert f"stage=landing_{missing}" in message
+    assert "landing_ready=complete" in message
+    assert f"account_shape={'0,0' if missing == 'account' else '1,1'}" in message
+    assert f"my_causes_shape={'0,0' if missing == 'my_causes' else '1,1'}" in message
+    assert "never-log-password" not in message
+
+
+async def test_slow_landing_probe_stays_within_login_deadline() -> None:
+    from app.ojv.browser_login import _LandingProbe, _sample_landing
+
+    class SlowCount(_Counted):
+        async def count(self):
+            await asyncio.sleep(5)
+
+    class SlowPage(_Page):
+        def locator(self, _selector):
+            return SlowCount()
+
+    page = SlowPage()
+    page.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
+    probe = _LandingProbe()
+    start = time.monotonic()
+    await _sample_landing(page, probe, start + 0.02)
+    assert time.monotonic() - start < 0.2
+    assert probe.account == (-1, -1)
+
+
+async def test_landing_probe_failure_cannot_reject_an_authenticated_session(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BadDiagnosticPage(_Page):
+        async def evaluate(self, _script):
+            raise RuntimeError("private-provider-message-must-not-escape")
+
+    context, browser = _install_fake_browser(monkeypatch, BadDiagnosticPage())
+    result = await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert result.cookies[0].name == "AUTH"
+    assert context.closed and browser.closed
+    assert not [record for record in caplog.records if record.name == "app.ojv.browser_login"]
+
+
+async def test_landing_watcher_cancel_is_drained_before_browser_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.ojv.browser_login as adapter
+    stopped = False
+
+    async def watch(*_args):
+        nonlocal stopped
+        try:
+            await asyncio.sleep(5)
+        finally:
+            stopped = True
+
+    class LandingYieldPage(_Page):
+        def get_by_role(self, role, *, name, exact):
+            if name == "Mis Causas":
+                class YieldCount(_Counted):
+                    async def wait_for(self, **_kwargs):
+                        await asyncio.sleep(0.01)
+                return YieldCount()
+            return super().get_by_role(role, name=name, exact=exact)
+
+    monkeypatch.setattr(adapter, "_watch_landing", watch)
+    _install_fake_browser(monkeypatch, LandingYieldPage())
+    await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    assert stopped
+
+
+async def test_landing_redirect_during_marker_wait_is_rejected_and_classified(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RedirectPage(_Page):
+        def get_by_role(self, role, *, name, exact):
+            if name == "Mis Causas":
+                page = self
+                class RedirectMarker(_Counted):
+                    async def wait_for(self, **_kwargs):
+                        page.url = "https://unexpected.invalid/?token=never-log-token"
+                return RedirectMarker()
+            return super().get_by_role(role, name=name, exact=exact)
+
+    context, browser = _install_fake_browser(monkeypatch, RedirectPage())
+    cookie_reads = []
+    original_cookies = context.cookies
+    async def observe_cookie_read():
+        cookie_reads.append(True)
+        return await original_cookies()
+    context.cookies = observe_cookie_read
+    with pytest.raises(OjvUpstreamChangedError):
+        await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret"), proxy_url=None, user_agent="official-test-agent")
+    message = next(record.getMessage() for record in caplog.records if record.name == "app.ojv.browser_login")
+    assert "stage=landing_final_url" in message
+    assert "landing_location=untrusted" in message
+    assert "unexpected.invalid" not in message
+    assert "never-log-token" not in message
+    assert cookie_reads == []
+    assert context.closed and browser.closed
 
 
 async def test_explicit_rejection_is_credential_invalid_without_provider_exception_details(
@@ -763,7 +883,8 @@ async def test_entry_failure_logs_only_closed_exception_and_network_details(
     assert len(records) == 1
     assert records[0].getMessage() == (
         f"pjud_private_login_failed stage=entry_goto outcome={outcome} "
-        f"kind={kind} network={network} entry_http=0 entry_origin=unknown"
+        f"kind={kind} network={network} entry_http=0 entry_origin=unknown "
+        "landing_http=0 landing_ready=unavailable landing_location=unknown account_shape=-1,-1 my_causes_shape=-1,-1"
     )
     assert "secret-token" not in repr(records[0].__dict__)
     assert records[0].exc_info is None
