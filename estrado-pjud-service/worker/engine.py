@@ -46,6 +46,7 @@ from app.proxy_cost import (
     is_proxy_cost_control_error,
 )
 from app.r2 import R2Client
+from app.runtime_fence import runtime_generation_headers
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
 from worker.import_jobs import ImportDiscoveryWorker
 from worker.sync_messages import BlockCause, blocked_error_message
@@ -690,6 +691,8 @@ class SyncEngine:
         self._metrics = metrics
         self._backoff = backoff
         self._config = config
+        self._runtime_headers = runtime_generation_headers(getattr(config, "PJUD_RUNTIME_GENERATION", None))
+        self._sync_credentials = SyncCredentialClient(supabase, config)
         self._proxy_control = proxy_control or ProxyControl(supabase)
         proxy_url = getattr(config, "OJV_PROXY_URL", None)
         price = getattr(config, "OJV_PROXY_PRICE_PER_GB_USD", DEFAULT_PRICE_PER_GB_USD)
@@ -1429,12 +1432,12 @@ class SyncEngine:
             logger.error("VERCEL_APP_URL or INTERNAL_CREDENTIALS_API_KEY not configured")
             return None
         try:
-            headers = {"Authorization": f"Bearer {key}"}
+            headers = {**self._runtime_headers, "Authorization": f"Bearer {key}"}
             if law_firm_id is not None:
                 headers["X-Law-Firm-Id"] = law_firm_id
             if extra_headers:
                 if any(
-                    name.lower() in {"authorization", "x-law-firm-id"}
+                    name.lower() in {"authorization", "x-law-firm-id", "x-pjud-runtime-generation"}
                     for name in extra_headers
                 ):
                     logger.error("unsafe internal request header override (%s)", path)
@@ -1507,7 +1510,7 @@ class SyncEngine:
         return {"success": False, "new_movements": 0, "status": status}
 
     async def _sync_familia_case(self, case: dict, sync_run_id: str | None, started_at: datetime) -> dict:
-        client = SyncCredentialClient(self._sb, self._config)
+        client = self._sync_credentials
         try:
             claim = SyncCredentialClaim.model_validate({
                 "law_firm_id": case.get("law_firm_id"),

@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests.helpers import RuntimeControlDB, legacy_runtime_fence
+
 from worker.__main__ import (
     safe_initialize_pool,
     can_initialize_paid_pool,
@@ -17,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 def _entrypoint_config(*, validation_once=False):
     config = MagicMock()
+    config.PJUD_RUNTIME_GENERATION = None
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = validation_once
     config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = False
     config.OJV_PROXY_URL = "http://proxy.invalid"
@@ -41,7 +44,7 @@ def _entrypoint_config(*, validation_once=False):
 def _patch_entrypoint(monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff):
     monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
     monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
-    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: MagicMock())
+    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: RuntimeControlDB())
     monkeypatch.setattr(worker_main, "ProxyUsageTracker", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "ProxyControl", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "SessionPool", lambda *_a, **_k: pool)
@@ -94,7 +97,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
         handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
 
     engine.sync_case = AsyncMock(side_effect=sync_case)
-    scheduler.get_next_batch.return_value = [{"id": "scheduled-case"}]
+    scheduler.get_next_batch.return_value = [{"id": "scheduled-case", "sync_claim_token": "synthetic-token"}]
 
     async def process_import():
         if not reopen:
@@ -107,7 +110,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
 
     if reopen:
         scheduler.get_next_batch.assert_awaited_once()
-        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case"})
+        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case", "sync_claim_token": "synthetic-token"})
     else:
         engine.process_import_job.assert_awaited_once()
         scheduler.get_next_batch.assert_not_awaited()
@@ -289,7 +292,10 @@ async def test_outside_hours_main_loop_still_invokes_bounded_reconciliation(monk
     monkeypatch.setattr(worker_main, "safe_initialize_pool", initialize_pool)
     monkeypatch.setattr(worker_main, "is_processing_allowed", MagicMock(return_value=False))
 
+    real_wait_for = asyncio.wait_for
     async def stop_after_office_gate(awaitable, *, timeout):
+        if timeout == 5.0:
+            return await real_wait_for(awaitable, timeout=timeout)
         awaitable.close()
         raise RuntimeError("stop after outside-hours loop")
 
@@ -377,7 +383,7 @@ async def test_safe_initialize_retries_then_returns_false_no_crash(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is False
     assert pool.initialize.await_count == 3
     assert len(slept) == 2  # backed off between attempts, not after the last one
@@ -393,7 +399,7 @@ async def test_safe_initialize_succeeds_first_try(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is True
     assert pool.initialize.await_count == 1
     assert slept == []
@@ -413,6 +419,7 @@ async def test_safe_initialize_402_trips_control_and_never_retries(monkeypatch):
         base_delay=1,
         proxy_control=control,
         backoff=backoff,
+        runtime_fence=legacy_runtime_fence(),
     )
 
     assert ok is False

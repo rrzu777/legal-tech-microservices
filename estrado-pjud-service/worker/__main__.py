@@ -11,6 +11,7 @@ from app.bandwidth import METER
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
+from app.runtime_fence import PjudRuntimeError, RuntimeFence
 from worker.config import WorkerConfig
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
@@ -60,6 +61,8 @@ async def process_batch(
     proxy_control: ProxyControl | None = None,
     processing_window=is_scheduled_processing_window,
     shutdown_grace_seconds: float = 30.0,
+    *,
+    runtime_fence: RuntimeFence | None,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
@@ -72,6 +75,8 @@ async def process_batch(
 
     async def _run_one(case):
         async with sem:
+            if not await runtime_admitted(runtime_fence, getattr(engine, "_metrics", None)):
+                return
             # Un lote reclamado al final de la jornada puede seguir esperando
             # el semáforo después de las 18:00. No iniciar tráfico nuevo cuando
             # finalmente obtiene un slot; next_sync_at queda vencido para la
@@ -159,11 +164,14 @@ async def maybe_alert_bandwidth(config, state: "BandwidthAlertState", now: float
 
 async def safe_initialize_pool(
     pool, max_retries: int = 5, base_delay: int = 10,
-    proxy_control=None, backoff=None,
+    proxy_control=None, backoff=None, runtime_fence: RuntimeFence | None = None,
 ) -> bool:
     """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
     sin crashear (evita el crash-loop de systemd martillando PJUD)."""
     for attempt in range(1, max_retries + 1):
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
         try:
             await pool.initialize()
             return True
@@ -258,19 +266,35 @@ async def run_import_discovery_loop(
     metrics,
     shutdown_event: asyncio.Event,
     *,
+    runtime_fence: RuntimeFence | None,
     poll_interval: float = 5.0,
     traffic_allowed=lambda: True,
 ) -> None:
     """Independent one-at-a-time discovery loop with structured cancellation."""
     while not shutdown_event.is_set():
-        if traffic_allowed():
+        if await runtime_admitted(runtime_fence, metrics) and traffic_allowed():
             processed = await safe_process_import_job(engine, metrics)
             if processed:
                 continue
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
-        except asyncio.TimeoutError:
-            pass
+        await wait_before_retry(shutdown_event, poll_interval, validation_once=False)
+
+
+async def runtime_admitted(runtime_fence: RuntimeFence | None, metrics) -> bool:
+    """A local denial is infrastructure state, never a case failure or ops alert."""
+    try:
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
+        return True
+    except PjudRuntimeError as error:
+        report_runtime_rejection(error, metrics)
+        return False
+
+
+def report_runtime_rejection(error: PjudRuntimeError, metrics) -> None:
+    if metrics is not None:
+        metrics.set_status("backoff" if error.code == "pjud_runtime_unavailable" else "paused")
+    notify_status(error.code)
 
 
 def public_sync_concurrency(session_capacity: int, *, imports_enabled: bool) -> int:
@@ -354,6 +378,7 @@ async def main():
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
 
     supabase = create_supabase(config)
+    runtime_fence = RuntimeFence(supabase, config.PJUD_RUNTIME_GENERATION)
     proxy_usage = ProxyUsageTracker(
         supabase,
         enabled=bool(config.OJV_PROXY_URL),
@@ -390,6 +415,10 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
+            if not await runtime_admitted(runtime_fence, metrics):
+                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                    return
+                continue
             if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
                 notify_status("sync-run reconciliation unavailable; traffic blocked")
@@ -441,18 +470,29 @@ async def main():
                 # Manual discovery claims and authorizes credentials before
                 # checkout. Preparing empty slots does not mint/pay for idle
                 # capacity; normal acquisition retains proxy/cost controls.
+                if not await runtime_admitted(runtime_fence, metrics):
+                    if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                        return
+                    continue
                 await pool.initialize(prewarm=False)
                 initialized = True
                 break
 
             metrics.set_status("starting")
             notify_status("initializing proxy pool")
-            initialized = await safe_initialize_pool(
-                pool,
-                max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
-                proxy_control=proxy_control,
-                backoff=backoff,
-            )
+            try:
+                initialized = await safe_initialize_pool(
+                    pool,
+                    max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
+                    proxy_control=proxy_control,
+                    backoff=backoff,
+                    runtime_fence=runtime_fence,
+                )
+            except PjudRuntimeError as error:
+                report_runtime_rejection(error, metrics)
+                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                    return
+                continue
             if initialized:
                 break
 
@@ -494,6 +534,7 @@ async def main():
                     engine,
                     metrics,
                     shutdown_event,
+                    runtime_fence=runtime_fence,
                     traffic_allowed=lambda: not backoff.is_open,
                 ),
                 name="pjud-import-discovery",
@@ -511,6 +552,10 @@ async def main():
             )
 
         while not shutdown_event.is_set():
+            if not await runtime_admitted(runtime_fence, metrics):
+                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                    return
+                continue
             if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
                 metrics.set_status("backoff")
                 notify_status("sync-run reconciliation unavailable; traffic blocked")
@@ -563,6 +608,10 @@ async def main():
             metrics.set_status("running")
             notify_status("running")
 
+            if not await runtime_admitted(runtime_fence, metrics):
+                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                    return
+                continue
             batch = await safe_get_next_batch(scheduler, metrics, backoff)
 
             if batch is None:
@@ -589,7 +638,10 @@ async def main():
                     pass
                 continue
 
-            case_ids = [c["id"] for c in batch]
+            release_claims = [
+                {"case_id": row["id"], "claim_token": row["sync_claim_token"]}
+                for row in batch
+            ]
 
             session_capacity = (
                 config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
@@ -604,6 +656,7 @@ async def main():
                 concurrency,
                 shutdown_event,
                 backoff,
+                runtime_fence=runtime_fence,
                 proxy_control=proxy_control,
                 processing_window=(
                     lambda: is_processing_allowed(
@@ -613,7 +666,7 @@ async def main():
                 ),
             )
 
-            await scheduler.release_batch(case_ids)
+            await scheduler.release_batch(release_claims)
             await maybe_alert_bandwidth(config, bandwidth_alert_state)
             if validation_once:
                 logger.info("One-shot validation completed one batch")

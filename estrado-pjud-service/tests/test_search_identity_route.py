@@ -23,8 +23,9 @@ def _env(monkeypatch):
 @pytest.fixture
 def client():
     from app.main import create_app
+    from tests.helpers import install_runtime_control
 
-    return TestClient(create_app())
+    return TestClient(install_runtime_control(create_app()))
 
 
 def _session():

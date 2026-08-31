@@ -143,6 +143,7 @@ def test_invalid_lane_budget_is_rejected_before_worker_start():
 
 @pytest.mark.asyncio
 async def test_scheduled_shutdown_bounds_and_cancels_inflight_work_without_acknowledging():
+    from tests.helpers import legacy_runtime_fence
     from worker.__main__ import process_batch
 
     entered = asyncio.Event()
@@ -160,7 +161,7 @@ async def test_scheduled_shutdown_bounds_and_cancels_inflight_work_without_ackno
     backoff = type("Backoff", (), {"is_open": False})()
     task = asyncio.create_task(process_batch(
         [{"id": "case-1"}], Engine(), 1, shutdown, backoff,
-        processing_window=lambda: True,
+        runtime_fence=legacy_runtime_fence(), processing_window=lambda: True,
         shutdown_grace_seconds=0.01,
     ))
     await entered.wait()
