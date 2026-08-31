@@ -30,6 +30,7 @@ from app.ojv.errors import (
 )
 from app.proxy import split_proxy_for_playwright
 from app.proxy_billing import ProxyBillingExhaustedError
+from app.ojv.submit_diagnostics import _SubmitProbe
 
 
 _OFFICIAL_ENTRY = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
@@ -276,7 +277,18 @@ def _record_request(request: object) -> None:
         body = b""
 
 
-async def _page_has_visible_credential_rejection(page: object) -> bool:
+def _submit_location(page: object) -> str:
+    try:
+        url = page.url
+        if not _is_trusted_official_url(url):
+            return "untrusted"
+        path = urlparse(url).path
+        return {"/home/index.php": "official_entry", "/indexN.php": "official_landing"}.get(path, "official_other")
+    except Exception:
+        return "unavailable"
+
+
+async def _page_has_visible_credential_rejection(page: object, probe: _SubmitProbe | None = None) -> bool:
     """Classify only an explicit, currently visible post-submit alert."""
     messages: list[str] = []
     try:
@@ -289,12 +301,14 @@ async def _page_has_visible_credential_rejection(page: object) -> bool:
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except BaseException:
+        if probe is not None:
+            probe.inspection_failed = True
         return False
     finally:
         messages.clear()
 
 
-async def _page_has_visible_challenge(page: object) -> bool:
+async def _page_has_visible_challenge(page: object, probe: _SubmitProbe | None = None) -> bool:
     try:
         # The official entry page displays a reCAPTCHA badge even before login.
         # Its logo iframe is not an interactive challenge. Keep stopping for
@@ -307,10 +321,12 @@ async def _page_has_visible_challenge(page: object) -> bool:
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except BaseException:
+        if probe is not None:
+            probe.inspection_failed = True
         return False
 
 
-async def _resolve_post_submit(page: object, deadline: float) -> OjvSessionError | None:
+async def _resolve_post_submit(page: object, deadline: float, probe: _SubmitProbe | None = None) -> OjvSessionError | None:
     """Observe post-submit state only while login time remains."""
     while True:
         try:
@@ -321,10 +337,20 @@ async def _resolve_post_submit(page: object, deadline: float) -> OjvSessionError
             return None
         try:
             if _is_trusted_official_url(page.url):
-                if await _within_deadline(_page_has_visible_credential_rejection(page), deadline):
+                if probe is not None:
+                    probe.increment("inspection_attempts")
+                    probe.inspection_failed = False
+                    probe.inspection = "inspection_unavailable"
+                if await _within_deadline(_page_has_visible_credential_rejection(page, probe), deadline):
+                    if probe is not None:
+                        probe.inspection = "rejection"
                     return InvalidCredentialsError()
-                if await _within_deadline(_page_has_visible_challenge(page), deadline):
+                if await _within_deadline(_page_has_visible_challenge(page, probe), deadline):
+                    if probe is not None:
+                        probe.inspection = "challenge"
                     return FamiliaBlockedError()
+                if probe is not None and not probe.inspection_failed:
+                    probe.inspection = "checked_none"
             await _within_deadline(asyncio.sleep(0.05), deadline)
         except (asyncio.TimeoutError, PlaywrightTimeoutError):
             return OjvTimeoutError()
@@ -365,6 +391,7 @@ async def login_official_ojv(
     entry_http = 0
     entry_origin = "unknown"
     landing_probe = _LandingProbe()
+    submit_probe = _SubmitProbe()
     landing_observer = None
     try:
         if proxy_url:
@@ -464,11 +491,14 @@ async def login_official_ojv(
                                 failure = OjvUpstreamChangedError()
                             else:
                                 stage = "submit"
+                                submit_probe.start(page, deadline)
                                 await _within_deadline(submit.click(timeout=_remaining_timeout_ms(deadline)), deadline)
                                 submitted = True
             if failure is None and submitted:
                 stage = "post_submit"
-                failure = await _resolve_post_submit(page, deadline)
+                failure = await _resolve_post_submit(page, deadline, submit_probe)
+                submit_probe.location = _submit_location(page)
+                submit_probe.stop(page, deadline)
             if failure is None and submitted:
                 stage = "landing_url"
                 if not _is_trusted_official_url(page.url, landing=True):
@@ -505,6 +535,9 @@ async def login_official_ojv(
             error_kind, network_code = _exception_diagnostic(error)
             failure = OjvUpstreamChangedError()
         finally:
+            if submit_probe.active:
+                submit_probe.location = _submit_location(page)
+                submit_probe.stop(page, deadline)
             if submitted and page is not None:
                 try:
                     landing_probe.location = (
@@ -566,10 +599,11 @@ async def login_official_ojv(
     if failure is not None:
         logger.warning(
             "pjud_private_login_failed stage=%s outcome=%s kind=%s network=%s entry_http=%s entry_origin=%s "
-            "landing_http=%s landing_ready=%s landing_location=%s account_shape=%s my_causes_shape=%s",
+            "landing_http=%s landing_ready=%s landing_location=%s account_shape=%s my_causes_shape=%s %s",
             stage, failure.code.value, error_kind, network_code, entry_http, entry_origin,
             landing_probe.main_http, landing_probe.ready, landing_probe.location,
             ",".join(map(str, landing_probe.account)), ",".join(map(str, landing_probe.my_causes)),
+            submit_probe.summary(),
         )
         raise failure from None
     if result is None:
