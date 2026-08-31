@@ -360,7 +360,12 @@ async def login_official_ojv(
                 form = modal.locator("#fSGN")
                 rut_input = form.locator("input[type=text]")
                 password_input = form.locator("input[type=password]")
-                submit = form.get_by_role("button", name="Ingresar", exact=True)
+                # OJV leaves aria-hidden=true on its visibly open login modal.
+                # Include accessibility-hidden matches, but both wait and click
+                # must still target a unique physically visible button in this form.
+                submit = form.get_by_role(
+                    "button", name="Ingresar", exact=True, include_hidden=True,
+                ).filter(visible=True)
                 for stage, item in (
                     ("modal", modal), ("form", form), ("rut_input", rut_input),
                     ("password_input", password_input),
