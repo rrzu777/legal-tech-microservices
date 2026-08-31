@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -20,24 +20,19 @@ from app.cookie_scope import (
     legacy_cookie_scope,
 )
 from app.ojv.errors import (
-    FamiliaBlockedError,
-    InvalidCredentialsError,
-    OjvSessionError,
     OjvTimeoutError,
     OjvUpstreamChangedError,
     SessionError,
     SessionExpiredError,
 )
-from app.parsers.search_parser import detect_blocked
 from app.proxy_billing import ProxyBillingExhaustedError, is_proxy_billing_error
 
 
 logger = logging.getLogger(__name__)
 
 _OJV_BASE = "https://oficinajudicialvirtual.pjud.cl"
-_OJV_KPITEC = "https://ojv.pjud.cl"
-_CPJ_LOGIN_PAGE = f"{_OJV_KPITEC}/kpitec-ojv-web/views/login_pjud.html"
-_CPJ_LOGIN_API = f"{_OJV_KPITEC}/kpitec-ojv-web/login_pjud"
+
+BrowserLoginCallable = Callable[..., Awaitable[object]]
 
 
 def decode_ojv_html(response: httpx.Response) -> str:
@@ -97,12 +92,16 @@ class OjvSession:
         user_agent: str | None = None,
         rate_limit_s: float = 2.5,
         transport: httpx.AsyncBaseTransport | None = None,
+        browser_login: BrowserLoginCallable | None = None,
     ) -> None:
         self._rate_s = rate_limit_s
         self._last = 0.0
         self._authenticated_rut: SecretStr | None = None
         self._authenticated_dv: SecretStr | None = None
         self._closed = False
+        self._browser_proxy = SecretStr(proxy_url) if proxy_url else None
+        self._user_agent = user_agent or _USER_AGENT
+        self._browser_login = browser_login
         cookie_records = cookies or ()
         if isinstance(cookie_records, Mapping):
             domain, secure = legacy_cookie_scope(_OJV_BASE)
@@ -114,7 +113,7 @@ class OjvSession:
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             headers={
-                "User-Agent": user_agent or _USER_AGENT,
+                "User-Agent": self._user_agent,
                 "Accept-Language": "es-CL,es;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
@@ -202,65 +201,55 @@ class OjvSession:
         if auth_type != "clave_pj":
             raise ValueError("Only Clave Poder Judicial is supported")
 
-        await self._wait()
-        login_page = await self._get(_CPJ_LOGIN_PAGE)
-        login_page_html = decode_ojv_html(login_page)
-        login_page_error: OjvSessionError | None = None
-        if login_page.status_code in {403, 429} or detect_blocked(login_page_html):
-            login_page_error = FamiliaBlockedError()
-        elif login_page.status_code == 408 or login_page.status_code >= 500:
-            login_page_error = OjvTimeoutError()
-        elif login_page.status_code >= 400:
-            login_page_error = OjvUpstreamChangedError()
-        login_page = None
-        login_page_html = ""
-        if login_page_error is not None:
-            raise login_page_error
+        from app.ojv.browser_login import login_official_ojv
 
-        rut_value = rut_secret.get_secret_value()
-        password_value = password_secret.get_secret_value()
-        rut_digits, _ = rut_parts(rut_value)
-
-        await self._wait()
-        credential_form = {"rutPjud": rut_digits, "passwordPjud": password_value}
+        login_callable = self._browser_login or login_official_ojv
+        proxy_value = (
+            self._browser_proxy.get_secret_value()
+            if self._browser_proxy is not None
+            else None
+        )
+        result: object | None = None
+        cookies: object | None = None
+        new_jar = None
         try:
-            response = await self._post(
-                _CPJ_LOGIN_API,
-                data=credential_form,
-                headers={
-                    "Referer": _CPJ_LOGIN_PAGE,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
+            result = await login_callable(
+                rut_secret,
+                password_secret,
+                proxy_url=proxy_value,
+                user_agent=self._user_agent,
             )
+            cookies = getattr(result, "cookies", None)
+            result_user_agent = getattr(result, "user_agent", None)
+            if result_user_agent != self._user_agent:
+                raise OjvUpstreamChangedError()
+            new_jar = cookie_jar_from_records(cookies)
+        except BaseException:
+            # A failed browser attempt must never leave a borrowed/public jar
+            # appearing authenticated to the bounded listing client.
+            self._client.cookies.clear()
+            self._authenticated_rut = None
+            self._authenticated_dv = None
+            proxy_value = None
+            cookies = None
+            new_jar = None
+            result = None
+            raise
+        proxy_value = None
+        cookies = None
+        result = None
+        try:
+            self._client.cookies.clear()
+            for cookie in new_jar:
+                self._client.cookies.jar.set_cookie(cookie)
+            self._remember_authenticated_rut(rut_secret)
+        except BaseException:
+            self._client.cookies.clear()
+            self._authenticated_rut = None
+            self._authenticated_dv = None
+            raise
         finally:
-            credential_form.clear()
-            rut_value = ""
-            password_value = ""
-            rut_digits = ""
-        html = decode_ojv_html(response)
-        login_error: OjvSessionError | None = None
-        if response.status_code in {403, 429} or detect_blocked(html):
-            login_error = FamiliaBlockedError()
-        elif response.status_code == 419:
-            login_error = SessionExpiredError()
-        elif response.status_code == 408 or response.status_code >= 500:
-            login_error = OjvTimeoutError()
-        elif response.status_code == 401:
-            login_error = InvalidCredentialsError()
-        elif response.status_code >= 400:
-            login_error = OjvUpstreamChangedError()
-        elif detect_login_error(html):
-            login_error = InvalidCredentialsError()
-        elif looks_like_login_url(str(response.url)):
-            login_error = SessionExpiredError()
-        elif (response.url.host or "").casefold() != "oficinajudicialvirtual.pjud.cl":
-            login_error = OjvUpstreamChangedError()
-        response = None
-        html = ""
-        if login_error is not None:
-            raise login_error
-
-        self._remember_authenticated_rut(rut_secret)
+            new_jar = None
         logger.info("ojv_session login status=ok")
 
     def _remember_authenticated_rut(self, rut: SecretStr) -> None:

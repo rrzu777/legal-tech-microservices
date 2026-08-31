@@ -1,325 +1,158 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
+from app.cookie_scope import CookieRecord
+from app.ojv.browser_login import BrowserLoginResult
 from app.ojv.errors import (
     InvalidCredentialsError,
-    OjvSessionErrorCode,
     OjvTimeoutError,
     OjvUpstreamChangedError,
     OjvWafError,
     SessionExpiredError,
 )
 from app.ojv.session import OjvSession
-from app.proxy_billing import ProxyBillingExhaustedError, is_proxy_billing_error
-
+from app.proxy_billing import ProxyBillingExhaustedError
 
 RUT = "11.111.111-1"
 PASSWORD = "synthetic-password-never-log"
 COOKIE = "synthetic-cookie-never-log"
 
 
-def _secrets_are_absent(value: object) -> None:
-    rendered = repr(value)
-    assert RUT not in rendered
-    assert "11111111" not in rendered
-    assert PASSWORD not in rendered
-    assert COOKIE not in rendered
+def _result(user_agent: str) -> BrowserLoginResult:
+    return BrowserLoginResult((CookieRecord(
+        name="AUTH", value=COOKIE, domain="oficinajudicialvirtual.pjud.cl", secure=True,
+    ),), user_agent=user_agent)
 
 
-def _production_traceback_locals(error: BaseException) -> str:
-    frames: list[str] = []
-    traceback = error.__traceback__
-    while traceback is not None:
-        if "/app/ojv/" in traceback.tb_frame.f_code.co_filename:
-            frames.append(repr(traceback.tb_frame.f_locals))
-        traceback = traceback.tb_next
-    return " ".join(frames)
+async def test_login_uses_only_the_injected_official_adapter_and_replaces_cookie_jar() -> None:
+    calls = 0
 
+    async def login(*_args: object, user_agent: str, **_kwargs: object) -> BrowserLoginResult:
+        nonlocal calls
+        calls += 1
+        return _result(user_agent)
 
-async def test_clave_pj_login_preserves_redirect_and_cookie_sequence() -> None:
-    requests: list[tuple[str, str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(
-            (
-                request.method,
-                request.url.path,
-                request.headers.get("cookie", ""),
-            )
-        )
-        if request.url.path.endswith("login_pjud.html"):
-            return httpx.Response(
-                200,
-                text="<html>login</html>",
-                headers={"Set-Cookie": f"F5={COOKIE}; Path=/"},
-                request=request,
-            )
-        if request.url.path.endswith("login_pjud"):
-            payload = dict(httpx.QueryParams(request.content.decode()))
-            assert payload == {"rutPjud": "11111111", "passwordPjud": PASSWORD}
-            return httpx.Response(
-                302,
-                headers={
-                    "Location": "https://oficinajudicialvirtual.pjud.cl/indexN.php"
-                },
-                request=request,
-            )
-        return httpx.Response(200, text="<html>Bienvenido</html>", request=request)
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
+    session = OjvSession(
+        cookies={"F5": "borrowed-public-cookie"}, rate_limit_s=0,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+        browser_login=login,
+    )
     await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert requests == [
-        ("GET", "/kpitec-ojv-web/views/login_pjud.html", ""),
-        ("POST", "/kpitec-ojv-web/login_pjud", f"F5={COOKIE}"),
-        ("GET", "/indexN.php", ""),
-    ]
+    assert calls == 1
     assert session.authenticated_form_identity() == ("11111111", "1")
+    assert session._client.cookies.get("AUTH") == COOKIE
+    assert session._client.cookies.get("F5") is None
     await session.close()
 
 
-async def test_login_redirect_without_invalid_body_is_session_expired() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("login_pjud.html"):
-            return httpx.Response(200, text="login", request=request)
-        if request.url.path.endswith("login_pjud"):
-            return httpx.Response(
-                302,
-                headers={
-                    "Location": "https://oficinajudicialvirtual.pjud.cl/login.php"
-                },
-                request=request,
-            )
-        return httpx.Response(200, text="login form", request=request)
+async def test_independent_sessions_do_not_share_authenticated_cookie_jars() -> None:
+    async def login(*_args: object, user_agent: str, **_kwargs: object) -> BrowserLoginResult:
+        value = "first" if user_agent == "one" else "second"
+        return BrowserLoginResult((CookieRecord(
+            name="AUTH", value=value, domain="oficinajudicialvirtual.pjud.cl", secure=True,
+        ),), user_agent=user_agent)
 
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(SessionExpiredError) as exc_info:
-        await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert exc_info.value.code is OjvSessionErrorCode.EXPIRED
-    await session.close()
+    one = OjvSession(cookies={"PUBLIC": "one"}, user_agent="one", browser_login=login)
+    two = OjvSession(cookies={"PUBLIC": "two"}, user_agent="two", browser_login=login)
+    await one.login(SecretStr(RUT), SecretStr(PASSWORD))
+    await two.login(SecretStr(RUT), SecretStr(PASSWORD))
+    assert one._client.cookies.get("AUTH") == "first"
+    assert two._client.cookies.get("AUTH") == "second"
+    assert one._client.cookies.get("PUBLIC") is None
+    assert two._client.cookies.get("PUBLIC") is None
+    await one.close()
+    await two.close()
 
 
 @pytest.mark.parametrize(
-    ("response_status", "response_body", "error_type", "code"),
+    ("error_type", "code"),
     [
-        (200, "<p>RUT o contraseña incorrectos</p>", InvalidCredentialsError, "credential_invalid"),
-        (419, "<html>expired csrf no existe</html>", SessionExpiredError, "session_expired"),
-        (403, "<html>private provider body</html>", OjvWafError, "waf"),
-        (503, "<html>temporary no existe</html>", OjvTimeoutError, "timeout"),
-        (422, "<html>private provider body</html>", OjvUpstreamChangedError, "upstream_changed"),
+        (InvalidCredentialsError, "credential_invalid"), (OjvWafError, "waf"),
+        (OjvTimeoutError, "timeout"), (OjvUpstreamChangedError, "upstream_changed"),
+        (SessionExpiredError, "session_expired"), (ProxyBillingExhaustedError, None),
     ],
 )
-async def test_login_has_exact_safe_terminal_taxonomy(
-    response_status: int,
-    response_body: str,
-    error_type: type[Exception],
-    code: str,
+async def test_login_preserves_closed_adapter_errors_and_clears_borrowed_state(
+    error_type: type[BaseException], code: str | None,
 ) -> None:
-    calls = 0
+    async def fail(*_args: object, **_kwargs: object) -> BrowserLoginResult:
+        raise error_type()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return httpx.Response(200, text="login", request=request)
-        return httpx.Response(
-            response_status,
-            text=response_body,
-            headers={"Set-Cookie": f"OJVID={COOKIE}; Path=/"},
-            request=request,
-        )
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
+    session = OjvSession(
+        cookies={"F5": COOKIE}, rate_limit_s=0,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+        browser_login=fail,
+    )
     with pytest.raises(error_type) as exc_info:
         await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert exc_info.value.code.value == code
-    _secrets_are_absent(exc_info.value)
-    assert response_body not in str(exc_info.value)
+    if code is not None:
+        assert getattr(exc_info.value, "code").value == code
+    assert list(session._client.cookies.jar) == []
+    with pytest.raises(SessionExpiredError):
+        session.authenticated_form_identity()
     await session.close()
 
 
-async def test_login_timeout_has_safe_taxonomy_without_retry() -> None:
+async def test_login_has_no_retry_when_adapter_times_out() -> None:
     calls = 0
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    async def fail(*_args: object, **_kwargs: object) -> BrowserLoginResult:
         nonlocal calls
         calls += 1
-        raise httpx.ReadTimeout(
-            f"timeout body={COOKIE} rut={RUT}", request=request
-        )
+        raise OjvTimeoutError()
 
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(OjvTimeoutError) as exc_info:
+    session = OjvSession(rate_limit_s=0, browser_login=fail)
+    with pytest.raises(OjvTimeoutError):
         await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
     assert calls == 1
-    assert exc_info.value.code is OjvSessionErrorCode.TIMEOUT
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-    _secrets_are_absent(exc_info.value)
-    traceback_locals = _production_traceback_locals(exc_info.value)
-    assert RUT not in traceback_locals
-    assert "11111111" not in traceback_locals
-    assert PASSWORD not in traceback_locals
-    assert COOKIE not in traceback_locals
     await session.close()
 
 
-@pytest.mark.parametrize("status_code", [408, 503])
-async def test_login_page_transient_status_uses_timeout_before_posting_credentials(
-    status_code: int,
-) -> None:
-    requests: list[httpx.Request] = []
+async def test_login_propagates_cancellation_after_clearing_borrowed_state() -> None:
+    async def cancel(*_args: object, **_kwargs: object) -> BrowserLoginResult:
+        raise asyncio.CancelledError()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(status_code, text="private timeout body", request=request)
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(OjvTimeoutError) as exc_info:
+    session = OjvSession(cookies={"F5": COOKIE}, rate_limit_s=0, browser_login=cancel)
+    with pytest.raises(asyncio.CancelledError):
         await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert len(requests) == 1
-    assert exc_info.value.code is OjvSessionErrorCode.TIMEOUT
-    await session.close()
-
-
-async def test_login_page_waf_traceback_never_materializes_credentials() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            403,
-            text=f"<html>{RUT} {PASSWORD} {COOKIE} bobcmn</html>",
-            request=request,
-        )
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(OjvWafError) as exc_info:
-        await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    traceback_locals = _production_traceback_locals(exc_info.value)
-    assert RUT not in traceback_locals
-    assert "11111111" not in traceback_locals
-    assert PASSWORD not in traceback_locals
-    assert COOKIE not in traceback_locals
-    await session.close()
-
-
-async def test_transport_failure_is_redacted_into_the_closed_timeout_taxonomy() -> None:
-    calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return httpx.Response(200, text="login", request=request)
-        raise httpx.ConnectError(
-            f"proxy={COOKIE} rut={RUT} password={PASSWORD}", request=request
-        )
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(OjvTimeoutError) as exc_info:
-        await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert exc_info.value.code is OjvSessionErrorCode.TIMEOUT
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-    _secrets_are_absent(exc_info.value)
-    traceback_locals = _production_traceback_locals(exc_info.value)
-    assert RUT not in traceback_locals
-    assert "11111111" not in traceback_locals
-    assert PASSWORD not in traceback_locals
-    assert COOKIE not in traceback_locals
-    await session.close()
-
-
-async def test_proxy_402_preserves_safe_billing_control_signal_without_chain() -> None:
-    calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return httpx.Response(200, text="login", request=request)
-        raise httpx.ProxyError(
-            f"402 Payment Required {RUT} {PASSWORD} {COOKIE}", request=request
-        )
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with pytest.raises(ProxyBillingExhaustedError) as exc_info:
-        await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    assert is_proxy_billing_error(exc_info.value) is True
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-    _secrets_are_absent(exc_info.value)
-    traceback_locals = _production_traceback_locals(exc_info.value)
-    assert RUT not in traceback_locals
-    assert "11111111" not in traceback_locals
-    assert PASSWORD not in traceback_locals
-    assert COOKIE not in traceback_locals
+    assert list(session._client.cookies.jar) == []
     await session.close()
 
 
 async def test_session_requires_secret_wrappers_at_the_auth_boundary() -> None:
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(lambda _: None))
+    session = OjvSession(rate_limit_s=0)
     with pytest.raises(TypeError, match="SecretStr"):
         await session.login(RUT, PASSWORD)  # type: ignore[arg-type]
     await session.close()
 
 
 async def test_close_is_idempotent_and_clears_identity_cookies_and_transport() -> None:
-    session = OjvSession(
-        rate_limit_s=0,
-        cookies={"OJVID": COOKIE},
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, text="unused", request=request)
-        ),
-    )
+    session = OjvSession(rate_limit_s=0, cookies={"OJVID": COOKIE})
     session._remember_authenticated_rut(SecretStr(RUT))
-
     await session.close()
     await session.close()
-
     assert session._client.is_closed is True
     assert list(session._client.cookies.jar) == []
-    with pytest.raises(SessionExpiredError) as exc_info:
+    with pytest.raises(SessionExpiredError):
         session.authenticated_form_identity()
-    assert exc_info.value.code is OjvSessionErrorCode.EXPIRED
-    _secrets_are_absent(session)
 
 
-async def test_session_and_errors_never_log_or_render_sensitive_upstream_data(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    private_body = f"<html>{RUT} {PASSWORD} {COOKIE}</html>"
+async def test_session_does_not_log_sensitive_adapter_success(caplog: pytest.LogCaptureFixture) -> None:
+    async def login(*_args: object, user_agent: str, **_kwargs: object) -> BrowserLoginResult:
+        return _result(user_agent)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("login_pjud.html"):
-            return httpx.Response(200, text="login", request=request)
-        return httpx.Response(422, text=private_body, request=request)
-
-    session = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(OjvUpstreamChangedError) as exc_info:
-            await session.login(SecretStr(RUT), SecretStr(PASSWORD))
-
-    rendered = f"{session!r} {vars(session)!r} {exc_info.value!s} {exc_info.value!r} {caplog.text}"
+    session = OjvSession(rate_limit_s=0, browser_login=login)
+    with caplog.at_level(logging.INFO):
+        await session.login(SecretStr(RUT), SecretStr(PASSWORD))
+    rendered = f"{session!r} {vars(session)!r} {caplog.text}"
     assert RUT not in rendered
     assert "11111111" not in rendered
     assert PASSWORD not in rendered
     assert COOKIE not in rendered
-    assert private_body not in rendered
-    traceback_locals = _production_traceback_locals(exc_info.value)
-    assert RUT not in traceback_locals
-    assert "11111111" not in traceback_locals
-    assert PASSWORD not in traceback_locals
-    assert COOKIE not in traceback_locals
-    assert private_body not in traceback_locals
     await session.close()

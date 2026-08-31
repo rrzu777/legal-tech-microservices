@@ -4,6 +4,8 @@ import pytest
 from pydantic import SecretStr
 
 from app.bandwidth import METER
+from app.cookie_scope import CookieRecord
+from app.ojv.browser_login import BrowserLoginResult
 from app.ojv.errors import OjvTimeoutError
 from app.familia.auth import (
     FamiliaAuthSession,
@@ -164,13 +166,11 @@ async def test_search_transport_traceback_does_not_retain_encoded_form_identity(
 
 
 async def test_login_clave_pj_raises_blocked_on_f5_challenge():
-    def handler(request):
-        return httpx.Response(200, text="<html>bobcmn challenge</html>")
+    async def login(*_args, **_kwargs):
+        raise _FBE()
 
-    s = FamiliaAuthSession(proxy_url=None, cookies=None, user_agent=None, rate_limit_s=0)
-    await s._client.aclose()
-    s._client = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), follow_redirects=True
+    s = FamiliaAuthSession(
+        proxy_url=None, cookies=None, user_agent=None, rate_limit_s=0, browser_login=login,
     )
     with pytest.raises(_FBE):
         await s.login(SecretStr("11111111-1"), SecretStr("x"), "clave_pj")
@@ -178,18 +178,12 @@ async def test_login_clave_pj_raises_blocked_on_f5_challenge():
 
 
 async def test_successful_login_retains_redacted_identity_only_in_memory():
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("login_pjud.html"):
-            return httpx.Response(200, text="login", request=request)
-        if request.url.path.endswith("login_pjud"):
-            return httpx.Response(
-                302,
-                headers={"Location": "https://oficinajudicialvirtual.pjud.cl/indexN.php"},
-                request=request,
-            )
-        return httpx.Response(200, text="<html>Bienvenido</html>", request=request)
+    async def login(*_args, user_agent: str, **_kwargs):
+        return BrowserLoginResult((CookieRecord(
+            name="AUTH", value="synthetic-cookie", domain="oficinajudicialvirtual.pjud.cl", secure=True,
+        ),), user_agent)
 
-    s = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
+    s = OjvSession(rate_limit_s=0, browser_login=login)
     await s.login(
         SecretStr("11.111.111-1"), SecretStr("synthetic-password"), "clave_pj"
     )
@@ -205,14 +199,10 @@ async def test_successful_login_retains_redacted_identity_only_in_memory():
 
 
 async def test_rejected_login_never_retains_identity():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            text="<html>RUT o contraseña incorrectos</html>",
-            request=request,
-        )
+    async def login(*_args, **_kwargs):
+        raise InvalidCredentialsError()
 
-    s = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
+    s = OjvSession(rate_limit_s=0, browser_login=login)
     with pytest.raises(InvalidCredentialsError):
         await s.login(
             SecretStr("11.111.111-1"), SecretStr("synthetic-password"), "clave_pj"
@@ -223,24 +213,18 @@ async def test_rejected_login_never_retains_identity():
 
 
 async def test_bare_eight_digit_login_stays_compatible_but_cannot_seed_discovery():
-    posted_rut: list[str] = []
+    received_ruts: list[str] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("login_pjud.html"):
-            return httpx.Response(200, text="login", request=request)
-        if request.url.path.endswith("login_pjud"):
-            posted_rut.append(dict(httpx.QueryParams(request.content.decode()))["rutPjud"])
-            return httpx.Response(
-                302,
-                headers={"Location": "https://oficinajudicialvirtual.pjud.cl/indexN.php"},
-                request=request,
-            )
-        return httpx.Response(200, text="<html>Bienvenido</html>", request=request)
+    async def login(rut, *_args, user_agent: str, **_kwargs):
+        received_ruts.append(rut.get_secret_value())
+        return BrowserLoginResult((CookieRecord(
+            name="AUTH", value="synthetic-cookie", domain="oficinajudicialvirtual.pjud.cl", secure=True,
+        ),), user_agent)
 
-    s = OjvSession(rate_limit_s=0, transport=httpx.MockTransport(handler))
+    s = OjvSession(rate_limit_s=0, browser_login=login)
     await s.login(SecretStr("12345678"), SecretStr("synthetic-password"), "clave_pj")
 
-    assert posted_rut == ["12345678"]
+    assert received_ruts == ["12345678"]
     with pytest.raises(SessionError, match="OJV session unavailable"):
         s.authenticated_form_identity()
     await s.close()
