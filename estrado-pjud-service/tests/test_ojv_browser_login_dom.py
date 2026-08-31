@@ -150,3 +150,117 @@ async def test_landing_probe_reads_real_dom_without_exposing_page_contents(
             assert "https" not in repr(probe)
         finally:
             await browser.close()
+
+
+@pytest.mark.parametrize('mode', ['success', 'no_transition', 'xhr_failure', 'js_failure'])
+async def test_synthetic_async_submit_observes_counts_without_assuming_provider_protocol(monkeypatch, caplog, mode):
+    # Deliberately synthetic: unnamed inputs, no form action/method, asynchronous
+    # JS handler. Every request is fulfilled/aborted before leaving Chromium.
+    sentinel = 'SYNTHETIC_PRIVATE_NEVER_LOG'
+    html = '''<meta charset="utf-8"><button>Todos los servicios</button>
+      <a href="#" onclick="document.querySelector('#segunda-clave-access').style.display='block';return false">Clave Poder Judicial</a>
+      <div id="segunda-clave-access" aria-hidden="true" style="display:none">
+        <form id="fSGN">
+          <input type="text" placeholder="Ingrese su Rut sin dígito verificador, Ej: 12345678">
+          <input type="password"><button>Ingresar</button>
+        </form>
+      </div><script>
+      document.querySelector('#fSGN').addEventListener('submit', event => {
+        event.preventDefault();
+        setTimeout(async () => {
+          MODE_HANDLER
+        }, 50);
+      });</script>'''
+    handlers = {
+        'success': "await (await fetch('/synthetic-submit')).text(); location.href='/indexN.php';",
+        'no_transition': "await fetch('/synthetic-submit');",
+        'xhr_failure': "try { await fetch('/synthetic-submit'); } catch (_) {}",
+        'js_failure': f"throw new Error('{sentinel}');",
+    }
+    html = html.replace('MODE_HANDLER', handlers[mode])
+    counts = {'fetches': 0, 'unexpected': 0}
+    observed = []
+    original_stop = browser_login._SubmitProbe.stop
+
+    def stop(probe, page, deadline):
+        original_stop(probe, page, deadline)
+        observed.append(probe.summary())
+
+    monkeypatch.setattr(browser_login._SubmitProbe, 'stop', stop)
+    async with async_playwright() as runtime:
+        original_launch = runtime.chromium.launch
+
+        async def launch(**kwargs):
+            kwargs['headless'] = True
+            browser = await original_launch(**kwargs)
+            original_context = browser.new_context
+
+            async def new_context(**kwargs):
+                context = await original_context(**kwargs, service_workers='block')
+
+                async def route_request(route):
+                    request = route.request
+                    if request.url == browser_login._OFFICIAL_ENTRY:
+                        await route.fulfill(status=200, content_type='text/html', body=html)
+                    elif request.url == 'https://oficinajudicialvirtual.pjud.cl/synthetic-submit':
+                        counts['fetches'] += 1
+                        if mode == 'xhr_failure':
+                            await route.abort('connectionreset')
+                        else:
+                            await route.fulfill(status=200 if mode == 'success' else 503, body=sentinel)
+                    elif request.url == browser_login._OFFICIAL_LANDING:
+                        await route.fulfill(status=200, headers={
+                            'Content-Type': 'text/html', 'Set-Cookie': 'AUTH=synthetic; Secure; Path=/; HttpOnly',
+                        }, body='<a href="#infousuario">Cuenta</a><a href="#">Mis Causas</a>')
+                    else:
+                        counts['unexpected'] += 1
+                        await route.abort()
+
+                await context.route('**/*', route_request)
+                return context
+
+            monkeypatch.setattr(browser, 'new_context', new_context)
+            return browser
+
+        class BorrowedRuntime:
+            async def __aenter__(self):
+                return runtime
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr(runtime.chromium, 'launch', launch)
+        monkeypatch.setattr(browser_login, 'async_playwright', BorrowedRuntime)
+        monkeypatch.setattr(browser_login, '_LOGIN_TIMEOUT_S', 3.0)
+        start = time.monotonic()
+        if mode == 'success':
+            result = await browser_login.login_official_ojv(
+                SecretStr('11.111.111-1'), SecretStr(sentinel), proxy_url=None, user_agent='offline-regression',
+            )
+            assert result.cookies[0].name == 'AUTH'
+            assert 'submit_location=official_landing' in observed[0]
+        else:
+            with pytest.raises(OjvTimeoutError):
+                await browser_login.login_official_ojv(
+                    SecretStr('11.111.111-1'), SecretStr(sentinel), proxy_url=None, user_agent='offline-regression',
+                )
+            records = [r for r in caplog.records if 'pjud_private_login_failed' in r.msg]
+            assert len(records) == 1
+            assert sentinel not in repr(records[0].__dict__)
+            # The deadline may interrupt the final DOM inspection, even after
+            # earlier completed empty inspections. Do not report that as empty.
+            assert any(f'submit_inspection={state}' in records[0].getMessage()
+                       for state in ('checked_none', 'inspection_unavailable'))
+            assert 'submit_inspection_attempts=0 ' not in records[0].getMessage()
+            assert 'submit_location=official_entry' in records[0].getMessage()
+        assert time.monotonic() - start < 5
+        assert counts == {'fetches': 0 if mode == 'js_failure' else 1, 'unexpected': 0}
+        assert len(observed) == 1
+        expected = {
+            'success': ['submit_started_fetch=1', 'submit_finished_fetch=1', 'submit_started_navigation=1'],
+            'no_transition': ['submit_started_fetch=1', 'submit_finished_fetch=1', 'submit_http_5xx=1'],
+            'xhr_failure': ['submit_started_fetch=1', 'submit_failed_fetch=1', 'submit_transport_reset=1'],
+            'js_failure': ['submit_started_fetch=0', 'submit_js_errors=1'],
+        }
+        for field in expected[mode]:
+            assert field in observed[0]

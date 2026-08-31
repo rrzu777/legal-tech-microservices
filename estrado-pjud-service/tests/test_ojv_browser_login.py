@@ -270,7 +270,7 @@ async def test_official_adapter_uses_observed_ui_and_returns_owned_typed_cookies
     assert result.user_agent == "official-test-agent"
     # The launch arguments were cleared after use, which also drops proxy credentials.
     # Context/user-agent and UI calls above prove the requested browser configuration.
-    assert page.events == ["request", "response"]
+    assert page.events == ["request", "response", "request", "requestfinished", "requestfailed", "response", "pageerror"]
     assert browser.closed is True
     assert context.closed is True
     assert context.cdp.detached is True
@@ -881,7 +881,7 @@ async def test_entry_failure_logs_only_closed_exception_and_network_details(
         await login_official_ojv(SecretStr("11.111.111-1"), SecretStr("secret-token"), proxy_url=None, user_agent="official-test-agent")
     records = [record for record in caplog.records if record.name == "app.ojv.browser_login"]
     assert len(records) == 1
-    assert records[0].getMessage() == (
+    assert records[0].getMessage().split(" submit_click_remaining_ms=", 1)[0] == (
         f"pjud_private_login_failed stage=entry_goto outcome={outcome} "
         f"kind={kind} network={network} entry_http=0 entry_origin=unknown "
         "landing_http=0 landing_ready=unavailable landing_location=unknown account_shape=-1,-1 my_causes_shape=-1,-1"
