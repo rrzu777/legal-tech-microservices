@@ -45,6 +45,38 @@ class HvfTests(unittest.TestCase):
                 with self.subTest(item=item), self.assertRaises(RuntimeError):
                     self.hvf.validate_payload(root, [item])
 
+    def test_payload_includes_exact_stdlib_worker_and_untracked_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            expected = {
+                'estrado-pjud-service/worker/__init__.py',
+                'estrado-pjud-service/worker/maintenance.py',
+                'estrado-pjud-service/worker/maintenance_store.py',
+                'estrado-pjud-service/worker/sd_notify.py',
+                'ops/tests/native/fixture.py', 'ops/tests/native/fixture_worker.py',
+                'ops/tests/native/exercise.py', 'ops/tests/native/probe.py',
+                'ops/tracked.py',
+            }
+            for relative in expected | {'estrado-pjud-service/.env',
+                                        'estrado-pjud-service/worker/__main__.py'}:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('fixture')
+            self.assertTrue(hasattr(self.hvf, 'payload_files'), 'Worker payload builder missing')
+            with patch.object(self.hvf, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, 'ops/tracked.py\0', '')):
+                paths = self.hvf.payload_files(root)
+            self.assertEqual(set(paths), expected)
+            for relative in ('estrado-pjud-service/.env', 'estrado-pjud-service/worker/__main__.py',
+                             'estrado-pjud-service/app/__init__.py', 'ops/secrets/.env',
+                             str(root / 'ops/tracked.py')):
+                with self.subTest(relative=relative), self.assertRaises(RuntimeError):
+                    self.hvf.validate_payload(root, [relative])
+            (root / 'estrado-pjud-service/worker/sd_notify.py').unlink()
+            (root / 'estrado-pjud-service/worker/sd_notify.py').symlink_to(root / 'ops/tracked.py')
+            with self.assertRaises(RuntimeError):
+                self.hvf.validate_payload(root, ['estrado-pjud-service/worker/sd_notify.py'])
+
     def test_cleanup_refuses_unowned_directory(self):
         with tempfile.TemporaryDirectory(prefix='resource-guards-hvf-') as directory:
             path = Path(directory).resolve()

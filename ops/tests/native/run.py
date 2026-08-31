@@ -13,6 +13,8 @@ IMAGE = 'resource-guards-native-vm:20260830'
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 DOCKER = ['docker']
+sys.path.insert(0, str(HERE))
+from run_hvf import payload_files
 
 
 def execute(*args, check=True, timeout=60):
@@ -76,14 +78,10 @@ def main():
                 '--memory', '3g', '--memory-swap', '3g', '--cpus', '2', '--pids-limit', '128',
                 '--entrypoint', '/usr/bin/timeout', image_id,
                 '3600', 'python3', '/usr/local/bin/native-vm-boot.py')
-        # Only tracked ops code + these test fixtures. Never copy the workspace,
+        # Tracked ops + explicit fixtures + four stdlib worker modules only.
+        # Never copy the workspace,
         # .env files, SSH agent, Docker socket or a host filesystem mount.
-        files = execute('git', '-C', str(ROOT), 'ls-files', '-z', 'ops').stdout.split('\0')
-        for relative in filter(None, files):
-            path = ROOT / relative
-            if path.is_symlink() or not path.resolve().is_relative_to(ROOT) or path.suffix == '.env':
-                raise RuntimeError('Refusing unsafe payload')
-        listing = '\0'.join(filter(None, files)) + '\0'
+        listing = '\0'.join(payload_files(ROOT)) + '\0'
         archive = subprocess.run(['tar', '-C', str(ROOT), '--null', '-T', '-', '-cf', '-'],
                                  input=listing.encode(), capture_output=True, check=True, timeout=60)
         subprocess.run([*DOCKER, 'cp', '-', name + ':/payload'], input=archive.stdout,

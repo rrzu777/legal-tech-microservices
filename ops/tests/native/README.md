@@ -20,7 +20,13 @@ The lifetime limit uses an external supervisor: a native smoke test showed that
 QEMU did not honor an inherited SIGALRM deadline. Supervisor timeout and SIGTERM
 cleanup are tested against real child processes, including a child ignoring alarms.
 
-Only reviewed `ops/` source copies enter a TAR inside a readonly ISO. Linux ISO
+Only reviewed `ops/` source plus the exact stdlib worker allowlist enter a TAR
+inside a readonly ISO: `worker/__init__.py`, `maintenance.py`,
+`maintenance_store.py`, and `sd_notify.py`. The fixture, its isolated
+`fixture_worker.py` helper, exercise and probe are explicitly included even before
+commit. No blanket service copy, `.env`, application client or real venv enters
+the payload. Host validation and guest extraction enforce the same allowlist.
+Linux ISO
 name normalization previously removed a dot from `hermes-user.slice.conf`; TAR
 preserves names and modes. Archive and manifest hashes are pinned before extraction,
 every file is verified, and the guest-local extracted payload is bind-mounted
@@ -40,7 +46,7 @@ capacity, the 6 GiB admission gate, memory pressure protection or stress isolati
 This laboratory runs a disposable Ubuntu 24.04 ARM64 guest inside QEMU, inside
 an unprivileged Docker Desktop container. It never connects to the VPS. No host
 directory, Docker socket, device, SSH agent or published port is passed through.
-Only tracked `ops/` source is copied. A fresh guest-only SSH key is destroyed with
+The same explicit ops/fixture/stdlib allowlist is copied. A fresh guest-only SSH key is destroyed with
 the container. Bootstrap uses the network for Ubuntu packages; Docker networking
 is disconnected and verified before any test payload runs.
 
@@ -71,14 +77,86 @@ sandboxes, manual rollback, then one injected HTTP failure and automatic rollbac
 The 16 managed paths (excluding credential contents), swap-file metadata, unit activity/enablement,
 worker cgroup, swap and swappiness must equal the pre-apply baseline after each
 rollback. Local monitor events must report no active unhealthy/unknown rule.
-`fixture.py` prepares harmless API/worker/Hermes doubles for the integral rollout;
+`fixture.py` prepares harmless API/operation/Hermes doubles for the integral rollout;
 it refuses a reused fixture or a non-QEMU/non-laboratory guest. Real application
 traffic, browser automation and external credentials are not used. Integral
 rollout execution is a separate gate, not implied by a successful probe.
 
+## Real maintenance protocol exercise (Task 4)
+
+The compatible baseline has legacy resource placement (`system.slice`), not a
+legacy worker: production `MaintenanceStore`, `WorkerMaintenance` and `sd_notify`
+run under real `xvfb-run`. Control is initialized explicitly while the isolated
+fixture worker is stopped; this does not implement production legacy bootstrap.
+systemd creates the 0700 runtime ACK directory. The worker UID cannot write
+control, replace the stable lock, or create entries in the control directory.
+The fixture exports complete matching `RG_TEST_MODE=1` and `WM_TEST_MODE=1`
+boundaries. WM still uses real guest Python/flock/date/sleep/systemctl, `/proc`,
+protocol paths and root/estrado IDs resolved from the guest account database.
+Only health points to the local fixture API. This same environment reaches the
+maintenance helper and delegated provision; there is no fake maintenance CLI.
+
+The exercise authenticates CLI/kernel/cgroup/MainPID and the Python ACK publisher,
+then covers:
+
+- A helper dying after genuine hold/drain; hold survives loss of both leases.
+- Rejection of stale operation/PID/start-ticks/boot/nonce ACK proofs.
+- Closed restart under continuous real EX leases, recreated RuntimeDirectory,
+  new nonce/kernel identity and blocked new work, followed by validated release.
+- Incompatible installed unit and absent legacy ACK rejected before mutation.
+- An operation admitted before apply/manual rollback; live work retains SH while
+  hold blocks a new operation, then the operator drains and changes lifecycle.
+- Real apply/postflight and both exact rollback snapshots, with hold checked
+  separately. Control and its stable lock are never part of restoration.
+- One intended final-postflight HTTP failure and automatic rollback, still held.
+
+After each rollback, the exercise first proves exact baseline restoration and
+then explicitly invokes low-level CLI `finish` with current identity, EX and API
+health. The restored legacy resource layout intentionally fails the full new
+guards postflight; this fixture release is not a recommendation to bypass a
+production recovery gate. No API/worker business E2E or remote-outcome proof is
+claimed from these local operation doubles.
+
 ## Validation status (2026-08-30)
 
-The accelerated HVF integral run **passed** on real Ubuntu systemd
+Task 4 host/Linux regressions cover the real fixture coordinator, actual Unix
+datagram, payload boundary, identity comparisons and CLI publication failures.
+
+The corrected fresh controller-owned HVF integral trial **PASSED** on systemd
+255.4-1ubuntu8.17. Evidence is retained at
+`/private/tmp/resource-guards-hvf-evidence-ixpgrme8/`:
+
+- `integral.log`: actual MainPID/ACK identity, helper-death hold, five stale ACK
+  fields rejected, closed service restart and release, incompatible unit/missing
+  ACK rejected, preflight/apply/postflight success and active alert keys `[]`.
+  Manual rollback matches the baseline and retains hold before validated release.
+  The intended final-postflight fault reaches automatic rollback, also exact,
+  held, and explicitly released; final marker is
+  `NATIVE AUTOMATIC ROLLBACK EXACT; REAL MAINTENANCE INTEGRAL PASS`.
+- `probe.py.log`: all three native probes pass; tested resource-guards SHA256
+  `b30dc3804402c77c3b75d09fecb85737910ae242485d25ea4163a8479ccd0013`.
+- `payload.log`:83 exact files, manifest SHA256
+  `ed17c8b38441a8b8465f5cc7110481c156c3e7c65f0a0b33fbc1b9bc821fb788`.
+- `isolation.log`: restricted QEMU user networking; host TCP probe refused.
+
+The controller reports runner exit0 and cleanup of its owned guest disk/seed/key.
+This proves the enumerated local fixture contracts, not RAM admission/capacity,
+stress isolation, business E2E/remote effects or a full host reboot during hold.
+Final whole-branch review and rebase/integration remain controller-owned;
+production rollout, legacy bootstrap, natural observation and access authorization
+remain separate gates.
+
+The first controller-owned maintenance-aware HVF trial verified actual
+MainPID/ACK identity, helper-death hold, rejection of five stale ACK fields,
+closed restart and validated release. It did **not** complete: the first guard
+entry rejected the incomplete RG/WM fixture environment with exit2, before
+preflight/mutation. Its evidence remains in
+`/private/tmp/resource-guards-hvf-evidence-7d_xaa_e/`. Fix round2 completed that
+boundary and tested actual guard/helper/provision initialization before the
+separate successful corrected trial above. Neither attempt is relabeled or
+combined with the earlier dummy-worker result.
+
+The earlier, pre-maintenance accelerated HVF integral run **passed** on real Ubuntu systemd
 255.4-1ubuntu8.17: all three probes, preflight, apply, postflight, local monitoring
 without active alert keys, manual rollback and an automatic rollback after the
 intended final-postflight HTTP failure. Both rollbacks matched the enumerated

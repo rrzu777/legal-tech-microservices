@@ -315,6 +315,7 @@ def main(argv=None):
                  args.journal_root, args.health_url, args.root_uid, args.root_gid, args.worker_uid, args.worker_gid)
     if (args.test_mode and any(value is None for value in overrides)) or (not args.test_mode and any(value is not None for value in overrides)):
         p.error("test overrides require the complete explicit test boundary")
+    release_attempted = False
     try:
         require(1 <= args.timeout_seconds <= 10)
         if not args.test_mode:
@@ -400,16 +401,27 @@ def main(argv=None):
                     healthy(args)
                     journal["result"] = "succeeded"
                     journal_write(args, journal)
-                    try:
-                        store.transition(args.operation_id, "hold", Control(1, "open", args.operation_id,
-                                         datetime.now(timezone.utc).isoformat()))
-                    except (MaintenanceError, OSError):
-                        print("ERROR: finalization uncertain; admission may already be open; do not retry mutation", file=sys.stderr)
-                        return 3
-                print(identity_text(identity))
+                    release_attempted = True
+                    store.transition(args.operation_id, "hold", Control(1, "open", args.operation_id,
+                                     datetime.now(timezone.utc).isoformat()))
+                # Include buffered output errors in the post-publication phase,
+                # not Python's implicit shutdown flush (which can replace rc3).
+                print(identity_text(identity), flush=True)
                 return 0
     except (MaintenanceError, OSError, ValueError, KeyError, IndexError, TypeError,
             subprocess.SubprocessError, UnicodeError, RecursionError):
+        if release_attempted:
+            # No control/lifecycle action is safe here. Disable a second flush
+            # of the failed output stream at interpreter shutdown.
+            sys.stdout = None
+            try:
+                print("ERROR: finalization uncertain; admission may already be open; do not retry mutation",
+                      file=sys.stderr, flush=True)
+            except OSError:
+                # A merged stderr/stdout pipe can be closed too. Diagnostics
+                # are best-effort; a second shutdown flush must not replace rc3.
+                sys.stderr = None
+            return 3
         print("ERROR: maintenance protocol unavailable; hold is not released", file=sys.stderr)
         return 1
 

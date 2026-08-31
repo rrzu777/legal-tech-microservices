@@ -124,7 +124,7 @@ stop_worker_for_change
 
 ### Task 4: Native integration, documentation and final review
 
-**Files:** `ops/tests/native/{fixture.py,exercise.py,run_hvf.py,test_*.py,README.md}` as needed; `ops/monitoring/README.md`, new `ops/worker-maintenance.md`; `estrado-pjud-service/tests/test_maintenance_wiring.py` for the deferred R2 contrast regression below; `estrado-pjud-service/worker/sd_notify.py` and focused notification tests for the exact MainPID handoff below.
+**Files:** `ops/tests/native/{fixture.py,fixture_worker.py,exercise.py,run_hvf.py,test_*.py,README.md}` as needed; `ops/monitoring/README.md`, new `ops/worker-maintenance.md`; `estrado-pjud-service/tests/test_maintenance_wiring.py` for the deferred R2 contrast regression below; `estrado-pjud-service/worker/sd_notify.py` and focused notification tests for the exact MainPID handoff below; `ops/worker-maintenance.py` and its CLI tests for the deferred publication-output diagnostic.
 
 **Consumes:** Tasks 1–3 exact source; existing authorized local QEMU/HVF and pinned image. **Produces:** evidence of native real admission module during apply/rollback; no production claims.
 

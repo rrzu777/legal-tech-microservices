@@ -179,6 +179,70 @@ def test_post_rename_release_error_is_uncertain_after_durable_success(host, monk
     assert "may already be open" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("failure", ["write", "flush"])
+def test_output_failure_after_open_is_postpublication_without_control_rewrite(host, monkeypatch, capsys, failure):
+    hold(host)
+    spec = importlib.util.spec_from_file_location("operator_cli_output", CLI)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original = MaintenanceStore.transition
+    transitions = []
+    def transition(store, *args):
+        transitions.append(args[2].state)
+        return original(store, *args)
+    class BrokenOutput:
+        def write(self, value):
+            if failure == "write":
+                raise OSError("private-output-sentinel")
+            return len(value)
+        def flush(self):
+            raise OSError("private-output-sentinel")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(MaintenanceStore, "transition", transition)
+        scoped.setattr(sys, "stdout", BrokenOutput())
+        result = module.main([*host[2], "finish", "--operation-id", OP, "--identity", IDENTITY])
+    assert result == 3
+    assert transitions == ["open"]
+    assert host[1].read_control().state == "open"
+    assert json.loads((host[0] / f"journals/{OP}.json").read_text())["result"] == "succeeded"
+    diagnostic = capsys.readouterr().err
+    assert "may already be open" in diagnostic
+    assert "hold is not released" not in diagnostic
+    assert "private-output-sentinel" not in diagnostic
+
+
+def test_real_closed_stdout_pipe_keeps_postpublication_exit_three_not_atexit_120(host):
+    hold(host)
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        result = subprocess.run([sys.executable, str(CLI), *host[2], "finish",
+                                 "--operation-id", OP, "--identity", IDENTITY],
+                                stdout=writer, stderr=subprocess.PIPE, text=True)
+    finally:
+        os.close(writer)
+    assert result.returncode == 3
+    assert host[1].read_control().state == "open"
+    assert "may already be open" in result.stderr
+    assert "hold is not released" not in result.stderr
+    assert "Exception ignored" not in result.stderr
+
+
+def test_both_real_closed_output_pipes_cannot_override_postpublication_exit_three(host):
+    hold(host)
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        result = subprocess.run([sys.executable, str(CLI), *host[2], "finish",
+                                 "--operation-id", OP, "--identity", IDENTITY],
+                                stdout=writer, stderr=writer)
+    finally:
+        os.close(writer)
+    assert result.returncode == 3
+    assert host[1].read_control().state == "open"
+    assert json.loads((host[0] / f"journals/{OP}.json").read_text())["result"] == "succeeded"
+
+
 @pytest.mark.parametrize("payload", [
     '{"version":1,"operation_id":"' + OP + '","initial_identity":"' + IDENTITY + '","result":"intended","result":"succeeded"}',
     '{"version":true,"operation_id":"' + OP + '","initial_identity":"' + IDENTITY + '","result":"succeeded"}',

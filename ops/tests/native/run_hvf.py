@@ -22,6 +22,8 @@ ROOT = HERE.parents[2]
 QEMU = '/opt/homebrew/opt/qemu/bin/qemu-system-aarch64'
 BASE_HASH = 'afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f'
 CANCELLED = False
+WORKER_PAYLOAD = tuple('estrado-pjud-service/worker/' + name for name in
+                       ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py'))
 
 
 def run(*args, check=True, timeout=60):
@@ -34,13 +36,24 @@ def run(*args, check=True, timeout=60):
 def validate_payload(root, paths):
     for relative in paths:
         path = Path(relative)
-        if not path.parts or path.parts[0] != 'ops' or '..' in path.parts or path.name.startswith('.env'):
+        if (not path.parts or path.is_absolute() or str(path) != relative or '..' in path.parts
+                or any(part.startswith('.env') for part in path.parts)
+                or (path.parts[0] != 'ops' and relative not in WORKER_PAYLOAD)):
             raise RuntimeError('Unsafe native payload path')
         for parent in (path, *path.parents):
             if (root / parent).is_symlink():
                 raise RuntimeError('Linked native payload path')
         if not (root / path).is_file():
             raise RuntimeError('Missing native payload file')
+
+
+def payload_files(root):
+    files = list(filter(None, run('git', '-C', str(root), 'ls-files', '-z', 'ops').stdout.split('\0')))
+    files += ['ops/tests/native/' + name for name in
+              ('fixture.py', 'fixture_worker.py', 'exercise.py', 'probe.py')]
+    files += list(WORKER_PAYLOAD)
+    validate_payload(root, files)
+    return sorted(set(files))
 
 
 def clean_workspace(work, owner):
@@ -150,9 +163,7 @@ def main():
         canary_port = canary.getsockname()[1]
         payload, seed, media = work / 'payload', work / 'seed', work / 'media'
         payload.mkdir(); seed.mkdir(); media.mkdir()
-        files = list(filter(None, run('git', '-C', str(ROOT), 'ls-files', '-z', 'ops').stdout.split('\0')))
-        files += ['ops/tests/native/' + name for name in ('fixture.py', 'exercise.py', 'probe.py')]
-        validate_payload(ROOT, files)
+        files = payload_files(ROOT)
         for relative in set(files):
             target = payload / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -230,7 +241,9 @@ destination.mkdir()
 with tarfile.open(media/'payload.tar') as archive:
     members=archive.getmembers()
     assert len(members) == len(manifest) and {{m.name for m in members}} == set(manifest)
-    assert all(m.isfile() and m.name.startswith('ops/') and '..' not in Path(m.name).parts for m in members)
+    assert all(m.isfile() and not Path(m.name).is_absolute() and '..' not in Path(m.name).parts
+               and not any(p.startswith('.env') for p in Path(m.name).parts)
+               and (m.name.startswith('ops/') or m.name in {WORKER_PAYLOAD!r}) for m in members)
     archive.extractall(destination,filter='data')
 for relative, expected in manifest.items():
     path=destination/relative

@@ -226,6 +226,28 @@ async def test_r2_known_missing_object_does_not_poison_admission(worker_maintena
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code,status", [("AccessDenied", 403), ("InternalError", 500)])
+async def test_r2_unknown_head_outcome_returns_false_but_keeps_ex_blocked(worker_maintenance, code, status):
+    from app.r2 import R2Client
+    from botocore.exceptions import ClientError
+    def head(**kwargs):
+        assert kwargs == {"Bucket": "fake-bucket", "Key": "unknown.pdf"}
+        raise ClientError({"Error": {"Code": code},
+                           "ResponseMetadata": {"HTTPStatusCode": status}}, "HeadObject")
+    client = object.__new__(R2Client)
+    client._bucket = "fake-bucket"
+    client._s3 = SimpleNamespace(head_object=head, exceptions=SimpleNamespace(ClientError=ClientError))
+    assert await worker_maintenance.run(lambda: client.exists("unknown.pdf")) is False
+    hold(worker_maintenance)
+    assert worker_maintenance.uncertain
+    assert worker_maintenance.inflight == 0
+    assert worker_maintenance.publish_ack().state == "draining"
+    with pytest.raises(AdmissionClosed):
+        with worker_maintenance.store.exclusive_lease():
+            pytest.fail("unknown R2 outcome released its safety lease")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["query", "upload", "exists"])
 async def test_late_inherited_thread_is_rejected_before_submission(worker_maintenance, kind):
     worker = worker_maintenance

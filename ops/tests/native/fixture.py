@@ -6,10 +6,15 @@ Never run on the VPS: guest identity and virtualization are mandatory gates.
 """
 from pathlib import Path
 import json
+import fcntl
+import grp
 import os
+import pwd
 import re
 import shutil
 import subprocess
+import sys
+import uuid
 
 REPO = Path('/opt/legal-tech-microservices')
 
@@ -35,6 +40,35 @@ def fixture_values(inventory):
     return values
 
 
+def fixture_environment(source, *, worker_uid, worker_gid):
+    """Explicit native tool/path boundary; no application fixture executables."""
+    variables, env = {}, {'RG_TEST_MODE': '1'}
+    for variable, key, value in re.findall(r'^(\w+)=\$\{(RG_\w+):-([^}]*)\}$', source, re.M):
+        for previous, replacement in variables.items():
+            value = value.replace('$' + previous, replacement)
+        if '$' in value:
+            raise RuntimeError('Unresolved native test default')
+        variables[variable], env[key] = value, value
+    names = re.search(r'readonly -a OVERRIDE_NAMES=\((.*?)\)', source, re.S).group(1).split()
+    if set(names) - env.keys():
+        raise RuntimeError('Incomplete native test boundary')
+    env.update(RG_TEST_MODE='1', RG_JURISTRACK_HEALTH_URL='http://127.0.0.1:9080/',
+               RG_ESTRADO_HEALTH_URL='http://127.0.0.1:8000/api/v1/health')
+    # Guards require matching explicit RG/WM modes. These WM values still name
+    # real guest tools, kernel paths and protocol authority, not shell doubles.
+    # The same exported boundary reaches the helper and delegated provision.
+    env.update(WM_TEST_MODE='1', WM_PYTHON=env['RG_PYTHON_BIN'],
+               WM_FLOCK=env['RG_FLOCK_BIN'], WM_DATE=env['RG_DATE_BIN'],
+               WM_SLEEP=env['RG_SLEEP_BIN'], WM_POLL_ATTEMPTS='900', WM_POLL_SECONDS='1',
+               WM_CONTROL_DIR='/var/lib/worker-maintenance', WM_ACK_DIR='/run/worker-maintenance',
+               WM_PROC_ROOT='/proc', WM_SYSTEMCTL=env['RG_SYSTEMCTL_BIN'],
+               WM_GLOBAL_LOCK=env['RG_LOCK_FILE'], WM_JOURNAL_ROOT='/var/lib/worker-maintenance-operations',
+               WM_HEALTH_URL=env['RG_ESTRADO_HEALTH_URL'],
+               WM_ROOT_UID=env['RG_TEST_ROOT_UID'], WM_ROOT_GID=env['RG_TEST_ROOT_GID'],
+               WM_WORKER_UID=str(worker_uid), WM_WORKER_GID=str(worker_gid))
+    return env
+
+
 def main():
     if os.geteuid() != 0 or Path('/etc/hostname').read_text().strip() != 'native-guards':
         raise SystemExit('Not the isolated validation guest')
@@ -47,37 +81,27 @@ def main():
     run('usermod', '-aG', 'estrado', 'www-data')
     REPO.mkdir()
     shutil.copytree('/mnt/payload/ops', REPO / 'ops')
-    write(REPO / '.gitignore', 'estrado-pjud-service/\n')
+    modules = ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py')
+    write(REPO / '.gitignore', 'estrado-pjud-service/*\n!estrado-pjud-service/worker/\n'
+          'estrado-pjud-service/worker/*\n' + ''.join(
+              '!estrado-pjud-service/worker/' + name + '\n' for name in modules))
     application = REPO / 'estrado-pjud-service'
     application.mkdir()
+    Path('/opt/native-fixture').mkdir()
+    (application / 'worker').mkdir()
+    for name in modules:
+        shutil.copy2(Path('/mnt/payload/estrado-pjud-service/worker') / name,
+                     application / 'worker' / name)
+    shutil.copy2('/mnt/payload/ops/tests/native/fixture_worker.py', '/opt/native-fixture/fixture_worker.py')
     values = fixture_values((REPO / 'ops/env.inventory').read_text())
     write(application / '.env', ''.join(f'{key}={value}\n' for key, value in values.items()), 0o640)
     run('chown', 'root:estrado', str(application / '.env'))
     (application / 'logs').mkdir()
     run('chown', 'estrado:estrado', str(application / 'logs'))
-    # No application code/import, browser, RPC, proxy or real credential exists.
-    write(application / '.venv/bin/python', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/worker.py\n', 0o755)
+    # Only production stdlib protocol code; application operations remain local.
+    write(application / '.venv/bin/python', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/fixture_worker.py\n', 0o755)
     write(application / '.venv/bin/uvicorn', '#!/bin/sh\nexec /usr/bin/python3 /opt/native-fixture/fixture_http_server.py 8000\n', 0o755)
     write('/opt/estrado-cron/run-cron.sh', '#!/bin/sh\nexit 0\n', 0o755)
-    write('/opt/native-fixture/worker.py', '''import datetime, json, os, socket, time
-from pathlib import Path
-address = os.environ.get('NOTIFY_SOCKET')
-if address:
-    address = '\\0' + address[1:] if address.startswith('@') else address
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    client.connect(address)
-    client.send(b'READY=1')
-while True:
-    heartbeat = [{'status':'idle_off_hours',
-      'last_heartbeat_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-      'metadata':{'process_outside_office_hours_enabled':False,'mint_attempts':0}}]
-    destination = Path('/opt/legal-tech-microservices/estrado-pjud-service/logs/heartbeat.json')
-    temporary = destination.with_suffix('.tmp')
-    temporary.write_text(json.dumps(heartbeat))
-    temporary.replace(destination)
-    if address: client.send(b'WATCHDOG=1')
-    time.sleep(1)
-''')
     write('/opt/native-fixture/fixture_http_server.py', '''from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sys
@@ -102,6 +126,23 @@ HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
         else:
             body = body.replace('CPUWeight=500', 'CPUWeight=100')
         write('/etc/systemd/system/' + unit, body)
+    write('/etc/systemd/system/estrado-pjud-worker.service.d/xvfb.conf',
+          (REPO / 'ops/systemd/estrado-pjud-worker.service.d/xvfb.conf').read_text())
+    # Explicit one-time lab bootstrap while no worker has ever started. This is
+    # not a legacy cutover recipe: real mutators deliberately cannot bootstrap.
+    run('install', '-d', '-o', 'root', '-g', 'estrado', '-m', '0750', '/var/lib/worker-maintenance')
+    write('/var/lib/worker-maintenance/admission.lock', '', 0o640)
+    run('chown', 'root:estrado', '/var/lib/worker-maintenance/admission.lock')
+    sys.path.insert(0, str(application))
+    from dataclasses import replace
+    from worker.maintenance_store import MaintenanceStore
+    write('/run/lock/legaltech-resource-guards.lock', '', 0o600)
+    with open('/run/lock/legaltech-resource-guards.lock', 'rb') as global_lock:
+        fcntl.flock(global_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        store = MaintenanceStore.production(operator=True)
+        initial = store.initialize_hold(str(uuid.uuid4()))
+        store.transition(initial.operation_id, 'hold', replace(initial, state='open'))
+    assert not Path('/run/worker-maintenance').exists(), 'systemd must create ACK runtime directory'
     for unit in ('legaltech-monitor.service', 'legaltech-resource-tracker.service'):
         write('/etc/systemd/system/' + unit,
               '[Unit]\nPartOf=legaltech.slice\n[Service]\nType=simple\n'
@@ -121,24 +162,14 @@ HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
     run('systemctl', 'enable', '--now', 'estrado-pjud.service', 'estrado-pjud-worker.service',
         'legaltech-monitor.service', 'legaltech-resource-tracker.service')
     run('git', '-C', str(REPO), 'init', '-q')
-    run('git', '-C', str(REPO), 'add', '.gitignore', 'ops')
+    run('git', '-C', str(REPO), 'add', '.gitignore', 'ops', 'estrado-pjud-service/worker')
     run('git', '-C', str(REPO), '-c', 'user.name=Native Fixture',
         '-c', 'user.email=native@example.invalid', 'commit', '-qm', 'native fixture payload')
     # Resolve the complete explicit test boundary to the real guest defaults.
     # Only health URLs differ; the local HTTP server represents external APIs.
-    text = (REPO / 'ops/resource-guards.sh').read_text()
-    variables, env = {}, {'RG_TEST_MODE': '1'}
-    for variable, key, value in re.findall(r'^(\w+)=\$\{(RG_\w+):-([^}]*)\}$', text, re.M):
-        for previous, replacement in variables.items():
-            value = value.replace('$' + previous, replacement)
-        if '$' in value:
-            raise RuntimeError('Unresolved native test default')
-        variables[variable], env[key] = value, value
-    names = re.search(r'readonly -a OVERRIDE_NAMES=\((.*?)\)', text, re.S).group(1).split()
-    if set(names) - env.keys():
-        raise RuntimeError('Incomplete native test boundary')
-    env.update(RG_TEST_MODE='1', RG_JURISTRACK_HEALTH_URL='http://127.0.0.1:9080/',
-               RG_ESTRADO_HEALTH_URL='http://127.0.0.1:8000/api/v1/health')
+    env = fixture_environment((REPO / 'ops/resource-guards.sh').read_text(),
+                              worker_uid=pwd.getpwnam('estrado').pw_uid,
+                              worker_gid=grp.getgrnam('estrado').gr_gid)
     write('/opt/native-fixture/environment.json', json.dumps(env), 0o600)
     print('NATIVE FIXTURE READY sha=' + run('git', '-C', str(REPO), 'rev-parse', 'HEAD'))
 

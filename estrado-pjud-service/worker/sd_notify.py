@@ -11,8 +11,8 @@ _socket_path: str | None = os.environ.get("NOTIFY_SOCKET")
 
 
 def notify_ready():
-    """Tell systemd the service is ready."""
-    _send("READY=1")
+    """Hand off xvfb-run's MainPID to this ready Python worker atomically."""
+    _send(f"READY=1\nMAINPID={os.getpid()}")
 
 
 def notify_watchdog():

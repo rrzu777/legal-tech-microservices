@@ -262,8 +262,13 @@ control open, simulan ACK ni aceptan PID0 como bootstrap. Un worker ya parado
 sólo se admite dentro de una transacción propia/delegada con prueba previa de
 drenaje y los dos descriptores exclusivos todavía retenidos.
 
-La unidad con `xvfb-run` requiere el handoff MAINPID del proceso Python y su
-verificación bajo systemd nativo (Task 4); no se relaja la igualdad MainPID/ACK.
+El notificador local envía `READY=1` y `MAINPID=<PID Python propio>` juntos en un
+datagrama, usando `NotifyAccess=all` del drop-in `xvfb-run`. El test de socket
+Unix real cubre ese contrato; el ensayo HVF corregido de Task4 pasó bajo systemd
+255.4-1ubuntu8.17, incluyendo la selección del MainPID y su revalidación tras
+reinicios del servicio bajo hold. No se relaja la igualdad MainPID/ACK ni se acepta
+cualquier hijo del cgroup. Ver [protocolo de mantenimiento](../worker-maintenance.md).
 Las pruebas locales no acreditan tráfico PJUD, capacidad del VPS ni telemetría
-de producción. La observación natural posterior y el bootstrap siguen siendo
-gates operacionales separados.
+de producción, E2E de negocio o reboot completo durante hold. La revisión global
+de rama/rebase, el rollout autorizado, la observación natural, el bootstrap y el
+acceso de Ricardo siguen siendo gates separados.
