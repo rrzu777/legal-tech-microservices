@@ -14,7 +14,8 @@ def app_and_session(monkeypatch):
     from app.routes import familia
     monkeypatch.setenv("API_KEY", "test-key")
     get_settings.cache_clear()
-    app = create_app()
+    from tests.helpers import install_runtime_control
+    app = install_runtime_control(create_app())
     app.state.session_pool = SimpleNamespace(acquire_familia_bundle=AsyncMock(return_value=SimpleNamespace(proxy_url="http://proxy", cookies={}, user_agent="UA")))
     app.state.sync_credentials = None
     app.state.proxy_supabase = rpc_client([True, True, True])

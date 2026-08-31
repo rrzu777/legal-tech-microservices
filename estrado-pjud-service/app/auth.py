@@ -1,9 +1,10 @@
 import hmac
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import get_settings
+from app.runtime_fence import PjudRuntimeError, RUNTIME_GENERATION_HEADER
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -32,3 +33,13 @@ async def _verify_api_key(
 
 
 verify_api_key = Depends(_verify_api_key)
+
+
+async def _require_runtime_http(request: Request, _key: str = verify_api_key):
+    fence = getattr(request.app.state, "pjud_runtime_fence", None)
+    if fence is None:
+        raise HTTPException(status_code=503, detail="pjud_runtime_unavailable")
+    try:
+        await fence.require_origin(request.headers.getlist(RUNTIME_GENERATION_HEADER))
+    except PjudRuntimeError as error:
+        raise HTTPException(status_code=503, detail=error.code) from None

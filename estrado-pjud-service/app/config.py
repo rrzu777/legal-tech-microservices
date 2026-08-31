@@ -5,12 +5,14 @@ from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 from app.proxy import sticky_lifetime_seconds
+from app.runtime_fence import validate_runtime_generation
 
 
 class Settings(BaseSettings):
     API_KEY: str
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_KEY: str = ""
+    PJUD_RUNTIME_GENERATION: str | None = None
     OJV_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     RATE_LIMIT_MS: int = 2500
     LOG_LEVEL: str = "INFO"
@@ -37,6 +39,9 @@ class Settings(BaseSettings):
 
     _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
         validate_cookie_store_path
+    )
+    _runtime_generation = field_validator("PJUD_RUNTIME_GENERATION", mode="before")(
+        validate_runtime_generation
     )
 
     @field_validator("OJV_PROXY_STICKY_LIFETIME")

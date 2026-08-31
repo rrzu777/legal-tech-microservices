@@ -91,7 +91,7 @@ async def test_el_worker_no_re_mintea_el_slot_ni_penaliza_la_causa():
         notifier=AsyncMock(),
         metrics=MagicMock(),
         backoff=MagicMock(),
-        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+        config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
     )
 
     with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \

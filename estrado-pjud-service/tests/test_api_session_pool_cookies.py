@@ -70,6 +70,36 @@ def test_lifespan_never_constructs_catalog_refresh_queue_even_with_obsolete_env(
     assert events == ["pool.close"]
 
 
+def test_api_supabase_is_constructed_with_fixed_runtime_header(monkeypatch):
+    """Lifespan copies the deployment identity before constructing shared clients."""
+    from fastapi.testclient import TestClient
+    from app.config import Settings
+    from app import main as main_module
+    from tests.helpers import GENERATION_A, GENERATION_B
+
+    settings = Settings(
+        API_KEY="synthetic", SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=GENERATION_A,
+        _env_file=None,
+    )
+    constructed = []
+    fake_sb = MagicMock()
+    def create(url, key, *, options):
+        constructed.append((url, key, options))
+        return fake_sb
+    class Pool:
+        def __init__(self, *_args, **_kwargs): pass
+        async def close_all(self): pass
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main_module, "create_client", create)
+    monkeypatch.setattr(main_module, "APISessionPool", Pool)
+    app = main_module.create_app()
+    with TestClient(app):
+        settings.PJUD_RUNTIME_GENERATION = GENERATION_B
+        assert app.state.pjud_runtime_fence.generation == GENERATION_A
+    assert constructed[0][2].headers["x-pjud-runtime-generation"] == GENERATION_A
+
+
 def test_acquire_injects_cookies_from_store(monkeypatch):
     """Single-slot store (multi-bundle store with exactly one bundle) still
     injects that bundle's cookies/UA into the adapter."""

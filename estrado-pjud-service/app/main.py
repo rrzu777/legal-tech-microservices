@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
@@ -11,6 +11,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
+from app.auth import _require_runtime_http
+from app.runtime_fence import RuntimeFence, runtime_generation_headers
 from app.logging_redaction import install_secret_redaction
 from app.rate_limit import limiter
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
@@ -21,7 +23,7 @@ from app.catalogs import CatalogService
 from app.routes import health, search, detail, familia
 from app.ojv.budget import OjvLaneBudget
 from app.session_pool import APISessionPool
-from supabase import create_client
+from supabase import ClientOptions, create_client
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import ProxyUsageTracker
 
@@ -72,7 +74,11 @@ async def lifespan(app: FastAPI):
     proxy_control_required = bool(settings.OJV_PROXY_URL)
     proxy_supabase = None
     if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_KEY:
-        proxy_supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        proxy_supabase = create_client(
+            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY,
+            options=ClientOptions(headers=runtime_generation_headers(settings.PJUD_RUNTIME_GENERATION)),
+        )
+    app.state.pjud_runtime_fence = RuntimeFence(proxy_supabase, settings.PJUD_RUNTIME_GENERATION)
     proxy_control = (
         ProxyControl(proxy_supabase, actor="estrado-pjud-api")
         if proxy_control_required
@@ -185,9 +191,9 @@ def create_app() -> FastAPI:
     app.add_middleware(PrivateSyncHttpMiddleware)
 
     app.include_router(health.router)
-    app.include_router(search.router)
-    app.include_router(detail.router)
-    app.include_router(familia.router)
+    app.include_router(search.router, dependencies=[Depends(_require_runtime_http)])
+    app.include_router(detail.router, dependencies=[Depends(_require_runtime_http)])
+    app.include_router(familia.router, dependencies=[Depends(_require_runtime_http)])
     return app
 
 

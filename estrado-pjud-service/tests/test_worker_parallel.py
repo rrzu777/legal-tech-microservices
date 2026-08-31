@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.helpers import legacy_runtime_fence
 from worker.__main__ import process_batch
 
 
@@ -54,7 +55,7 @@ async def test_process_batch_bounds_concurrency_to_n():
     backoff = FakeBackoff()
 
     task = asyncio.create_task(
-        process_batch(batch, engine, 3, shutdown_event, backoff, processing_window=lambda: True)
+        process_batch(batch, engine, 3, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
     # Let the semaphore-bound tasks start and block on the delay event.
@@ -82,7 +83,7 @@ async def test_process_batch_skips_not_yet_started_on_shutdown():
     backoff = FakeBackoff()
 
     task = asyncio.create_task(
-        process_batch(batch, engine, 2, shutdown_event, backoff, processing_window=lambda: True)
+        process_batch(batch, engine, 2, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
     # Wait until the first wave (bounded by N=2) has started.
@@ -128,7 +129,7 @@ async def test_shutdown_drains_running_case_before_batch_release_and_skips_undis
             1,
             shutdown_event,
             FakeBackoff(),
-            processing_window=lambda: True,
+            runtime_fence=legacy_runtime_fence(), processing_window=lambda: True,
         )
     )
 
@@ -156,7 +157,7 @@ async def test_process_batch_skips_when_circuit_breaker_opens_mid_batch():
     backoff = FakeBackoff()
 
     task = asyncio.create_task(
-        process_batch(batch, engine, 2, shutdown_event, backoff, processing_window=lambda: True)
+        process_batch(batch, engine, 2, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
     for _ in range(20):
@@ -182,7 +183,7 @@ async def test_process_batch_one_case_raising_does_not_sink_others():
 
     # Should not raise, despite one case's sync_case raising.
     await process_batch(
-        batch, engine, 5, shutdown_event, backoff, processing_window=lambda: True,
+        batch, engine, 5, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True,
     )
 
     assert sorted(engine.ran) == list(range(5))
@@ -211,7 +212,7 @@ async def test_process_batch_rechecks_persistent_gate_before_each_case():
         asyncio.Event(),
         backoff,
         proxy_control=control,
-        processing_window=lambda: True,
+        runtime_fence=legacy_runtime_fence(), processing_window=lambda: True,
     )
 
     assert engine.ran == []
@@ -228,7 +229,7 @@ async def test_process_batch_does_not_start_cases_after_office_window_closes():
         1,
         asyncio.Event(),
         FakeBackoff(),
-        processing_window=lambda: False,
+        runtime_fence=legacy_runtime_fence(), processing_window=lambda: False,
     )
 
     assert engine.ran == []

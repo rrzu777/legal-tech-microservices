@@ -1,3 +1,19 @@
+import pytest
+
+
+@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+def test_runtime_generation_rejects_noncanonical_identity(value):
+    from worker.config import WorkerConfig
+    with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
+        WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=value, _env_file=None)
+
+
+def test_runtime_generation_legacy_blank_and_explicit_identity():
+    from worker.config import WorkerConfig
+    config = WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=" ", _env_file=None)
+    assert config.PJUD_RUNTIME_GENERATION is None
+
+
 class TestWorkerConfig:
     def test_loads_from_env(self, monkeypatch):
         monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
@@ -49,8 +65,6 @@ class TestWorkerConfig:
         assert WorkerConfig(_env_file=None).PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
 
     def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
-        import pytest
-
         from worker.config import WorkerConfig
 
         with pytest.raises(ValueError, match="SESSION_REUSE_ROLLOUT_STARTED_AT"):

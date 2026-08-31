@@ -151,7 +151,7 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
         notifier=mock_notifier,
         metrics=mock_metrics,
         backoff=mock_backoff,
-        config=MagicMock(
+        config=MagicMock(PJUD_RUNTIME_GENERATION=None,
             OJV_TIMEOUT_S=25,
             R2_ENABLED=False,
             WORKER_ID="test-worker",
@@ -396,7 +396,7 @@ class TestSyncEngine:
             notifier=mock_notifier,
             metrics=mock_metrics,
             backoff=mock_backoff,
-            config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+            config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
         )
 
         case = _make_case()
@@ -477,7 +477,7 @@ class TestSyncEngine:
             notifier=mock_notifier,
             metrics=mock_metrics,
             backoff=mock_backoff,
-            config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+            config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
         )
 
         case = _make_case()
@@ -528,7 +528,7 @@ class TestSyncEngine:
             notifier=AsyncMock(),
             metrics=MagicMock(),
             backoff=MagicMock(),
-            config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+            config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
         )
 
         case = _make_case(case_number="INVALID")
@@ -1041,7 +1041,7 @@ class TestSyncEngine:
             notifier=mock_notifier,
             metrics=mock_metrics,
             backoff=mock_backoff,
-            config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+            config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
         )
 
         case = _make_case()
@@ -1083,7 +1083,7 @@ class TestSyncEngine:
             notifier=AsyncMock(),
             metrics=MagicMock(),
             backoff=MagicMock(),
-            config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+            config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
         )
 
         case = _make_case()
@@ -1524,7 +1524,7 @@ class TestSyncEngine:
         """A real SessionPool(1) must not deadlock resolving a broad result."""
         from worker.session_pool import SessionPool, _Slot
 
-        config = MagicMock(
+        config = MagicMock(PJUD_RUNTIME_GENERATION=None,
             OJV_PROXY_URL="http://proxy.example",
             OJV_PROXY_POOL_SIZE=1,
             POOL_SIZE=1,

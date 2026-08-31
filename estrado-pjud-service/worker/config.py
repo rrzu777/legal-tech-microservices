@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 from app.proxy import sticky_lifetime_seconds
+from app.runtime_fence import validate_runtime_generation
 from worker.maintenance import has_active_operation, track_auxiliary
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
@@ -28,6 +29,7 @@ async def run_query(query):
 class WorkerConfig(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
+    PJUD_RUNTIME_GENERATION: str | None = None
     WORKER_ID: str = "worker-1"
     POOL_SIZE: int = 1
     BATCH_SIZE: int = 10
@@ -88,6 +90,9 @@ class WorkerConfig(BaseSettings):
 
     _cookie_store_outside_git = field_validator("COOKIE_STORE_PATH")(
         validate_cookie_store_path
+    )
+    _runtime_generation = field_validator("PJUD_RUNTIME_GENERATION", mode="before")(
+        validate_runtime_generation
     )
 
     @field_validator("SESSION_REUSE_ROLLOUT_STARTED_AT", mode="before")

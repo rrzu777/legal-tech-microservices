@@ -2,6 +2,19 @@ import os
 import pytest
 
 
+@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+def test_runtime_generation_rejects_noncanonical_identity(value):
+    from app.config import Settings
+    with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
+        Settings(API_KEY="synthetic", PJUD_RUNTIME_GENERATION=value, _env_file=None)
+
+
+def test_runtime_generation_legacy_blank_and_explicit_identity():
+    from app.config import Settings
+    assert Settings(API_KEY="synthetic", PJUD_RUNTIME_GENERATION=" ", _env_file=None).PJUD_RUNTIME_GENERATION is None
+    assert Settings(API_KEY="synthetic", PJUD_RUNTIME_GENERATION="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", _env_file=None).PJUD_RUNTIME_GENERATION == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
 def test_config_loads_from_env(monkeypatch):
     monkeypatch.setenv("API_KEY", "test-key-123")
     monkeypatch.setenv("OJV_BASE_URL", "https://example.com")

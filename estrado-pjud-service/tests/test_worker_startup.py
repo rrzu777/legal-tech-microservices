@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests.helpers import RuntimeControlDB, legacy_runtime_fence
+
 from worker.__main__ import (
     safe_initialize_pool,
     can_initialize_paid_pool,
@@ -105,6 +107,7 @@ async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatc
 
 def _entrypoint_config(*, validation_once=False):
     config = MagicMock()
+    config.PJUD_RUNTIME_GENERATION = None
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = validation_once
     config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = False
     config.OJV_PROXY_URL = "http://proxy.invalid"
@@ -126,10 +129,13 @@ def _entrypoint_config(*, validation_once=False):
     return config
 
 
-def _patch_entrypoint(monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff):
+def _patch_entrypoint(
+    monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff,
+    maintenance=None,
+):
     monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
     monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
-    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: MagicMock())
+    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: RuntimeControlDB())
     monkeypatch.setattr(worker_main, "ProxyUsageTracker", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "ProxyControl", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "SessionPool", lambda *_a, **_k: pool)
@@ -141,6 +147,16 @@ def _patch_entrypoint(monkeypatch, worker_main, *, config, scheduler, pool, metr
     monkeypatch.setattr(worker_main, "notify_ready", lambda: None)
     monkeypatch.setattr(worker_main, "notify_status", lambda *_a: None)
     monkeypatch.setattr(worker_main, "notify_stopping", lambda: None)
+    if maintenance is not None:
+        monkeypatch.setattr(
+            worker_main.MaintenanceStore, "production", lambda: maintenance.store,
+        )
+        monkeypatch.setattr(
+            worker_main.ProcessIdentity, "current", lambda: maintenance.identity,
+        )
+        monkeypatch.setattr(
+            worker_main, "WorkerMaintenance", lambda _store, _identity: maintenance,
+        )
 
 
 def test_paid_pool_initialization_only_during_office_window():
@@ -182,7 +198,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
         handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
 
     engine.sync_case = AsyncMock(side_effect=sync_case)
-    scheduler.get_next_batch.return_value = [{"id": "scheduled-case"}]
+    scheduler.get_next_batch.return_value = [{"id": "scheduled-case", "sync_claim_token": "synthetic-token"}]
 
     async def process_import():
         if not reopen:
@@ -195,7 +211,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
 
     if reopen:
         scheduler.get_next_batch.assert_awaited_once()
-        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case"})
+        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case", "sync_claim_token": "synthetic-token"})
     else:
         engine.process_import_job.assert_awaited_once()
         scheduler.get_next_batch.assert_not_awaited()
@@ -245,11 +261,13 @@ async def test_main_holds_complete_operation_at_each_effect_boundary(monkeypatch
         await phase("contract")
     async def initialize():
         await phase("initialize")
+    claim_row = {"id": "case", "sync_claim_token": "synthetic-token"}
+
     async def claim():
         await phase("batch_claim")
-        return [{"id": "case"}]
-    async def release(ids):
-        assert ids == ["case"]
+        return [claim_row]
+    async def release(claims):
+        assert claims == [{"case_id": "case", "claim_token": "synthetic-token"}]
         await phase("batch_release")
     async def sync(case):
         await phase("sync_case")
@@ -454,7 +472,10 @@ async def test_outside_hours_main_loop_still_invokes_bounded_reconciliation(monk
     monkeypatch.setattr(worker_main, "safe_initialize_pool", initialize_pool)
     monkeypatch.setattr(worker_main, "is_processing_allowed", MagicMock(return_value=False))
 
+    real_wait_for = asyncio.wait_for
     async def stop_after_office_gate(awaitable, *, timeout):
+        if timeout == 5.0:
+            return await real_wait_for(awaitable, timeout=timeout)
         awaitable.close()
         raise RuntimeError("stop after outside-hours loop")
 
@@ -542,7 +563,7 @@ async def test_safe_initialize_retries_then_returns_false_no_crash(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is False
     assert pool.initialize.await_count == 3
     assert len(slept) == 2  # backed off between attempts, not after the last one
@@ -558,7 +579,7 @@ async def test_safe_initialize_succeeds_first_try(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is True
     assert pool.initialize.await_count == 1
     assert slept == []
@@ -578,6 +599,7 @@ async def test_safe_initialize_402_trips_control_and_never_retries(monkeypatch):
         base_delay=1,
         proxy_control=control,
         backoff=backoff,
+        runtime_fence=legacy_runtime_fence(),
     )
 
     assert ok is False
