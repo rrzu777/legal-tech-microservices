@@ -12,7 +12,7 @@ from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
 from app.runtime_fence import PjudRuntimeError, RuntimeFence
-from worker.config import WorkerConfig
+from worker.config import WorkerConfig, validate_import_trial_mode
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
 from worker.scheduler import (
@@ -352,6 +352,12 @@ async def main():
     process_outside_office_hours = (
         config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
     )
+    configured_session_capacity = (
+        config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+    )
+    import_trial_once = validate_import_trial_mode(
+        config, configured_session_capacity,
+    )
     if validation_once:
         # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
         # en el proceso transitorio y acota el tráfico de adquisición a un slot
@@ -415,23 +421,28 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
-            if not await runtime_admitted(runtime_fence, metrics):
-                if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
-                    return
-                continue
-            if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
-                metrics.set_status("backoff")
-                notify_status("sync-run reconciliation unavailable; traffic blocked")
-                if not await wait_before_retry(
-                    shutdown_event, 30, validation_once=validation_once,
-                ):
-                    return
-                continue
+            if import_trial_once:
+                await runtime_fence.require()
+            else:
+                if not await runtime_admitted(runtime_fence, metrics):
+                    if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
+                        return
+                    continue
+                if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
+                    metrics.set_status("backoff")
+                    notify_status("sync-run reconciliation unavailable; traffic blocked")
+                    if not await wait_before_retry(
+                        shutdown_event, 30, validation_once=validation_once,
+                    ):
+                        return
+                    continue
 
             # Never mint a paid-proxy session before the persistent control
             # allows traffic. Missing control/DB is intentionally fail-closed.
             snapshot = await refresh_proxy_gate(proxy_control, backoff)
             if not snapshot.allowed:
+                if import_trial_once:
+                    raise RuntimeError("pjud_import_trial_proxy_denied")
                 metrics.set_status("paused")
                 notify_status("paused")
                 logger.warning(
@@ -444,7 +455,7 @@ async def main():
                     return
                 continue
 
-            prewarm = can_initialize_paid_pool(
+            prewarm = False if import_trial_once else can_initialize_paid_pool(
                 validation_once=validation_once,
                 process_outside_office_hours=process_outside_office_hours,
             )
@@ -457,7 +468,10 @@ async def main():
                     return
                 continue
 
-            if not await scheduler_contract_ready(scheduler, metrics, backoff):
+            if (
+                not import_trial_once
+                and not await scheduler_contract_ready(scheduler, metrics, backoff)
+            ):
                 metrics.set_status("backoff")
                 notify_status("scheduler migration unavailable; mint blocked")
                 if not await wait_before_retry(
@@ -470,7 +484,9 @@ async def main():
                 # Manual discovery claims and authorizes credentials before
                 # checkout. Preparing empty slots does not mint/pay for idle
                 # capacity; normal acquisition retains proxy/cost controls.
-                if not await runtime_admitted(runtime_fence, metrics):
+                if import_trial_once:
+                    await runtime_fence.require()
+                elif not await runtime_admitted(runtime_fence, metrics):
                     if not await wait_before_retry(shutdown_event, 30, validation_once=validation_once):
                         return
                     continue
@@ -524,6 +540,16 @@ async def main():
             proxy_control=proxy_control,
             proxy_usage=proxy_usage,
         )
+        if import_trial_once:
+            metrics.set_status("running")
+            notify_status("running")
+            await runtime_fence.require()
+            processed = await engine.process_import_job()
+            if not processed:
+                raise RuntimeError("pjud_import_trial_no_eligible_job")
+            logger.info("Import trial processed exactly one eligible job")
+            return
+
         logger.info("Worker ready, entering main loop")
         metrics.set_status("running")
         notify_status("running")
