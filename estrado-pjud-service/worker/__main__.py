@@ -13,7 +13,7 @@ from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
 from app.runtime_fence import PjudRuntimeError, RuntimeFence
 from worker.config import WorkerConfig, validate_import_trial_mode
-from worker.supabase_client import create_supabase
+from worker.supabase_client import create_supabase, create_trial_supabase
 from worker.session_pool import SessionPool
 from worker.scheduler import (
     Scheduler,
@@ -490,14 +490,21 @@ async def claim_process_release_batch(
 
 async def import_trial_runtime_error(
     runtime_fence: RuntimeFence | None,
-) -> PjudRuntimeError | None:
+) -> Exception | None:
     """Return an expected runtime denial so maintenance can close cleanly."""
     try:
         if runtime_fence is None:
             raise PjudRuntimeError()
-        await runtime_fence.require()
+        snapshot = await runtime_fence.require(admission=False)
     except PjudRuntimeError as error:
         return error
+    if (
+        snapshot.generation_required is not True
+        or snapshot.generation != runtime_fence.generation
+    ):
+        return PjudRuntimeError("pjud_runtime_generation_mismatch")
+    if snapshot.admission_paused is not True:
+        return RuntimeError("pjud_import_trial_requires_paused_admission")
     return None
 
 
@@ -518,10 +525,10 @@ async def initialize_import_trial_attempt(
 
 async def process_import_trial_once(
     engine, runtime_fence: RuntimeFence | None,
-) -> bool | PjudRuntimeError:
+) -> bool | Exception:
     if error := await import_trial_runtime_error(runtime_fence):
         return error
-    return await engine.process_import_job()
+    return await engine.process_trial_import_job()
 
 
 async def main():
@@ -551,12 +558,19 @@ async def main():
         and session_capacity >= 2
         and not validation_once
     )
+    trial_capability = getattr(config, "PJUD_IMPORT_TRIAL_CAPABILITY", None)
+    raw_trial_capability = (
+        trial_capability.get_secret_value()
+        if trial_capability is not None
+        else None
+    )
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
             config.TELEGRAM_BOT_TOKEN,
             config.SUPABASE_SERVICE_KEY,
             config.OJV_PROXY_URL,
+            raw_trial_capability,
         ))),
     )
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
@@ -565,9 +579,11 @@ async def main():
     maintenance = WorkerMaintenance(MaintenanceStore.production(), ProcessIdentity.current())
 
     supabase = create_supabase(config)
+    trial_supabase = create_trial_supabase(config) if import_trial_once else None
     runtime_fence = RuntimeFence(supabase, config.PJUD_RUNTIME_GENERATION)
     proxy_usage = ProxyUsageTracker(
         supabase,
+        trial_supabase=trial_supabase,
         enabled=bool(config.OJV_PROXY_URL),
         price_per_gb_usd=config.OJV_PROXY_PRICE_PER_GB_USD,
     )
@@ -680,6 +696,7 @@ async def main():
             config=config,
             proxy_control=proxy_control,
             proxy_usage=proxy_usage,
+            trial_supabase=trial_supabase,
         )
         if import_trial_once:
             metrics.set_status("running")
@@ -687,7 +704,7 @@ async def main():
             processed = await maintenance.run(
                 lambda: process_import_trial_once(engine, runtime_fence)
             )
-            if isinstance(processed, PjudRuntimeError):
+            if isinstance(processed, Exception):
                 raise processed
             if not processed:
                 raise RuntimeError("pjud_import_trial_no_eligible_job")

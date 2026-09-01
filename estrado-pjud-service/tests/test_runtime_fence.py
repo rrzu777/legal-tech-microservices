@@ -1,10 +1,12 @@
 """Closed protocol, fixed identity and admission boundaries (no external I/O)."""
 import asyncio
+import httpx
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import SecretStr
 
 from app.runtime_fence import (
     PjudRuntimeError, RuntimeFence, runtime_generation_headers,
@@ -236,6 +238,66 @@ def test_supabase_client_headers_are_fixed_and_isolated(monkeypatch):
     assert one.options.headers["x-pjud-runtime-generation"] == GENERATION_A
     assert two.options.headers["x-pjud-runtime-generation"] == GENERATION_B
     assert one.options.headers is not two.options.headers
+
+
+def test_trial_supabase_client_is_dedicated_and_normal_headers_never_gain_capability():
+    """Catch trial authority leaking to fence, table reads or generic RPCs."""
+    from worker import supabase_client
+
+    capability = "b" * 64
+    normal = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=False,
+        PJUD_IMPORT_TRIAL_CAPABILITY=None,
+    )
+    trial = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(capability),
+    )
+
+    normal_client = supabase_client.create_supabase(normal)
+    normal_from_trial_config = supabase_client.create_supabase(trial)
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"status": "empty"})
+
+    trial_client = supabase_client.create_trial_supabase(
+        trial, transport=httpx.MockTransport(respond),
+    )
+
+    assert normal_client.options.headers["x-pjud-runtime-generation"] == GENERATION_A
+    assert (
+        normal_from_trial_config.options.headers["x-pjud-runtime-generation"]
+        == GENERATION_A
+    )
+    response = trial_client.rpc("claim_pjud_trial_import_job", {}).execute()
+    assert response.data == {"status": "empty"}
+    assert len(requests) == 1
+    assert requests[0].headers["x-pjud-runtime-trial-capability"] == capability
+    assert requests[0].headers["x-pjud-runtime-generation"] == GENERATION_A
+
+    for headers in (
+        normal_client.options.headers,
+        normal_from_trial_config.options.headers,
+        trial_client._postgrest.headers,
+        trial_client._postgrest.session.headers,
+    ):
+        assert "x-pjud-runtime-trial-capability" not in headers
+        assert capability not in repr(headers)
+    assert not hasattr(trial_client, "storage")
+    assert not hasattr(trial_client, "auth")
+    assert capability not in repr(trial_client)
+    assert capability not in repr(vars(trial_client))
+
+    with pytest.raises(ValueError, match="pjud_trial_supabase_client_requires_trial"):
+        supabase_client.create_trial_supabase(normal)
 
 
 @pytest.mark.asyncio

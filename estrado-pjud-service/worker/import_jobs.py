@@ -13,8 +13,10 @@ import logging
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
+import httpx
 from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
 
 from app.familia.auth import FamiliaAuthSession
@@ -26,6 +28,7 @@ from app.proxy_billing import ProxyBillingExhaustedError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from worker.config import run_query
 from worker.proxy_usage import DISABLED_PROXY_USAGE, ProxyUsageTracker
+from worker.trial_scope import TrialScope
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,18 @@ _T = TypeVar("_T")
 _MAX_CANDIDATES = 1_000
 _MAX_CANDIDATE_BYTES = 4_096
 _MAX_PAYLOAD_BYTES = 1_048_576
+_TRIAL_GRANT_CLOSE_REPLAY_DELAYS_S = (0.1,)
+_TRIAL_DISCOVERY_FINALIZE_REPLAY_DELAYS_S = (0.1,)
+_TRIAL_IMPORT_CLAIM_REPLAY_DELAYS_S = (0.1,)
+# These failures can lose a committed response. Connect/pool failures are
+# pre-send and do not need an authority-bearing replay.
+_AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
 _CANDIDATE_FIELDS = frozenset({
     "matter",
     "case_type",
@@ -70,6 +85,13 @@ class ClaimedImportJob(BaseModel):
     include_closed: bool
     claim_token: UUID4
     lease_expires_at: str
+
+
+class ClaimedTrialImportJob(ClaimedImportJob):
+    """Exact output contract of the capability-scoped trial claim."""
+
+    trial_grant_id: UUID4
+    expected_credentials_updated_at: datetime
 
 
 def _normalize_identity_text(value: str | None) -> str | None:
@@ -224,9 +246,11 @@ class ImportDiscoveryWorker:
         self,
         *,
         supabase,
+        trial_supabase=None,
         pool,
         worker_id: str,
         fetch_credential: Callable[[str, str, str, str, str], Awaitable[dict | None]],
+        fetch_trial_credential: Callable[..., Awaitable[dict | None]] | None = None,
         discover: Callable[..., Awaitable[DiscoveryResult]] = discover_my_causes,
         session_factory=FamiliaAuthSession,
         concurrency: int = 1,
@@ -241,9 +265,11 @@ class ImportDiscoveryWorker:
         if not 15 <= lease_seconds <= 900:
             raise ValueError("import_lease_seconds_out_of_range")
         self._sb = supabase
+        self._trial_sb = trial_supabase
         self._pool = pool
         self._worker_id = worker_id
         self._fetch_credential = fetch_credential
+        self._fetch_trial_credential = fetch_trial_credential
         self._discover = discover
         self._session_factory = session_factory
         self._lane_budget = lane_budget or OjvLaneBudget(concurrency)
@@ -265,6 +291,82 @@ class ImportDiscoveryWorker:
             raise RuntimeError(f"{name}_failed")
         return getattr(response, "data", None)
 
+    async def _trial_rpc(self, name: str, payload: dict[str, Any]) -> Any:
+        if self._trial_sb is None:
+            raise RuntimeError("trial_rpc_client_unavailable")
+        response = await run_query(self._trial_sb.rpc(name, payload))
+        error = getattr(response, "error", None)
+        if error:
+            raise RuntimeError(f"{name}_failed")
+        return getattr(response, "data", None)
+
+    async def _close_trial_grant(self, scope: TrialScope) -> None:
+        payload = {
+            "p_expected_generation": str(scope.runtime_generation),
+            "p_trial_grant_id": str(scope.trial_grant_id),
+            "p_job_id": str(scope.job_id),
+        }
+        attempts = len(_TRIAL_GRANT_CLOSE_REPLAY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                closed = await self._trial_rpc(
+                    "close_pjud_runtime_trial_grant", payload,
+                )
+            except _AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS:
+                if attempt == attempts - 1:
+                    raise RuntimeError(
+                        "pjud_trial_grant_close_unconfirmed"
+                    ) from None
+                logger.warning(
+                    "Ambiguous PJUD trial grant close transport; "
+                    "replaying exact RPC"
+                )
+                await asyncio.sleep(
+                    _TRIAL_GRANT_CLOSE_REPLAY_DELAYS_S[attempt]
+                )
+                continue
+            except Exception:
+                raise RuntimeError(
+                    "pjud_trial_grant_close_unconfirmed"
+                ) from None
+            if closed is True:
+                return
+            raise RuntimeError("pjud_trial_grant_close_unconfirmed") from None
+
+        raise RuntimeError("pjud_trial_grant_close_unconfirmed")
+
+    async def _finalize_trial_discovery(self, payload: dict[str, Any]) -> None:
+        """Replay only the exact idempotent finalize after an ambiguous send."""
+        attempts = len(_TRIAL_DISCOVERY_FINALIZE_REPLAY_DELAYS_S) + 1
+        ambiguity_observed = False
+        for attempt in range(attempts):
+            try:
+                await self._trial_rpc(
+                    "finalize_pjud_trial_import_discovery", payload,
+                )
+                return
+            except _AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS:
+                ambiguity_observed = True
+                if attempt == attempts - 1:
+                    raise RuntimeError(
+                        "pjud_trial_discovery_finalize_unconfirmed"
+                    ) from None
+                logger.warning(
+                    "Ambiguous PJUD trial discovery finalize transport; "
+                    "replaying exact RPC"
+                )
+                await asyncio.sleep(
+                    _TRIAL_DISCOVERY_FINALIZE_REPLAY_DELAYS_S[attempt]
+                )
+            except Exception:
+                if ambiguity_observed:
+                    raise RuntimeError(
+                        "pjud_trial_discovery_finalize_unconfirmed"
+                    ) from None
+                raise
+
+        raise RuntimeError("pjud_trial_discovery_finalize_unconfirmed")
+
     async def _claim(self) -> ClaimedImportJob | None:
         data = await self._rpc(
             "claim_pjud_import_job",
@@ -283,24 +385,99 @@ class ImportDiscoveryWorker:
             raise RuntimeError("invalid_import_job_claim_status")
         return job
 
-    async def _renew_until_cancelled(self, job: ClaimedImportJob) -> None:
+    async def _claim_trial(
+        self,
+        *,
+        capability: SecretStr,
+        runtime_generation: str,
+    ) -> tuple[ClaimedTrialImportJob, TrialScope] | None:
+        payload = {
+            "p_expected_generation": runtime_generation,
+            "p_worker_id": self._worker_id,
+            "p_lease_seconds": self._lease_seconds,
+        }
+        attempts = len(_TRIAL_IMPORT_CLAIM_REPLAY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                data = await self._trial_rpc(
+                    "claim_pjud_trial_import_job", payload,
+                )
+                break
+            except _AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS:
+                if attempt == attempts - 1:
+                    raise RuntimeError(
+                        "pjud_trial_import_job_claim_unconfirmed"
+                    ) from None
+                logger.warning(
+                    "Ambiguous PJUD trial claim transport; replaying exact RPC"
+                )
+                await asyncio.sleep(
+                    _TRIAL_IMPORT_CLAIM_REPLAY_DELAYS_S[attempt]
+                )
+            except Exception:
+                raise RuntimeError(
+                    "pjud_trial_import_job_claim_unconfirmed"
+                ) from None
+        else:  # pragma: no cover - finite loop either breaks or raises.
+            raise RuntimeError("pjud_trial_import_job_claim_unconfirmed")
+        if data == {"status": "empty"}:
+            return None
+        try:
+            job = ClaimedTrialImportJob.model_validate(data)
+            scope = TrialScope(
+                capability=capability,
+                runtime_generation=runtime_generation,
+                trial_grant_id=job.trial_grant_id,
+                job_id=job.job_id,
+                claim_token=job.claim_token,
+                worker_id=self._worker_id,
+                law_firm_id=job.law_firm_id,
+                credential_id=job.credential_id,
+                expected_credentials_updated_at=(
+                    job.expected_credentials_updated_at
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError("invalid_trial_import_job_claim_contract") from exc
+        if job.status != "acquired":
+            raise RuntimeError("invalid_trial_import_job_claim_status")
+        return job, scope
+
+    async def _renew_until_cancelled(
+        self,
+        job: ClaimedImportJob,
+        trial_scope: TrialScope | None = None,
+    ) -> None:
         while True:
             await asyncio.sleep(self._renewal_interval_seconds)
-            renewed = await self._rpc(
-                "renew_pjud_import_job_claim",
-                {
-                    "p_job_id": str(job.job_id),
-                    "p_claim_token": str(job.claim_token),
-                    "p_worker_id": self._worker_id,
-                    "p_lease_seconds": self._lease_seconds,
-                },
-            )
+            payload = {
+                "p_job_id": str(job.job_id),
+                "p_claim_token": str(job.claim_token),
+                "p_worker_id": self._worker_id,
+                "p_lease_seconds": self._lease_seconds,
+            }
+            rpc_name = "renew_pjud_import_job_claim"
+            if trial_scope is not None:
+                payload["p_expected_generation"] = str(
+                    trial_scope.runtime_generation
+                )
+                payload["p_trial_grant_id"] = str(trial_scope.trial_grant_id)
+                rpc_name = "renew_pjud_trial_import_job_claim"
+            rpc = self._trial_rpc if trial_scope is not None else self._rpc
+            renewed = await rpc(rpc_name, payload)
             if renewed is not True:
                 raise RuntimeError("import_job_claim_lost")
 
-    async def _run_fenced(self, job: ClaimedImportJob, operation: Awaitable[_T]) -> _T:
+    async def _run_fenced(
+        self,
+        job: ClaimedImportJob,
+        operation: Awaitable[_T],
+        trial_scope: TrialScope | None = None,
+    ) -> _T:
         operation_task = asyncio.create_task(operation)
-        renewal_task = asyncio.create_task(self._renew_until_cancelled(job))
+        renewal_task = asyncio.create_task(
+            self._renew_until_cancelled(job, trial_scope),
+        )
         try:
             done, _ = await asyncio.wait(
                 {operation_task, renewal_task}, return_when=asyncio.FIRST_COMPLETED,
@@ -316,18 +493,31 @@ class ImportDiscoveryWorker:
             await asyncio.gather(operation_task, renewal_task, return_exceptions=True)
 
     async def _validate_credential_revision(
-        self, job: ClaimedImportJob, binding_version: str,
+        self,
+        job: ClaimedImportJob,
+        binding_version: str,
+        trial_scope: TrialScope | None = None,
     ) -> None:
-        valid = await self._rpc(
-            "validate_pjud_import_credential_claim",
-            {
-                "p_job_id": str(job.job_id),
-                "p_claim_token": str(job.claim_token),
-                "p_worker_id": self._worker_id,
-                "p_credential_id": str(job.credential_id),
-                "p_expected_credential_updated_at": binding_version,
-            },
-        )
+        payload = {
+            "p_job_id": str(job.job_id),
+            "p_claim_token": str(job.claim_token),
+            "p_worker_id": self._worker_id,
+            "p_credential_id": str(job.credential_id),
+            "p_expected_credential_updated_at": binding_version,
+        }
+        rpc_name = "validate_pjud_import_credential_claim"
+        if trial_scope is not None:
+            payload["p_expected_generation"] = str(
+                trial_scope.runtime_generation
+            )
+            payload["p_trial_grant_id"] = str(trial_scope.trial_grant_id)
+            payload.pop("p_expected_credential_updated_at")
+            payload["p_expected_credential_updated_at"] = (
+                trial_scope.expected_credentials_updated_at.isoformat()
+            )
+            rpc_name = "validate_pjud_trial_import_credential_claim"
+        rpc = self._trial_rpc if trial_scope is not None else self._rpc
+        valid = await rpc(rpc_name, payload)
         if valid is not True:
             raise RuntimeError("import_credential_revision_lost")
 
@@ -336,10 +526,26 @@ class ImportDiscoveryWorker:
         job: ClaimedImportJob,
         credential: dict,
         session_attempt: int,
+        trial_scope: TrialScope | None = None,
     ) -> DiscoveryResult:
-        bundle, slot = await self._pool.acquire_familia_bundle()
+        if trial_scope is None:
+            bundle, slot = await self._pool.acquire_familia_bundle()
+        else:
+            bundle, slot = await self._pool.acquire_familia_bundle(
+                trial_scope=trial_scope,
+            )
         if bundle is None:
-            await self._pool.release_familia_bundle(slot, disposition="healthy")
+            if trial_scope is None:
+                await self._pool.release_familia_bundle(
+                    slot, disposition="healthy",
+                )
+            else:
+                await self._pool.release_familia_bundle(
+                    slot,
+                    disposition="healthy",
+                    remint=False,
+                    trial_scope=trial_scope,
+                )
             raise RuntimeError("import_session_unavailable")
         disposition = "healthy"
         remint = True
@@ -358,26 +564,34 @@ class ImportDiscoveryWorker:
                 }
 
                 def request_scope(request_key: str):
-                    return self._proxy_usage.track(
-                        operation="search",
+                    usage = {
+                        "operation": "search",
                         **common_usage,
-                        transaction_key=(
+                        "transaction_key": (
                             f"{job.job_id}:{job.claim_token}:session-{session_attempt}:"
                             f"page:{request_key}"
                         ),
+                    }
+                    if trial_scope is not None:
+                        usage["trial_scope"] = trial_scope
+                    return self._proxy_usage.track(
+                        **usage,
                     )
 
                 try:
                     await self._validate_credential_revision(
-                        job, credential["binding_version"],
+                        job, credential["binding_version"], trial_scope,
                     )
-                    async with self._proxy_usage.track(
-                        operation="other",
+                    login_usage = {
+                        "operation": "other",
                         **common_usage,
-                        transaction_key=(
+                        "transaction_key": (
                             f"{job.job_id}:{job.claim_token}:session-{session_attempt}:login"
                         ),
-                    ):
+                    }
+                    if trial_scope is not None:
+                        login_usage["trial_scope"] = trial_scope
+                    async with self._proxy_usage.track(**login_usage):
                         await session.login(
                             SecretStr(credential["rut"]),
                             SecretStr(credential["password"]),
@@ -392,7 +606,7 @@ class ImportDiscoveryWorker:
                         status=cast(DiscoveryStatus, error.code.value),
                     )
                 await self._validate_credential_revision(
-                    job, credential["binding_version"],
+                    job, credential["binding_version"], trial_scope,
                 )
                 return await self._discover(
                     session,
@@ -420,17 +634,24 @@ class ImportDiscoveryWorker:
             disposition = "replace_before_reuse"
             raise
         finally:
-            await self._pool.release_familia_bundle(
-                slot, disposition=disposition, remint=remint,
-            )
+            release = {
+                "disposition": disposition,
+                "remint": remint,
+            }
+            if trial_scope is not None:
+                release["trial_scope"] = trial_scope
+            await self._pool.release_familia_bundle(slot, **release)
 
     async def _discover_with_session_retry(
-        self, job: ClaimedImportJob, credential: dict,
+        self,
+        job: ClaimedImportJob,
+        credential: dict,
+        trial_scope: TrialScope | None = None,
     ) -> DiscoveryResult:
-        result = await self._discover_once(job, credential, 1)
+        result = await self._discover_once(job, credential, 1, trial_scope)
         if result.status != "session_expired":
             return result
-        return await self._discover_once(job, credential, 2)
+        return await self._discover_once(job, credential, 2, trial_scope)
 
     async def process_next(self) -> bool:
         if not self._enabled:
@@ -442,13 +663,43 @@ class ImportDiscoveryWorker:
             await self._process_claimed_with_budget(job)
             return True
 
+    async def process_trial_next(
+        self,
+        *,
+        capability: SecretStr,
+        runtime_generation: str,
+    ) -> bool:
+        if not self._enabled:
+            return False
+        async with self._lane_budget.slot():
+            claimed = await self._claim_trial(
+                capability=capability,
+                runtime_generation=runtime_generation,
+            )
+            if claimed is None:
+                return False
+            job, scope = claimed
+            await self._process_claimed_with_budget(job, scope)
+            await self._close_trial_grant(scope)
+            return True
+
     async def _fetch_and_discover(
-        self, job: ClaimedImportJob,
+        self,
+        job: ClaimedImportJob,
+        trial_scope: TrialScope | None = None,
     ) -> tuple[DiscoveryResult, str | None]:
-        credential = await self._fetch_credential(
+        credential_args = (
             str(job.credential_id), str(job.law_firm_id), str(job.job_id),
             str(job.claim_token), self._worker_id,
         )
+        if trial_scope is None:
+            credential = await self._fetch_credential(*credential_args)
+        else:
+            if self._fetch_trial_credential is None:
+                raise RuntimeError("trial_import_credential_boundary_unavailable")
+            credential = await self._fetch_trial_credential(
+                *credential_args, trial_scope,
+            )
         if not credential or credential.get("password_type") != "clave_poder_judicial":
             return DiscoveryResult(
                 candidates=[], page_count=0, status="credential_invalid",
@@ -456,7 +707,27 @@ class ImportDiscoveryWorker:
         binding_version = credential.get("binding_version")
         if not isinstance(binding_version, str) or not binding_version:
             raise RuntimeError("invalid_import_credential_contract")
-        return await self._discover_with_session_retry(job, credential), binding_version
+        if trial_scope is not None:
+            try:
+                observed_revision = datetime.fromisoformat(
+                    binding_version.replace("Z", "+00:00"),
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "trial_import_credential_revision_mismatch"
+                ) from exc
+            if (
+                observed_revision.utcoffset() is None
+                or observed_revision
+                != trial_scope.expected_credentials_updated_at
+            ):
+                raise RuntimeError("trial_import_credential_revision_mismatch")
+            binding_version = (
+                trial_scope.expected_credentials_updated_at.isoformat()
+            )
+        return await self._discover_with_session_retry(
+            job, credential, trial_scope,
+        ), binding_version
 
     async def process_claimed(self, raw_job: ClaimedImportJob | dict[str, Any]) -> None:
         job = (
@@ -467,9 +738,13 @@ class ImportDiscoveryWorker:
         async with self._lane_budget.slot():
             await self._process_claimed_with_budget(job)
 
-    async def _process_claimed_with_budget(self, job: ClaimedImportJob) -> None:
+    async def _process_claimed_with_budget(
+        self,
+        job: ClaimedImportJob,
+        trial_scope: TrialScope | None = None,
+    ) -> None:
         result, credential_binding_version = await self._run_fenced(
-            job, self._fetch_and_discover(job),
+            job, self._fetch_and_discover(job, trial_scope), trial_scope,
         )
         try:
             batch = _candidate_payloads(list(result.candidates))
@@ -488,17 +763,28 @@ class ImportDiscoveryWorker:
                 "error_code": "invalid_candidate_payload",
                 "error_class": "contract",
             }
-        await self._rpc(
-            "finalize_pjud_import_discovery",
-            {
-                "p_job_id": str(job.job_id),
-                "p_claim_token": str(job.claim_token),
-                "p_candidates": candidates,
-                "p_summary": summary,
-                "p_worker_id": self._worker_id,
-                "p_expected_credential_updated_at": credential_binding_version,
-            },
-        )
+        payload = {
+            "p_job_id": str(job.job_id),
+            "p_claim_token": str(job.claim_token),
+            "p_candidates": candidates,
+            "p_summary": summary,
+            "p_worker_id": self._worker_id,
+            "p_expected_credential_updated_at": credential_binding_version,
+        }
+        rpc_name = "finalize_pjud_import_discovery"
+        if trial_scope is not None:
+            payload["p_expected_generation"] = str(
+                trial_scope.runtime_generation
+            )
+            payload["p_trial_grant_id"] = str(trial_scope.trial_grant_id)
+            payload.pop("p_expected_credential_updated_at")
+            payload["p_expected_credential_updated_at"] = (
+                trial_scope.expected_credentials_updated_at.isoformat()
+            )
+        if trial_scope is None:
+            await self._rpc(rpc_name, payload)
+        else:
+            await self._finalize_trial_discovery(payload)
         logger.info(
             "my_causes status=%s pages=%d count=%d",
             result.status,

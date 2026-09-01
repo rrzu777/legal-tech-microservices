@@ -23,6 +23,7 @@ from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.usage_context import current_usage_scope
 from worker.config import run_query
+from worker.trial_scope import TrialScope
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,17 @@ _SESSION_REASONS: frozenset[str] = frozenset({
 })
 _SESSION_REASONS_WITHOUT_AGE = frozenset({"startup", "missing_bundle"})
 _SESSION_OPERATIONS = frozenset({"health", "mint"})
+_TRIAL_OPERATIONS = frozenset({"search", "mint", "health", "other"})
+_TRIAL_RESERVATION_BASE_KEYS = frozenset({
+    "allowed", "reservation_id", "claim_status",
+})
+_TRIAL_RESERVATION_KEYS_WITH_SCOPE = (
+    _TRIAL_RESERVATION_BASE_KEYS | {"blocking_scope"}
+)
+_TRIAL_RESERVATION_STATUSES = frozenset({
+    "claimed", "already_reserved", "blocked", "control_disabled",
+})
+_TRIAL_BLOCKING_SCOPES = frozenset({"global", "law_firm"})
 FailureCode = Literal[
     "mint_navigation_failed",
     "mint_deadline_exceeded",
@@ -97,12 +109,14 @@ class ProxyUsageTracker:
         self,
         supabase,
         *,
+        trial_supabase=None,
         enabled: bool,
         component: str = "worker",
         provider: str = "iproyal",
         price_per_gb_usd: float = DEFAULT_PRICE_PER_GB_USD,
     ):
         self._sb = supabase
+        self._trial_sb = trial_supabase
         self._enabled = enabled
         self._component = component
         self._provider = provider
@@ -126,6 +140,219 @@ class ProxyUsageTracker:
         if len(rows) != 1 or rows[0].get("claim_token") != claim_token:
             return None
         return rows[0]
+
+    @staticmethod
+    def _trial_rpc_subject(scope: TrialScope) -> dict[str, str]:
+        return {
+            "p_expected_generation": str(scope.runtime_generation),
+            "p_trial_grant_id": str(scope.trial_grant_id),
+            "p_job_id": str(scope.job_id),
+            "p_import_claim_token": str(scope.claim_token),
+            "p_worker_id": scope.worker_id,
+        }
+
+    @staticmethod
+    def _validate_trial_attribution(
+        scope: TrialScope,
+        *,
+        law_firm_id: str | None,
+        import_job_id: str | None,
+        import_claim_token: str | None,
+        import_worker_id: str | None,
+        case_id: str | None,
+        sync_run_id: str | None,
+        lookup_attempt_id: str | None,
+        movement_id: str | None,
+        operation: str,
+    ) -> None:
+        if (
+            law_firm_id != str(scope.law_firm_id)
+            or import_job_id != str(scope.job_id)
+            or import_claim_token != str(scope.claim_token)
+            or import_worker_id != scope.worker_id
+            or case_id is not None
+            or sync_run_id is not None
+            or lookup_attempt_id is not None
+            or movement_id is not None
+            or operation not in _TRIAL_OPERATIONS
+        ):
+            raise RuntimeError("trial usage attribution mismatch")
+
+    async def _owned_trial_reservation(
+        self,
+        *,
+        scope: TrialScope,
+        idempotency_key: str | None,
+        reservation_claim_token: str,
+        reservation_id: str | None = None,
+    ) -> dict | None:
+        query = (
+            self._sb.from_("pjud_proxy_budget_reservations")
+            .select(
+                "id,claim_token,status,blocking_scope,law_firm_id,trial_grant_id,"
+                "import_job_id,import_claim_token,import_worker_id"
+            )
+            .eq("claim_token", reservation_claim_token)
+            .eq("law_firm_id", str(scope.law_firm_id))
+            .eq("trial_grant_id", str(scope.trial_grant_id))
+            .eq("import_job_id", str(scope.job_id))
+            .eq("import_claim_token", str(scope.claim_token))
+            .eq("import_worker_id", scope.worker_id)
+        )
+        if idempotency_key is not None:
+            query = query.eq("idempotency_key", idempotency_key)
+        if reservation_id is not None:
+            query = query.eq("id", reservation_id)
+        response = await run_query(query.limit(1))
+        rows = response.data if isinstance(response.data, list) else []
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        expected = {
+            "claim_token": reservation_claim_token,
+            "law_firm_id": str(scope.law_firm_id),
+            "trial_grant_id": str(scope.trial_grant_id),
+            "import_job_id": str(scope.job_id),
+            "import_claim_token": str(scope.claim_token),
+            "import_worker_id": scope.worker_id,
+        }
+        if any(row.get(field) != value for field, value in expected.items()):
+            return None
+        return row
+
+    async def _reserve_trial_budget(
+        self,
+        *,
+        scope: TrialScope,
+        estimated_cost: float,
+        idempotency_key: str,
+        reservation_claim_token: str,
+        operation: str,
+    ) -> dict:
+        if self._trial_sb is None:
+            raise RuntimeError("trial proxy rpc client unavailable")
+        payload = {
+            **self._trial_rpc_subject(scope),
+            "p_estimated_cost_usd": estimated_cost,
+            "p_idempotency_key": idempotency_key,
+            "p_reservation_claim_token": reservation_claim_token,
+            "p_provider": self._provider,
+            "p_operation": operation,
+            "p_price_per_gb_usd": self._price_per_gb_usd,
+        }
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._trial_sb.rpc(
+                        "pjud_proxy_reserve_trial_budget", payload,
+                    )
+                )
+                reservation = response.data
+                if not isinstance(reservation, dict):
+                    raise RuntimeError(
+                        "trial budget reservation returned invalid contract"
+                    )
+                keys = frozenset(reservation)
+                status = reservation.get("claim_status")
+                allowed = reservation.get("allowed")
+                blocking_scope = reservation.get("blocking_scope")
+                if (
+                    keys not in {
+                        _TRIAL_RESERVATION_BASE_KEYS,
+                        _TRIAL_RESERVATION_KEYS_WITH_SCOPE,
+                    }
+                    or type(allowed) is not bool
+                    or status not in _TRIAL_RESERVATION_STATUSES
+                    or (
+                        keys == _TRIAL_RESERVATION_KEYS_WITH_SCOPE
+                        and status != "blocked"
+                        and blocking_scope is not None
+                    )
+                ):
+                    raise RuntimeError(
+                        "trial budget reservation returned invalid contract"
+                    )
+                if status in {"claimed", "already_reserved"}:
+                    try:
+                        uuid.UUID(str(reservation.get("reservation_id")))
+                    except (TypeError, ValueError, AttributeError):
+                        raise RuntimeError(
+                            "trial budget reservation returned invalid contract"
+                        ) from None
+                    if allowed is not True or blocking_scope is not None:
+                        raise RuntimeError(
+                            "trial budget reservation returned invalid contract"
+                        )
+                elif (
+                    allowed is not False
+                    or reservation.get("reservation_id") is not None
+                    or (
+                        status == "blocked"
+                        and (
+                            keys != _TRIAL_RESERVATION_KEYS_WITH_SCOPE
+                            or blocking_scope not in _TRIAL_BLOCKING_SCOPES
+                        )
+                    )
+                    or (
+                        status == "control_disabled"
+                        and blocking_scope is not None
+                    )
+                ):
+                    raise RuntimeError(
+                        "trial budget reservation returned invalid contract"
+                    )
+                if status == "already_reserved":
+                    existing = await self._owned_trial_reservation(
+                        scope=scope,
+                        idempotency_key=idempotency_key,
+                        reservation_claim_token=reservation_claim_token,
+                        reservation_id=str(reservation["reservation_id"]),
+                    )
+                    if (
+                        existing is not None
+                        and existing.get("id")
+                        == reservation.get("reservation_id")
+                        and existing.get("status") == "reserved"
+                    ):
+                        return {
+                            **reservation,
+                            "allowed": True,
+                            "claim_status": "recovered_reserved",
+                            "blocking_scope": existing.get("blocking_scope"),
+                        }
+                    raise RuntimeError(
+                        "trial budget reservation ownership was not recovered"
+                    )
+                return reservation
+            except (httpx.TransportError, APIError) as exc:
+                if (
+                    isinstance(exc, APIError)
+                    and not _is_transient_telemetry_api_error(exc)
+                ):
+                    raise
+                try:
+                    existing = await self._owned_trial_reservation(
+                        scope=scope,
+                        idempotency_key=idempotency_key,
+                        reservation_claim_token=reservation_claim_token,
+                    )
+                except (httpx.TransportError, APIError):
+                    existing = None
+                if existing is not None and existing.get("status") in {
+                    "reserved", "blocked",
+                }:
+                    status = existing["status"]
+                    return {
+                        "allowed": status == "reserved",
+                        "reservation_id": existing["id"],
+                        "claim_status": f"recovered_{status}",
+                        "blocking_scope": existing.get("blocking_scope"),
+                    }
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+        raise RuntimeError("unreachable trial reservation retry state")
 
     async def _validate_import_job_scope(
         self,
@@ -208,6 +435,110 @@ class ProxyUsageTracker:
                 raise RuntimeError(
                     "usage ledger insert outcome could not be reconciled"
                 )
+            await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+
+    async def _persist_trial_usage_event(
+        self,
+        *,
+        scope: TrialScope,
+        reservation_id: str,
+        reservation_claim_token: str,
+        payload: dict,
+    ) -> None:
+        if self._trial_sb is None:
+            raise RuntimeError("trial proxy rpc client unavailable")
+        rpc_payload = {
+            **self._trial_rpc_subject(scope),
+            "p_reservation_id": reservation_id,
+            "p_reservation_claim_token": reservation_claim_token,
+            "p_payload": payload,
+        }
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            try:
+                response = await run_query(
+                    self._trial_sb.rpc(
+                        "pjud_proxy_record_trial_usage", rpc_payload,
+                    )
+                )
+                uuid.UUID(str(response.data))
+                return
+            except (httpx.TransportError, APIError) as exc:
+                if (
+                    isinstance(exc, APIError)
+                    and not _is_transient_telemetry_api_error(exc)
+                ):
+                    raise
+                try:
+                    if await self._existing_usage_event(payload) is not None:
+                        return
+                except (httpx.TransportError, APIError):
+                    pass
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
+
+    async def _finalize_trial(
+        self,
+        *,
+        scope: TrialScope,
+        reservation_id: str,
+        reservation_claim_token: str,
+        release: bool,
+        operation: str,
+    ) -> None:
+        if self._trial_sb is None:
+            raise RuntimeError("trial proxy rpc client unavailable")
+        payload = {
+            **self._trial_rpc_subject(scope),
+            "p_reservation_id": reservation_id,
+            "p_reservation_claim_token": reservation_claim_token,
+            "p_release": release,
+        }
+        expected_status = "released" if release else "finalized"
+        attempts = len(_TELEMETRY_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            failure: Exception | None = None
+            try:
+                response = await run_query(
+                    self._trial_sb.rpc(
+                        "pjud_proxy_finalize_trial_budget_reservation",
+                        payload,
+                    )
+                )
+                if response.data is True:
+                    return
+                failure = RuntimeError(
+                    "trial budget finalization was not confirmed"
+                )
+            except (httpx.TransportError, APIError) as exc:
+                if (
+                    isinstance(exc, APIError)
+                    and not _is_transient_telemetry_api_error(exc)
+                ):
+                    raise
+                failure = exc
+            try:
+                existing = await self._owned_trial_reservation(
+                    scope=scope,
+                    idempotency_key=None,
+                    reservation_claim_token=reservation_claim_token,
+                    reservation_id=reservation_id,
+                )
+            except (httpx.TransportError, APIError):
+                existing = None
+            if existing is not None and existing.get("id") == reservation_id:
+                status = existing.get("status")
+                if status == expected_status:
+                    return
+                if status not in {"reserved", "unresolved"}:
+                    raise RuntimeError(
+                        "trial budget finalization reached unexpected state"
+                    ) from failure
+            if attempt == attempts - 1:
+                raise RuntimeError(
+                    "trial budget finalization outcome could not be reconciled"
+                ) from failure
             await asyncio.sleep(_TELEMETRY_RETRY_DELAYS_S[attempt])
 
     async def _reserve_budget(
@@ -431,6 +762,7 @@ class ProxyUsageTracker:
         session_cycle_id: uuid.UUID | None = None,
         session_reason: SessionReason | None = None,
         session_age_seconds: int | None = None,
+        trial_scope: TrialScope | None = None,
     ):
         (
             normalized_session_cycle_id,
@@ -447,6 +779,10 @@ class ProxyUsageTracker:
         case_id = case_id or inherited["case_id"]
         sync_run_id = sync_run_id or inherited["sync_run_id"]
         lookup_attempt_id = lookup_attempt_id or inherited["lookup_attempt_id"]
+        if trial_scope is not None and not isinstance(trial_scope, TrialScope):
+            raise ProxyUsagePersistenceError("invalid trial usage scope")
+        if trial_scope is not None and not self._enabled:
+            raise ProxyUsagePersistenceError("trial proxy usage is disabled")
         if not self._enabled:
             with capture_proxy_usage() as usage:
                 usage.cause_operation = cause_operation
@@ -467,14 +803,35 @@ class ProxyUsageTracker:
         estimated_cost = estimate / 1_000_000_000 * self._price_per_gb_usd
 
         try:
-            if self._component == "api" and sync_run_id is not None:
+            if trial_scope is not None:
+                self._validate_trial_attribution(
+                    trial_scope,
+                    law_firm_id=law_firm_id,
+                    import_job_id=import_job_id,
+                    import_claim_token=import_claim_token,
+                    import_worker_id=import_worker_id,
+                    case_id=case_id,
+                    sync_run_id=sync_run_id,
+                    lookup_attempt_id=lookup_attempt_id,
+                    movement_id=movement_id,
+                    operation=operation,
+                )
+            if (
+                trial_scope is None
+                and self._component == "api"
+                and sync_run_id is not None
+            ):
                 await self._validate_sync_scope(
                     sync_run_id=sync_run_id,
                     case_id=case_id,
                     law_firm_id=law_firm_id,
                     operation=operation,
                 )
-            if self._component == "api" and lookup_attempt_id is not None:
+            if (
+                trial_scope is None
+                and self._component == "api"
+                and lookup_attempt_id is not None
+            ):
                 if case_id is not None or sync_run_id is not None:
                     raise RuntimeError("lookup attribution subject is not exclusive")
                 await self._validate_lookup_scope(
@@ -483,7 +840,10 @@ class ProxyUsageTracker:
                     operation=operation,
                 )
             import_subject = (import_job_id, import_claim_token, import_worker_id)
-            if any(value is not None for value in import_subject):
+            if (
+                trial_scope is None
+                and any(value is not None for value in import_subject)
+            ):
                 if not all(isinstance(value, str) and value for value in import_subject):
                     raise RuntimeError("incomplete import job usage attribution")
                 if case_id is not None or sync_run_id is not None or lookup_attempt_id is not None:
@@ -494,14 +854,23 @@ class ProxyUsageTracker:
                     import_claim_token=cast(str, import_claim_token),
                     import_worker_id=cast(str, import_worker_id),
                 )
-            reservation = await self._reserve_budget(
-                case_id=case_id,
-                law_firm_id=law_firm_id,
-                estimated_cost=estimated_cost,
-                idempotency_key=idempotency_key,
-                claim_token=claim_token,
-                operation=operation,
-            )
+            if trial_scope is not None:
+                reservation = await self._reserve_trial_budget(
+                    scope=trial_scope,
+                    estimated_cost=estimated_cost,
+                    idempotency_key=idempotency_key,
+                    reservation_claim_token=claim_token,
+                    operation=operation,
+                )
+            else:
+                reservation = await self._reserve_budget(
+                    case_id=case_id,
+                    law_firm_id=law_firm_id,
+                    estimated_cost=estimated_cost,
+                    idempotency_key=idempotency_key,
+                    claim_token=claim_token,
+                    operation=operation,
+                )
         except Exception as exc:
             raise ProxyUsagePersistenceError(
                 "proxy budget reservation unavailable"
@@ -538,6 +907,7 @@ class ProxyUsageTracker:
                         session_cycle_id=normalized_session_cycle_id,
                         session_reason=normalized_session_reason,
                         session_age_seconds=normalized_session_age_seconds,
+                        trial_scope=trial_scope,
                     )
                 except Exception as exc:
                     if caught is not None:
@@ -566,13 +936,26 @@ class ProxyUsageTracker:
         session_cycle_id: str | None,
         session_reason: SessionReason | None,
         session_age_seconds: int | None,
+        trial_scope: TrialScope | None,
     ) -> None:
         has_provider_usage = usage.request_count > 0
         has_savings_event = usage.documents_skipped > 0
         if not has_provider_usage and not has_savings_event:
-            await self._finalize(
-                reservation_id, claim_token, release=True, operation=operation,
-            )
+            if trial_scope is not None:
+                await self._finalize_trial(
+                    scope=trial_scope,
+                    reservation_id=reservation_id,
+                    reservation_claim_token=claim_token,
+                    release=True,
+                    operation=operation,
+                )
+            else:
+                await self._finalize(
+                    reservation_id,
+                    claim_token,
+                    release=True,
+                    operation=operation,
+                )
             return
 
         if error is not None:
@@ -632,13 +1015,23 @@ class ProxyUsageTracker:
         # events must remain insertable while production lacks this new column.
         if import_job_id is not None:
             payload["import_job_id"] = import_job_id
+        if trial_scope is not None:
+            payload["trial_grant_id"] = str(trial_scope.trial_grant_id)
         if session_cycle_id is not None:
             payload.update({
                 "session_cycle_id": session_cycle_id,
                 "session_reason": session_reason,
                 "session_age_seconds": session_age_seconds,
             })
-        await self._persist_usage_event(payload)
+        if trial_scope is not None:
+            await self._persist_trial_usage_event(
+                scope=trial_scope,
+                reservation_id=reservation_id,
+                reservation_claim_token=claim_token,
+                payload=payload,
+            )
+        else:
+            await self._persist_usage_event(payload)
 
         # The append-only causal fact already exists once INSERT succeeds. A
         # later reservation-finalize outage must not attribute the same marker
@@ -649,12 +1042,21 @@ class ProxyUsageTracker:
             and usage.cause_session_id is not None
         )
 
-        await self._finalize(
-            reservation_id,
-            claim_token,
-            release=not has_provider_usage,
-            operation=operation,
-        )
+        if trial_scope is not None:
+            await self._finalize_trial(
+                scope=trial_scope,
+                reservation_id=reservation_id,
+                reservation_claim_token=claim_token,
+                release=not has_provider_usage,
+                operation=operation,
+            )
+        else:
+            await self._finalize(
+                reservation_id,
+                claim_token,
+                release=not has_provider_usage,
+                operation=operation,
+            )
 
     async def _finalize(
         self,
