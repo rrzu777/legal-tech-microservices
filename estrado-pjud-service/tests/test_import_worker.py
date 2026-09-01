@@ -1586,6 +1586,9 @@ async def test_trial_import_credential_relay_adds_only_exact_capability_and_gran
             "X-Pjud-Import-Job-Id": JOB["job_id"],
             "X-Pjud-Import-Claim-Token": JOB["claim_token"],
             "X-Pjud-Import-Worker-Id": "import-worker",
+            "X-Pjud-Import-Credential-Updated-At": (
+                "2026-08-23T12:00:00+00:00"
+            ),
             "x-pjud-runtime-trial-capability": TRIAL_CAPABILITY,
             "X-Pjud-Runtime-Trial-Grant-Id": TRIAL_GRANT_ID,
         },

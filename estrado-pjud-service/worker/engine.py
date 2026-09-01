@@ -1567,6 +1567,9 @@ class SyncEngine:
                 "X-Pjud-Import-Job-Id": job_id,
                 "X-Pjud-Import-Claim-Token": claim_token,
                 "X-Pjud-Import-Worker-Id": worker_id,
+                "X-Pjud-Import-Credential-Updated-At": (
+                    trial_scope.expected_credentials_updated_at.isoformat()
+                ),
                 PJUD_RUNTIME_TRIAL_CAPABILITY_HEADER: (
                     trial_scope.capability.get_secret_value()
                 ),
