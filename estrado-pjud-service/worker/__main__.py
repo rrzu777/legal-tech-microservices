@@ -12,7 +12,7 @@ from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
 from app.runtime_fence import PjudRuntimeError, RuntimeFence
-from worker.config import WorkerConfig
+from worker.config import WorkerConfig, validate_import_trial_mode
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
 from worker.scheduler import (
@@ -488,11 +488,53 @@ async def claim_process_release_batch(
     return batch
 
 
+async def import_trial_runtime_error(
+    runtime_fence: RuntimeFence | None,
+) -> PjudRuntimeError | None:
+    """Return an expected runtime denial so maintenance can close cleanly."""
+    try:
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
+    except PjudRuntimeError as error:
+        return error
+    return None
+
+
+async def initialize_import_trial_attempt(
+    pool, proxy_control, backoff, runtime_fence: RuntimeFence | None,
+) -> Exception | None:
+    """One admitted, finite import-only initialization attempt."""
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    snapshot = await refresh_proxy_gate(proxy_control, backoff)
+    if not snapshot.allowed:
+        return RuntimeError("pjud_import_trial_proxy_denied")
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    await pool.initialize(prewarm=False)
+    return None
+
+
+async def process_import_trial_once(
+    engine, runtime_fence: RuntimeFence | None,
+) -> bool | PjudRuntimeError:
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    return await engine.process_import_job()
+
+
 async def main():
     config = WorkerConfig()
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
     process_outside_office_hours = (
         config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+    )
+    configured_session_capacity = (
+        config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+    )
+    import_trial_once = validate_import_trial_mode(
+        config, configured_session_capacity,
     )
     if validation_once:
         # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
@@ -562,6 +604,17 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
+            if import_trial_once:
+                trial_error = await maintenance.run(
+                    lambda: initialize_import_trial_attempt(
+                        pool, proxy_control, backoff, runtime_fence,
+                    )
+                )
+                if trial_error is not None:
+                    raise trial_error
+                initialized = True
+                break
+
             try:
                 outcome = await maintenance.run(lambda: initialize_worker_attempt(
                     pool, scheduler, metrics, backoff, proxy_control, config,
@@ -628,6 +681,19 @@ async def main():
             proxy_control=proxy_control,
             proxy_usage=proxy_usage,
         )
+        if import_trial_once:
+            metrics.set_status("running")
+            notify_status("running")
+            processed = await maintenance.run(
+                lambda: process_import_trial_once(engine, runtime_fence)
+            )
+            if isinstance(processed, PjudRuntimeError):
+                raise processed
+            if not processed:
+                raise RuntimeError("pjud_import_trial_no_eligible_job")
+            logger.info("Import trial processed exactly one eligible job")
+            return
+
         logger.info("Worker ready, entering main loop")
         metrics.set_status("running")
         notify_status("running")

@@ -26,6 +26,24 @@ async def run_query(query):
     return await asyncio.to_thread(query.execute)
 
 
+def validate_import_trial_mode(config, session_capacity: int) -> bool:
+    """Validate the finite import-only mode before startup has side effects."""
+    trial_once = config.PJUD_IMPORT_TRIAL_ONCE is True
+    if not trial_once:
+        return False
+    if config.PJUD_OFF_HOURS_VALIDATION_ONCE is True:
+        raise ValueError("pjud_import_trial_incompatible_validation_once")
+    if config.ENABLE_PJUD_MY_CAUSES_IMPORT is not True:
+        raise ValueError("pjud_import_trial_requires_imports")
+    if (
+        isinstance(session_capacity, bool)
+        or not isinstance(session_capacity, int)
+        or session_capacity < 2
+    ):
+        raise ValueError("pjud_import_trial_requires_capacity")
+    return True
+
+
 class WorkerConfig(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
@@ -56,6 +74,7 @@ class WorkerConfig(BaseSettings):
     # mint-storms). Configurable por env para tunear throughput sin redeploy.
     BLOCK_PAUSE_S: int = 30
     PJUD_OFF_HOURS_VALIDATION_ONCE: bool = False
+    PJUD_IMPORT_TRIAL_ONCE: bool = False
     # Override operacional temporal para una marcha blanca continua. El valor
     # por defecto conserva estrictamente la ventana hábil.
     PJUD_PROCESS_OUTSIDE_OFFICE_HOURS: bool = False
@@ -124,6 +143,17 @@ class WorkerConfig(BaseSettings):
             return value == "true"
         raise ValueError("pjud_my_causes_import_flag_must_be_literal")
 
+    @field_validator("PJUD_IMPORT_TRIAL_ONCE", mode="before")
+    @classmethod
+    def _literal_import_trial_flag(cls, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and not value.strip():
+            return False
+        if isinstance(value, str) and value in {"true", "false"}:
+            return value == "true"
+        raise ValueError("pjud_import_trial_once_flag_must_be_literal")
+
     @property
     def session_hard_effective_age_s(self) -> int:
         sticky_ceiling = (
@@ -147,6 +177,14 @@ class WorkerConfig(BaseSettings):
             )
         if rollout_started_at is not None and rollout_started_at.tzinfo is None:
             raise ValueError("SESSION_REUSE_ROLLOUT_STARTED_AT must be timezone-aware")
+        return self
+
+    @model_validator(mode="after")
+    def _valid_import_trial_mode(self):
+        session_capacity = (
+            self.OJV_PROXY_POOL_SIZE if self.OJV_PROXY_URL else self.POOL_SIZE
+        )
+        validate_import_trial_mode(self, session_capacity)
         return self
 
     @field_validator("MINT_TRAFFIC_BUDGET_S")
