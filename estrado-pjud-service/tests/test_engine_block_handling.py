@@ -7,7 +7,7 @@ def _make_engine(pool):
     return SyncEngine(
         pool=pool, supabase=MagicMock(), notifier=MagicMock(),
         metrics=MagicMock(), backoff=MagicMock(),
-        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+        config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
     )
 
 

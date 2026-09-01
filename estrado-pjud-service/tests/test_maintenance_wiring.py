@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+from tests.helpers import legacy_runtime_fence
 from worker.config import run_query
 from worker.maintenance_store import AdmissionClosed, MaintenanceError
 
@@ -205,6 +206,7 @@ async def test_case_error_swallowed_by_batch_marks_unsafe(worker_maintenance):
     engine = SimpleNamespace(sync_case=AsyncMock(side_effect=RuntimeError("unknown case outcome")))
     await worker_maintenance.run(lambda: process_batch(
         [{"id": "fake"}], engine, 1, asyncio.Event(), MagicMock(is_open=False),
+        runtime_fence=legacy_runtime_fence(),
         processing_window=lambda: True,
     ))
     hold(worker_maintenance)
@@ -331,7 +333,7 @@ async def test_import_hold_during_claim_owns_finalize_and_capacity_release(worke
         return True
     running = asyncio.create_task(run_import_discovery_loop(
         SimpleNamespace(process_import_job=process_import_job), MagicMock(), shutdown,
-        poll_interval=0.001, maintenance=worker,
+        runtime_fence=legacy_runtime_fence(), poll_interval=0.001, maintenance=worker,
     ))
     try:
         await asyncio.wait_for(started.wait(), 1)
@@ -366,7 +368,9 @@ async def test_process_batch_parent_cancellation_joins_case_cleanup(worker_maint
             cleaned.set()
     async def operation():
         await process_batch([{"id": "one"}], SimpleNamespace(sync_case=sync_case), 1,
-                            asyncio.Event(), MagicMock(is_open=False), processing_window=lambda: True)
+                            asyncio.Event(), MagicMock(is_open=False),
+                            runtime_fence=legacy_runtime_fence(),
+                            processing_window=lambda: True)
     running = asyncio.create_task(worker.run(operation))
     try:
         await started.wait()

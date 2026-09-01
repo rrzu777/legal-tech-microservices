@@ -14,6 +14,7 @@ from app.ojv.session import OjvSession
 from worker.__main__ import safe_initialize_pool
 from worker.import_jobs import ImportDiscoveryWorker
 from worker.maintenance_store import AdmissionClosed
+from tests.helpers import legacy_runtime_fence
 from tests.test_maintenance_wiring import hold, assert_held, assert_quiescent
 from tests.test_minter import _FakeContext, _FakeBrowser
 from tests.test_ojv_browser_login import _Page, _Context, _Browser
@@ -65,7 +66,9 @@ def consumer(monkeypatch, kind, phase, exit_mode):
         runtime = Runtime(browser, phase, exit_mode)
         monkeypatch.setattr("app.minter.async_playwright", lambda: runtime)
         pool = SimpleNamespace(initialize=CookieMinter("https://example.invalid").mint)
-        return runtime, lambda: safe_initialize_pool(pool, max_retries=1)
+        return runtime, lambda: safe_initialize_pool(
+            pool, max_retries=1, runtime_fence=legacy_runtime_fence(),
+        )
 
     page = _Page()
     # A business result absorbed by the actual import consumer, after cleanup.

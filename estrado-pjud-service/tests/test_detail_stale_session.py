@@ -68,7 +68,7 @@ async def test_worker_no_penaliza_causa_y_descarta_slot_rechazado():
         notifier=AsyncMock(),
         metrics=MagicMock(),
         backoff=MagicMock(),
-        config=MagicMock(OJV_TIMEOUT_S=25, R2_ENABLED=False),
+        config=MagicMock(PJUD_RUNTIME_GENERATION=None, OJV_TIMEOUT_S=25, R2_ENABLED=False),
     )
 
     with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \

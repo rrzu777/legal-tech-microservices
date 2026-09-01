@@ -49,7 +49,10 @@ async def test_http_post_body_and_tenant_are_exact(monkeypatch):
                               else {"ok": True, "status": "invalid", "outcome": "invalidated"})
     real_client = httpx.AsyncClient
     monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    client = mod.SyncCredentialClient(rpc_client([]), SimpleNamespace(VERCEL_APP_URL="https://app.test", INTERNAL_CREDENTIALS_API_KEY="k"))
+    from tests.helpers import GENERATION_A, GENERATION_B
+    config = SimpleNamespace(VERCEL_APP_URL="https://app.test", INTERNAL_CREDENTIALS_API_KEY="k", PJUD_RUNTIME_GENERATION=GENERATION_A)
+    client = mod.SyncCredentialClient(rpc_client([]), config)
+    config.PJUD_RUNTIME_GENERATION = GENERATION_B
     claim = mod.SyncCredentialClaim.model_validate(CLAIM)
     cred = await client.decrypt(claim)
     assert await client.invalidate(claim, cred.credential_version) == "invalidated"
@@ -59,6 +62,7 @@ async def test_http_post_body_and_tenant_are_exact(monkeypatch):
     for request in seen:
         assert request.headers["Authorization"] == "Bearer k"
         assert request.headers["X-Law-Firm-Id"] == CLAIM["law_firm_id"]
+        assert request.headers["x-pjud-runtime-generation"] == GENERATION_A
         assert CLAIM["claim_token"] not in str(request.url)
 
 

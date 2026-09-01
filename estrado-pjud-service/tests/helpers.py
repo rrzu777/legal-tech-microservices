@@ -3,6 +3,53 @@
 from unittest.mock import MagicMock
 
 
+GENERATION_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+GENERATION_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+def runtime_control(*, generation=None, paused=False):
+    return {
+        "protocol_version": 1, "revision": 1,
+        "admission_paused": paused, "generation_required": generation is not None,
+        "generation": generation,
+        "sealed_at": "2026-08-31T12:00:00+00:00" if generation else None,
+        "bindings": dict.fromkeys(
+            ("micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha"), "a" * 40,
+        ) if generation else None,
+    }
+
+
+class RuntimeControlDB:
+    """Explicit in-memory read-only control RPC; never a global admission mock."""
+    def __init__(self, control=None):
+        self.control = runtime_control() if control is None else control
+        self.calls = []
+        self.error = None
+
+    def rpc(self, name, args):
+        assert name == "get_pjud_runtime_control"
+        assert args == {}
+        self.calls.append((name, args))
+        return self
+
+    def execute(self):
+        from copy import deepcopy
+        from types import SimpleNamespace
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(data=deepcopy(self.control))
+
+
+def legacy_runtime_fence():
+    from app.runtime_fence import RuntimeFence
+    return RuntimeFence(RuntimeControlDB(), None)
+
+
+def install_runtime_control(app):
+    app.state.pjud_runtime_fence = legacy_runtime_fence()
+    return app
+
+
 def cookie_values(cookies) -> dict[str, str]:
     if isinstance(cookies, dict):
         return dict(cookies)

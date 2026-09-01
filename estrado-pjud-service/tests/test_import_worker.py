@@ -707,6 +707,7 @@ async def test_engine_import_poll_does_not_use_paid_sync_batch_semaphore():
 
     import_worker = SimpleNamespace(process_next=AsyncMock(return_value=False))
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._import_worker = import_worker
 
     assert await engine.process_import_job() is False
@@ -759,6 +760,7 @@ async def test_import_completion_log_is_aggregate_only(caplog):
 
 @pytest.mark.asyncio
 async def test_import_poll_loop_is_independent_and_shutdown_cancels_inflight_work():
+    from tests.helpers import legacy_runtime_fence
     from worker.__main__ import run_import_discovery_loop
 
     shutdown = asyncio.Event()
@@ -775,7 +777,7 @@ async def test_import_poll_loop_is_independent_and_shutdown_cancels_inflight_wor
     engine = SimpleNamespace(process_import_job=AsyncMock(side_effect=process))
     metrics = SimpleNamespace(record_error=MagicMock())
     loop = asyncio.create_task(
-        run_import_discovery_loop(engine, metrics, shutdown, poll_interval=0.001),
+        run_import_discovery_loop(engine, metrics, shutdown, runtime_fence=legacy_runtime_fence(), poll_interval=0.001),
     )
     await entered.wait()
     shutdown.set()
@@ -819,6 +821,7 @@ async def test_import_credential_url_has_one_path_separator(monkeypatch, base_ur
         transport=httpx.MockTransport(respond), **kw,
     ))
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._config = SimpleNamespace(VERCEL_APP_URL=base_url, INTERNAL_CREDENTIALS_API_KEY="test-only")
     result = await engine._get_import_credential(
         JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"], JOB["claim_token"], "import-worker",
@@ -846,6 +849,7 @@ async def test_import_credential_never_follows_redirect_with_internal_key(monkey
         transport=httpx.MockTransport(respond), **kw,
     ))
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._config = SimpleNamespace(VERCEL_APP_URL="https://app.test", INTERNAL_CREDENTIALS_API_KEY="test-only")
     with pytest.raises(ImportCredentialInfrastructureError):
         await engine._get_import_credential(
@@ -860,6 +864,7 @@ async def test_import_credential_fetch_treats_internal_outage_as_retryable():
     from worker.engine import ImportCredentialInfrastructureError, SyncEngine
 
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._call_app_internal = AsyncMock(return_value=None)
 
     with pytest.raises(ImportCredentialInfrastructureError):
@@ -874,6 +879,7 @@ async def test_import_credential_fetch_keeps_terminal_not_found_distinct():
     from worker.engine import SyncEngine
 
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._call_app_internal = AsyncMock(
         return_value=SimpleNamespace(status_code=404, json=lambda: {"error": "not found"}),
     )
@@ -895,6 +901,7 @@ async def test_import_credential_fetch_retries_malformed_200_contract(payload):
     from worker.engine import ImportCredentialInfrastructureError, SyncEngine
 
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._call_app_internal = AsyncMock(
         return_value=SimpleNamespace(status_code=200, json=lambda: payload),
     )
@@ -911,6 +918,7 @@ async def test_import_credential_fetch_uses_import_specific_claim_boundary():
     from worker.engine import SyncEngine
 
     engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {}
     engine._call_app_internal = AsyncMock(
         return_value=SimpleNamespace(status_code=404, json=lambda: {"error": "closed"}),
     )

@@ -14,6 +14,7 @@ from pydantic import (
 )
 
 from worker.config import run_query
+from app.runtime_fence import runtime_generation_headers
 
 _UUID = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 ClaimUUID = Annotated[str, Field(pattern=_UUID)]
@@ -83,6 +84,7 @@ class SyncCredentialClient:
     def __init__(self, supabase, config=None):
         self._sb = supabase
         self._config = config
+        self._runtime_headers = runtime_generation_headers(getattr(config, "PJUD_RUNTIME_GENERATION", None))
 
     @staticmethod
     def _args(claim: SyncCredentialClaim, version: str | None) -> dict:
@@ -122,7 +124,7 @@ class SyncCredentialClient:
             async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
                 response = await client.post(
                     f"{url.rstrip('/')}/api/internal/credentials/{claim.credential_id}/{operation}",
-                    headers={"Authorization": f"Bearer {key}", "X-Law-Firm-Id": claim.law_firm_id},
+                    headers={**self._runtime_headers, "Authorization": f"Bearer {key}", "X-Law-Firm-Id": claim.law_firm_id},
                     json=body,
                 )
             data = response.json()

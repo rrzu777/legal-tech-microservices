@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests.helpers import RuntimeControlDB, legacy_runtime_fence
+
 from worker.__main__ import (
     safe_initialize_pool,
     can_initialize_paid_pool,
@@ -105,7 +107,9 @@ async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatc
 
 def _entrypoint_config(*, validation_once=False):
     config = MagicMock()
+    config.PJUD_RUNTIME_GENERATION = None
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = validation_once
+    config.PJUD_IMPORT_TRIAL_ONCE = False
     config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = False
     config.OJV_PROXY_URL = "http://proxy.invalid"
     config.OJV_PROXY_POOL_SIZE = 3
@@ -126,10 +130,115 @@ def _entrypoint_config(*, validation_once=False):
     return config
 
 
-def _patch_entrypoint(monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff):
+def _patch_import_trial_entrypoint(
+    monkeypatch,
+    worker_main,
+    *,
+    result=True,
+    runtime_error=None,
+    proxy_allowed=True,
+):
+    from worker.maintenance import has_active_operation
+    from worker.proxy_control import ProxyControlSnapshot
+
+    config = _entrypoint_config()
+    config.PJUD_IMPORT_TRIAL_ONCE = True
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = True
+    scheduler = AsyncMock()
+    async def initialize_pool(**_kwargs):
+        assert has_active_operation()
+
+    pool = MagicMock(
+        initialize=AsyncMock(side_effect=initialize_pool), close_all=AsyncMock(),
+    )
+    metrics = MagicMock(stop=AsyncMock())
+    backoff = MagicMock(is_open=False)
+    _patch_entrypoint(
+        monkeypatch,
+        worker_main,
+        config=config,
+        scheduler=scheduler,
+        pool=pool,
+        metrics=metrics,
+        backoff=backoff,
+    )
+    async def require_runtime():
+        assert has_active_operation()
+        if runtime_error is not None:
+            raise runtime_error
+
+    runtime_fence = MagicMock(require=AsyncMock(side_effect=require_runtime))
+    monkeypatch.setattr(worker_main, "RuntimeFence", lambda *_a, **_k: runtime_fence)
+    async def read_proxy_gate(*_args):
+        assert has_active_operation()
+        return ProxyControlSnapshot(
+            allowed=proxy_allowed,
+            status="enabled" if proxy_allowed else "paused",
+            reason_code=None if proxy_allowed else "operator_pause",
+            revision=7,
+            source="database",
+        )
+
+    proxy_gate = AsyncMock(side_effect=read_proxy_gate)
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", proxy_gate)
+    monkeypatch.setattr(
+        worker_main,
+        "can_initialize_paid_pool",
+        MagicMock(side_effect=AssertionError("trial must not select scheduled prewarm")),
+    )
+    reconcile = AsyncMock(side_effect=AssertionError("trial must not reconcile scheduled work"))
+    monkeypatch.setattr(worker_main, "safe_reconcile_stale_runs", reconcile)
+    contract_check = AsyncMock(side_effect=AssertionError("trial must not verify scheduled claims"))
+    monkeypatch.setattr(worker_main, "scheduler_contract_ready", contract_check)
+    import_loop = MagicMock(side_effect=AssertionError("trial must not start a background import loop"))
+    monkeypatch.setattr(worker_main, "run_import_discovery_loop", import_loop)
+    process_cases = AsyncMock(side_effect=AssertionError("trial must not process scheduled cases"))
+    monkeypatch.setattr(worker_main, "process_batch", process_cases)
+    bandwidth_alert = AsyncMock(side_effect=AssertionError("trial must not emit bandwidth alerts"))
+    monkeypatch.setattr(worker_main, "maybe_alert_bandwidth", bandwidth_alert)
+    ops_alert = AsyncMock(side_effect=AssertionError("trial must not emit scheduled ops alerts"))
+    monkeypatch.setattr(worker_main, "send_ops_alert", ops_alert)
+    retry_wait = AsyncMock(side_effect=AssertionError("trial must not retry"))
+    monkeypatch.setattr(worker_main, "wait_before_retry", retry_wait)
+    async def process_import_job():
+        assert has_active_operation()
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    engine = MagicMock(
+        process_import_job=AsyncMock(side_effect=process_import_job),
+        drain_work=AsyncMock(),
+    )
+    engine_factory = MagicMock(return_value=engine)
+    monkeypatch.setattr(worker_main, "SyncEngine", engine_factory)
+    return {
+        "config": config,
+        "scheduler": scheduler,
+        "pool": pool,
+        "metrics": metrics,
+        "backoff": backoff,
+        "runtime_fence": runtime_fence,
+        "proxy_gate": proxy_gate,
+        "reconcile": reconcile,
+        "contract_check": contract_check,
+        "import_loop": import_loop,
+        "process_cases": process_cases,
+        "bandwidth_alert": bandwidth_alert,
+        "ops_alert": ops_alert,
+        "retry_wait": retry_wait,
+        "engine": engine,
+        "engine_factory": engine_factory,
+    }
+
+
+def _patch_entrypoint(
+    monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff,
+    maintenance=None,
+):
     monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
     monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
-    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: MagicMock())
+    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: RuntimeControlDB())
     monkeypatch.setattr(worker_main, "ProxyUsageTracker", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "ProxyControl", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "SessionPool", lambda *_a, **_k: pool)
@@ -141,6 +250,203 @@ def _patch_entrypoint(monkeypatch, worker_main, *, config, scheduler, pool, metr
     monkeypatch.setattr(worker_main, "notify_ready", lambda: None)
     monkeypatch.setattr(worker_main, "notify_status", lambda *_a: None)
     monkeypatch.setattr(worker_main, "notify_stopping", lambda: None)
+    if maintenance is not None:
+        monkeypatch.setattr(
+            worker_main.MaintenanceStore, "production", lambda: maintenance.store,
+        )
+        monkeypatch.setattr(
+            worker_main.ProcessIdentity, "current", lambda: maintenance.identity,
+        )
+        monkeypatch.setattr(
+            worker_main, "WorkerMaintenance", lambda _store, _identity: maintenance,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid", "error_code"),
+    [
+        ("imports_disabled", "pjud_import_trial_requires_imports"),
+        ("insufficient_capacity", "pjud_import_trial_requires_capacity"),
+        ("validation_once", "pjud_import_trial_incompatible_validation_once"),
+    ],
+)
+async def test_import_trial_rejects_invalid_modes_before_readiness_or_effects(
+    monkeypatch, invalid, error_code,
+):
+    """Catch an invalid trial reaching setup, readiness, DB, pool or alerts."""
+    from worker import __main__ as worker_main
+
+    config = _entrypoint_config(validation_once=invalid == "validation_once")
+    config.PJUD_IMPORT_TRIAL_ONCE = True
+    config.ENABLE_PJUD_MY_CAUSES_IMPORT = invalid != "imports_disabled"
+    config.OJV_PROXY_POOL_SIZE = 1 if invalid == "insufficient_capacity" else 3
+    setup_logging = MagicMock()
+    create_supabase = MagicMock(
+        side_effect=AssertionError("invalid trial reached Supabase construction"),
+    )
+    notify_ready = MagicMock()
+    send_ops_alert = AsyncMock()
+    monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
+    monkeypatch.setattr(worker_main, "setup_logging", setup_logging)
+    monkeypatch.setattr(worker_main, "create_supabase", create_supabase)
+    monkeypatch.setattr(worker_main, "notify_ready", notify_ready)
+    monkeypatch.setattr(worker_main, "send_ops_alert", send_ops_alert)
+
+    with pytest.raises(ValueError, match=error_code):
+        await worker_main.main()
+
+    setup_logging.assert_not_called()
+    create_supabase.assert_not_called()
+    notify_ready.assert_not_called()
+    send_ops_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_trial_maintenance_hold_fails_finitely_without_effects(
+    monkeypatch, worker_maintenance,
+):
+    from worker import __main__ as worker_main
+    from worker.maintenance_store import MaintenanceError
+    from tests.test_maintenance_wiring import hold
+
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main)
+    hold(worker_maintenance)
+
+    with pytest.raises(MaintenanceError):
+        await worker_main.main()
+
+    state["runtime_fence"].require.assert_not_awaited()
+    state["proxy_gate"].assert_not_awaited()
+    state["pool"].initialize.assert_not_awaited()
+    state["engine_factory"].assert_not_called()
+    state["retry_wait"].assert_not_awaited()
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_error",
+    [
+        pytest.param("pjud_admission_paused", id="paused"),
+        pytest.param("pjud_runtime_generation_mismatch", id="generation-mismatch"),
+        pytest.param("pjud_runtime_unavailable", id="unavailable"),
+    ],
+)
+async def test_import_trial_runtime_rejection_fails_without_work(monkeypatch, runtime_error):
+    """Catch a denied generation being retried or crossing into any work path."""
+    from app.runtime_fence import PjudRuntimeError
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        runtime_error=PjudRuntimeError(runtime_error),
+    )
+
+    with pytest.raises(PjudRuntimeError, match=runtime_error):
+        await worker_main.main()
+
+    state["runtime_fence"].require.assert_awaited_once_with()
+    state["reconcile"].assert_not_awaited()
+    state["scheduler"].reconcile_stale_runs.assert_not_awaited()
+    state["scheduler"].get_next_batch.assert_not_awaited()
+    state["pool"].initialize.assert_not_awaited()
+    state["engine_factory"].assert_not_called()
+    state["retry_wait"].assert_not_awaited()
+    state["ops_alert"].assert_not_awaited()
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_import_trial_proxy_denial_is_finite_and_does_not_mint(monkeypatch):
+    """Catch the one-shot bypassing the existing persistent proxy gate."""
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        proxy_allowed=False,
+    )
+
+    with pytest.raises(RuntimeError, match="pjud_import_trial_proxy_denied"):
+        await worker_main.main()
+
+    state["runtime_fence"].require.assert_awaited_once_with()
+    state["proxy_gate"].assert_awaited_once()
+    state["reconcile"].assert_not_awaited()
+    state["pool"].initialize.assert_not_awaited()
+    state["engine_factory"].assert_not_called()
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_import_trial_processes_exactly_one_job_without_scheduled_work(monkeypatch):
+    """Catch a second poll, background loop or scheduled-case path in trial mode."""
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=True)
+
+    await worker_main.main()
+
+    assert state["runtime_fence"].require.await_count == 3
+    state["proxy_gate"].assert_awaited_once()
+    state["pool"].initialize.assert_awaited_once_with(prewarm=False)
+    state["engine"].process_import_job.assert_awaited_once_with()
+    state["reconcile"].assert_not_awaited()
+    state["contract_check"].assert_not_awaited()
+    state["scheduler"].reconcile_stale_runs.assert_not_awaited()
+    state["scheduler"].verify_claim_contract.assert_not_awaited()
+    state["scheduler"].get_next_batch.assert_not_awaited()
+    state["import_loop"].assert_not_called()
+    state["process_cases"].assert_not_awaited()
+    state["bandwidth_alert"].assert_not_awaited()
+    state["ops_alert"].assert_not_awaited()
+    state["engine"].stop_accepting_work.assert_called_once_with()
+    state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_import_trial_empty_queue_is_a_visible_failure_with_cleanup(monkeypatch):
+    """Catch an empty eligible queue being reported as a successful verification."""
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=False)
+
+    with pytest.raises(RuntimeError, match="pjud_import_trial_no_eligible_job"):
+        await worker_main.main()
+
+    state["engine"].process_import_job.assert_awaited_once_with()
+    state["retry_wait"].assert_not_awaited()
+    state["metrics"].record_error.assert_not_called()
+    state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_import_trial_processing_error_propagates_without_retry_or_relabel(monkeypatch):
+    """Catch a failed import being swallowed, retried or relabeled as case telemetry."""
+    from worker import __main__ as worker_main
+
+    failure = LookupError("synthetic import failure")
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=failure)
+
+    with pytest.raises(LookupError, match="synthetic import failure"):
+        await worker_main.main()
+
+    state["engine"].process_import_job.assert_awaited_once_with()
+    state["retry_wait"].assert_not_awaited()
+    state["metrics"].record_error.assert_not_called()
+    state["ops_alert"].assert_not_awaited()
+    state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
 
 
 def test_paid_pool_initialization_only_during_office_window():
@@ -182,7 +488,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
         handlers[worker_main.signal.SIGTERM](worker_main.signal.SIGTERM, None)
 
     engine.sync_case = AsyncMock(side_effect=sync_case)
-    scheduler.get_next_batch.return_value = [{"id": "scheduled-case"}]
+    scheduler.get_next_batch.return_value = [{"id": "scheduled-case", "sync_claim_token": "synthetic-token"}]
 
     async def process_import():
         if not reopen:
@@ -195,7 +501,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
 
     if reopen:
         scheduler.get_next_batch.assert_awaited_once()
-        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case"})
+        engine.sync_case.assert_awaited_once_with({"id": "scheduled-case", "sync_claim_token": "synthetic-token"})
     else:
         engine.process_import_job.assert_awaited_once()
         scheduler.get_next_batch.assert_not_awaited()
@@ -245,11 +551,13 @@ async def test_main_holds_complete_operation_at_each_effect_boundary(monkeypatch
         await phase("contract")
     async def initialize():
         await phase("initialize")
+    claim_row = {"id": "case", "sync_claim_token": "synthetic-token"}
+
     async def claim():
         await phase("batch_claim")
-        return [{"id": "case"}]
-    async def release(ids):
-        assert ids == ["case"]
+        return [claim_row]
+    async def release(claims):
+        assert claims == [{"case_id": "case", "claim_token": "synthetic-token"}]
         await phase("batch_release")
     async def sync(case):
         await phase("sync_case")
@@ -454,7 +762,10 @@ async def test_outside_hours_main_loop_still_invokes_bounded_reconciliation(monk
     monkeypatch.setattr(worker_main, "safe_initialize_pool", initialize_pool)
     monkeypatch.setattr(worker_main, "is_processing_allowed", MagicMock(return_value=False))
 
+    real_wait_for = asyncio.wait_for
     async def stop_after_office_gate(awaitable, *, timeout):
+        if timeout == 5.0:
+            return await real_wait_for(awaitable, timeout=timeout)
         awaitable.close()
         raise RuntimeError("stop after outside-hours loop")
 
@@ -542,7 +853,7 @@ async def test_safe_initialize_retries_then_returns_false_no_crash(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is False
     assert pool.initialize.await_count == 3
     assert len(slept) == 2  # backed off between attempts, not after the last one
@@ -558,7 +869,7 @@ async def test_safe_initialize_succeeds_first_try(monkeypatch):
         slept.append(s)
 
     monkeypatch.setattr("worker.__main__.asyncio.sleep", fake_sleep)
-    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1)
+    ok = await safe_initialize_pool(pool, max_retries=3, base_delay=1, runtime_fence=legacy_runtime_fence())
     assert ok is True
     assert pool.initialize.await_count == 1
     assert slept == []
@@ -578,6 +889,7 @@ async def test_safe_initialize_402_trips_control_and_never_retries(monkeypatch):
         base_delay=1,
         proxy_control=control,
         backoff=backoff,
+        runtime_fence=legacy_runtime_fence(),
     )
 
     assert ok is False

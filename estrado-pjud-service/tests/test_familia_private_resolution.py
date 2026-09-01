@@ -143,8 +143,9 @@ def test_http_validation_never_echoes_private_input(monkeypatch, payload):
     monkeypatch.setenv("ENABLE_PJUD_PRIVATE_FAMILIA", "true")
     get_settings.cache_clear()
     from app.main import create_app
+    from tests.helpers import install_runtime_control
 
-    response = TestClient(create_app()).post(
+    response = TestClient(install_runtime_control(create_app())).post(
         "/api/v1/familia/resolve-private",
         headers={"Authorization": "Bearer synthetic-api-key"},
         json=payload,

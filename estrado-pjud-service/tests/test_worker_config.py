@@ -1,3 +1,19 @@
+import pytest
+
+
+@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+def test_runtime_generation_rejects_noncanonical_identity(value):
+    from worker.config import WorkerConfig
+    with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
+        WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=value, _env_file=None)
+
+
+def test_runtime_generation_legacy_blank_and_explicit_identity():
+    from worker.config import WorkerConfig
+    config = WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=" ", _env_file=None)
+    assert config.PJUD_RUNTIME_GENERATION is None
+
+
 class TestWorkerConfig:
     def test_loads_from_env(self, monkeypatch):
         monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
@@ -26,6 +42,7 @@ class TestWorkerConfig:
         assert config.POOL_SIZE == 1
         assert config.BATCH_SIZE == 10
         assert config.PJUD_OFF_HOURS_VALIDATION_ONCE is False
+        assert config.PJUD_IMPORT_TRIAL_ONCE is False
         assert config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is False
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
@@ -48,9 +65,77 @@ class TestWorkerConfig:
 
         assert WorkerConfig(_env_file=None).PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
 
-    def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
-        import pytest
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("", False), ("false", False), ("true", True), (False, False), (True, True)],
+    )
+    def test_import_trial_once_uses_a_blank_safe_literal_boolean(self, value, expected):
+        """Catch permissive truthy parsing or a blank deployment value enabling traffic."""
+        from worker.config import WorkerConfig
 
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            PJUD_IMPORT_TRIAL_ONCE=value,
+            ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+            POOL_SIZE=2,
+            _env_file=None,
+        )
+
+        assert config.PJUD_IMPORT_TRIAL_ONCE is expected
+
+    @pytest.mark.parametrize("value", ["TRUE", "False", "1", "yes", 1])
+    def test_import_trial_once_rejects_nonliteral_values(self, value):
+        """Catch a typo or permissive coercion silently selecting the production trial."""
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match="pjud_import_trial_once_flag_must_be_literal"):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                PJUD_IMPORT_TRIAL_ONCE=value,
+                ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+                POOL_SIZE=2,
+                _env_file=None,
+            )
+
+    @pytest.mark.parametrize(
+        ("settings", "error_code"),
+        [
+            (
+                {"ENABLE_PJUD_MY_CAUSES_IMPORT": False, "POOL_SIZE": 2},
+                "pjud_import_trial_requires_imports",
+            ),
+            (
+                {"ENABLE_PJUD_MY_CAUSES_IMPORT": True, "POOL_SIZE": 1},
+                "pjud_import_trial_requires_capacity",
+            ),
+            (
+                {
+                    "ENABLE_PJUD_MY_CAUSES_IMPORT": True,
+                    "POOL_SIZE": 2,
+                    "PJUD_OFF_HOURS_VALIDATION_ONCE": True,
+                },
+                "pjud_import_trial_incompatible_validation_once",
+            ),
+        ],
+    )
+    def test_import_trial_once_rejects_invalid_config_combinations(
+        self, settings, error_code,
+    ):
+        """Catch an impossible one-shot combination before entrypoint startup."""
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match=error_code):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                PJUD_IMPORT_TRIAL_ONCE=True,
+                _env_file=None,
+                **settings,
+            )
+
+    def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
         from worker.config import WorkerConfig
 
         with pytest.raises(ValueError, match="SESSION_REUSE_ROLLOUT_STARTED_AT"):

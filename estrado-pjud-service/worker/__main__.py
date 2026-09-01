@@ -11,7 +11,8 @@ from app.bandwidth import METER
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.logging_redaction import install_secret_redaction
-from worker.config import WorkerConfig
+from app.runtime_fence import PjudRuntimeError, RuntimeFence
+from worker.config import WorkerConfig, validate_import_trial_mode
 from worker.supabase_client import create_supabase
 from worker.session_pool import SessionPool
 from worker.scheduler import (
@@ -30,6 +31,7 @@ from worker.maintenance import WorkerMaintenance, has_active_operation, mark_unc
 from worker.maintenance_store import MaintenanceError, MaintenanceStore, ProcessIdentity
 
 logger = logging.getLogger("worker")
+_RUNTIME_REJECTED = object()
 
 
 class JsonFormatter(logging.Formatter):
@@ -62,6 +64,8 @@ async def process_batch(
     proxy_control: ProxyControl | None = None,
     processing_window=is_scheduled_processing_window,
     shutdown_grace_seconds: float = 30.0,
+    *,
+    runtime_fence: RuntimeFence | None,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
@@ -74,6 +78,8 @@ async def process_batch(
 
     async def _run_one(case):
         async with sem:
+            if not await runtime_admitted(runtime_fence, getattr(engine, "_metrics", None)):
+                return
             # Un lote reclamado al final de la jornada puede seguir esperando
             # el semáforo después de las 18:00. No iniciar tráfico nuevo cuando
             # finalmente obtiene un slot; next_sync_at queda vencido para la
@@ -176,11 +182,14 @@ async def maybe_alert_bandwidth(config, state: "BandwidthAlertState", now: float
 
 async def safe_initialize_pool(
     pool, max_retries: int = 5, base_delay: int = 10,
-    proxy_control=None, backoff=None,
+    proxy_control=None, backoff=None, runtime_fence: RuntimeFence | None = None,
 ) -> bool:
     """Inicializa el pool con backoff; devuelve False si falla tras los reintentos,
     sin crashear (evita el crash-loop de systemd martillando PJUD)."""
     for attempt in range(1, max_retries + 1):
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
         try:
             await pool.initialize()
             return True
@@ -279,6 +288,7 @@ async def run_import_discovery_loop(
     metrics,
     shutdown_event: asyncio.Event,
     *,
+    runtime_fence: RuntimeFence | None,
     poll_interval: float = 5.0,
     traffic_allowed=lambda: True,
     maintenance: WorkerMaintenance | None = None,
@@ -288,17 +298,43 @@ async def run_import_discovery_loop(
         if traffic_allowed():
             try:
                 processed = (
-                    await maintenance.run(lambda: safe_process_import_job(engine, metrics))
-                    if maintenance is not None else await safe_process_import_job(engine, metrics)
+                    await maintenance.run(
+                        lambda: runtime_guarded_import(runtime_fence, engine, metrics)
+                    )
+                    if maintenance is not None
+                    else await runtime_guarded_import(runtime_fence, engine, metrics)
                 )
             except MaintenanceError:
                 processed = False
             if processed:
                 continue
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
-        except asyncio.TimeoutError:
-            pass
+        await wait_before_retry(shutdown_event, poll_interval, validation_once=False)
+
+
+async def runtime_guarded_import(
+    runtime_fence: RuntimeFence | None, engine, metrics,
+) -> bool:
+    if not await runtime_admitted(runtime_fence, metrics):
+        return False
+    return await safe_process_import_job(engine, metrics)
+
+
+async def runtime_admitted(runtime_fence: RuntimeFence | None, metrics) -> bool:
+    """A local denial is infrastructure state, never a case failure or ops alert."""
+    try:
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
+        return True
+    except PjudRuntimeError as error:
+        report_runtime_rejection(error, metrics)
+        return False
+
+
+def report_runtime_rejection(error: PjudRuntimeError, metrics) -> None:
+    if metrics is not None:
+        metrics.set_status("backoff" if error.code == "pjud_runtime_unavailable" else "paused")
+    notify_status(error.code)
 
 
 def public_sync_concurrency(session_capacity: int, *, imports_enabled: bool) -> int:
@@ -377,10 +413,13 @@ async def watch_maintenance(
 async def initialize_worker_attempt(
     pool, scheduler, metrics, backoff, proxy_control, config, *,
     validation_once: bool, process_outside_office_hours: bool, imports_enabled: bool,
+    runtime_fence: RuntimeFence | None,
 ) -> str:
     """One bounded startup operation; idle/retry waits belong outside admission."""
     # Only reached after admission. A forbidden initializer must not refresh
     # proxy control merely to manufacture an idle heartbeat on closed startup.
+    if not await runtime_admitted(runtime_fence, metrics):
+        return "runtime_rejected"
     metrics.initialization_started = True
     if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
         return "reconcile_unavailable"
@@ -397,18 +436,29 @@ async def initialize_worker_attempt(
         return "contract_unavailable"
     if not prewarm:
         # Manual imports still claim/authorize before lazy paid checkout.
+        if not await runtime_admitted(runtime_fence, metrics):
+            return "runtime_rejected"
         await pool.initialize(prewarm=False)
         return "ready"
     metrics.set_status("starting")
     notify_status("initializing proxy pool")
-    initialized = await safe_initialize_pool(
-        pool, max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
-        proxy_control=proxy_control, backoff=backoff,
-    )
+    try:
+        initialized = await safe_initialize_pool(
+            pool, max_retries=1 if validation_once else config.MINT_MAX_RETRIES,
+            proxy_control=proxy_control, backoff=backoff,
+            runtime_fence=runtime_fence,
+        )
+    except PjudRuntimeError as error:
+        report_runtime_rejection(error, metrics)
+        return "runtime_rejected"
     return "ready" if initialized else "mint_failed"
 
 
-async def reconcile_and_refresh(scheduler, metrics, backoff, proxy_control):
+async def reconcile_and_refresh(
+    scheduler, metrics, backoff, proxy_control, runtime_fence: RuntimeFence | None,
+):
+    if not await runtime_admitted(runtime_fence, metrics):
+        return _RUNTIME_REJECTED
     if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
         return None
     return await refresh_proxy_gate(proxy_control, backoff)
@@ -416,18 +466,62 @@ async def reconcile_and_refresh(scheduler, metrics, backoff, proxy_control):
 
 async def claim_process_release_batch(
     scheduler, metrics, backoff, engine, concurrency, shutdown_event, *,
+    runtime_fence: RuntimeFence | None,
     proxy_control=None, processing_window=is_scheduled_processing_window,
 ):
     """The caller admits before claim and retains ownership through release."""
+    if not await runtime_admitted(runtime_fence, metrics):
+        return _RUNTIME_REJECTED
     batch = await safe_get_next_batch(scheduler, metrics, backoff)
     if not batch:
         return batch
+    release_claims = [
+        {"case_id": case["id"], "claim_token": case["sync_claim_token"]}
+        for case in batch
+    ]
     await process_batch(
         batch, engine, concurrency, shutdown_event, backoff,
+        runtime_fence=runtime_fence,
         proxy_control=proxy_control, processing_window=processing_window,
     )
-    await scheduler.release_batch([case["id"] for case in batch])
+    await scheduler.release_batch(release_claims)
     return batch
+
+
+async def import_trial_runtime_error(
+    runtime_fence: RuntimeFence | None,
+) -> PjudRuntimeError | None:
+    """Return an expected runtime denial so maintenance can close cleanly."""
+    try:
+        if runtime_fence is None:
+            raise PjudRuntimeError()
+        await runtime_fence.require()
+    except PjudRuntimeError as error:
+        return error
+    return None
+
+
+async def initialize_import_trial_attempt(
+    pool, proxy_control, backoff, runtime_fence: RuntimeFence | None,
+) -> Exception | None:
+    """One admitted, finite import-only initialization attempt."""
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    snapshot = await refresh_proxy_gate(proxy_control, backoff)
+    if not snapshot.allowed:
+        return RuntimeError("pjud_import_trial_proxy_denied")
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    await pool.initialize(prewarm=False)
+    return None
+
+
+async def process_import_trial_once(
+    engine, runtime_fence: RuntimeFence | None,
+) -> bool | PjudRuntimeError:
+    if error := await import_trial_runtime_error(runtime_fence):
+        return error
+    return await engine.process_import_job()
 
 
 async def main():
@@ -435,6 +529,12 @@ async def main():
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
     process_outside_office_hours = (
         config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+    )
+    configured_session_capacity = (
+        config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
+    )
+    import_trial_once = validate_import_trial_mode(
+        config, configured_session_capacity,
     )
     if validation_once:
         # Una causa no necesita un pool de tres salidas. Esta mutación sólo vive
@@ -465,6 +565,7 @@ async def main():
     maintenance = WorkerMaintenance(MaintenanceStore.production(), ProcessIdentity.current())
 
     supabase = create_supabase(config)
+    runtime_fence = RuntimeFence(supabase, config.PJUD_RUNTIME_GENERATION)
     proxy_usage = ProxyUsageTracker(
         supabase,
         enabled=bool(config.OJV_PROXY_URL),
@@ -503,12 +604,24 @@ async def main():
     try:
         initialized = False
         while not shutdown_event.is_set() and not initialized:
+            if import_trial_once:
+                trial_error = await maintenance.run(
+                    lambda: initialize_import_trial_attempt(
+                        pool, proxy_control, backoff, runtime_fence,
+                    )
+                )
+                if trial_error is not None:
+                    raise trial_error
+                initialized = True
+                break
+
             try:
                 outcome = await maintenance.run(lambda: initialize_worker_attempt(
                     pool, scheduler, metrics, backoff, proxy_control, config,
                     validation_once=validation_once,
                     process_outside_office_hours=process_outside_office_hours,
                     imports_enabled=imports_enabled,
+                    runtime_fence=runtime_fence,
                 ))
             except MaintenanceError:
                 metrics.set_status("paused")
@@ -519,6 +632,13 @@ async def main():
             if outcome == "ready":
                 initialized = True
                 break
+
+            if outcome == "runtime_rejected":
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
+                continue
 
             if outcome != "mint_failed":
                 status, message = {
@@ -561,6 +681,19 @@ async def main():
             proxy_control=proxy_control,
             proxy_usage=proxy_usage,
         )
+        if import_trial_once:
+            metrics.set_status("running")
+            notify_status("running")
+            processed = await maintenance.run(
+                lambda: process_import_trial_once(engine, runtime_fence)
+            )
+            if isinstance(processed, PjudRuntimeError):
+                raise processed
+            if not processed:
+                raise RuntimeError("pjud_import_trial_no_eligible_job")
+            logger.info("Import trial processed exactly one eligible job")
+            return
+
         logger.info("Worker ready, entering main loop")
         metrics.set_status("running")
         notify_status("running")
@@ -571,6 +704,7 @@ async def main():
                     engine,
                     metrics,
                     shutdown_event,
+                    runtime_fence=runtime_fence,
                     traffic_allowed=lambda: not backoff.is_open,
                     maintenance=maintenance,
                 ),
@@ -591,12 +725,18 @@ async def main():
         while not shutdown_event.is_set():
             try:
                 snapshot = await maintenance.run(lambda: reconcile_and_refresh(
-                    scheduler, metrics, backoff, proxy_control,
+                    scheduler, metrics, backoff, proxy_control, runtime_fence,
                 ))
             except MaintenanceError:
                 metrics.set_status("paused")
                 notify_status("maintenance admission closed")
                 await wait_before_retry(shutdown_event, 1, validation_once=False)
+                continue
+            if snapshot is _RUNTIME_REJECTED:
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
             if snapshot is None:
                 metrics.set_status("backoff")
@@ -655,6 +795,7 @@ async def main():
             try:
                 batch = await maintenance.run(lambda: claim_process_release_batch(
                     scheduler, metrics, backoff, engine, concurrency, shutdown_event,
+                    runtime_fence=runtime_fence,
                     proxy_control=proxy_control,
                     processing_window=lambda: is_processing_allowed(
                         validation_once=validation_once,
@@ -665,6 +806,13 @@ async def main():
                 metrics.set_status("paused")
                 notify_status("maintenance admission closed")
                 await wait_before_retry(shutdown_event, 1, validation_once=False)
+                continue
+
+            if batch is _RUNTIME_REJECTED:
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
                 continue
 
             if batch is None:
