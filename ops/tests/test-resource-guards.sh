@@ -90,6 +90,7 @@ setup() {
     "$FAKE/etc/sysctl.d" "$FAKE/etc/caddy" "$FAKE/etc/logrotate.d" \
     "$FAKE/monitoring" "$FAKE/backups" "$STATE" "$BIN"
   chmod 700 "$FAKE/backups"
+  cp "$ROOT/ops/bootstrap-worker-maintenance.py" "$FAKE/repo/ops/bootstrap-worker-maintenance.py"
   : > "$EVENTS"
   : > "$CASE_DIR/null"
   printf '%s\n' "$EXPECTED_SHA" > "$STATE/git-sha"
@@ -794,6 +795,14 @@ if [ -n "$config" ]; then
     safe) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
     safe-historical-mint) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":7}}]' > "$output" ;;
     safe-new) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:02:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
+    maintenance-safe|maintenance-safe-new)
+      maintenance_identity=$(cat "$RG_TEST_STATE/maintenance-identity")
+      maintenance_timestamp=2026-08-22T00:00:00Z
+      [ "$heartbeat_state" = maintenance-safe ] \
+        || maintenance_timestamp=2026-08-22T00:02:00Z
+      printf '[{"status":"paused","last_heartbeat_at":"%s","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0,"maintenance":{"version":1,"operation_id":"64a8eb10-2d55-457f-924c-23d5a532c847","identity":"%s","state":"quiescent","inflight":0,"startup_blocked":true}}}]' \
+        "$maintenance_timestamp" "$maintenance_identity" > "$output"
+      ;;
     safe-subsecond) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00.100000Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
     safe-new-subsecond) printf '[{"status":"idle_off_hours","last_heartbeat_at":"2026-08-22T00:00:00.900000Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
     starting-new) printf '[{"status":"starting","last_heartbeat_at":"2026-08-22T00:01:00Z","metadata":{"process_outside_office_hours_enabled":false,"proxy_control_status":"enabled","proxy_control_reason":null,"mint_attempts":0}}]' > "$output" ;;
@@ -2972,6 +2981,60 @@ run_protocol_regressions() {
   TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
   expect_eq 'postflight failure preserves hold' "$(cat "$STATE/maintenance-state")" hold
   expect_exact_count 'failed postflight never attempts release' 'maintenance finish' 0
+
+  setup
+  configure_active_worker
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  printf '%s\n' maintenance-safe-new > "$STATE/heartbeat-post"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847
+  [ "$RC" -eq 0 ] || printf '  adopted diagnostic: %s\n' "$OUT"
+  expect_eq 'adopted hold applies guards' "$RC" 0
+  expect_exact_count 'adopted hold verifies bootstrap once' 'bootstrap verify-adopted' 1
+  expect_exact_count 'adopted hold creates no second maintenance operation' 'maintenance begin' 0
+  expect_before 'adopted bootstrap journal is authenticated before any mutating ACK verifier' \
+    'bootstrap verify-adopted' 'maintenance verify-ack'
+  expect_before 'adopted verification precedes worker mutation' 'bootstrap verify-adopted' \
+    'systemctl stop estrado-pjud-worker.service'
+  expect_before 'adopted apply postflight precedes release' \
+    'systemctl start legaltech-monitor.service legaltech-resource-tracker.service' 'maintenance finish'
+  BACKUP_DIR=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d | head -1)
+  expect_eq 'adopted apply persists the bootstrap operation in backup' \
+    "$(cat "$BACKUP_DIR/maintenance-operation-id")" 64a8eb10-2d55-457f-924c-23d5a532c847
+
+  setup
+  configure_active_worker
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  touch "$STATE/bootstrap-verify-fail"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847
+  expect_eq 'unverified adopted hold is rejected' "$RC" 1
+  expect_count 'unverified adopted hold performs no provision' 'provision ' 0
+  expect_exact_count 'unverified adopted hold never releases' 'maintenance finish' 0
+  expect_eq 'unverified adopted hold stays closed' "$(cat "$STATE/maintenance-state")" hold
+
+  setup
+  configure_active_worker
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  touch "$STATE/bootstrap-journal-drift"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847
+  expect_eq 'pre-existing adopted journal drift is rejected before normalization' "$RC" 1
+  expect_count 'journal drift performs no provision' 'provision ' 0
+  expect_exact_count 'journal drift invokes no mutating ACK verifier' 'maintenance verify-ack' 0
+  expect_eq 'journal drift stays closed' "$(cat "$STATE/maintenance-state")" hold
 }
 
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = maintenance ]; then

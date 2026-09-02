@@ -5,6 +5,23 @@ from pathlib import Path
 import sys
 import uuid
 
+if len(sys.argv) >= 2 and sys.argv[1].endswith("/bootstrap-worker-maintenance.py"):
+    args = sys.argv[2:]
+    root = Path(os.environ["WM_FIXTURE_ROOT"])
+    with (root / "events").open("a") as events:
+        events.write("bootstrap verify-adopted\n")
+    def option(name, default=""):
+        return args[args.index(name) + 1] if name in args else default
+    state = (root / "maintenance-state").read_text().strip()
+    operation = (root / "maintenance-operation").read_text().strip()
+    if ("verify-adopted" not in args or state != "hold"
+            or option("--operation-id") != operation
+            or (root / "bootstrap-verify-fail").exists()
+            or (root / "bootstrap-journal-drift").exists()):
+        raise SystemExit(1)
+    print('{"phase":"adopted","result":"verified"}')
+    raise SystemExit(0)
+
 if len(sys.argv) < 2 or not sys.argv[1].endswith("/worker-maintenance.py"):
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 
@@ -43,6 +60,9 @@ elif command == "begin":
     write("maintenance-operation", option("--operation-id"))
     print(option("--operation-id"))
 elif command == "verify-ack":
+    drift = root / "bootstrap-journal-drift"
+    if drift.exists():
+        drift.unlink()  # Models the real verifier rewriting drained_identity.
     if option("--identity") and option("--identity") != identity:
         raise SystemExit(1)
     if (root / "maintenance-fail-after-initial-drain").exists() and (root / "events").read_text().count("maintenance verify-ack\n") > int(read("maintenance-fail-after-drain-count", "1")):

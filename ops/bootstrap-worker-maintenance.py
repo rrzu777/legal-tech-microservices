@@ -276,7 +276,7 @@ def operator_args(config):
     return SimpleNamespace(root_uid=config.root_uid, root_gid=config.root_gid,
         unit_file=config.systemd_dir / UNITS[1], dropin_file=drop if drop.exists() else None,
         journal_root=config.journal_root, control_dir=config.control_dir, ack_dir=config.ack_dir,
-        proc_root=config.proc_root, systemctl="/usr/bin/systemctl", timeout_seconds=10,
+        proc_root=config.proc_root, systemctl="/usr/bin/systemctl", global_lock=config.global_lock, timeout_seconds=10,
         health_url="http://127.0.0.1:8000/api/v1/health", test_mode=False,
         admission_fd=None, global_fd=None)
 
@@ -343,14 +343,15 @@ def install(config, runner=subprocess.run):
         return dict(operation_id=operation, phase="installed", result="succeeded")
 
 
-def record_read(config, operation):
+def record_read(config, operation, expected_phase="installed"):
     operator.metadata(operator.safe_path(config.bootstrap_root).stat(), config.root_uid, config.root_gid, 0o700, True)
     value = json.loads(file_text(config, config.bootstrap_root / "record.json", 0o600),
                        object_pairs_hook=operator.unique_pairs)
     require(type(value) is dict and set(value) == {
         "version", "operation_id", "expected_sha", "original_hash", "target_hash", "dropin_hash", "phase"})
+    require(expected_phase in ("installed", "adopted"))
     require(type(value["version"]) is int and value["version"] == 1 and value["operation_id"] == operation
-            and value["expected_sha"] == config.expected_sha and value["phase"] == "installed")
+            and value["expected_sha"] == config.expected_sha and value["phase"] == expected_phase)
     original = file_text(config, config.bootstrap_root / "worker-unit.original", 0o600)
     target = target_unit(original)
     require(value["original_hash"] == digest(original) and value["target_hash"] == digest(target))
@@ -396,6 +397,41 @@ def adopt(config, operation, runner=subprocess.run):
         return dict(operation_id=operation, phase="adopted", result="succeeded")
 
 
+def verify_adopted(config, operation, identity_text, global_fd, admission_fd, runner=subprocess.run):
+    """Authenticate the adopted bootstrap while the guards controller owns both EX leases."""
+    require(type(operation) is str and str(uuid.UUID(operation)) == operation)
+    expected = operator.parse_identity(identity_text)
+    require(type(global_fd) is int and global_fd >= 0 and type(admission_fd) is int and admission_fd >= 0)
+    window(config)
+    args = operator_args(config)
+    args.global_fd = global_fd
+    args.admission_fd = admission_fd
+    store = store_for(config)
+    with operator.global_lease(args):
+        exact_tree(config, runner)
+        record = record_read(config, operation, "adopted")
+        first = installed_files(config, runner)
+        operator.validate_unit(args)
+        control = store.read_control()
+        require(control.state == "hold" and control.operation_id == operation)
+        with operator.admission_lease(args, store):
+            identity = operator.current_identity(args, store, expected)
+            acknowledgement = store.read_ack(expected_operation_id=operation, expected_identity=identity)
+            require(acknowledgement.state == "quiescent" and acknowledgement.inflight == 0)
+            journal = operator.journal_read(args, operation)
+            rendered = operator.identity_text(identity)
+            require(journal["result"] == "intended" and journal["initial_identity"] == rendered
+                    and journal["drained_identity"] == rendered)
+            exact_tree(config, runner)
+            require(installed_files(config, runner) == first)
+            require(record_read(config, operation, "adopted") == record)
+            require(store.read_control() == control)
+            operator.current_identity(args, store, identity)
+            acknowledgement = store.read_ack(expected_operation_id=operation, expected_identity=identity)
+            require(acknowledgement.state == "quiescent" and acknowledgement.inflight == 0)
+    return dict(operation_id=operation, phase="adopted", result="verified")
+
+
 def service_values(raw):
     """Fail closed on ambiguous continuations/duplicate protected assignments."""
     require("\x00" not in raw and "\r" not in raw and "\\\n" not in raw)
@@ -432,16 +468,27 @@ def target_unit(original):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("command", choices=("install", "adopt"))
+    result.add_argument("command", choices=("install", "adopt", "verify-adopted"))
     result.add_argument("--expected-sha", required=True)
     result.add_argument("--operation-id")
+    result.add_argument("--identity")
+    result.add_argument("--global-fd", type=int)
+    result.add_argument("--admission-fd", type=int)
     return result
 
 
-def execute(config, command, operation, runner=subprocess.run):
+def execute(config, command, operation, runner=subprocess.run, identity=None, global_fd=None, admission_fd=None):
     try:
-        require(command in ("install", "adopt") and (operation is None if command == "install" else operation is not None))
-        return install(config, runner) if command == "install" else adopt(config, operation, runner)
+        require(command in ("install", "adopt", "verify-adopted")
+                and (operation is None if command == "install" else operation is not None))
+        if command == "install":
+            require(identity is None and global_fd is None and admission_fd is None)
+            return install(config, runner)
+        if command == "adopt":
+            require(identity is None and global_fd is None and admission_fd is None)
+            return adopt(config, operation, runner)
+        require(identity is not None and global_fd is not None and admission_fd is not None)
+        return verify_adopted(config, operation, identity, global_fd, admission_fd, runner)
     except Exception:
         # Report only validated finite recovery hints. Never echo OS/provider data.
         result = dict(operation_id=None, phase="validation", result="blocked")
@@ -466,13 +513,19 @@ def main(argv=None):
     try:
         require(sys.platform == "linux" and os.geteuid() == 0)
         require(re.fullmatch(r"[0-9a-f]{40}", args.expected_sha) is not None)
-        require((args.command == "install" and args.operation_id is None)
+        require((args.command == "install" and args.operation_id is None and args.identity is None
+                 and args.global_fd is None and args.admission_fd is None)
                 or (args.command == "adopt" and type(args.operation_id) is str
-                    and str(uuid.UUID(args.operation_id)) == args.operation_id))
+                    and str(uuid.UUID(args.operation_id)) == args.operation_id and args.identity is None
+                    and args.global_fd is None and args.admission_fd is None)
+                or (args.command == "verify-adopted" and type(args.operation_id) is str
+                    and str(uuid.UUID(args.operation_id)) == args.operation_id and type(args.identity) is str
+                    and args.global_fd is not None and args.admission_fd is not None))
         config = Config(args.expected_sha, worker_uid=pwd.getpwnam("estrado").pw_uid,
                         worker_gid=grp.getgrnam("estrado").gr_gid)
-        result = execute(config, args.command, args.operation_id)
-        status = 0 if result["result"] == "succeeded" else 1
+        result = execute(config, args.command, args.operation_id, identity=args.identity,
+                         global_fd=args.global_fd, admission_fd=args.admission_fd)
+        status = 0 if result["result"] in ("succeeded", "verified") else 1
     except Exception:
         pass
     try:

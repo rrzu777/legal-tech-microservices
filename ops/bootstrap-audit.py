@@ -133,7 +133,7 @@ def load_credentials(config):
             raise Unavailable()
     require(set(values) == ENV_FIELDS)
     require(all(values[flag] in {"true", "false"} for flag in ENV_FLAGS))
-    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", values["WORKER_ID"]) is not None)
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", values["WORKER_ID"]) is not None)
     require(re.fullmatch(r"[A-Za-z0-9_.=-]{1,8192}", values["SUPABASE_SERVICE_KEY"]) is not None)
     url = values["SUPABASE_URL"]
     require(re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/?", url) is not None)
