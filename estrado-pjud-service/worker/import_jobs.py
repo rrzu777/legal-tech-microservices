@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from app.ojv.errors import OjvSessionError
 from app.ojv.budget import OjvLaneBudget
 from app.proxy_billing import ProxyBillingExhaustedError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
+from app.runtime_fence import validate_runtime_generation
 from worker.config import run_query
 from worker.proxy_usage import DISABLED_PROXY_USAGE, ProxyUsageTracker
 from worker.trial_scope import TrialScope
@@ -40,6 +42,22 @@ _MAX_PAYLOAD_BYTES = 1_048_576
 _TRIAL_GRANT_CLOSE_REPLAY_DELAYS_S = (0.1,)
 _TRIAL_DISCOVERY_FINALIZE_REPLAY_DELAYS_S = (0.1,)
 _TRIAL_IMPORT_CLAIM_REPLAY_DELAYS_S = (0.1,)
+_TRIAL_GRANT_CLOSE_FIELDS = frozenset({
+    "status",
+    "job_status",
+    "summary_status",
+    "discovered_count",
+    "candidate_count",
+    "evidence_sha256",
+})
+_TRIAL_JOB_STATUSES = frozenset({
+    "needs_selection",
+    "completed",
+    "partial",
+    "failed",
+})
+_TRIAL_SUMMARY_STATUSES = frozenset({"needs_selection", "partial", "failed"})
+_EVIDENCE_SHA256 = re.compile(r"[0-9a-f]{64}")
 # These failures can lose a committed response. Connect/pool failures are
 # pre-send and do not need an authority-bearing replay.
 _AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS = (
@@ -92,6 +110,87 @@ class ClaimedTrialImportJob(ClaimedImportJob):
 
     trial_grant_id: UUID4
     expected_credentials_updated_at: datetime
+
+
+@dataclass(frozen=True)
+class TrialImportOutcome:
+    """DB-confirmed result after exact finalize and terminal grant close."""
+
+    claimed: bool
+    job_id: str | None
+    job_status: str | None
+    summary_status: str | None
+    discovered_count: int
+    candidate_count: int
+    evidence_sha256: str | None
+
+    @property
+    def successful(self) -> bool:
+        return (
+            self.claimed
+            and self.job_id is not None
+            and self.job_status == "needs_selection"
+            and self.summary_status == "needs_selection"
+            and self.discovered_count == self.candidate_count
+            and self.discovered_count > 0
+            and isinstance(self.evidence_sha256, str)
+            and _EVIDENCE_SHA256.fullmatch(self.evidence_sha256) is not None
+        )
+
+    @classmethod
+    def from_close_proof(
+        cls,
+        raw: Any,
+        *,
+        job_id: str,
+    ) -> TrialImportOutcome:
+        if type(raw) is not dict or set(raw) != _TRIAL_GRANT_CLOSE_FIELDS:
+            raise ValueError("invalid_trial_grant_close_contract")
+        if raw["status"] != "trial_grant_closed":
+            raise ValueError("invalid_trial_grant_close_contract")
+        if (
+            type(raw["job_status"]) is not str
+            or raw["job_status"] not in _TRIAL_JOB_STATUSES
+            or type(raw["summary_status"]) is not str
+            or raw["summary_status"] not in _TRIAL_SUMMARY_STATUSES
+        ):
+            raise ValueError("invalid_trial_grant_close_contract")
+        discovered_count = raw["discovered_count"]
+        candidate_count = raw["candidate_count"]
+        if (
+            type(discovered_count) is not int
+            or discovered_count < 0
+            or type(candidate_count) is not int
+            or candidate_count < 0
+        ):
+            raise ValueError("invalid_trial_grant_close_contract")
+        evidence_sha256 = raw["evidence_sha256"]
+        if (
+            type(evidence_sha256) is not str
+            or _EVIDENCE_SHA256.fullmatch(evidence_sha256) is None
+        ):
+            raise ValueError("invalid_trial_grant_close_contract")
+        return cls(
+            claimed=True,
+            job_id=job_id,
+            job_status=raw["job_status"],
+            summary_status=raw["summary_status"],
+            discovered_count=discovered_count,
+            candidate_count=candidate_count,
+            evidence_sha256=evidence_sha256,
+        )
+
+    @classmethod
+    def empty(cls) -> TrialImportOutcome:
+        return cls(
+            claimed=False,
+            job_id=None,
+            job_status=None,
+            summary_status=None,
+            discovered_count=0,
+            candidate_count=0,
+            evidence_sha256=None,
+        )
 
 
 def _normalize_identity_text(value: str | None) -> str | None:
@@ -300,7 +399,10 @@ class ImportDiscoveryWorker:
             raise RuntimeError(f"{name}_failed")
         return getattr(response, "data", None)
 
-    async def _close_trial_grant(self, scope: TrialScope) -> None:
+    async def _close_trial_grant(
+        self,
+        scope: TrialScope,
+    ) -> TrialImportOutcome:
         payload = {
             "p_expected_generation": str(scope.runtime_generation),
             "p_trial_grant_id": str(scope.trial_grant_id),
@@ -309,7 +411,7 @@ class ImportDiscoveryWorker:
         attempts = len(_TRIAL_GRANT_CLOSE_REPLAY_DELAYS_S) + 1
         for attempt in range(attempts):
             try:
-                closed = await self._trial_rpc(
+                close_proof = await self._trial_rpc(
                     "close_pjud_runtime_trial_grant", payload,
                 )
             except _AMBIGUOUS_TRIAL_GRANT_CLOSE_ERRORS:
@@ -329,9 +431,15 @@ class ImportDiscoveryWorker:
                 raise RuntimeError(
                     "pjud_trial_grant_close_unconfirmed"
                 ) from None
-            if closed is True:
-                return
-            raise RuntimeError("pjud_trial_grant_close_unconfirmed") from None
+            try:
+                return TrialImportOutcome.from_close_proof(
+                    close_proof,
+                    job_id=str(scope.job_id),
+                )
+            except ValueError:
+                raise RuntimeError(
+                    "pjud_trial_grant_close_unconfirmed"
+                ) from None
 
         raise RuntimeError("pjud_trial_grant_close_unconfirmed")
 
@@ -668,20 +776,22 @@ class ImportDiscoveryWorker:
         *,
         capability: SecretStr,
         runtime_generation: str,
-    ) -> bool:
+    ) -> TrialImportOutcome:
         if not self._enabled:
-            return False
+            return TrialImportOutcome.empty()
+        generation = validate_runtime_generation(runtime_generation)
+        if generation is None:
+            raise ValueError("pjud_runtime_invalid_generation")
         async with self._lane_budget.slot():
             claimed = await self._claim_trial(
                 capability=capability,
-                runtime_generation=runtime_generation,
+                runtime_generation=generation,
             )
             if claimed is None:
-                return False
+                return TrialImportOutcome.empty()
             job, scope = claimed
             await self._process_claimed_with_budget(job, scope)
-            await self._close_trial_grant(scope)
-            return True
+            return await self._close_trial_grant(scope)
 
     async def _fetch_and_discover(
         self,

@@ -21,6 +21,7 @@ from worker.scheduler import (
     is_scheduled_processing_window,
 )
 from worker.engine import SyncEngine
+from worker.import_jobs import TrialImportOutcome
 from worker.notifier import Notifier
 from worker.metrics import Metrics
 from worker.backoff import CircuitBreaker
@@ -525,7 +526,7 @@ async def initialize_import_trial_attempt(
 
 async def process_import_trial_once(
     engine, runtime_fence: RuntimeFence | None,
-) -> bool | Exception:
+) -> TrialImportOutcome | Exception:
     if error := await import_trial_runtime_error(runtime_fence):
         return error
     return await engine.process_trial_import_job()
@@ -706,9 +707,21 @@ async def main():
             )
             if isinstance(processed, Exception):
                 raise processed
-            if not processed:
+            if not getattr(processed, "claimed", False):
                 raise RuntimeError("pjud_import_trial_no_eligible_job")
-            logger.info("Import trial processed exactly one eligible job")
+            if not getattr(processed, "successful", False):
+                logger.error(
+                    "Import trial discovery was not successful "
+                    "status=%s summary_status=%s count=%d",
+                    getattr(processed, "job_status", "invalid"),
+                    getattr(processed, "summary_status", "invalid"),
+                    getattr(processed, "discovered_count", 0),
+                )
+                raise RuntimeError("pjud_import_trial_unsuccessful_discovery")
+            logger.info(
+                "Import trial persisted a selectable preview count=%d",
+                processed.discovered_count,
+            )
             return
 
         logger.info("Worker ready, entering main loop")

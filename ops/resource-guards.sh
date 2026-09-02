@@ -559,7 +559,7 @@ load_worker_fence_config() {
     && [ "$worker_count" -eq 1 ] && [ "$outside_count" -eq 1 ] \
     && [ "$validation_count" -le 1 ] && [ "$proxy_count" -le 1 ] \
     && [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ] || return 1
-  [[ "$worker_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]] || return 1
+  [[ "$worker_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$ ]] || return 1
   if [ "$test_mode" = 1 ]; then
     [[ "$SUPABASE_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[^\"[:space:]]*)?$ ]] || return 1
   else

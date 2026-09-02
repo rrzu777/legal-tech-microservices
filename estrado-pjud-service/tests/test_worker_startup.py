@@ -160,7 +160,7 @@ def _patch_import_trial_entrypoint(
     monkeypatch,
     worker_main,
     *,
-    result=True,
+    result=None,
     runtime_error=None,
     proxy_allowed=True,
     admission_paused=True,
@@ -170,6 +170,17 @@ def _patch_import_trial_entrypoint(
     from worker.maintenance import has_active_operation
     from worker.proxy_control import ProxyControlSnapshot
 
+    if result is None:
+        result = SimpleNamespace(
+            claimed=True,
+            successful=True,
+            job_status="needs_selection",
+            summary_status="needs_selection",
+            discovered_count=1,
+            candidate_count=1,
+            evidence_sha256="a" * 64,
+            job_id="98200000-0000-4000-8000-000000000041",
+        )
     config = _entrypoint_config()
     config.PJUD_IMPORT_TRIAL_ONCE = True
     config.PJUD_IMPORT_TRIAL_CAPABILITY = SecretStr("a" * 64)
@@ -465,7 +476,7 @@ async def test_import_trial_processes_exactly_one_job_without_scheduled_work(mon
     """Catch a second poll, background loop or scheduled-case path in trial mode."""
     from worker import __main__ as worker_main
 
-    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=True)
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main)
 
     await worker_main.main()
 
@@ -493,7 +504,7 @@ async def test_import_trial_processes_exactly_one_job_without_scheduled_work(mon
 async def test_import_trial_wires_dedicated_client_and_redacts_raw_capability(monkeypatch):
     from worker import __main__ as worker_main
 
-    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=True)
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main)
     normal_supabase = RuntimeControlDB()
     trial_supabase = MagicMock(name="trial_supabase")
     proxy_usage = MagicMock(name="proxy_usage")
@@ -527,7 +538,20 @@ async def test_import_trial_empty_queue_is_a_visible_failure_with_cleanup(monkey
     """Catch an empty eligible queue being reported as a successful verification."""
     from worker import __main__ as worker_main
 
-    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=False)
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        result=SimpleNamespace(
+            claimed=False,
+            successful=False,
+            job_status=None,
+            summary_status=None,
+            discovered_count=0,
+            candidate_count=0,
+            evidence_sha256=None,
+            job_id=None,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="pjud_import_trial_no_eligible_job"):
         await worker_main.main()
@@ -536,6 +560,49 @@ async def test_import_trial_empty_queue_is_a_visible_failure_with_cleanup(monkey
     state["engine"].process_import_job.assert_not_awaited()
     state["retry_wait"].assert_not_awaited()
     state["metrics"].record_error.assert_not_called()
+    state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_status", "summary_status", "count"),
+    [
+        ("completed", "needs_selection", 0),
+        ("failed", "failed", 0),
+        ("partial", "partial", 1),
+    ],
+)
+async def test_import_trial_unsuccessful_persisted_outcome_exits_nonzero_after_cleanup(
+    monkeypatch, job_status, summary_status, count,
+):
+    """Catch a finalized non-success outcome producing an exit-zero trial."""
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        result=SimpleNamespace(
+            claimed=True,
+            successful=False,
+            job_status=job_status,
+            summary_status=summary_status,
+            discovered_count=count,
+            candidate_count=count,
+            evidence_sha256="a" * 64,
+            job_id="98200000-0000-4000-8000-000000000041",
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^pjud_import_trial_unsuccessful_discovery$",
+    ):
+        await worker_main.main()
+
+    state["engine"].process_trial_import_job.assert_awaited_once_with()
+    state["retry_wait"].assert_not_awaited()
     state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
     state["metrics"].stop.assert_awaited_once_with()
     state["pool"].close_all.assert_awaited_once_with()

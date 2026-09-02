@@ -49,7 +49,7 @@ from app.proxy_cost import (
 from app.r2 import R2Client
 from app.runtime_fence import RUNTIME_GENERATION_HEADER, runtime_generation_headers
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
-from worker.import_jobs import ImportDiscoveryWorker
+from worker.import_jobs import ImportDiscoveryWorker, TrialImportOutcome
 from worker.sync_messages import BlockCause, blocked_error_message
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import (
@@ -765,7 +765,7 @@ class SyncEngine:
         """Poll one discovery job outside the paid public batch semaphore."""
         return await self._import_worker.process_next()
 
-    async def process_trial_import_job(self) -> bool:
+    async def process_trial_import_job(self) -> TrialImportOutcome:
         """Consume exactly one capability-bound trial claim."""
         capability = getattr(
             self._config, "PJUD_IMPORT_TRIAL_CAPABILITY", None,

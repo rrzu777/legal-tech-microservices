@@ -37,11 +37,30 @@ JOB = {
 TRIAL_CAPABILITY = "c" * 64
 TRIAL_GENERATION = "11111111-1111-4111-8111-111111111111"
 TRIAL_GRANT_ID = "98200000-0000-4000-8000-000000000031"
+TRIAL_EVIDENCE_SHA256 = "a" * 64
 TRIAL_JOB = {
     **JOB,
     "trial_grant_id": TRIAL_GRANT_ID,
     "expected_credentials_updated_at": "2026-08-23T12:00:00.000Z",
 }
+
+
+def trial_close_proof(
+    *,
+    job_status="needs_selection",
+    summary_status="needs_selection",
+    discovered_count=1,
+    candidate_count=1,
+    evidence_sha256=TRIAL_EVIDENCE_SHA256,
+):
+    return {
+        "status": "trial_grant_closed",
+        "job_status": job_status,
+        "summary_status": summary_status,
+        "discovered_count": discovered_count,
+        "candidate_count": candidate_count,
+        "evidence_sha256": evidence_sha256,
+    }
 
 
 class Rpc:
@@ -63,7 +82,7 @@ class FakeSupabase:
         self.renew_result = True
         self.credential_valid = True
         self.finalize_trial_results = [None]
-        self.close_results = [True]
+        self.close_results = [trial_close_proof()]
         self.before_close = None
 
     def rpc(self, name, payload):
@@ -310,10 +329,19 @@ async def test_trial_claim_is_exact_and_propagates_one_immutable_scope_everywher
         _session,
     ) = make_trial_worker()
 
-    assert await worker.process_trial_next(
+    outcome = await worker.process_trial_next(
         capability=SecretStr(TRIAL_CAPABILITY),
         runtime_generation=TRIAL_GENERATION,
-    ) is True
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is True
+    assert outcome.job_status == "needs_selection"
+    assert outcome.summary_status == "needs_selection"
+    assert outcome.discovered_count == 1
+    assert outcome.candidate_count == 1
+    assert outcome.evidence_sha256 == TRIAL_EVIDENCE_SHA256
+    assert outcome.job_id == JOB["job_id"]
 
     assert sb.calls[0] == (
         "claim_pjud_trial_import_job",
@@ -420,15 +448,160 @@ async def test_trial_claim_is_exact_and_propagates_one_immutable_scope_everywher
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("discovery", "credential", "job_status", "summary_status", "count"),
+    [
+        (
+            DiscoveryResult(candidates=[], page_count=1, status="ok"),
+            None,
+            "completed",
+            "needs_selection",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="credential_invalid"),
+            AsyncMock(return_value=None),
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="session_expired"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="waf"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="timeout"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(
+                candidates=[candidate()], page_count=1, status="upstream_changed",
+            ),
+            None,
+            "partial",
+            "partial",
+            1,
+        ),
+    ],
+)
+async def test_trial_unsuccessful_discovery_returns_persisted_outcome_after_close(
+    discovery, credential, job_status, summary_status, count,
+):
+    """Catch a terminal discovery failure being relabeled as trial success."""
+    worker, sb, *_ = make_trial_worker(
+        discovery=AsyncMock(return_value=discovery),
+        credential=credential,
+    )
+    sb.close_results = [trial_close_proof(
+        job_status=job_status,
+        summary_status=summary_status,
+        discovered_count=count,
+        candidate_count=count,
+    )]
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is False
+    assert outcome.job_status == job_status
+    assert outcome.summary_status == summary_status
+    assert outcome.discovered_count == count
+    assert outcome.candidate_count == count
+    assert outcome.job_id == JOB["job_id"]
+    assert [name for name, _payload in sb.calls][-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+    assert sum(
+        name == "close_pjud_runtime_trial_grant"
+        for name, _payload in sb.calls
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_candidate_payload_failure_is_persisted_as_failed_and_closed():
+    worker, sb, *_ = make_trial_worker(discovery=AsyncMock(return_value=DiscoveryResult(
+        candidates=[candidate()], page_count=1, status="ok",
+    )))
+    sb.close_results = [trial_close_proof(
+        job_status="failed",
+        summary_status="failed",
+        discovered_count=0,
+        candidate_count=0,
+    )]
+
+    with patch(
+        "worker.import_jobs._candidate_payloads",
+        side_effect=ValueError("synthetic serialization contract failure"),
+    ):
+        outcome = await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    assert outcome.successful is False
+    assert outcome.job_status == "failed"
+    assert outcome.summary_status == "failed"
+    assert outcome.discovered_count == 0
+    assert [name for name, _payload in sb.calls][-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_generation",
+    [
+        "11111111-1111-1111-8111-111111111111",
+        "11111111-1111-4111-7111-111111111111",
+    ],
+)
+async def test_trial_rejects_non_v4_generation_before_first_rpc(runtime_generation):
+    worker, sb, pool, discover, normal_credential, trial_credential, *_ = (
+        make_trial_worker()
+    )
+
+    with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=runtime_generation,
+        )
+
+    assert sb.calls == []
+    normal_credential.assert_not_awaited()
+    trial_credential.assert_not_awaited()
+    pool.acquire_familia_bundle.assert_not_awaited()
+    discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_trial_claim_replays_once_with_the_exact_payload_after_ambiguous_transport():
     worker, sb, pool, discover, _normal, trial_credential, *_ = make_trial_worker()
     sb.trial_claim_results = [httpx.ReadTimeout("response lost"), TRIAL_JOB]
 
     with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
-        assert await worker.process_trial_next(
+        outcome = await worker.process_trial_next(
             capability=SecretStr(TRIAL_CAPABILITY),
             runtime_generation=TRIAL_GENERATION,
-        ) is True
+        )
+        assert outcome.successful is True
 
     claim_calls = [
         entry for entry in sb.calls if entry[0] == "claim_pjud_trial_import_job"
@@ -496,16 +669,34 @@ async def test_trial_close_waits_until_proxy_reservations_are_settled():
 
     sb.before_close = assert_settled_before_close
 
-    assert await worker.process_trial_next(
+    outcome = await worker.process_trial_next(
         capability=SecretStr(TRIAL_CAPABILITY),
         runtime_generation=TRIAL_GENERATION,
-    ) is True
+    )
+    assert outcome.successful is True
     assert proxy_usage.events[-2:] == ["settled", "close"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("close_result", [False, RuntimeError("database detail")])
-async def test_trial_close_false_or_error_is_terminal_and_redacted(close_result):
+@pytest.mark.parametrize(
+    "close_result",
+    [
+        True,
+        False,
+        None,
+        {"status": "trial_grant_closed"},
+        {**trial_close_proof(), "unexpected": "field"},
+        trial_close_proof(job_status="unexpected_status"),
+        trial_close_proof(summary_status="unexpected_status"),
+        trial_close_proof(evidence_sha256="A" * 64),
+        trial_close_proof(discovered_count=True),
+        trial_close_proof(candidate_count=-1),
+        RuntimeError("database detail"),
+    ],
+)
+async def test_trial_close_malformed_contract_or_error_is_terminal_and_redacted(
+    close_result,
+):
     worker, sb, *_ = make_trial_worker()
     sb.close_results = [close_result]
 
@@ -524,18 +715,26 @@ async def test_trial_close_false_or_error_is_terminal_and_redacted(close_result)
         "finalize_pjud_trial_import_discovery",
         "close_pjud_runtime_trial_grant",
     ]
+    assert sum(
+        name == "close_pjud_runtime_trial_grant"
+        for name, _payload in sb.calls
+    ) == 1
 
 
 @pytest.mark.asyncio
 async def test_trial_close_replays_the_exact_rpc_after_ambiguous_transport():
     worker, sb, *_ = make_trial_worker()
-    sb.close_results = [httpx.ReadTimeout("response lost"), True]
+    sb.close_results = [
+        httpx.ReadTimeout("response lost"),
+        trial_close_proof(),
+    ]
 
     with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
-        assert await worker.process_trial_next(
+        outcome = await worker.process_trial_next(
             capability=SecretStr(TRIAL_CAPABILITY),
             runtime_generation=TRIAL_GENERATION,
-        ) is True
+        )
+        assert outcome.successful is True
 
     close_calls = [
         call for call in sb.calls if call[0] == "close_pjud_runtime_trial_grant"
@@ -543,6 +742,50 @@ async def test_trial_close_replays_the_exact_rpc_after_ambiguous_transport():
     assert len(close_calls) == 2
     assert close_calls[0] == close_calls[1]
     assert call(0.1) in sleep.await_args_list
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "close_result",
+    [
+        trial_close_proof(
+            discovered_count=1,
+            candidate_count=2,
+        ),
+        trial_close_proof(
+            job_status="completed",
+            summary_status="needs_selection",
+            discovered_count=0,
+            candidate_count=0,
+        ),
+        trial_close_proof(
+            job_status="partial",
+            summary_status="partial",
+        ),
+        trial_close_proof(
+            job_status="failed",
+            summary_status="failed",
+            discovered_count=0,
+            candidate_count=0,
+        ),
+    ],
+)
+async def test_trial_close_proof_requires_selectable_coherent_evidence_for_success(
+    close_result,
+):
+    worker, sb, *_ = make_trial_worker()
+    sb.close_results = [close_result]
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is False
+    assert outcome.job_status == close_result["job_status"]
+    assert outcome.candidate_count == close_result["candidate_count"]
+    assert outcome.evidence_sha256 == TRIAL_EVIDENCE_SHA256
 
 
 @pytest.mark.asyncio
@@ -595,10 +838,11 @@ async def test_trial_finalize_replays_exact_rpc_after_ambiguous_transport():
     sb.finalize_trial_results = [httpx.ReadTimeout("response lost"), None]
 
     with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
-        assert await worker.process_trial_next(
+        outcome = await worker.process_trial_next(
             capability=SecretStr(TRIAL_CAPABILITY),
             runtime_generation=TRIAL_GENERATION,
-        ) is True
+        )
+        assert outcome.successful is True
 
     finalize_calls = [
         call for call in sb.calls
@@ -657,14 +901,24 @@ async def test_sync_engine_trial_entrypoint_passes_only_validated_secret_and_gen
         PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(TRIAL_CAPABILITY),
         PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
     )
+    expected = SimpleNamespace(
+        claimed=True,
+        successful=True,
+        job_status="needs_selection",
+        summary_status="needs_selection",
+        discovered_count=1,
+        candidate_count=1,
+        evidence_sha256=TRIAL_EVIDENCE_SHA256,
+        job_id=JOB["job_id"],
+    )
     engine._import_worker = MagicMock(
-        process_trial_next=AsyncMock(return_value=True),
+        process_trial_next=AsyncMock(return_value=expected),
         process_next=AsyncMock(
             side_effect=AssertionError("generic claim must not be reachable"),
         ),
     )
 
-    assert await engine.process_trial_import_job() is True
+    assert await engine.process_trial_import_job() is expected
 
     engine._import_worker.process_trial_next.assert_awaited_once_with(
         capability=engine._config.PJUD_IMPORT_TRIAL_CAPABILITY,

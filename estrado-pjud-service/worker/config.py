@@ -13,6 +13,7 @@ from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_pa
 from app.proxy import sticky_lifetime_seconds
 from app.runtime_fence import validate_runtime_generation
 from worker.maintenance import has_active_operation, track_auxiliary
+from worker.trial_scope import validate_worker_id
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
 _TRIAL_CAPABILITY_MARKERS: ContextVar[dict[str, SecretStr] | None] = ContextVar(
@@ -170,6 +171,7 @@ class WorkerConfig(BaseSettings):
     _runtime_generation = field_validator("PJUD_RUNTIME_GENERATION", mode="before")(
         validate_runtime_generation
     )
+    _worker_id = field_validator("WORKER_ID")(validate_worker_id)
 
     def __init__(self, **values):
         registry: dict[str, SecretStr] = {}

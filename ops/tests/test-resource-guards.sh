@@ -1700,7 +1700,7 @@ write_safe_worker_env() {
 }
 
 configure_worker_precondition_scenario() {
-  local scenario=$1 env_file="$FAKE/repo/estrado-pjud-service/.env"
+  local scenario=$1 env_file="$FAKE/repo/estrado-pjud-service/.env" worker_id
   case "$scenario" in
     before-window) printf '%s\n' 19 > "$STATE/local-hour" ;;
     after-window) printf '%s\n' 04 > "$STATE/local-hour" ;;
@@ -1712,6 +1712,12 @@ configure_worker_precondition_scenario() {
     worker-duplicate) printf '%s\n' 'WORKER_ID=worker-2' >> "$env_file" ;;
     worker-empty) /usr/bin/sed 's/^WORKER_ID=.*/WORKER_ID=/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
     worker-invalid) /usr/bin/sed 's/^WORKER_ID=.*/WORKER_ID=worker secret/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
+    worker-oversized)
+      printf -v worker_id '%101s' ''
+      worker_id=${worker_id// /w}
+      /usr/bin/sed "s/^WORKER_ID=.*/WORKER_ID=$worker_id/" "$env_file" > "$env_file.next"
+      /bin/mv "$env_file.next" "$env_file"
+      ;;
     override-missing) /usr/bin/sed '/^PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=/d' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
     override-duplicate) printf '%s\n' 'PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=false' >> "$env_file" ;;
     override-true) /usr/bin/sed 's/^PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=.*/PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=true/' "$env_file" > "$env_file.next"; /bin/mv "$env_file.next" "$env_file" ;;
@@ -1740,6 +1746,7 @@ configure_worker_precondition_scenario() {
     claims-active) printf '%s\n' 1 > "$STATE/claim-count" ;;
     *) return 1 ;;
   esac
+  /bin/chmod 640 "$env_file"
 }
 
 run_worker_post_start_wait_regressions() {
@@ -1768,10 +1775,10 @@ run_worker_post_start_wait_regressions() {
 }
 
 run_worker_fence_regressions() {
-  local scenario rollback_count backup_path
+  local scenario rollback_count backup_path worker_id
   local -a unsafe_scenarios=(
     before-window after-window hour-missing hour-multiline hour-nondecimal hour-producer-fail
-    worker-missing worker-duplicate worker-empty worker-invalid
+    worker-missing worker-duplicate worker-empty worker-invalid worker-oversized
     override-missing override-duplicate override-true override-malformed
     validation-once-true validation-once-duplicate validation-once-malformed
     heartbeat-wrong-worker heartbeat-zero heartbeat-multiple heartbeat-stale heartbeat-future
@@ -1780,6 +1787,19 @@ run_worker_fence_regressions() {
     proxy-paused proxy-unavailable proxy-telemetry heartbeat-producer-fail jq-producer-fail
     claims-producer-fail claims-active
   )
+
+  echo '== worker identity accepts the exact 100-character upper bound'
+  setup
+  configure_active_worker
+  printf -v worker_id '%100s' ''
+  worker_id=${worker_id// /w}
+  /usr/bin/sed "s/^WORKER_ID=.*/WORKER_ID=$worker_id/" \
+    "$FAKE/repo/estrado-pjud-service/.env" > "$FAKE/repo/estrado-pjud-service/.env.next"
+  /bin/mv "$FAKE/repo/estrado-pjud-service/.env.next" "$FAKE/repo/estrado-pjud-service/.env"
+  /bin/chmod 640 "$FAKE/repo/estrado-pjud-service/.env"
+  printf '%s\n' 0 0 0 > "$STATE/claim-sequence"
+  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq '100-character worker identity remains admissible' "$RC" 0
 
   echo '== changed active worker refuses every unsafe fence precondition before stop or provision'
   for scenario in "${unsafe_scenarios[@]}"; do

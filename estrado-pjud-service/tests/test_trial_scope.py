@@ -52,6 +52,15 @@ def test_trial_scope_is_complete_immutable_and_secret_safe():
         ({"capability": SecretStr("c" * 63)}, "invalid_trial_capability"),
         ({"worker_id": ""}, "invalid_trial_worker"),
         ({"worker_id": "worker\nforged"}, "invalid_trial_worker"),
+        ({"worker_id": "w" * 101}, "invalid_trial_worker"),
+        (
+            {"runtime_generation": "11111111-1111-1111-8111-111111111111"},
+            "pjud_runtime_invalid_generation",
+        ),
+        (
+            {"runtime_generation": "11111111-1111-4111-7111-111111111111"},
+            "pjud_runtime_invalid_generation",
+        ),
         ({"job_id": None}, "UUID"),
         (
             {"expected_credentials_updated_at": "2026-08-23T12:00:00"},
@@ -67,3 +76,10 @@ def test_trial_scope_rejects_missing_or_noncanonical_tuple_without_secret_leak(
         _scope(**overrides)
 
     assert CAPABILITY not in str(exc_info.value)
+
+
+def test_trial_scope_accepts_a_one_hundred_character_worker_identity():
+    worker_id = "a" + "._:-" * 24 + "xyz"
+
+    assert len(worker_id) == 100
+    assert _scope(worker_id=worker_id).worker_id == worker_id

@@ -5,7 +5,13 @@ TRIAL_CAPABILITY = "a" * 64
 TRIAL_GENERATION = "11111111-1111-4111-8111-111111111111"
 
 
-@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+@pytest.mark.parametrize("value", [
+    "bad",
+    "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-4aaa-7aaa-aaaaaaaaaaaa",
+])
 def test_runtime_generation_rejects_noncanonical_identity(value):
     from worker.config import WorkerConfig
     with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
@@ -16,6 +22,36 @@ def test_runtime_generation_legacy_blank_and_explicit_identity():
     from worker.config import WorkerConfig
     config = WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=" ", _env_file=None)
     assert config.PJUD_RUNTIME_GENERATION is None
+
+
+@pytest.mark.parametrize(
+    "worker_id",
+    ["", "-worker", "worker id", "worker\nforged", "w" * 101],
+)
+def test_worker_id_rejects_noncanonical_or_oversized_value_before_startup(worker_id):
+    """Catch an invalid RPC identity before any worker boundary can be built."""
+    from worker.config import WorkerConfig
+
+    with pytest.raises(ValueError, match="invalid_trial_worker"):
+        WorkerConfig(
+            SUPABASE_URL="https://db.test",
+            SUPABASE_SERVICE_KEY="synthetic",
+            WORKER_ID=worker_id,
+            _env_file=None,
+        )
+
+
+def test_worker_id_accepts_the_exact_one_to_one_hundred_character_contract():
+    from worker.config import WorkerConfig
+
+    for worker_id in ("a", "a" + "._:-" * 24 + "xyz"):
+        config = WorkerConfig(
+            SUPABASE_URL="https://db.test",
+            SUPABASE_SERVICE_KEY="synthetic",
+            WORKER_ID=worker_id,
+            _env_file=None,
+        )
+        assert config.WORKER_ID == worker_id
 
 
 class TestWorkerConfig:

@@ -408,6 +408,29 @@ def test_malformed_duplicate_or_unsafe_env_blocks(audit_fixture, change):
     assert audit_fixture.run()["ready_for_shutdown_review"] is False
 
 
+def test_worker_identity_accepts_100_characters_and_rejects_101(audit_fixture):
+    valid_worker_id = "w" + "._:-" * 24 + "xyz"
+    assert len(valid_worker_id) == 100
+    original = audit_fixture.env_file.read_text()
+    audit_fixture.env_file.write_text(
+        original.replace("WORKER_ID=worker-test", f"WORKER_ID={valid_worker_id}"),
+    )
+    assert (
+        audit_fixture.module.load_credentials(audit_fixture.config)["WORKER_ID"]
+        == valid_worker_id
+    )
+
+    oversized_worker_id = "w" * 101
+    audit_fixture.env_file.write_text(
+        original.replace(
+            "WORKER_ID=worker-test",
+            f"WORKER_ID={oversized_worker_id}",
+        ),
+    )
+    with pytest.raises(audit_fixture.module.Unavailable):
+        audit_fixture.module.load_credentials(audit_fixture.config)
+
+
 @pytest.mark.parametrize("field,value", [
     ("status", "running"), ("status", "paused"), ("status", SECRET),
     ("last_heartbeat_at", "2026-08-31T01:00:01Z"), ("last_heartbeat_at", "2026-08-31T00:54:59Z"),

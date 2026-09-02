@@ -26,7 +26,16 @@ async def test_old_process_does_not_adopt_new_control_generation():
         fence.generation = GENERATION_B
 
 
-@pytest.mark.parametrize("value", [GENERATION_A.upper(), " " + GENERATION_A, GENERATION_A + " ", "bad", 1, True])
+@pytest.mark.parametrize("value", [
+    GENERATION_A.upper(),
+    " " + GENERATION_A,
+    GENERATION_A + " ",
+    "11111111-1111-1111-8111-111111111111",
+    "11111111-1111-4111-7111-111111111111",
+    "bad",
+    1,
+    True,
+])
 def test_generation_rejects_noncanonical_nonblank(value):
     with pytest.raises(ValueError, match="^pjud_runtime_invalid_generation$"):
         validate_runtime_generation(value)
