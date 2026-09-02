@@ -864,8 +864,6 @@ class SyncEngine:
             })
             .eq("id", case["id"])
             .eq("sync_worker_id", getattr(self._config, "WORKER_ID", "worker-1"))
-            .select("id")
-            .maybe_single()
         )
         publish_response = await run_query(case_update)
         if getattr(publish_response, "error", None) or not getattr(publish_response, "data", None):

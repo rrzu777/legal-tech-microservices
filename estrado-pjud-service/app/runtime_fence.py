@@ -8,6 +8,8 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
 
+from app.supabase_executor import execute_supabase_query
+
 RUNTIME_GENERATION_HEADER = "x-pjud-runtime-generation"
 _UUID4 = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -88,8 +90,9 @@ class RuntimeFence:
         try:
             if self._supabase is None:
                 raise PjudRuntimeError()
+            query = self._supabase.rpc("get_pjud_runtime_control", {})
             response = await asyncio.wait_for(
-                asyncio.to_thread(lambda: self._supabase.rpc("get_pjud_runtime_control", {}).execute()),
+                execute_supabase_query(query),
                 timeout=5.0,
             )
             return PjudRuntimeControl.parse(response.data)

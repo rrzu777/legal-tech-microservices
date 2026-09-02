@@ -1,7 +1,6 @@
 import asyncio
 import re
 import secrets
-from contextvars import copy_context
 from contextvars import ContextVar
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -12,6 +11,7 @@ from pydantic_settings import BaseSettings
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 from app.proxy import sticky_lifetime_seconds
 from app.runtime_fence import validate_runtime_generation
+from app.supabase_executor import submit_supabase_query
 from worker.maintenance import has_active_operation, track_auxiliary
 from worker.trial_scope import validate_worker_id
 
@@ -65,15 +65,13 @@ def _secret_safe_settings_source(source):
 
 
 async def run_query(query):
-    """Run a Supabase query chain in a thread to avoid blocking the event loop."""
+    """Run a serialized Supabase query without blocking the event loop."""
     if has_active_operation():
         # Register the executor's real completion, not a cancellable to_thread
         # wrapper. No await may separate the pre-creation probe and registration.
-        future = asyncio.get_running_loop().run_in_executor(
-            None, copy_context().run, query.execute,
-        )
+        future = submit_supabase_query(query)
         return await track_auxiliary(future)
-    return await asyncio.to_thread(query.execute)
+    return await submit_supabase_query(query)
 
 
 def validate_import_trial_mode(config, session_capacity: int) -> bool:
