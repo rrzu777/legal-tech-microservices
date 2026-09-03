@@ -1,7 +1,10 @@
 import asyncio
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from tests.helpers import RuntimeControlDB, legacy_runtime_fence
 
@@ -15,6 +18,28 @@ from worker.__main__ import (
 )
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+
+def test_logging_redacts_trial_capability_from_message_and_exception(capsys):
+    from worker import __main__ as worker_main
+
+    capability = "a" * 64
+    root = logging.getLogger()
+    prior_handlers, prior_level = list(root.handlers), root.level
+    try:
+        worker_main.setup_logging("INFO", secrets=(capability,))
+        logger = logging.getLogger("worker.trial-redaction-test")
+        logger.error("trial capability=%s", capability)
+        try:
+            raise RuntimeError(capability)
+        except RuntimeError:
+            logger.exception("trial boundary failed")
+        output = capsys.readouterr().out
+    finally:
+        root.handlers = prior_handlers
+        root.setLevel(prior_level)
+    assert capability not in output
+    assert "[REDACTED]" in output
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +135,7 @@ def _entrypoint_config(*, validation_once=False):
     config.PJUD_RUNTIME_GENERATION = None
     config.PJUD_OFF_HOURS_VALIDATION_ONCE = validation_once
     config.PJUD_IMPORT_TRIAL_ONCE = False
+    config.PJUD_IMPORT_TRIAL_CAPABILITY = None
     config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS = False
     config.OJV_PROXY_URL = "http://proxy.invalid"
     config.OJV_PROXY_POOL_SIZE = 3
@@ -134,15 +160,31 @@ def _patch_import_trial_entrypoint(
     monkeypatch,
     worker_main,
     *,
-    result=True,
+    result=None,
     runtime_error=None,
     proxy_allowed=True,
+    admission_paused=True,
+    generation_required=True,
+    snapshot_generation=None,
 ):
     from worker.maintenance import has_active_operation
     from worker.proxy_control import ProxyControlSnapshot
 
+    if result is None:
+        result = SimpleNamespace(
+            claimed=True,
+            successful=True,
+            job_status="needs_selection",
+            summary_status="needs_selection",
+            discovered_count=1,
+            candidate_count=1,
+            evidence_sha256="a" * 64,
+            job_id="98200000-0000-4000-8000-000000000041",
+        )
     config = _entrypoint_config()
     config.PJUD_IMPORT_TRIAL_ONCE = True
+    config.PJUD_IMPORT_TRIAL_CAPABILITY = SecretStr("a" * 64)
+    config.PJUD_RUNTIME_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     config.ENABLE_PJUD_MY_CAUSES_IMPORT = True
     scheduler = AsyncMock()
     async def initialize_pool(**_kwargs):
@@ -162,12 +204,27 @@ def _patch_import_trial_entrypoint(
         metrics=metrics,
         backoff=backoff,
     )
-    async def require_runtime():
+    runtime_snapshot = SimpleNamespace(
+        generation_required=generation_required,
+        generation=(
+            config.PJUD_RUNTIME_GENERATION
+            if snapshot_generation is None
+            else snapshot_generation
+        ),
+        admission_paused=admission_paused,
+    )
+
+    async def require_runtime(*, admission=True):
         assert has_active_operation()
+        assert admission is False
         if runtime_error is not None:
             raise runtime_error
+        return runtime_snapshot
 
-    runtime_fence = MagicMock(require=AsyncMock(side_effect=require_runtime))
+    runtime_fence = MagicMock(
+        generation=config.PJUD_RUNTIME_GENERATION,
+        require=AsyncMock(side_effect=require_runtime),
+    )
     monkeypatch.setattr(worker_main, "RuntimeFence", lambda *_a, **_k: runtime_fence)
     async def read_proxy_gate(*_args):
         assert has_active_operation()
@@ -200,14 +257,17 @@ def _patch_import_trial_entrypoint(
     monkeypatch.setattr(worker_main, "send_ops_alert", ops_alert)
     retry_wait = AsyncMock(side_effect=AssertionError("trial must not retry"))
     monkeypatch.setattr(worker_main, "wait_before_retry", retry_wait)
-    async def process_import_job():
+    async def process_trial_import_job():
         assert has_active_operation()
         if isinstance(result, BaseException):
             raise result
         return result
 
     engine = MagicMock(
-        process_import_job=AsyncMock(side_effect=process_import_job),
+        process_import_job=AsyncMock(
+            side_effect=AssertionError("trial must not use generic import claim"),
+        ),
+        process_trial_import_job=AsyncMock(side_effect=process_trial_import_job),
         drain_work=AsyncMock(),
     )
     engine_factory = MagicMock(return_value=engine)
@@ -239,6 +299,7 @@ def _patch_entrypoint(
     monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
     monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
     monkeypatch.setattr(worker_main, "create_supabase", lambda _config: RuntimeControlDB())
+    monkeypatch.setattr(worker_main, "create_trial_supabase", lambda _config: MagicMock())
     monkeypatch.setattr(worker_main, "ProxyUsageTracker", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "ProxyControl", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(worker_main, "SessionPool", lambda *_a, **_k: pool)
@@ -329,7 +390,6 @@ async def test_import_trial_maintenance_hold_fails_finitely_without_effects(
 @pytest.mark.parametrize(
     "runtime_error",
     [
-        pytest.param("pjud_admission_paused", id="paused"),
         pytest.param("pjud_runtime_generation_mismatch", id="generation-mismatch"),
         pytest.param("pjud_runtime_unavailable", id="unavailable"),
     ],
@@ -348,7 +408,7 @@ async def test_import_trial_runtime_rejection_fails_without_work(monkeypatch, ru
     with pytest.raises(PjudRuntimeError, match=runtime_error):
         await worker_main.main()
 
-    state["runtime_fence"].require.assert_awaited_once_with()
+    state["runtime_fence"].require.assert_awaited_once_with(admission=False)
     state["reconcile"].assert_not_awaited()
     state["scheduler"].reconcile_stale_runs.assert_not_awaited()
     state["scheduler"].get_next_batch.assert_not_awaited()
@@ -358,6 +418,34 @@ async def test_import_trial_runtime_rejection_fails_without_work(monkeypatch, ru
     state["ops_alert"].assert_not_awaited()
     state["metrics"].stop.assert_awaited_once_with()
     state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "error_code"),
+    [
+        ({"admission_paused": False}, "pjud_import_trial_requires_paused_admission"),
+        ({"generation_required": False}, "pjud_runtime_generation_mismatch"),
+        (
+            {"snapshot_generation": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+            "pjud_runtime_generation_mismatch",
+        ),
+    ],
+)
+async def test_import_trial_requires_paused_exact_generation_before_any_effect(
+    monkeypatch, overrides, error_code,
+):
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, **overrides)
+
+    with pytest.raises(Exception, match=error_code):
+        await worker_main.main()
+
+    state["runtime_fence"].require.assert_awaited_once_with(admission=False)
+    state["proxy_gate"].assert_not_awaited()
+    state["pool"].initialize.assert_not_awaited()
+    state["engine_factory"].assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -374,7 +462,7 @@ async def test_import_trial_proxy_denial_is_finite_and_does_not_mint(monkeypatch
     with pytest.raises(RuntimeError, match="pjud_import_trial_proxy_denied"):
         await worker_main.main()
 
-    state["runtime_fence"].require.assert_awaited_once_with()
+    state["runtime_fence"].require.assert_awaited_once_with(admission=False)
     state["proxy_gate"].assert_awaited_once()
     state["reconcile"].assert_not_awaited()
     state["pool"].initialize.assert_not_awaited()
@@ -388,14 +476,15 @@ async def test_import_trial_processes_exactly_one_job_without_scheduled_work(mon
     """Catch a second poll, background loop or scheduled-case path in trial mode."""
     from worker import __main__ as worker_main
 
-    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=True)
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main)
 
     await worker_main.main()
 
     assert state["runtime_fence"].require.await_count == 3
     state["proxy_gate"].assert_awaited_once()
     state["pool"].initialize.assert_awaited_once_with(prewarm=False)
-    state["engine"].process_import_job.assert_awaited_once_with()
+    state["engine"].process_trial_import_job.assert_awaited_once_with()
+    state["engine"].process_import_job.assert_not_awaited()
     state["reconcile"].assert_not_awaited()
     state["contract_check"].assert_not_awaited()
     state["scheduler"].reconcile_stale_runs.assert_not_awaited()
@@ -412,18 +501,108 @@ async def test_import_trial_processes_exactly_one_job_without_scheduled_work(mon
 
 
 @pytest.mark.asyncio
+async def test_import_trial_wires_dedicated_client_and_redacts_raw_capability(monkeypatch):
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(monkeypatch, worker_main)
+    normal_supabase = RuntimeControlDB()
+    trial_supabase = MagicMock(name="trial_supabase")
+    proxy_usage = MagicMock(name="proxy_usage")
+    create_trial_supabase = MagicMock(return_value=trial_supabase)
+    proxy_usage_factory = MagicMock(return_value=proxy_usage)
+    setup_logging = MagicMock()
+    monkeypatch.setattr(worker_main, "create_supabase", lambda _config: normal_supabase)
+    monkeypatch.setattr(worker_main, "create_trial_supabase", create_trial_supabase)
+    monkeypatch.setattr(worker_main, "ProxyUsageTracker", proxy_usage_factory)
+    monkeypatch.setattr(worker_main, "setup_logging", setup_logging)
+
+    await worker_main.main()
+
+    create_trial_supabase.assert_called_once_with(state["config"])
+    proxy_usage_factory.assert_called_once_with(
+        normal_supabase,
+        trial_supabase=trial_supabase,
+        enabled=True,
+        price_per_gb_usd=1.0,
+    )
+    assert state["engine_factory"].call_args.kwargs["supabase"] is normal_supabase
+    assert state["engine_factory"].call_args.kwargs["trial_supabase"] is trial_supabase
+    assert state["engine_factory"].call_args.kwargs["proxy_usage"] is proxy_usage
+    raw = state["config"].PJUD_IMPORT_TRIAL_CAPABILITY.get_secret_value()
+    assert raw in setup_logging.call_args.kwargs["secrets"]
+    assert raw not in repr(state["engine_factory"].call_args)
+
+
+@pytest.mark.asyncio
 async def test_import_trial_empty_queue_is_a_visible_failure_with_cleanup(monkeypatch):
     """Catch an empty eligible queue being reported as a successful verification."""
     from worker import __main__ as worker_main
 
-    state = _patch_import_trial_entrypoint(monkeypatch, worker_main, result=False)
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        result=SimpleNamespace(
+            claimed=False,
+            successful=False,
+            job_status=None,
+            summary_status=None,
+            discovered_count=0,
+            candidate_count=0,
+            evidence_sha256=None,
+            job_id=None,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="pjud_import_trial_no_eligible_job"):
         await worker_main.main()
 
-    state["engine"].process_import_job.assert_awaited_once_with()
+    state["engine"].process_trial_import_job.assert_awaited_once_with()
+    state["engine"].process_import_job.assert_not_awaited()
     state["retry_wait"].assert_not_awaited()
     state["metrics"].record_error.assert_not_called()
+    state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
+    state["metrics"].stop.assert_awaited_once_with()
+    state["pool"].close_all.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_status", "summary_status", "count"),
+    [
+        ("completed", "needs_selection", 0),
+        ("failed", "failed", 0),
+        ("partial", "partial", 1),
+    ],
+)
+async def test_import_trial_unsuccessful_persisted_outcome_exits_nonzero_after_cleanup(
+    monkeypatch, job_status, summary_status, count,
+):
+    """Catch a finalized non-success outcome producing an exit-zero trial."""
+    from worker import __main__ as worker_main
+
+    state = _patch_import_trial_entrypoint(
+        monkeypatch,
+        worker_main,
+        result=SimpleNamespace(
+            claimed=True,
+            successful=False,
+            job_status=job_status,
+            summary_status=summary_status,
+            discovered_count=count,
+            candidate_count=count,
+            evidence_sha256="a" * 64,
+            job_id="98200000-0000-4000-8000-000000000041",
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^pjud_import_trial_unsuccessful_discovery$",
+    ):
+        await worker_main.main()
+
+    state["engine"].process_trial_import_job.assert_awaited_once_with()
+    state["retry_wait"].assert_not_awaited()
     state["engine"].drain_work.assert_awaited_once_with(timeout_seconds=5.0)
     state["metrics"].stop.assert_awaited_once_with()
     state["pool"].close_all.assert_awaited_once_with()
@@ -440,7 +619,8 @@ async def test_import_trial_processing_error_propagates_without_retry_or_relabel
     with pytest.raises(LookupError, match="synthetic import failure"):
         await worker_main.main()
 
-    state["engine"].process_import_job.assert_awaited_once_with()
+    state["engine"].process_trial_import_job.assert_awaited_once_with()
+    state["engine"].process_import_job.assert_not_awaited()
     state["retry_wait"].assert_not_awaited()
     state["metrics"].record_error.assert_not_called()
     state["ops_alert"].assert_not_awaited()

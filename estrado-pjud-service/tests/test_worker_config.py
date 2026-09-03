@@ -1,7 +1,17 @@
 import pytest
 
 
-@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+TRIAL_CAPABILITY = "a" * 64
+TRIAL_GENERATION = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.mark.parametrize("value", [
+    "bad",
+    "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-4aaa-7aaa-aaaaaaaaaaaa",
+])
 def test_runtime_generation_rejects_noncanonical_identity(value):
     from worker.config import WorkerConfig
     with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
@@ -12,6 +22,36 @@ def test_runtime_generation_legacy_blank_and_explicit_identity():
     from worker.config import WorkerConfig
     config = WorkerConfig(SUPABASE_URL="https://db.test", SUPABASE_SERVICE_KEY="synthetic", PJUD_RUNTIME_GENERATION=" ", _env_file=None)
     assert config.PJUD_RUNTIME_GENERATION is None
+
+
+@pytest.mark.parametrize(
+    "worker_id",
+    ["", "-worker", "worker id", "worker\nforged", "w" * 101],
+)
+def test_worker_id_rejects_noncanonical_or_oversized_value_before_startup(worker_id):
+    """Catch an invalid RPC identity before any worker boundary can be built."""
+    from worker.config import WorkerConfig
+
+    with pytest.raises(ValueError, match="invalid_trial_worker"):
+        WorkerConfig(
+            SUPABASE_URL="https://db.test",
+            SUPABASE_SERVICE_KEY="synthetic",
+            WORKER_ID=worker_id,
+            _env_file=None,
+        )
+
+
+def test_worker_id_accepts_the_exact_one_to_one_hundred_character_contract():
+    from worker.config import WorkerConfig
+
+    for worker_id in ("a", "a" + "._:-" * 24 + "xyz"):
+        config = WorkerConfig(
+            SUPABASE_URL="https://db.test",
+            SUPABASE_SERVICE_KEY="synthetic",
+            WORKER_ID=worker_id,
+            _env_file=None,
+        )
+        assert config.WORKER_ID == worker_id
 
 
 class TestWorkerConfig:
@@ -43,6 +83,7 @@ class TestWorkerConfig:
         assert config.BATCH_SIZE == 10
         assert config.PJUD_OFF_HOURS_VALIDATION_ONCE is False
         assert config.PJUD_IMPORT_TRIAL_ONCE is False
+        assert config.PJUD_IMPORT_TRIAL_CAPABILITY is None
         assert config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is False
         assert config.HEARTBEAT_INTERVAL_S == 60
         assert config.SESSION_MAX_AGE_S == 1500
@@ -79,6 +120,14 @@ class TestWorkerConfig:
             PJUD_IMPORT_TRIAL_ONCE=value,
             ENABLE_PJUD_MY_CAUSES_IMPORT=True,
             POOL_SIZE=2,
+            **(
+                {
+                    "PJUD_IMPORT_TRIAL_CAPABILITY": TRIAL_CAPABILITY,
+                    "PJUD_RUNTIME_GENERATION": TRIAL_GENERATION,
+                }
+                if expected
+                else {}
+            ),
             _env_file=None,
         )
 
@@ -131,9 +180,234 @@ class TestWorkerConfig:
                 SUPABASE_URL="https://test.supabase.co",
                 SUPABASE_SERVICE_KEY="eyJtest",
                 PJUD_IMPORT_TRIAL_ONCE=True,
+                PJUD_IMPORT_TRIAL_CAPABILITY=TRIAL_CAPABILITY,
+                PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
                 _env_file=None,
                 **settings,
             )
+
+    def test_import_trial_capability_is_secret_and_requires_exact_lowercase_hex(self):
+        """Catch malformed ambient authority reaching any startup boundary."""
+        from worker.config import WorkerConfig
+
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            PJUD_IMPORT_TRIAL_ONCE=True,
+            PJUD_IMPORT_TRIAL_CAPABILITY=TRIAL_CAPABILITY,
+            PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
+            ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+            POOL_SIZE=2,
+            _env_file=None,
+        )
+
+        assert config.PJUD_IMPORT_TRIAL_CAPABILITY.get_secret_value() == TRIAL_CAPABILITY
+        assert TRIAL_CAPABILITY not in repr(config)
+        assert "**********" in repr(config.PJUD_IMPORT_TRIAL_CAPABILITY)
+
+        malformed_values = [
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            "g" * 64,
+            " " + ("a" * 64),
+        ]
+        for malformed in malformed_values:
+            with pytest.raises(
+                ValueError,
+                match="pjud_import_trial_capability_must_be_64_lowercase_hex",
+            ) as exc_info:
+                WorkerConfig(
+                    SUPABASE_URL="https://test.supabase.co",
+                    SUPABASE_SERVICE_KEY="eyJtest",
+                    PJUD_IMPORT_TRIAL_ONCE=True,
+                    PJUD_IMPORT_TRIAL_CAPABILITY=malformed,
+                    PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
+                    ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+                    POOL_SIZE=2,
+                    _env_file=None,
+                )
+            if malformed:
+                assert malformed not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("settings", "error_code"),
+        [
+            ({}, "pjud_import_trial_requires_capability"),
+            (
+                {"PJUD_IMPORT_TRIAL_CAPABILITY": TRIAL_CAPABILITY},
+                "pjud_import_trial_requires_generation",
+            ),
+        ],
+    )
+    def test_import_trial_requires_capability_and_generation(self, settings, error_code):
+        """Catch a one-shot that cannot be bound to durable runtime authority."""
+        from worker.config import WorkerConfig
+
+        with pytest.raises(ValueError, match=error_code):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                PJUD_IMPORT_TRIAL_ONCE=True,
+                ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+                POOL_SIZE=2,
+                _env_file=None,
+                **settings,
+            )
+
+    def test_import_trial_capability_is_rejected_outside_trial_mode(self):
+        """Catch a normal worker silently retaining trial authority."""
+        from worker.config import WorkerConfig
+
+        with pytest.raises(
+            ValueError,
+            match="pjud_import_trial_capability_requires_trial_mode",
+        ):
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                PJUD_IMPORT_TRIAL_CAPABILITY=TRIAL_CAPABILITY,
+                _env_file=None,
+            )
+
+    def test_import_trial_capability_is_fully_hidden_in_config_diagnostics(self):
+        """Pydantic must not retain even a distinctive capability fragment."""
+        from worker.config import WorkerConfig
+
+        capability = "0123456789abcdef" * 4
+        with pytest.raises(ValueError) as exc_info:
+            WorkerConfig(
+                SUPABASE_URL="https://test.supabase.co",
+                SUPABASE_SERVICE_KEY="eyJtest",
+                PJUD_IMPORT_TRIAL_CAPABILITY=capability,
+                _env_file=None,
+            )
+
+        rendered = str(exc_info.value)
+        assert capability not in rendered
+        assert capability[:16] not in rendered
+        assert capability[-16:] not in rendered
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {
+                "PJUD_IMPORT_TRIAL_ONCE": True,
+                "PJUD_IMPORT_TRIAL_CAPABILITY": "sentinel-capability-not-hex",
+                "PJUD_RUNTIME_GENERATION": TRIAL_GENERATION,
+                "ENABLE_PJUD_MY_CAUSES_IMPORT": True,
+                "POOL_SIZE": 2,
+            },
+            {
+                "PJUD_IMPORT_TRIAL_CAPABILITY": "0123456789abcdef" * 4,
+            },
+        ],
+    )
+    def test_import_trial_capability_is_hidden_from_structured_validation_errors(
+        self, settings,
+    ):
+        """Structured collectors must not recover authority from Pydantic input."""
+        from pydantic import SecretStr, ValidationError
+        from worker.config import WorkerConfig
+
+        sentinel = settings["PJUD_IMPORT_TRIAL_CAPABILITY"]
+        recovered: list[str] = []
+        seen: set[int] = set()
+
+        def collect(value):
+            marker = id(value)
+            if marker in seen:
+                return
+            seen.add(marker)
+            if isinstance(value, SecretStr):
+                recovered.append(value.get_secret_value())
+                return
+            if isinstance(value, str):
+                recovered.append(value)
+                return
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    collect(key)
+                    collect(item)
+                return
+            if isinstance(value, (list, tuple, set, frozenset)):
+                for item in value:
+                    collect(item)
+                return
+            values = getattr(value, "__dict__", None)
+            if isinstance(values, dict):
+                collect(values)
+
+        if sentinel == "sentinel-capability-not-hex":
+            with pytest.raises(ValidationError) as exc_info:
+                WorkerConfig(
+                    SUPABASE_URL="https://test.supabase.co",
+                    SUPABASE_SERVICE_KEY="eyJtest",
+                    _env_file=None,
+                    **settings,
+                )
+            assert sentinel not in repr(exc_info.value.args)
+        else:
+            # Force an unrelated model-level Pydantic error while valid trial
+            # authority is present. This is the path that previously retained
+            # the SecretStr object in ``errors()[...]['input']``.
+            with pytest.raises(ValidationError) as exc_info:
+                WorkerConfig(
+                    SUPABASE_URL="https://test.supabase.co",
+                    SUPABASE_SERVICE_KEY="eyJtest",
+                    PJUD_IMPORT_TRIAL_ONCE=True,
+                    PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
+                    ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+                    POOL_SIZE=2,
+                    SESSION_SOFT_VERIFY_AGE_S=3000,
+                    SESSION_HARD_MAX_AGE_S=3000,
+                    _env_file=None,
+                    **settings,
+                )
+
+        collect(exc_info.value.errors())
+        assert sentinel not in recovered
+        assert all(sentinel not in value for value in recovered)
+
+    def test_empty_import_trial_capability_is_unset_for_normal_worker(self):
+        from worker.config import WorkerConfig
+
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            PJUD_IMPORT_TRIAL_ONCE="false",
+            PJUD_IMPORT_TRIAL_CAPABILITY="",
+            _env_file=None,
+        )
+
+        assert config.PJUD_IMPORT_TRIAL_ONCE is False
+        assert config.PJUD_IMPORT_TRIAL_CAPABILITY is None
+
+    def test_trial_rpc_client_state_repr_never_contains_capability(self):
+        from worker.config import WorkerConfig
+        from worker.supabase_client import create_trial_supabase
+
+        config = WorkerConfig(
+            SUPABASE_URL="https://test.supabase.co",
+            SUPABASE_SERVICE_KEY="eyJtest",
+            PJUD_IMPORT_TRIAL_ONCE=True,
+            PJUD_IMPORT_TRIAL_CAPABILITY=TRIAL_CAPABILITY,
+            PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
+            ENABLE_PJUD_MY_CAUSES_IMPORT=True,
+            POOL_SIZE=2,
+            _env_file=None,
+        )
+
+        client = create_trial_supabase(config)
+        assert TRIAL_CAPABILITY not in repr(config)
+        assert TRIAL_CAPABILITY not in repr(client)
+        assert TRIAL_CAPABILITY not in repr(vars(client))
+        assert TRIAL_CAPABILITY not in repr(client._postgrest)
+        assert TRIAL_CAPABILITY not in repr(client._postgrest.headers)
+        assert TRIAL_CAPABILITY not in repr(client._postgrest.session)
+        assert TRIAL_CAPABILITY not in repr(client._postgrest.session.headers)
+        assert not hasattr(client, "storage")
+        assert not hasattr(client, "auth")
 
     def test_reuse_canary_requires_an_authoritative_utc_cutoff(self):
         from worker.config import WorkerConfig

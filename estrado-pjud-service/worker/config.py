@@ -1,35 +1,86 @@
 import asyncio
-from contextvars import copy_context
+import re
+import secrets
+from contextvars import ContextVar
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
 from app.proxy import sticky_lifetime_seconds
 from app.runtime_fence import validate_runtime_generation
+from app.supabase_executor import submit_supabase_query
 from worker.maintenance import has_active_operation, track_auxiliary
+from worker.trial_scope import validate_worker_id
 
 TZ_SANTIAGO = ZoneInfo("America/Santiago")
+_TRIAL_CAPABILITY_MARKERS: ContextVar[dict[str, SecretStr] | None] = ContextVar(
+    "pjud_trial_capability_markers", default=None,
+)
+_TRIAL_CAPABILITY_MARKER_PREFIX = "sealed-pjud-trial-capability:"
+_INVALID_TRIAL_CAPABILITY_MARKER_PREFIX = "invalid-pjud-trial-capability:"
+
+
+def _seal_trial_capability(value) -> str | None:
+    """Replace authority with a per-construction opaque marker.
+
+    Pydantic includes field and model inputs in ``ValidationError.errors()``.
+    A ``SecretStr`` only masks its representation; the structured object still
+    exposes ``get_secret_value()``.  Keep the real value outside the model until
+    all Pydantic validation has succeeded.
+    """
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
+    if not isinstance(value, str):
+        return _INVALID_TRIAL_CAPABILITY_MARKER_PREFIX + secrets.token_hex(16)
+    if not value.strip():
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        return _INVALID_TRIAL_CAPABILITY_MARKER_PREFIX + secrets.token_hex(16)
+    registry = _TRIAL_CAPABILITY_MARKERS.get()
+    if registry is None:
+        raise RuntimeError("pjud_import_trial_capability_sealing_unavailable")
+    marker = _TRIAL_CAPABILITY_MARKER_PREFIX + secrets.token_hex(16)
+    registry[marker] = SecretStr(value)
+    return marker
+
+
+def _secret_safe_settings_source(source):
+    """Seal trial authority before Pydantic can retain source input in errors."""
+
+    def load_values():
+        values = source()
+        capability = values.get("PJUD_IMPORT_TRIAL_CAPABILITY")
+        if capability is not None:
+            values = dict(values)
+            values["PJUD_IMPORT_TRIAL_CAPABILITY"] = _seal_trial_capability(
+                capability,
+            )
+        return values
+
+    load_values.__name__ = f"SecretSafe{type(source).__name__}"
+    return load_values
 
 
 async def run_query(query):
-    """Run a Supabase query chain in a thread to avoid blocking the event loop."""
+    """Run a serialized Supabase query without blocking the event loop."""
     if has_active_operation():
         # Register the executor's real completion, not a cancellable to_thread
         # wrapper. No await may separate the pre-creation probe and registration.
-        future = asyncio.get_running_loop().run_in_executor(
-            None, copy_context().run, query.execute,
-        )
+        future = submit_supabase_query(query)
         return await track_auxiliary(future)
-    return await asyncio.to_thread(query.execute)
+    return await submit_supabase_query(query)
 
 
 def validate_import_trial_mode(config, session_capacity: int) -> bool:
     """Validate the finite import-only mode before startup has side effects."""
     trial_once = config.PJUD_IMPORT_TRIAL_ONCE is True
+    capability = getattr(config, "PJUD_IMPORT_TRIAL_CAPABILITY", None)
     if not trial_once:
+        if capability is not None:
+            raise ValueError("pjud_import_trial_capability_requires_trial_mode")
         return False
     if config.PJUD_OFF_HOURS_VALIDATION_ONCE is True:
         raise ValueError("pjud_import_trial_incompatible_validation_once")
@@ -41,6 +92,10 @@ def validate_import_trial_mode(config, session_capacity: int) -> bool:
         or session_capacity < 2
     ):
         raise ValueError("pjud_import_trial_requires_capacity")
+    if capability is None:
+        raise ValueError("pjud_import_trial_requires_capability")
+    if getattr(config, "PJUD_RUNTIME_GENERATION", None) is None:
+        raise ValueError("pjud_import_trial_requires_generation")
     return True
 
 
@@ -75,6 +130,7 @@ class WorkerConfig(BaseSettings):
     BLOCK_PAUSE_S: int = 30
     PJUD_OFF_HOURS_VALIDATION_ONCE: bool = False
     PJUD_IMPORT_TRIAL_ONCE: bool = False
+    PJUD_IMPORT_TRIAL_CAPABILITY: SecretStr | None = None
     # Override operacional temporal para una marcha blanca continua. El valor
     # por defecto conserva estrictamente la ventana hábil.
     PJUD_PROCESS_OUTSIDE_OFFICE_HOURS: bool = False
@@ -113,6 +169,53 @@ class WorkerConfig(BaseSettings):
     _runtime_generation = field_validator("PJUD_RUNTIME_GENERATION", mode="before")(
         validate_runtime_generation
     )
+    _worker_id = field_validator("WORKER_ID")(validate_worker_id)
+
+    def __init__(self, **values):
+        registry: dict[str, SecretStr] = {}
+        context_token = _TRIAL_CAPABILITY_MARKERS.set(registry)
+        try:
+            super().__init__(**values)
+            session_capacity = (
+                self.OJV_PROXY_POOL_SIZE if self.OJV_PROXY_URL else self.POOL_SIZE
+            )
+            # Relationship errors must also see only the opaque marker. The
+            # validator only needs capability presence, not its raw value.
+            validate_import_trial_mode(self, session_capacity)
+            sealed = self.PJUD_IMPORT_TRIAL_CAPABILITY
+            if sealed is not None:
+                marker = sealed.get_secret_value()
+                capability = registry.get(marker)
+                if capability is None:
+                    raise ValueError(
+                        "pjud_import_trial_capability_sealing_unavailable"
+                    )
+                object.__setattr__(
+                    self, "PJUD_IMPORT_TRIAL_CAPABILITY", capability,
+                )
+        finally:
+            registry.clear()
+            _TRIAL_CAPABILITY_MARKERS.reset(context_token)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        del settings_cls
+        return tuple(
+            _secret_safe_settings_source(source)
+            for source in (
+                init_settings,
+                env_settings,
+                dotenv_settings,
+                file_secret_settings,
+            )
+        )
 
     @field_validator("SESSION_REUSE_ROLLOUT_STARTED_AT", mode="before")
     @classmethod
@@ -154,6 +257,36 @@ class WorkerConfig(BaseSettings):
             return value == "true"
         raise ValueError("pjud_import_trial_once_flag_must_be_literal")
 
+    @field_validator("PJUD_IMPORT_TRIAL_CAPABILITY", mode="before")
+    @classmethod
+    def _blank_import_trial_capability_is_unset(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("PJUD_IMPORT_TRIAL_CAPABILITY")
+    @classmethod
+    def _valid_import_trial_capability(
+        cls, value: SecretStr | None,
+    ) -> SecretStr | None:
+        if value is None:
+            return None
+        marker = value.get_secret_value()
+        registry = _TRIAL_CAPABILITY_MARKERS.get()
+        if marker.startswith(_INVALID_TRIAL_CAPABILITY_MARKER_PREFIX):
+            raise ValueError(
+                "pjud_import_trial_capability_must_be_64_lowercase_hex"
+            )
+        if (
+            not marker.startswith(_TRIAL_CAPABILITY_MARKER_PREFIX)
+            or registry is None
+            or marker not in registry
+        ):
+            raise ValueError(
+                "pjud_import_trial_capability_sealing_unavailable"
+            )
+        return value
+
     @property
     def session_hard_effective_age_s(self) -> int:
         sticky_ceiling = (
@@ -179,14 +312,6 @@ class WorkerConfig(BaseSettings):
             raise ValueError("SESSION_REUSE_ROLLOUT_STARTED_AT must be timezone-aware")
         return self
 
-    @model_validator(mode="after")
-    def _valid_import_trial_mode(self):
-        session_capacity = (
-            self.OJV_PROXY_POOL_SIZE if self.OJV_PROXY_URL else self.POOL_SIZE
-        )
-        validate_import_trial_mode(self, session_capacity)
-        return self
-
     @field_validator("MINT_TRAFFIC_BUDGET_S")
     @classmethod
     def _valid_mint_traffic_budget(cls, value: float) -> float:
@@ -194,4 +319,9 @@ class WorkerConfig(BaseSettings):
             raise ValueError("MINT_TRAFFIC_BUDGET_S must be between 10 and 60 seconds")
         return value
 
-    model_config = {"env_file": (".env.worker", ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {
+        "env_file": (".env.worker", ".env"),
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+        "hide_input_in_errors": True,
+    }

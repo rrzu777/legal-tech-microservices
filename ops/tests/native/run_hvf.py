@@ -25,6 +25,80 @@ CANCELLED = False
 WORKER_PAYLOAD = tuple('estrado-pjud-service/worker/' + name for name in
                        ('__init__.py', 'maintenance.py', 'maintenance_store.py', 'sd_notify.py',
                         'maintenance_heartbeat.py'))
+BOOTSTRAP_PAYLOAD = ('ops/tests/native/bootstrap_exercise.py', 'ops/bootstrap-worker-maintenance.py',
+                     'ops/bootstrap-audit.py', 'ops/worker-maintenance.py')
+BOOTSTRAP_REQUIREMENTS = (
+    'uvicorn==0.41.0 --hash=sha256:29e35b1d2c36a04b9e180d4007ede3bcb32a85fbdfd6c6aeb3f26839de088187\n'
+    'click==8.1.8 --hash=sha256:63c132bbbed01578a06712a2d1f497bb62d9c1c0d329b7903a866228027263b2\n'
+    'h11==0.16.0 --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86\n'
+)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--base-image', type=Path, required=True)
+    parser.add_argument('--mode', choices=('integral', 'bootstrap-characterization'), default='integral')
+    parser.add_argument('--allow-daytime-lab', action='store_true',
+                        help='Allow daytime lifecycle characterization only in the disposable guest')
+    args = parser.parse_args(argv)
+    if args.allow_daytime_lab and args.mode != 'bootstrap-characterization':
+        parser.error('--allow-daytime-lab requires --mode bootstrap-characterization')
+    return args
+
+
+def native_stages(mode):
+    if mode == 'integral':
+        return ('probe.py', 'fixture.py', 'exercise.py')
+    if mode == 'bootstrap-characterization':
+        return ('bootstrap_exercise.py',)
+    raise ValueError('Unknown native mode')
+
+
+def stage_command(script, *, allow_daytime_lab=False):
+    if script not in (*native_stages('integral'), *native_stages('bootstrap-characterization')):
+        raise ValueError('Unknown native stage')
+    if allow_daytime_lab and script != 'bootstrap_exercise.py':
+        raise ValueError('Daytime opt-in is exclusive to shutdown characterization')
+    command = 'sudo python3 -u /mnt/payload/ops/tests/native/' + script
+    if script == 'bootstrap_exercise.py':
+        command = ('sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 '
+                   '/usr/bin/python3 -B -u /mnt/payload/ops/tests/native/' + script)
+        if allow_daytime_lab:
+            command += ' --allow-daytime-lab'
+    return command
+
+
+def cloud_config(public_key, *, mode='integral'):
+    native_stages(mode)  # Validate before creating any guest setup configuration.
+    config = {
+        'ssh_pwauth': False, 'ssh_genkeytypes': ['ed25519'], 'disable_root': True,
+        'ssh_authorized_keys': [public_key], 'package_update': True,
+        'packages': ['git', 'jq', 'curl', 'cron', 'xvfb', 'xauth', 'dbus-user-session'],
+        'mounts': [['LABEL=PAYLOAD', '/mnt/payload', 'iso9660', 'ro,nofail', '0', '0']],
+        'bootcmd': [['sh', '-c', 'test ! -f /etc/update-motd.d/90-updates-available || chmod a-x /etc/update-motd.d/90-updates-available']],
+        'runcmd': [['sh', '-ec', 'for t in git jq curl xvfb-run xauth busctl; do command -v "$t"; done; mountpoint -q /mnt/payload; touch /var/lib/native-ready']],
+    }
+    if mode == 'bootstrap-characterization':
+        config['packages'].append('python3-venv')
+        config['write_files'] = [{
+            'path': '/opt/native-runtime-requirements.txt', 'owner': 'root:root', 'permissions': '0644',
+            'content': BOOTSTRAP_REQUIREMENTS,
+        }]
+        # The final marker verifies actual installed distributions because
+        # cloud-init may continue runcmd after a prior command fails.
+        check = ('/opt/native-runtime/bin/python -c "import importlib.metadata as m; '
+                 "assert {k:m.version(k) for k in ('uvicorn','click','h11')} == "
+                 "{'uvicorn':'0.41.0','click':'8.1.8','h11':'0.16.0'}" + '"; ')
+        ready = config['runcmd'][0][-1].replace('touch /var/lib/native-ready', check + 'touch /var/lib/native-ready')
+        config['runcmd'] = [
+            ['/usr/bin/python3', '-m', 'venv', '/opt/native-runtime'],
+            ['/opt/native-runtime/bin/python', '-m', 'pip', '--isolated', 'install',
+             '--require-hashes', '--only-binary=:all:', '--no-deps', '--disable-pip-version-check',
+             '--no-cache-dir', '--retries', '0', '--timeout', '20', '--index-url', 'https://pypi.org/simple',
+             '-r', '/opt/native-runtime-requirements.txt'],
+            ['sh', '-ec', ready],
+        ]
+    return config
 
 
 def run(*args, check=True, timeout=60):
@@ -48,11 +122,14 @@ def validate_payload(root, paths):
             raise RuntimeError('Missing native payload file')
 
 
-def payload_files(root):
+def payload_files(root, *, mode='integral'):
+    native_stages(mode)
     files = list(filter(None, run('git', '-C', str(root), 'ls-files', '-z', 'ops').stdout.split('\0')))
     files += ['ops/tests/native/' + name for name in
               ('fixture.py', 'fixture_worker.py', 'exercise.py', 'probe.py')]
     files += list(WORKER_PAYLOAD)
+    if mode == 'bootstrap-characterization':
+        files += list(BOOTSTRAP_PAYLOAD)
     validate_payload(root, files)
     return sorted(set(files))
 
@@ -138,9 +215,7 @@ def check_cancelled():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base-image', type=Path, required=True)
-    args = parser.parse_args()
+    args = parse_args()
     if platform.system() != 'Darwin' or platform.machine() != 'arm64' or os.geteuid() == 0:
         raise SystemExit('Requires unprivileged macOS ARM64')
     if not pressure_ok(30) or shutil.disk_usage('/private/tmp').free < 40 * 1024**3:
@@ -150,7 +225,10 @@ def main():
         if hashlib.file_digest(stream, 'sha256').hexdigest() != BASE_HASH:
             raise SystemExit('Ubuntu base image checksum mismatch')
     print(run(QEMU, '--version').stdout.splitlines()[0], flush=True)
-    print('HVF guest: 2 CPUs / 4 GiB; RAM admission is a fixture, NOT capacity proof', flush=True)
+    if args.mode == 'integral':
+        print('HVF guest: 2 CPUs / 4 GiB; RAM admission is a fixture, NOT capacity proof', flush=True)
+    else:
+        print('HVF guest: 2 CPUs / 4 GiB; shutdown characterization only, NOT capacity proof', flush=True)
     work = Path(tempfile.mkdtemp(prefix='resource-guards-hvf-', dir='/private/tmp'))
     evidence = Path(tempfile.mkdtemp(prefix='resource-guards-hvf-evidence-', dir='/private/tmp'))
     owner = uuid.uuid4().hex
@@ -164,7 +242,7 @@ def main():
         canary_port = canary.getsockname()[1]
         payload, seed, media = work / 'payload', work / 'seed', work / 'media'
         payload.mkdir(); seed.mkdir(); media.mkdir()
-        files = payload_files(ROOT)
+        files = payload_files(ROOT, mode=args.mode)
         for relative in set(files):
             target = payload / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -172,15 +250,7 @@ def main():
         manifest_hash = make_payload_media(payload, media)
         archive_hash = hashlib.sha256((media / 'payload.tar').read_bytes()).hexdigest()
         run('/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(work / 'id_ed25519'))
-        config = {
-            'ssh_pwauth': False, 'ssh_genkeytypes': ['ed25519'], 'disable_root': True,
-            'ssh_authorized_keys': [(work / 'id_ed25519.pub').read_text().strip()],
-            'package_update': True,
-            'packages': ['git', 'jq', 'curl', 'cron', 'xvfb', 'xauth', 'dbus-user-session'],
-            'mounts': [['LABEL=PAYLOAD', '/mnt/payload', 'iso9660', 'ro,nofail', '0', '0']],
-            'bootcmd': [['sh', '-c', 'test ! -f /etc/update-motd.d/90-updates-available || chmod a-x /etc/update-motd.d/90-updates-available']],
-            'runcmd': [['sh', '-ec', 'for t in git jq curl xvfb-run xauth busctl; do command -v "$t"; done; mountpoint -q /mnt/payload; touch /var/lib/native-ready']],
-        }
+        config = cloud_config((work / 'id_ed25519.pub').read_text().strip(), mode=args.mode)
         (seed / 'user-data').write_text('#cloud-config\n' + json.dumps(config))
         (seed / 'meta-data').write_text('instance-id: ' + owner + '\nlocal-hostname: native-guards\n')
         for folder, label, filename in ((seed, 'cidata', 'seed.iso'), (media, 'PAYLOAD', 'payload.iso')):
@@ -258,21 +328,23 @@ PY'''
                 unpacked = run(*ssh, unpack)
                 print(unpacked.stdout, flush=True)
                 (evidence / 'payload.log').write_text(unpacked.stdout + 'manifest-sha256=' + manifest_hash + '\n')
-                for script in ('probe.py', 'fixture.py'):
-                    result = run(*ssh, 'sudo python3 -u /mnt/payload/ops/tests/native/' + script, check=False, timeout=180)
-                    (evidence / (script + '.log')).write_text(result.stdout + result.stderr)
+                for script in native_stages(args.mode):
+                    integral = script == 'exercise.py'
+                    characterization = script == 'bootstrap_exercise.py'
+                    if integral:
+                        # Only the existing integral path substitutes free(1).
+                        run(*ssh, small_guest_setup())
+                    command = stage_command(script, allow_daytime_lab=args.allow_daytime_lab)
+                    result = run(*ssh, command, check=False, timeout=900 if integral or characterization else 180)
+                    log_name = 'integral.log' if integral else ('bootstrap-characterization.log' if characterization else script + '.log')
+                    (evidence / log_name).write_text(result.stdout + result.stderr)
                     print(result.stdout + result.stderr, flush=True)
                     if result.returncode:
-                        raise RuntimeError('Native stage failed: ' + script)
-                # Only free(1) admission is substituted. All systemd, cgroups,
-                # swap, process ownership, metadata and rollback operations are real.
-                run(*ssh, small_guest_setup())
-                result = run(*ssh, 'sudo python3 -u /mnt/payload/ops/tests/native/exercise.py', check=False, timeout=900)
-                (evidence / 'integral.log').write_text(result.stdout + result.stderr)
-                print(result.stdout + result.stderr, flush=True)
-                if result.returncode:
-                    raise RuntimeError('Integral native exercise failed; no automatic retry')
-                print('HVF INTEGRAL PASS (capacity admission excluded)', flush=True)
+                        raise RuntimeError('Native stage failed: ' + script + '; no automatic retry')
+                if args.mode == 'integral':
+                    print('HVF INTEGRAL PASS (capacity admission excluded)', flush=True)
+                else:
+                    print('HVF SHUTDOWN CHARACTERIZATION ONLY; BOOTSTRAP TASK INCOMPLETE', flush=True)
     finally:
         for stop_watch, watcher in watchers:
             stop_watch.set(); watcher.join(timeout=12)

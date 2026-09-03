@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, date
 
 import httpx
+from pydantic import SecretStr
 
 from app.alerting import send_ops_alert
 from app.anexo_endpoints import ANEXO_ENDPOINTS
@@ -46,9 +47,9 @@ from app.proxy_cost import (
     is_proxy_cost_control_error,
 )
 from app.r2 import R2Client
-from app.runtime_fence import runtime_generation_headers
+from app.runtime_fence import RUNTIME_GENERATION_HEADER, runtime_generation_headers
 from worker.config import WorkerConfig, TZ_SANTIAGO, run_query
-from worker.import_jobs import ImportDiscoveryWorker
+from worker.import_jobs import ImportDiscoveryWorker, TrialImportOutcome
 from worker.sync_messages import BlockCause, blocked_error_message
 from worker.proxy_control import ProxyControl
 from worker.proxy_usage import (
@@ -59,6 +60,11 @@ from worker.session_pool import ReleaseDisposition
 from worker.sync_credentials import (
     SyncCredentialClaim, SyncCredentialClient,
     SyncCredentialClaimStaleError, SyncCredentialInfrastructureError,
+)
+from worker.trial_scope import (
+    PJUD_RUNTIME_TRIAL_CAPABILITY_HEADER,
+    PJUD_RUNTIME_TRIAL_GRANT_ID_HEADER,
+    TrialScope,
 )
 
 
@@ -684,6 +690,7 @@ class SyncEngine:
     def __init__(
         self, pool, supabase, notifier, metrics, backoff, config: WorkerConfig,
         catalog_service=None, proxy_control=None, proxy_usage=None,
+        trial_supabase=None,
     ):
         self._pool = pool
         self._sb = supabase
@@ -700,6 +707,7 @@ class SyncEngine:
             price = DEFAULT_PRICE_PER_GB_USD
         self._proxy_usage = proxy_usage or ProxyUsageTracker(
             supabase,
+            trial_supabase=trial_supabase,
             enabled=isinstance(proxy_url, str) and bool(proxy_url),
             price_per_gb_usd=float(price),
         )
@@ -734,9 +742,11 @@ class SyncEngine:
         )
         self._import_worker = ImportDiscoveryWorker(
             supabase=supabase,
+            trial_supabase=trial_supabase,
             pool=pool,
             worker_id=getattr(config, "WORKER_ID", "worker-1"),
             fetch_credential=self._get_import_credential,
+            fetch_trial_credential=self._get_trial_import_credential,
             concurrency=1,
             enabled=imports_enabled,
             lane_budget=self._work_budgets.discovery,
@@ -754,6 +764,24 @@ class SyncEngine:
     async def process_import_job(self) -> bool:
         """Poll one discovery job outside the paid public batch semaphore."""
         return await self._import_worker.process_next()
+
+    async def process_trial_import_job(self) -> TrialImportOutcome:
+        """Consume exactly one capability-bound trial claim."""
+        capability = getattr(
+            self._config, "PJUD_IMPORT_TRIAL_CAPABILITY", None,
+        )
+        runtime_generation = getattr(
+            self._config, "PJUD_RUNTIME_GENERATION", None,
+        )
+        if (
+            not isinstance(capability, SecretStr)
+            or not isinstance(runtime_generation, str)
+        ):
+            raise RuntimeError("invalid_trial_engine_authority")
+        return await self._import_worker.process_trial_next(
+            capability=capability,
+            runtime_generation=runtime_generation,
+        )
 
     def stop_accepting_work(self) -> None:
         """Close all local lanes before structured process drain."""
@@ -836,8 +864,6 @@ class SyncEngine:
             })
             .eq("id", case["id"])
             .eq("sync_worker_id", getattr(self._config, "WORKER_ID", "worker-1"))
-            .select("id")
-            .maybe_single()
         )
         publish_response = await run_query(case_update)
         if getattr(publish_response, "error", None) or not getattr(publish_response, "data", None):
@@ -1471,6 +1497,10 @@ class SyncEngine:
                 "X-Pjud-Import-Worker-Id": worker_id,
             },
         )
+        return self._parse_import_credential_response(resp)
+
+    @staticmethod
+    def _parse_import_credential_response(resp) -> dict | None:
         if resp is None or resp.status_code in {401, 403, 408, 429} or resp.status_code >= 500:
             raise ImportCredentialInfrastructureError("import_credential_boundary_unavailable")
         if resp.status_code in {404, 410, 422}:
@@ -1494,6 +1524,59 @@ class SyncEngine:
         if binding.tzinfo is None:
             raise ImportCredentialInfrastructureError("import_credential_contract_invalid")
         return data
+
+    async def _get_trial_import_credential(
+        self,
+        credential_id: str,
+        law_firm_id: str,
+        job_id: str,
+        claim_token: str,
+        worker_id: str,
+        trial_scope: TrialScope,
+    ) -> dict | None:
+        observed = (
+            credential_id,
+            law_firm_id,
+            job_id,
+            claim_token,
+            worker_id,
+        )
+        expected = (
+            str(trial_scope.credential_id),
+            str(trial_scope.law_firm_id),
+            str(trial_scope.job_id),
+            str(trial_scope.claim_token),
+            trial_scope.worker_id,
+        )
+        if (
+            observed != expected
+            or self._runtime_headers.get(RUNTIME_GENERATION_HEADER)
+            != str(trial_scope.runtime_generation)
+        ):
+            raise ImportCredentialInfrastructureError(
+                "trial_import_scope_mismatch"
+            )
+        resp = await self._call_app_internal(
+            "GET",
+            f"/api/internal/pjud-import/credentials/{credential_id}/decrypt",
+            "Trial import decrypt endpoint",
+            law_firm_id=law_firm_id,
+            extra_headers={
+                "X-Pjud-Import-Job-Id": job_id,
+                "X-Pjud-Import-Claim-Token": claim_token,
+                "X-Pjud-Import-Worker-Id": worker_id,
+                "X-Pjud-Import-Credential-Updated-At": (
+                    trial_scope.expected_credentials_updated_at.isoformat()
+                ),
+                PJUD_RUNTIME_TRIAL_CAPABILITY_HEADER: (
+                    trial_scope.capability.get_secret_value()
+                ),
+                PJUD_RUNTIME_TRIAL_GRANT_ID_HEADER: str(
+                    trial_scope.trial_grant_id
+                ),
+            },
+        )
+        return self._parse_import_credential_response(resp)
 
     async def _record_private_failure(self, client, claim, version, kind, code) -> dict:
         # Only SQL may resolve ambiguous read/finalize outcomes; never fall back

@@ -1,8 +1,10 @@
 import asyncio
+import httpx
 import json
+import traceback
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from pydantic import SecretStr
@@ -19,6 +21,7 @@ from app.ojv.errors import (
 from app.proxy_billing import ProxyBillingExhaustedError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from worker.import_jobs import ImportDiscoveryWorker
+from worker.trial_scope import TrialScope
 
 
 JOB = {
@@ -31,6 +34,33 @@ JOB = {
     "claim_token": "98200000-0000-4000-8000-000000000099",
     "lease_expires_at": "2026-08-23T13:00:00+00:00",
 }
+TRIAL_CAPABILITY = "c" * 64
+TRIAL_GENERATION = "11111111-1111-4111-8111-111111111111"
+TRIAL_GRANT_ID = "98200000-0000-4000-8000-000000000031"
+TRIAL_EVIDENCE_SHA256 = "a" * 64
+TRIAL_JOB = {
+    **JOB,
+    "trial_grant_id": TRIAL_GRANT_ID,
+    "expected_credentials_updated_at": "2026-08-23T12:00:00.000Z",
+}
+
+
+def trial_close_proof(
+    *,
+    job_status="needs_selection",
+    summary_status="needs_selection",
+    discovered_count=1,
+    candidate_count=1,
+    evidence_sha256=TRIAL_EVIDENCE_SHA256,
+):
+    return {
+        "status": "trial_grant_closed",
+        "job_status": job_status,
+        "summary_status": summary_status,
+        "discovered_count": discovered_count,
+        "candidate_count": candidate_count,
+        "evidence_sha256": evidence_sha256,
+    }
 
 
 class Rpc:
@@ -44,24 +74,49 @@ class Rpc:
 
 
 class FakeSupabase:
-    def __init__(self, claim=JOB):
+    def __init__(self, claim=JOB, trial_claim=None):
         self.claim = claim
+        self.trial_claim = TRIAL_JOB if trial_claim is None else trial_claim
+        self.trial_claim_results = None
         self.calls = []
         self.renew_result = True
         self.credential_valid = True
+        self.finalize_trial_results = [None]
+        self.close_results = [trial_close_proof()]
+        self.before_close = None
 
     def rpc(self, name, payload):
         self.calls.append((name, payload))
         if name == "claim_pjud_import_job":
             return Rpc(self.claim)
+        if name == "claim_pjud_trial_import_job":
+            result = (
+                self.trial_claim_results.pop(0)
+                if self.trial_claim_results is not None
+                else self.trial_claim
+            )
+            return Rpc(result)
         if name == "renew_pjud_import_job_claim":
             return Rpc(self.renew_result)
+        if name == "renew_pjud_trial_import_job_claim":
+            return Rpc(self.renew_result)
         if name == "validate_pjud_import_credential_claim":
+            return Rpc(self.credential_valid)
+        if name == "validate_pjud_trial_import_credential_claim":
             return Rpc(self.credential_valid)
         if name == "finalize_pjud_import_discovery":
             if not self.credential_valid:
                 return Rpc(RuntimeError("import_credential_revision_mismatch"))
             return Rpc(None)
+        if name == "finalize_pjud_trial_import_discovery":
+            if not self.credential_valid:
+                return Rpc(RuntimeError("import_credential_revision_mismatch"))
+            return Rpc(self.finalize_trial_results.pop(0))
+        if name == "close_pjud_runtime_trial_grant":
+            if self.before_close is not None:
+                self.before_close()
+            result = self.close_results.pop(0)
+            return Rpc(result)
         raise AssertionError(name)
 
 
@@ -97,6 +152,24 @@ class FakeProxyUsage:
         yield
 
 
+class SettlingProxyUsage(FakeProxyUsage):
+    def __init__(self):
+        super().__init__()
+        self.active = 0
+        self.events = []
+
+    @asynccontextmanager
+    async def track(self, **kwargs):
+        self.calls.append(kwargs)
+        self.active += 1
+        self.events.append("reserved")
+        try:
+            yield
+        finally:
+            self.active -= 1
+            self.events.append("settled")
+
+
 class RejectingProxyUsage:
     def __init__(self, error):
         self.error = error
@@ -129,6 +202,20 @@ def candidate(**overrides):
     return ImportCandidate.model_validate(values)
 
 
+def trial_scope() -> TrialScope:
+    return TrialScope(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+        trial_grant_id=TRIAL_GRANT_ID,
+        job_id=JOB["job_id"],
+        claim_token=JOB["claim_token"],
+        worker_id="import-worker",
+        law_firm_id=JOB["law_firm_id"],
+        credential_id=JOB["credential_id"],
+        expected_credentials_updated_at="2026-08-23T12:00:00.000Z",
+    )
+
+
 def make_worker(
     *, claim=JOB, discovery=None, credential=None, session=None, concurrency=1,
     proxy_usage=None,
@@ -158,6 +245,736 @@ def make_worker(
         proxy_usage=proxy_usage,
     )
     return worker, sb, pool, discovery, credential, session_factory, session
+
+
+def make_trial_worker(
+    *, trial_claim=TRIAL_JOB, discovery=None, credential=None, proxy_usage=None,
+):
+    sb = FakeSupabase(trial_claim=trial_claim)
+    pool = FakePool()
+    discovery = discovery or AsyncMock(return_value=DiscoveryResult(
+        candidates=[candidate()], page_count=1, status="ok",
+    ))
+    normal_credential = AsyncMock(
+        side_effect=AssertionError("trial must not use normal credential relay"),
+    )
+    trial_credential = credential or AsyncMock(return_value={
+        "rut": "11111111-1",
+        "password": "secret-value",
+        "password_type": "clave_poder_judicial",
+        "binding_version": "2026-08-23T12:00:00.000Z",
+    })
+    session = FakeSession()
+    proxy_usage = proxy_usage or FakeProxyUsage()
+    worker = ImportDiscoveryWorker(
+        supabase=sb,
+        trial_supabase=sb,
+        pool=pool,
+        worker_id="import-worker",
+        fetch_credential=normal_credential,
+        fetch_trial_credential=trial_credential,
+        discover=discovery,
+        session_factory=MagicMock(return_value=session),
+        lease_seconds=30,
+        renewal_interval_seconds=0.001,
+        proxy_usage=proxy_usage,
+    )
+    return (
+        worker,
+        sb,
+        pool,
+        discovery,
+        normal_credential,
+        trial_credential,
+        proxy_usage,
+        session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_trial_decrypt_revision_mismatch_fails_before_pool_or_provider():
+    """Catch the worker deriving authority from decrypt instead of the exact claim."""
+    credential = AsyncMock(return_value={
+        "rut": "11111111-1",
+        "password": "secret-value",
+        "password_type": "clave_poder_judicial",
+        "binding_version": "2026-08-23T12:00:01.000Z",
+    })
+    worker, sb, pool, discover, _normal, *_ = make_trial_worker(
+        credential=credential,
+    )
+
+    with pytest.raises(RuntimeError, match="trial_import_credential_revision_mismatch"):
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    pool.acquire_familia_bundle.assert_not_awaited()
+    discover.assert_not_awaited()
+    assert [name for name, _payload in sb.calls] == ["claim_pjud_trial_import_job"]
+
+
+@pytest.mark.asyncio
+async def test_trial_claim_is_exact_and_propagates_one_immutable_scope_everywhere():
+    """Catch fallback to the generic queue or tuple loss before provider work."""
+    (
+        worker,
+        sb,
+        pool,
+        _discover,
+        normal_credential,
+        trial_credential,
+        proxy_usage,
+        _session,
+    ) = make_trial_worker()
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is True
+    assert outcome.job_status == "needs_selection"
+    assert outcome.summary_status == "needs_selection"
+    assert outcome.discovered_count == 1
+    assert outcome.candidate_count == 1
+    assert outcome.evidence_sha256 == TRIAL_EVIDENCE_SHA256
+    assert outcome.job_id == JOB["job_id"]
+
+    assert sb.calls[0] == (
+        "claim_pjud_trial_import_job",
+        {
+            "p_expected_generation": TRIAL_GENERATION,
+            "p_worker_id": "import-worker",
+            "p_lease_seconds": 30,
+        },
+    )
+    names = [name for name, _payload in sb.calls]
+    assert not {
+        "claim_pjud_import_job",
+        "renew_pjud_import_job_claim",
+        "validate_pjud_import_credential_claim",
+        "finalize_pjud_import_discovery",
+    }.intersection(names)
+    assert "validate_pjud_trial_import_credential_claim" in names
+    assert "finalize_pjud_trial_import_discovery" in names
+    assert names[-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+    normal_credential.assert_not_awaited()
+    scope = trial_credential.await_args.args[-1]
+    assert isinstance(scope, TrialScope)
+    assert str(scope.trial_grant_id) == TRIAL_GRANT_ID
+    assert str(scope.job_id) == JOB["job_id"]
+    assert str(scope.claim_token) == JOB["claim_token"]
+    assert str(scope.law_firm_id) == JOB["law_firm_id"]
+    assert str(scope.credential_id) == JOB["credential_id"]
+    assert scope.expected_credentials_updated_at.isoformat() == (
+        "2026-08-23T12:00:00+00:00"
+    )
+    assert scope.worker_id == "import-worker"
+    assert scope.capability.get_secret_value() == TRIAL_CAPABILITY
+    assert TRIAL_CAPABILITY not in repr(scope)
+    pool.acquire_familia_bundle.assert_awaited_once_with(trial_scope=scope)
+    pool.release_familia_bundle.assert_awaited_once_with(
+        pool.slot, disposition="healthy", remint=True, trial_scope=scope,
+    )
+    assert proxy_usage.calls
+    assert all(call["trial_scope"] is scope for call in proxy_usage.calls)
+    trial_payloads = [
+        payload
+        for name, payload in sb.calls
+        if name in {
+            "validate_pjud_trial_import_credential_claim",
+            "finalize_pjud_trial_import_discovery",
+        }
+    ]
+    assert trial_payloads
+    assert all(payload["p_trial_grant_id"] == TRIAL_GRANT_ID for payload in trial_payloads)
+    assert all(
+        payload["p_expected_generation"] == TRIAL_GENERATION
+        for payload in trial_payloads
+    )
+    assert all(
+        payload["p_expected_credential_updated_at"]
+        == "2026-08-23T12:00:00+00:00"
+        for payload in trial_payloads
+    )
+    assert all("p_generation" not in payload for payload in trial_payloads)
+    assert all(
+        "p_expected_credentials_updated_at" not in payload
+        for payload in trial_payloads
+    )
+    validation_payloads = [
+        payload
+        for name, payload in sb.calls
+        if name == "validate_pjud_trial_import_credential_claim"
+    ]
+    assert validation_payloads
+    assert all(set(payload) == {
+        "p_expected_generation",
+        "p_trial_grant_id",
+        "p_job_id",
+        "p_claim_token",
+        "p_worker_id",
+        "p_credential_id",
+        "p_expected_credential_updated_at",
+    } for payload in validation_payloads)
+    finalize_payload = next(
+        payload
+        for name, payload in sb.calls
+        if name == "finalize_pjud_trial_import_discovery"
+    )
+    assert set(finalize_payload) == {
+        "p_expected_generation",
+        "p_trial_grant_id",
+        "p_job_id",
+        "p_claim_token",
+        "p_worker_id",
+        "p_candidates",
+        "p_summary",
+        "p_expected_credential_updated_at",
+    }
+    close_payload = sb.calls[-1][1]
+    assert close_payload == {
+        "p_expected_generation": TRIAL_GENERATION,
+        "p_trial_grant_id": TRIAL_GRANT_ID,
+        "p_job_id": JOB["job_id"],
+    }
+    assert all(TRIAL_CAPABILITY not in repr(payload) for payload in trial_payloads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("discovery", "credential", "job_status", "summary_status", "count"),
+    [
+        (
+            DiscoveryResult(candidates=[], page_count=1, status="ok"),
+            None,
+            "completed",
+            "needs_selection",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="credential_invalid"),
+            AsyncMock(return_value=None),
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="session_expired"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="waf"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(candidates=[], page_count=0, status="timeout"),
+            None,
+            "failed",
+            "failed",
+            0,
+        ),
+        (
+            DiscoveryResult(
+                candidates=[candidate()], page_count=1, status="upstream_changed",
+            ),
+            None,
+            "partial",
+            "partial",
+            1,
+        ),
+    ],
+)
+async def test_trial_unsuccessful_discovery_returns_persisted_outcome_after_close(
+    discovery, credential, job_status, summary_status, count,
+):
+    """Catch a terminal discovery failure being relabeled as trial success."""
+    worker, sb, *_ = make_trial_worker(
+        discovery=AsyncMock(return_value=discovery),
+        credential=credential,
+    )
+    sb.close_results = [trial_close_proof(
+        job_status=job_status,
+        summary_status=summary_status,
+        discovered_count=count,
+        candidate_count=count,
+    )]
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is False
+    assert outcome.job_status == job_status
+    assert outcome.summary_status == summary_status
+    assert outcome.discovered_count == count
+    assert outcome.candidate_count == count
+    assert outcome.job_id == JOB["job_id"]
+    assert [name for name, _payload in sb.calls][-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+    assert sum(
+        name == "close_pjud_runtime_trial_grant"
+        for name, _payload in sb.calls
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_candidate_payload_failure_is_persisted_as_failed_and_closed():
+    worker, sb, *_ = make_trial_worker(discovery=AsyncMock(return_value=DiscoveryResult(
+        candidates=[candidate()], page_count=1, status="ok",
+    )))
+    sb.close_results = [trial_close_proof(
+        job_status="failed",
+        summary_status="failed",
+        discovered_count=0,
+        candidate_count=0,
+    )]
+
+    with patch(
+        "worker.import_jobs._candidate_payloads",
+        side_effect=ValueError("synthetic serialization contract failure"),
+    ):
+        outcome = await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    assert outcome.successful is False
+    assert outcome.job_status == "failed"
+    assert outcome.summary_status == "failed"
+    assert outcome.discovered_count == 0
+    assert [name for name, _payload in sb.calls][-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_generation",
+    [
+        "11111111-1111-1111-8111-111111111111",
+        "11111111-1111-4111-7111-111111111111",
+    ],
+)
+async def test_trial_rejects_non_v4_generation_before_first_rpc(runtime_generation):
+    worker, sb, pool, discover, normal_credential, trial_credential, *_ = (
+        make_trial_worker()
+    )
+
+    with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=runtime_generation,
+        )
+
+    assert sb.calls == []
+    normal_credential.assert_not_awaited()
+    trial_credential.assert_not_awaited()
+    pool.acquire_familia_bundle.assert_not_awaited()
+    discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trial_claim_replays_once_with_the_exact_payload_after_ambiguous_transport():
+    worker, sb, pool, discover, _normal, trial_credential, *_ = make_trial_worker()
+    sb.trial_claim_results = [httpx.ReadTimeout("response lost"), TRIAL_JOB]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
+        outcome = await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+        assert outcome.successful is True
+
+    claim_calls = [
+        entry for entry in sb.calls if entry[0] == "claim_pjud_trial_import_job"
+    ]
+    assert len(claim_calls) == 2
+    assert claim_calls[0] == claim_calls[1]
+    assert call(0.1) in sleep.await_args_list
+    pool.acquire_familia_bundle.assert_awaited_once()
+    trial_credential.assert_awaited_once()
+    discover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_result",
+    [
+        httpx.RemoteProtocolError("second response lost"),
+        RuntimeError("database detail"),
+    ],
+)
+async def test_trial_claim_persistent_unknown_is_redacted_before_provider(
+    second_result,
+):
+    worker, sb, pool, discover, _normal, trial_credential, *_ = make_trial_worker()
+    sb.trial_claim_results = [
+        httpx.WriteTimeout("first response lost"),
+        second_result,
+    ]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
+        with pytest.raises(
+            RuntimeError, match="^pjud_trial_import_job_claim_unconfirmed$",
+        ) as exc_info:
+            await worker.process_trial_next(
+                capability=SecretStr(TRIAL_CAPABILITY),
+                runtime_generation=TRIAL_GENERATION,
+            )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert "response lost" not in rendered
+    assert "database detail" not in rendered
+    assert TRIAL_CAPABILITY not in rendered
+    claim_calls = [
+        entry for entry in sb.calls if entry[0] == "claim_pjud_trial_import_job"
+    ]
+    assert len(claim_calls) == 2
+    assert claim_calls[0] == claim_calls[1]
+    assert call(0.1) in sleep.await_args_list
+    pool.acquire_familia_bundle.assert_not_awaited()
+    trial_credential.assert_not_awaited()
+    discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trial_close_waits_until_proxy_reservations_are_settled():
+    proxy_usage = SettlingProxyUsage()
+    worker, sb, *_ = make_trial_worker(proxy_usage=proxy_usage)
+
+    def assert_settled_before_close():
+        assert proxy_usage.calls
+        assert proxy_usage.active == 0
+        assert proxy_usage.events[-1] == "settled"
+        assert sb.calls[-2][0] == "finalize_pjud_trial_import_discovery"
+        proxy_usage.events.append("close")
+
+    sb.before_close = assert_settled_before_close
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+    assert outcome.successful is True
+    assert proxy_usage.events[-2:] == ["settled", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "close_result",
+    [
+        True,
+        False,
+        None,
+        {"status": "trial_grant_closed"},
+        {**trial_close_proof(), "unexpected": "field"},
+        trial_close_proof(job_status="unexpected_status"),
+        trial_close_proof(summary_status="unexpected_status"),
+        trial_close_proof(evidence_sha256="A" * 64),
+        trial_close_proof(discovered_count=True),
+        trial_close_proof(candidate_count=-1),
+        RuntimeError("database detail"),
+    ],
+)
+async def test_trial_close_malformed_contract_or_error_is_terminal_and_redacted(
+    close_result,
+):
+    worker, sb, *_ = make_trial_worker()
+    sb.close_results = [close_result]
+
+    with pytest.raises(
+        RuntimeError, match="^pjud_trial_grant_close_unconfirmed$",
+    ) as exc_info:
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert "database detail" not in rendered
+    assert TRIAL_CAPABILITY not in rendered
+    assert [name for name, _payload in sb.calls][-2:] == [
+        "finalize_pjud_trial_import_discovery",
+        "close_pjud_runtime_trial_grant",
+    ]
+    assert sum(
+        name == "close_pjud_runtime_trial_grant"
+        for name, _payload in sb.calls
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_close_replays_the_exact_rpc_after_ambiguous_transport():
+    worker, sb, *_ = make_trial_worker()
+    sb.close_results = [
+        httpx.ReadTimeout("response lost"),
+        trial_close_proof(),
+    ]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
+        outcome = await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+        assert outcome.successful is True
+
+    close_calls = [
+        call for call in sb.calls if call[0] == "close_pjud_runtime_trial_grant"
+    ]
+    assert len(close_calls) == 2
+    assert close_calls[0] == close_calls[1]
+    assert call(0.1) in sleep.await_args_list
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "close_result",
+    [
+        trial_close_proof(
+            discovered_count=1,
+            candidate_count=2,
+        ),
+        trial_close_proof(
+            job_status="completed",
+            summary_status="needs_selection",
+            discovered_count=0,
+            candidate_count=0,
+        ),
+        trial_close_proof(
+            job_status="partial",
+            summary_status="partial",
+        ),
+        trial_close_proof(
+            job_status="failed",
+            summary_status="failed",
+            discovered_count=0,
+            candidate_count=0,
+        ),
+    ],
+)
+async def test_trial_close_proof_requires_selectable_coherent_evidence_for_success(
+    close_result,
+):
+    worker, sb, *_ = make_trial_worker()
+    sb.close_results = [close_result]
+
+    outcome = await worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    )
+
+    assert outcome.claimed is True
+    assert outcome.successful is False
+    assert outcome.job_status == close_result["job_status"]
+    assert outcome.candidate_count == close_result["candidate_count"]
+    assert outcome.evidence_sha256 == TRIAL_EVIDENCE_SHA256
+
+
+@pytest.mark.asyncio
+async def test_trial_close_persistent_ambiguity_is_terminal_and_redacted():
+    worker, sb, *_ = make_trial_worker()
+    sb.close_results = [
+        httpx.WriteTimeout("first response lost"),
+        httpx.ReadTimeout("second response lost"),
+    ]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
+        with pytest.raises(
+            RuntimeError, match="^pjud_trial_grant_close_unconfirmed$",
+        ) as exc_info:
+            await worker.process_trial_next(
+                capability=SecretStr(TRIAL_CAPABILITY),
+                runtime_generation=TRIAL_GENERATION,
+            )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert "response lost" not in rendered
+    assert TRIAL_CAPABILITY not in rendered
+    close_calls = [
+        call for call in sb.calls if call[0] == "close_pjud_runtime_trial_grant"
+    ]
+    assert len(close_calls) == 2
+    assert close_calls[0] == close_calls[1]
+    assert call(0.1) in sleep.await_args_list
+
+
+@pytest.mark.asyncio
+async def test_trial_finalize_failure_never_attempts_close():
+    worker, sb, *_ = make_trial_worker()
+    sb.finalize_trial_results = [RuntimeError("finalize unavailable")]
+
+    with pytest.raises(RuntimeError, match="finalize unavailable"):
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    assert "close_pjud_runtime_trial_grant" not in [
+        name for name, _payload in sb.calls
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trial_finalize_replays_exact_rpc_after_ambiguous_transport():
+    worker, sb, *_ = make_trial_worker()
+    sb.finalize_trial_results = [httpx.ReadTimeout("response lost"), None]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()) as sleep:
+        outcome = await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+        assert outcome.successful is True
+
+    finalize_calls = [
+        call for call in sb.calls
+        if call[0] == "finalize_pjud_trial_import_discovery"
+    ]
+    assert len(finalize_calls) == 2
+    assert finalize_calls[0] == finalize_calls[1]
+    assert sb.calls[-1][0] == "close_pjud_runtime_trial_grant"
+    assert call(0.1) in sleep.await_args_list
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replay_result",
+    [
+        RuntimeError("scope mismatch"),
+        httpx.WriteTimeout("second response also lost"),
+    ],
+)
+async def test_trial_finalize_unknown_replay_never_attempts_close(replay_result):
+    worker, sb, *_ = make_trial_worker()
+    sb.finalize_trial_results = [
+        httpx.ReadTimeout("first response lost"),
+        replay_result,
+    ]
+
+    with patch("worker.import_jobs.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(
+            RuntimeError,
+            match="^pjud_trial_discovery_finalize_unconfirmed$",
+        ) as exc_info:
+            await worker.process_trial_next(
+                capability=SecretStr(TRIAL_CAPABILITY),
+                runtime_generation=TRIAL_GENERATION,
+            )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert "response lost" not in rendered
+    assert "scope mismatch" not in rendered
+    assert TRIAL_CAPABILITY not in rendered
+    assert len([
+        call for call in sb.calls
+        if call[0] == "finalize_pjud_trial_import_discovery"
+    ]) == 2
+    assert "close_pjud_runtime_trial_grant" not in [
+        name for name, _payload in sb.calls
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_engine_trial_entrypoint_passes_only_validated_secret_and_generation():
+    from worker.engine import SyncEngine
+
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._config = SimpleNamespace(
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(TRIAL_CAPABILITY),
+        PJUD_RUNTIME_GENERATION=TRIAL_GENERATION,
+    )
+    expected = SimpleNamespace(
+        claimed=True,
+        successful=True,
+        job_status="needs_selection",
+        summary_status="needs_selection",
+        discovered_count=1,
+        candidate_count=1,
+        evidence_sha256=TRIAL_EVIDENCE_SHA256,
+        job_id=JOB["job_id"],
+    )
+    engine._import_worker = MagicMock(
+        process_trial_next=AsyncMock(return_value=expected),
+        process_next=AsyncMock(
+            side_effect=AssertionError("generic claim must not be reachable"),
+        ),
+    )
+
+    assert await engine.process_trial_import_job() is expected
+
+    engine._import_worker.process_trial_next.assert_awaited_once_with(
+        capability=engine._config.PJUD_IMPORT_TRIAL_CAPABILITY,
+        runtime_generation=TRIAL_GENERATION,
+    )
+    engine._import_worker.process_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trial_claim",
+    [JOB, [TRIAL_JOB, {**TRIAL_JOB, "job_id": "98200000-0000-4000-8000-000000000042"}]],
+)
+async def test_trial_claim_contract_fails_closed_before_any_provider_boundary(trial_claim):
+    """Catch a missing grant or multi-job response being processed as exact authority."""
+    worker, sb, pool, discover, normal_credential, trial_credential, *_ = (
+        make_trial_worker(trial_claim=trial_claim)
+    )
+
+    with pytest.raises(RuntimeError, match="invalid_trial_import_job_claim_contract"):
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    assert [name for name, _payload in sb.calls] == ["claim_pjud_trial_import_job"]
+    normal_credential.assert_not_awaited()
+    trial_credential.assert_not_awaited()
+    pool.acquire_familia_bundle.assert_not_awaited()
+    discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trial_claim_contract_error_does_not_expose_authority_tuple():
+    malformed = {
+        **TRIAL_JOB,
+        "unexpected_secretish_field": TRIAL_CAPABILITY,
+    }
+    worker, *_ = make_trial_worker(trial_claim=malformed)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await worker.process_trial_next(
+            capability=SecretStr(TRIAL_CAPABILITY),
+            runtime_generation=TRIAL_GENERATION,
+        )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert rendered.strip().endswith("invalid_trial_import_job_claim_contract")
+    for sensitive in (
+        TRIAL_CAPABILITY,
+        TRIAL_GRANT_ID,
+        JOB["job_id"],
+        JOB["claim_token"],
+        JOB["credential_id"],
+    ):
+        assert sensitive not in rendered
 
 
 @pytest.mark.asyncio
@@ -482,6 +1299,62 @@ async def test_lost_lease_cancels_discovery_and_stale_worker_never_finalizes():
         await asyncio.wait_for(task, timeout=0.1)
 
     assert not any(name == "finalize_pjud_import_discovery" for name, _ in sb.calls)
+
+
+@pytest.mark.asyncio
+async def test_lost_trial_claim_cancels_provider_work_without_remint_or_finalize():
+    started = asyncio.Event()
+
+    async def never_finishes(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    (
+        worker,
+        sb,
+        pool,
+        _discover,
+        _normal_credential,
+        trial_credential,
+        proxy_usage,
+        _session,
+    ) = make_trial_worker(discovery=AsyncMock(side_effect=never_finishes))
+    sb.renew_result = False
+    task = asyncio.create_task(worker.process_trial_next(
+        capability=SecretStr(TRIAL_CAPABILITY),
+        runtime_generation=TRIAL_GENERATION,
+    ))
+    await started.wait()
+
+    with pytest.raises(RuntimeError, match="import_job_claim_lost"):
+        await asyncio.wait_for(task, timeout=0.1)
+
+    names = [name for name, _payload in sb.calls]
+    assert names.count("claim_pjud_trial_import_job") == 1
+    assert "renew_pjud_trial_import_job_claim" in names
+    assert "finalize_pjud_trial_import_discovery" not in names
+    assert "claim_pjud_import_job" not in names
+    scope = trial_credential.await_args.args[-1]
+    pool.release_familia_bundle.assert_awaited_once_with(
+        pool.slot,
+        disposition="healthy",
+        remint=False,
+        trial_scope=scope,
+    )
+    assert all(call["trial_scope"] is scope for call in proxy_usage.calls)
+    renewal_payload = next(
+        payload
+        for name, payload in sb.calls
+        if name == "renew_pjud_trial_import_job_claim"
+    )
+    assert renewal_payload == {
+        "p_expected_generation": TRIAL_GENERATION,
+        "p_trial_grant_id": TRIAL_GRANT_ID,
+        "p_job_id": JOB["job_id"],
+        "p_claim_token": JOB["claim_token"],
+        "p_worker_id": "import-worker",
+        "p_lease_seconds": 30,
+    }
 
 
 @pytest.mark.asyncio
@@ -939,3 +1812,95 @@ async def test_import_credential_fetch_uses_import_specific_claim_boundary():
             "X-Pjud-Import-Worker-Id": "import-worker",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_trial_import_credential_relay_adds_only_exact_capability_and_grant_headers():
+    """Catch a trial decrypt losing grant authority or falling back to normal relay."""
+    from worker.engine import SyncEngine
+
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {"x-pjud-runtime-generation": TRIAL_GENERATION}
+    engine._call_app_internal = AsyncMock(
+        return_value=SimpleNamespace(status_code=404, json=lambda: {"error": "closed"}),
+    )
+    scope = trial_scope()
+
+    assert await engine._get_trial_import_credential(
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+        JOB["claim_token"], "import-worker", scope,
+    ) is None
+
+    engine._call_app_internal.assert_awaited_once_with(
+        "GET",
+        f"/api/internal/pjud-import/credentials/{JOB['credential_id']}/decrypt",
+        "Trial import decrypt endpoint",
+        law_firm_id=JOB["law_firm_id"],
+        extra_headers={
+            "X-Pjud-Import-Job-Id": JOB["job_id"],
+            "X-Pjud-Import-Claim-Token": JOB["claim_token"],
+            "X-Pjud-Import-Worker-Id": "import-worker",
+            "X-Pjud-Import-Credential-Updated-At": (
+                "2026-08-23T12:00:00+00:00"
+            ),
+            "x-pjud-runtime-trial-capability": TRIAL_CAPABILITY,
+            "X-Pjud-Runtime-Trial-Grant-Id": TRIAL_GRANT_ID,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("position", "replacement"),
+    [
+        (0, "98200000-0000-4000-8000-000000000022"),
+        (1, "98200000-0000-4000-8000-000000000002"),
+        (2, "98200000-0000-4000-8000-000000000042"),
+        (3, "98200000-0000-4000-8000-000000000098"),
+        (4, "other-worker"),
+    ],
+)
+async def test_trial_import_credential_relay_rejects_any_wrong_tuple_before_http(
+    position, replacement,
+):
+    """Catch one field being trusted independently from the immutable trial scope."""
+    from worker.engine import ImportCredentialInfrastructureError, SyncEngine
+
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {"x-pjud-runtime-generation": TRIAL_GENERATION}
+    engine._call_app_internal = AsyncMock()
+    args = [
+        JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+        JOB["claim_token"], "import-worker",
+    ]
+    args[position] = replacement
+
+    with pytest.raises(
+        ImportCredentialInfrastructureError,
+        match="trial_import_scope_mismatch",
+    ):
+        await engine._get_trial_import_credential(*args, trial_scope())
+
+    engine._call_app_internal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trial_import_credential_relay_rejects_wrong_runtime_generation_before_http():
+    from worker.engine import ImportCredentialInfrastructureError, SyncEngine
+
+    engine = SyncEngine.__new__(SyncEngine)
+    engine._runtime_headers = {
+        "x-pjud-runtime-generation": "99999999-9999-4999-8999-999999999999",
+    }
+    engine._call_app_internal = AsyncMock()
+
+    with pytest.raises(
+        ImportCredentialInfrastructureError,
+        match="trial_import_scope_mismatch",
+    ):
+        await engine._get_trial_import_credential(
+            JOB["credential_id"], JOB["law_firm_id"], JOB["job_id"],
+            JOB["claim_token"], "import-worker", trial_scope(),
+        )
+
+    engine._call_app_internal.assert_not_awaited()

@@ -1,10 +1,12 @@
 """Closed protocol, fixed identity and admission boundaries (no external I/O)."""
 import asyncio
+import httpx
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import SecretStr
 
 from app.runtime_fence import (
     PjudRuntimeError, RuntimeFence, runtime_generation_headers,
@@ -24,7 +26,16 @@ async def test_old_process_does_not_adopt_new_control_generation():
         fence.generation = GENERATION_B
 
 
-@pytest.mark.parametrize("value", [GENERATION_A.upper(), " " + GENERATION_A, GENERATION_A + " ", "bad", 1, True])
+@pytest.mark.parametrize("value", [
+    GENERATION_A.upper(),
+    " " + GENERATION_A,
+    GENERATION_A + " ",
+    "11111111-1111-1111-8111-111111111111",
+    "11111111-1111-4111-7111-111111111111",
+    "bad",
+    1,
+    True,
+])
 def test_generation_rejects_noncanonical_nonblank(value):
     with pytest.raises(ValueError, match="^pjud_runtime_invalid_generation$"):
         validate_runtime_generation(value)
@@ -236,6 +247,263 @@ def test_supabase_client_headers_are_fixed_and_isolated(monkeypatch):
     assert one.options.headers["x-pjud-runtime-generation"] == GENERATION_A
     assert two.options.headers["x-pjud-runtime-generation"] == GENERATION_B
     assert one.options.headers is not two.options.headers
+
+
+def test_trial_supabase_client_is_dedicated_and_normal_headers_never_gain_capability():
+    """Catch trial authority leaking to fence, table reads or generic RPCs."""
+    from worker import supabase_client
+
+    capability = "b" * 64
+    normal = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=False,
+        PJUD_IMPORT_TRIAL_CAPABILITY=None,
+    )
+    trial = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(capability),
+    )
+
+    normal_client = supabase_client.create_supabase(normal)
+    normal_from_trial_config = supabase_client.create_supabase(trial)
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"status": "empty"})
+
+    trial_client = supabase_client.create_trial_supabase(
+        trial, transport=httpx.MockTransport(respond),
+    )
+
+    assert normal_client.options.headers["x-pjud-runtime-generation"] == GENERATION_A
+    assert (
+        normal_from_trial_config.options.headers["x-pjud-runtime-generation"]
+        == GENERATION_A
+    )
+    response = trial_client.rpc("claim_pjud_trial_import_job", {}).execute()
+    assert response.data == {"status": "empty"}
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == (
+        "https://db.test/rest/v1/rpc/claim_pjud_trial_import_job"
+    )
+    assert requests[0].headers["x-pjud-runtime-trial-capability"] == capability
+    assert requests[0].headers["x-pjud-runtime-generation"] == GENERATION_A
+
+    for headers in (
+        normal_client.options.headers,
+        normal_from_trial_config.options.headers,
+        trial_client._postgrest.headers,
+        trial_client._postgrest.session.headers,
+    ):
+        assert "x-pjud-runtime-trial-capability" not in headers
+        assert capability not in repr(headers)
+    assert not hasattr(trial_client, "storage")
+    assert not hasattr(trial_client, "auth")
+    assert capability not in repr(trial_client)
+    assert capability not in repr(vars(trial_client))
+
+    with pytest.raises(ValueError, match="pjud_trial_supabase_client_requires_trial"):
+        supabase_client.create_trial_supabase(normal)
+
+
+@pytest.mark.parametrize(
+    "supabase_url,secret_fragment",
+    [
+        ("http://db.test", None),
+        ("https://user:password@db.test", "password"),
+        ("https://@db.test", None),
+        ("https://db.test/rest/v1", None),
+        ("https://db.test?token=query-secret", "query-secret"),
+        ("https://db.test?", None),
+        ("https://db.test#fragment-secret", "fragment-secret"),
+        ("https://db.test#", None),
+        ("https:///missing-host", None),
+        ("not-a-url", None),
+    ],
+)
+def test_trial_rpc_rejects_non_origin_https_endpoint_before_request(
+    supabase_url,
+    secret_fragment,
+):
+    """Catch trial authority being sent to an untrusted or ambiguous endpoint."""
+    from worker import supabase_client
+
+    capability = "c" * 64
+    requests = []
+    trial = SimpleNamespace(
+        SUPABASE_URL=supabase_url,
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(capability),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^pjud_trial_rpc_invalid_endpoint$",
+    ) as exc_info:
+        supabase_client.create_trial_supabase(
+            trial,
+            transport=httpx.MockTransport(
+                lambda request: requests.append(request),
+            ),
+        )
+
+    diagnostic = repr(exc_info.value)
+    assert capability not in diagnostic
+    if secret_fragment is not None:
+        assert secret_fragment not in diagnostic
+    assert requests == []
+
+
+@pytest.mark.parametrize("status_code", [300, 307, 399])
+def test_trial_rpc_rejects_redirect_without_replaying_authority(status_code):
+    """Catch a 3xx replaying the capability or API key to another origin."""
+    from worker import supabase_client
+
+    capability = "d" * 64
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            status_code,
+            headers={"location": "https://redirect.invalid/capture"},
+        )
+
+    trial = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(capability),
+    )
+    trial_client = supabase_client.create_trial_supabase(
+        trial,
+        transport=httpx.MockTransport(respond),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^pjud_trial_rpc_redirect_rejected$",
+    ) as exc_info:
+        trial_client.rpc("claim_pjud_trial_import_job", {}).execute()
+
+    assert capability not in repr(exc_info.value)
+    assert len(requests) == 1
+    assert requests[0].url.host == "db.test"
+    assert requests[0].headers["x-pjud-runtime-trial-capability"] == capability
+
+
+@pytest.mark.parametrize(
+    "rpc_name",
+    [
+        None,
+        1,
+        ["claim_pjud_trial_import_job"],
+        "",
+        "foo/bar",
+        "foo//bar",
+        r"foo\bar",
+        ".",
+        "..",
+        "%",
+        "%2e%2e",
+        "%252e%252e",
+        "foo%2fbar",
+        "foo%252fbar",
+        "foo%3Fbar",
+        "foo%23bar",
+        "claim_pjud_trial_import_job/extra",
+        "unknown_trial_rpc",
+        "get_pjud_runtime_control",
+    ],
+)
+def test_trial_rpc_rejects_name_outside_closed_allowlist_before_transport(
+    rpc_name,
+):
+    """Catch malformed, encoded or non-trial RPC names gaining authority."""
+    from worker import supabase_client
+
+    capability = "e" * 64
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"unexpected": True})
+
+    trial = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr(capability),
+    )
+    trial_client = supabase_client.create_trial_supabase(
+        trial,
+        transport=httpx.MockTransport(respond),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^pjud_trial_rpc_scope_violation$",
+    ) as exc_info:
+        trial_client.rpc(rpc_name, {}).execute()
+
+    assert capability not in repr(exc_info.value)
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "rpc_name",
+    [
+        "claim_pjud_trial_import_job",
+        "close_pjud_runtime_trial_grant",
+        "finalize_pjud_trial_import_discovery",
+        "pjud_proxy_finalize_trial_budget_reservation",
+        "pjud_proxy_record_trial_usage",
+        "pjud_proxy_reserve_trial_budget",
+        "renew_pjud_trial_import_job_claim",
+        "validate_pjud_trial_import_credential_claim",
+    ],
+)
+def test_trial_rpc_closed_allowlist_keeps_each_trial_operation_reachable(
+    rpc_name,
+):
+    """Catch an allowlist omission blocking one of the bounded trial RPCs."""
+    from worker import supabase_client
+
+    requests = []
+    trial = SimpleNamespace(
+        SUPABASE_URL="https://db.test",
+        SUPABASE_SERVICE_KEY="placeholder",
+        PJUD_RUNTIME_GENERATION=GENERATION_A,
+        PJUD_IMPORT_TRIAL_ONCE=True,
+        PJUD_IMPORT_TRIAL_CAPABILITY=SecretStr("f" * 64),
+    )
+    trial_client = supabase_client.create_trial_supabase(
+        trial,
+        transport=httpx.MockTransport(
+            lambda request: (
+                requests.append(request)
+                or httpx.Response(200, json={"status": "ok"})
+            ),
+        ),
+    )
+
+    response = trial_client.rpc(rpc_name, {}).execute()
+
+    assert response.data == {"status": "ok"}
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == f"/rest/v1/rpc/{rpc_name}"
 
 
 @pytest.mark.asyncio

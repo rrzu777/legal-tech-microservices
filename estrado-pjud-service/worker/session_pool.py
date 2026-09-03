@@ -32,6 +32,7 @@ from app.session import OJVSession
 from worker.config import WorkerConfig
 from worker.maintenance import has_active_operation, mark_uncertain, track_auxiliary
 from worker.proxy_usage import SessionReason
+from worker.trial_scope import TrialScope
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +168,27 @@ class SessionPool:
         ):
             await self._proxy_control.refresh()
 
+    @staticmethod
+    def _trial_usage_attribution(
+        trial_scope: TrialScope | None,
+    ) -> dict[str, object]:
+        if trial_scope is None:
+            return {}
+        return {
+            "trial_scope": trial_scope,
+            "law_firm_id": str(trial_scope.law_firm_id),
+            "import_job_id": str(trial_scope.job_id),
+            "import_claim_token": str(trial_scope.claim_token),
+            "import_worker_id": trial_scope.worker_id,
+        }
+
     @asynccontextmanager
     async def _mint_usage_scope(
-        self, slot: _Slot, attempt: int,
+        self,
+        slot: _Slot,
+        attempt: int,
+        *,
+        trial_scope: TrialScope | None = None,
     ):
         if self._proxy_usage is None or not self._proxy_base:
             yield None
@@ -181,10 +200,12 @@ class SessionPool:
                 "session_reason": slot.session_cycle_reason,
                 "session_age_seconds": slot.session_cycle_age_seconds,
             }
+        trial_kwargs = self._trial_usage_attribution(trial_scope)
         async with self._proxy_usage.track(
             operation="mint",
             transaction_key=f"slot:{slot.index}:attempt:{attempt}:{uuid.uuid4()}",
             **telemetry,
+            **trial_kwargs,
         ) as usage:
             if attempt > 1:
                 usage.retry_count += 1
@@ -198,16 +219,19 @@ class SessionPool:
         session_cycle_id: uuid.UUID,
         session_reason: SessionReason,
         session_age_seconds: int,
+        trial_scope: TrialScope | None = None,
     ):
         if self._proxy_usage is None or not self._proxy_base:
             yield None
             return
+        trial_kwargs = self._trial_usage_attribution(trial_scope)
         async with self._proxy_usage.track(
             operation="health",
             transaction_key=f"slot:{slot.index}:health:{uuid.uuid4()}",
             session_cycle_id=session_cycle_id,
             session_reason=session_reason,
             session_age_seconds=session_age_seconds,
+            **trial_kwargs,
         ) as usage:
             yield usage
 
@@ -289,7 +313,11 @@ class SessionPool:
     # -- Minteo por-slot ------------------------------------------------
 
     async def _mint_slot(
-        self, slot: _Slot, *, max_attempts: int | None = None,
+        self,
+        slot: _Slot,
+        *,
+        max_attempts: int | None = None,
+        trial_scope: TrialScope | None = None,
     ) -> None:
         """Mintea (o re-mintea) UN slot: nueva IP sticky (si hay proxy) + nueva
         sesión OJV. Swap-then-close: la sesión nueva se construye ANTES de
@@ -333,7 +361,9 @@ class SessionPool:
             new_session = None
             self.mint_attempts += 1
             try:
-                async with self._mint_usage_scope(slot, attempt):
+                async with self._mint_usage_scope(
+                    slot, attempt, trial_scope=trial_scope,
+                ):
                     timer = asyncio.timeout_at(deadline)
                     try:
                         async with timer:
@@ -461,9 +491,11 @@ class SessionPool:
             "Slot %d minteado (proxy=%s)", slot.index, redact_proxy_url(proxy_url)
         )
 
-    async def _refresh_slot(self, slot: _Slot) -> None:
+    async def _refresh_slot(
+        self, slot: _Slot, *, trial_scope: TrialScope | None = None,
+    ) -> None:
         """Wrapper de re-mint sobre un slot ya existente."""
-        await self._mint_slot(slot)
+        await self._mint_slot(slot, trial_scope=trial_scope)
 
     @staticmethod
     def _cookie_expiry(bundle: CookieBundle) -> int | None:
@@ -589,6 +621,7 @@ class SessionPool:
         session_cycle_id: uuid.UUID,
         session_reason: SessionReason,
         session_age_seconds: int,
+        trial_scope: TrialScope | None = None,
     ) -> None:
         proxy_url = self._bundle_proxy_url(bundle)
         settings = Settings(
@@ -609,6 +642,7 @@ class SessionPool:
                 session_cycle_id=session_cycle_id,
                 session_reason=session_reason,
                 session_age_seconds=session_age_seconds,
+                trial_scope=trial_scope,
             ):
                 await candidate.revalidate_once()
             final_cookies = adapter.snapshot_cookies()
@@ -688,6 +722,7 @@ class SessionPool:
         session_cycle_id: uuid.UUID | None = None,
         session_reason: SessionReason = "session_rejected",
         session_age_seconds: int | None = None,
+        trial_scope: TrialScope | None = None,
     ) -> None:
         cycle_id = session_cycle_id or slot.session_cycle_id or uuid.uuid4()
         age_seconds = session_age_seconds
@@ -701,7 +736,12 @@ class SessionPool:
         slot.session_cycle_reason = session_reason
         slot.session_cycle_age_seconds = age_seconds
         try:
-            await self._mint_slot(slot, max_attempts=1)
+            if trial_scope is None:
+                await self._mint_slot(slot, max_attempts=1)
+            else:
+                await self._mint_slot(
+                    slot, max_attempts=1, trial_scope=trial_scope,
+                )
         except BaseException as exc:
             if isinstance(exc, Exception) and not self._is_cost_control_error(exc):
                 self._enter_cooldown(slot)
@@ -736,6 +776,7 @@ class SessionPool:
         bundle: CookieBundle,
         *,
         session_reason: SessionReason = "soft_age",
+        trial_scope: TrialScope | None = None,
     ) -> bool:
         age = (
             self._slot_bundle_age(slot)
@@ -756,6 +797,7 @@ class SessionPool:
                 session_cycle_id=cycle_id,
                 session_reason=session_reason,
                 session_age_seconds=age_seconds,
+                trial_scope=trial_scope,
             )
         except BaseException as exc:
             outcome = self._validation_outcome(exc)
@@ -769,15 +811,20 @@ class SessionPool:
                 session_cycle_id=cycle_id,
                 session_reason=self._replacement_mint_reason(exc),
                 session_age_seconds=age_seconds,
+                trial_scope=trial_scope,
             )
             return True
         return False
 
-    async def _initialize_reuse_slot(self, slot: _Slot) -> bool:
+    async def _initialize_reuse_slot(
+        self, slot: _Slot, *, trial_scope: TrialScope | None = None,
+    ) -> bool:
         bundle = self._store.load_slot(slot.index)
         if bundle is None:
             self._begin_session_cycle(slot, None, "missing_bundle")
-            await self._mint_slot(slot, max_attempts=1)
+            await self._mint_slot(
+                slot, max_attempts=1, trial_scope=trial_scope,
+            )
             return True
         try:
             self._bundle_proxy_url(bundle)
@@ -786,7 +833,9 @@ class SessionPool:
                 self._wall_bundle_age(bundle.saved_at),
             )
             self._begin_session_cycle(slot, age_seconds, "missing_bundle")
-            await self._mint_slot(slot, max_attempts=1)
+            await self._mint_slot(
+                slot, max_attempts=1, trial_scope=trial_scope,
+            )
             return True
         now = self._wall_clock_now()
         cookie_expiry = self._cookie_expiry(bundle)
@@ -799,13 +848,20 @@ class SessionPool:
                 age_seconds,
                 "cookie_expired" if expired else "hard_age",
             )
-            await self._mint_slot(slot, max_attempts=1)
+            await self._mint_slot(
+                slot, max_attempts=1, trial_scope=trial_scope,
+            )
             return True
         return await self._revalidate_or_mint_once(
-            slot, bundle, session_reason="startup",
+            slot,
+            bundle,
+            session_reason="startup",
+            trial_scope=trial_scope,
         )
 
-    async def _prepare_reuse_slot(self, slot: _Slot) -> None:
+    async def _prepare_reuse_slot(
+        self, slot: _Slot, *, trial_scope: TrialScope | None = None,
+    ) -> None:
         if slot.disposition == "validate_before_reuse":
             bundle = self._store.load_slot(slot.index)
             if (
@@ -815,7 +871,10 @@ class SessionPool:
             ):
                 raise CookieStoreConcurrentUpdateError()
             slot.minted_during_acquire = await self._revalidate_or_mint_once(
-                slot, bundle, session_reason="transport_rotation",
+                slot,
+                bundle,
+                session_reason="transport_rotation",
+                trial_scope=trial_scope,
             )
             return
 
@@ -833,11 +892,14 @@ class SessionPool:
                 session_cycle_id=cycle_id,
                 session_reason="session_rejected",
                 session_age_seconds=age_seconds,
+                trial_scope=trial_scope,
             )
             return
 
         if slot.session is None or slot.bundle_saved_at is None:
-            slot.minted_during_acquire = await self._initialize_reuse_slot(slot)
+            slot.minted_during_acquire = await self._initialize_reuse_slot(
+                slot, trial_scope=trial_scope,
+            )
             return
 
         now = self._wall_clock_now()
@@ -862,6 +924,7 @@ class SessionPool:
                 session_cycle_id=cycle_id,
                 session_reason=slot.session_cycle_reason or "hard_age",
                 session_age_seconds=age_seconds,
+                trial_scope=trial_scope,
             )
             return
 
@@ -880,7 +943,9 @@ class SessionPool:
             or bundle.proxy_token != slot.token
         ):
             raise CookieStoreConcurrentUpdateError()
-        slot.minted_during_acquire = await self._revalidate_or_mint_once(slot, bundle)
+        slot.minted_during_acquire = await self._revalidate_or_mint_once(
+            slot, bundle, trial_scope=trial_scope,
+        )
 
     # -- Ciclo de vida ----------------------------------------------------
 
@@ -900,7 +965,9 @@ class SessionPool:
             if i < self._pool_size - 1:
                 await asyncio.sleep(1.5)  # stagger: evita N Chromium headed a la vez (G8)
 
-    async def _borrow_slot(self) -> _Slot:
+    async def _borrow_slot(
+        self, *, trial_scope: TrialScope | None = None,
+    ) -> _Slot:
         """Primitiva de checkout: toma un slot LIBRE y DISTINTO (G3), lo marca
         busy y lo re-mintea si no tiene sesión o está vencido. Bloquea si los N
         slots están ocupados. Base compartida por `acquire` (guest session) y
@@ -929,8 +996,15 @@ class SessionPool:
 
         if self._reuse_validation_enabled:
             try:
+                prepare_operation = (
+                    self._prepare_reuse_slot(slot)
+                    if trial_scope is None
+                    else self._prepare_reuse_slot(
+                        slot, trial_scope=trial_scope,
+                    )
+                )
                 await self._within_reuse_acquisition_deadline(
-                    self._prepare_reuse_slot(slot),
+                    prepare_operation,
                 )
             except BaseException as exc:
                 try:
@@ -956,7 +1030,12 @@ class SessionPool:
             )
             if needs_refresh:
                 try:
-                    await self._refresh_slot(slot)
+                    if trial_scope is None:
+                        await self._refresh_slot(slot)
+                    else:
+                        await self._refresh_slot(
+                            slot, trial_scope=trial_scope,
+                        )
                 except BaseException as exc:
                     try:
                         if isinstance(exc, Exception):
@@ -1001,6 +1080,7 @@ class SessionPool:
         remint: bool = True,
         *,
         disposition: ReleaseDisposition | None = None,
+        trial_scope: TrialScope | None = None,
     ) -> None:
         """Primitiva de devolución: si `healthy=False`, re-mintea ESE slot (IP
         nueva) antes de liberarlo — reactivo, por-slot, sin afectar otros slots
@@ -1022,9 +1102,12 @@ class SessionPool:
                         await self._mint_once_for_acquisition(
                             slot,
                             session_reason="session_rejected",
+                            trial_scope=trial_scope,
                         )
                     else:
-                        await self._refresh_slot(slot)
+                        await self._refresh_slot(
+                            slot, trial_scope=trial_scope,
+                        )
                 except Exception as exc:
                     if self._is_cost_control_error(exc):
                         await self._persist_cost_failure(exc)
@@ -1070,13 +1153,15 @@ class SessionPool:
             slot, healthy, remint=remint, disposition=disposition,
         )
 
-    async def acquire_familia_bundle(self) -> tuple[CookieBundle | None, _Slot]:
+    async def acquire_familia_bundle(
+        self, *, trial_scope: TrialScope | None = None,
+    ) -> tuple[CookieBundle | None, _Slot]:
         """Presta a Familia el bundle F5 (cookies+UA+proxy_url) de un slot libre
         SIN tomar la guest OJVSession. El slot queda busy (nadie más lo usa)
         hasta release_familia_bundle. El bundle sale del store persistido del
         slot; puede ser None si el slot nunca minteó y el refresh falló — el
         caller lo trata como bloqueo transitorio."""
-        slot = await self._borrow_slot()
+        slot = await self._borrow_slot(trial_scope=trial_scope)
         # load_slot puede fallar (JSON corrupto/locked). Si tira DESPUÉS de tomar
         # el slot, hay que devolverlo o queda colgado para siempre (pérdida de
         # capacidad). healthy=True: no re-mintea, solo libera sem+busy.
@@ -1084,7 +1169,9 @@ class SessionPool:
             bundle = self._store.load_slot(slot.index)
         except Exception:
             logger.exception("load_slot falló para slot %d (Familia)", slot.index)
-            await self._return_slot(slot, healthy=True)
+            await self._return_slot(
+                slot, healthy=True, trial_scope=trial_scope,
+            )
             raise
         if bundle is not None:
             # El store persiste sólo el token sticky, nunca la credencial. En el
@@ -1106,10 +1193,15 @@ class SessionPool:
         remint: bool = True,
         *,
         disposition: ReleaseDisposition | None = None,
+        trial_scope: TrialScope | None = None,
     ) -> None:
         """Libera un slot prestado a Familia. Misma semántica que release()."""
         await self._return_slot(
-            slot, healthy, remint=remint, disposition=disposition,
+            slot,
+            healthy,
+            remint=remint,
+            disposition=disposition,
+            trial_scope=trial_scope,
         )
 
     async def enforce_global_rate_limit(self):

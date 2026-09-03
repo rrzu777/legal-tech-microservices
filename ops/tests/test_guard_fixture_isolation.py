@@ -22,6 +22,7 @@ def evaluate(command, root):
     return subprocess.run(
         ['bash', '-eu', '-c', setup_functions() + '\n' + command],
         env={'PATH': os.environ['PATH'], 'TMP': str(root),
+             'ROOT': str(SOURCE.parents[2]),
              'EXPECTED_SHA': 'a' * 40, 'SECRET_SENTINEL': 'fixture-only'},
         text=True, capture_output=True, timeout=30,
     )

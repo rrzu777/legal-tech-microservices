@@ -2,7 +2,13 @@ import os
 import pytest
 
 
-@pytest.mark.parametrize("value", ["bad", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+@pytest.mark.parametrize("value", [
+    "bad",
+    "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa",
+    "aaaaaaaa-aaaa-4aaa-7aaa-aaaaaaaaaaaa",
+])
 def test_runtime_generation_rejects_noncanonical_identity(value):
     from app.config import Settings
     with pytest.raises(ValueError, match="pjud_runtime_invalid_generation"):

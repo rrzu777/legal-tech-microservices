@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from tests.helpers import find_update_payload, http_status_error
 
@@ -1345,6 +1346,72 @@ class TestSyncEngine:
         assert "key" not in inserted[0]["candidate_payload"]
         discarded = mock_sb.from_.return_value.update.call_args.args[0]
         assert set(discarded) == {"discarded_at"}
+
+    @pytest.mark.asyncio
+    async def test_candidate_publication_uses_real_update_builder_contract(self):
+        """Supabase update builders return rows but expose no select/single chain."""
+
+        class StrictQuery:
+            def __init__(self, table):
+                self.table = table
+                self.operation = None
+                self.filters = []
+
+            def insert(self, payload):
+                self.operation = ("insert", payload)
+                return self
+
+            def update(self, payload):
+                self.operation = ("update", payload)
+                return self
+
+            def eq(self, column, value):
+                self.filters.append(("eq", column, value))
+                return self
+
+            def like(self, column, value):
+                self.filters.append(("like", column, value))
+                return self
+
+            def is_(self, column, value):
+                self.filters.append(("is", column, value))
+                return self
+
+            def not_(self, column, operator, value):
+                self.filters.append(("not", column, operator, value))
+                return self
+
+            def execute(self):
+                if self.table == "cases" and self.operation[0] == "update":
+                    return SimpleNamespace(data=[{"id": "case-uuid-1"}], error=None)
+                return SimpleNamespace(data=[], error=None)
+
+        class StrictSupabase:
+            def __init__(self):
+                self.queries = []
+
+            def from_(self, table):
+                query = StrictQuery(table)
+                self.queries.append(query)
+                return query
+
+        supabase = StrictSupabase()
+        engine, *_ = _make_engine(mock_sb=supabase)
+        generation = await engine._publish_resolution_candidates(
+            _make_case(external_payload={}),
+            [{"key": "private", "rol": "C-1234-2024"}],
+            1,
+        )
+
+        assert generation
+        case_update = next(
+            query for query in supabase.queries
+            if query.table == "cases" and query.operation[0] == "update"
+        )
+        assert case_update.filters == [
+            ("eq", "id", "case-uuid-1"),
+            ("eq", "sync_worker_id", "test-worker"),
+        ]
 
     @pytest.mark.asyncio
     async def test_invalid_canonical_identity_never_falls_back_to_first_legacy_match(self):

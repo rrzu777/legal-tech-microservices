@@ -8,8 +8,12 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
 
+from app.supabase_executor import execute_supabase_query
+
 RUNTIME_GENERATION_HEADER = "x-pjud-runtime-generation"
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_UUID4 = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})")
 _BINDINGS = {"micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha"}
 
@@ -17,7 +21,7 @@ _BINDINGS = {"micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha"}
 def validate_runtime_generation(value: str | None) -> str | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
-    if not isinstance(value, str) or _UUID.fullmatch(value) is None:
+    if not isinstance(value, str) or _UUID4.fullmatch(value) is None:
         raise ValueError("pjud_runtime_invalid_generation")
     return value
 
@@ -86,8 +90,9 @@ class RuntimeFence:
         try:
             if self._supabase is None:
                 raise PjudRuntimeError()
+            query = self._supabase.rpc("get_pjud_runtime_control", {})
             response = await asyncio.wait_for(
-                asyncio.to_thread(lambda: self._supabase.rpc("get_pjud_runtime_control", {}).execute()),
+                execute_supabase_query(query),
                 timeout=5.0,
             )
             return PjudRuntimeControl.parse(response.data)
