@@ -73,6 +73,12 @@ class HTTPBoundary:
         self.count_overrides = {}
         self.health_status = 200
         self.heartbeat_status = 200
+        self.runtime_fence = {
+            "protocol_version": 1, "revision": 0, "admission_paused": False,
+            "generation_required": False, "generation": None,
+            "sealed_at": None, "bindings": None,
+        }
+        self.runtime_fence_response = None
         self.heartbeat = [{
             "status": "idle_off_hours", "last_heartbeat_at": "2026-08-31T00:59:50Z",
             "metadata": {"mint_attempts": 7, "process_outside_office_hours_enabled": False,
@@ -86,6 +92,15 @@ class HTTPBoundary:
         query = parse_qs(parsed.query)
         if "/rest/v1/" not in parsed.path:
             response = Response(self.health_status, body=SECRET.encode())
+        elif parsed.path == "/rest/v1/rpc/get_pjud_runtime_control":
+            assert request.get_method() == "GET" and query == {}
+            assert request.data is None
+            assert not request.has_header("X-pjud-runtime-generation")
+            response = self.runtime_fence_response
+            if isinstance(response, Exception):
+                raise response
+            if response is None:
+                response = Response(body=json.dumps(self.runtime_fence).encode())
         elif parsed.path.endswith("sync_worker_heartbeats"):
             assert request.get_method() == "GET"
             assert query == {"worker_id": ["eq.worker-test"], "select": ["status,last_heartbeat_at,metadata"]}
@@ -408,27 +423,26 @@ def test_malformed_duplicate_or_unsafe_env_blocks(audit_fixture, change):
     assert audit_fixture.run()["ready_for_shutdown_review"] is False
 
 
-def test_worker_identity_accepts_100_characters_and_rejects_101(audit_fixture):
-    valid_worker_id = "w" + "._:-" * 24 + "xyz"
-    assert len(valid_worker_id) == 100
-    original = audit_fixture.env_file.read_text()
+@pytest.mark.parametrize("length,accepted", [(100, True), (101, False)])
+def test_worker_id_matches_final_runtime_contract(audit_fixture, length, accepted):
+    worker_id = "w" + "a" * (length - 1)
     audit_fixture.env_file.write_text(
-        original.replace("WORKER_ID=worker-test", f"WORKER_ID={valid_worker_id}"),
+        audit_fixture.env_file.read_text().replace("WORKER_ID=worker-test", "WORKER_ID=" + worker_id)
     )
-    assert (
-        audit_fixture.module.load_credentials(audit_fixture.config)["WORKER_ID"]
-        == valid_worker_id
-    )
+    if accepted:
+        assert audit_fixture.module.load_credentials(audit_fixture.config)["WORKER_ID"] == worker_id
+    else:
+        with pytest.raises(audit_fixture.module.Unavailable):
+            audit_fixture.module.load_credentials(audit_fixture.config)
 
-    oversized_worker_id = "w" * 101
+
+def test_worker_id_accepts_full_allowed_alphabet(audit_fixture):
+    worker_id = "w" + "._:-" * 24 + "xyz"
+    assert len(worker_id) == 100
     audit_fixture.env_file.write_text(
-        original.replace(
-            "WORKER_ID=worker-test",
-            f"WORKER_ID={oversized_worker_id}",
-        ),
+        audit_fixture.env_file.read_text().replace("WORKER_ID=worker-test", "WORKER_ID=" + worker_id)
     )
-    with pytest.raises(audit_fixture.module.Unavailable):
-        audit_fixture.module.load_credentials(audit_fixture.config)
+    assert audit_fixture.module.load_credentials(audit_fixture.config)["WORKER_ID"] == worker_id
 
 
 @pytest.mark.parametrize("field,value", [
@@ -541,3 +555,152 @@ def test_heartbeat_bodies_are_bounded_strict_json(audit_fixture, body):
     result = audit_fixture.run()
     assert result["heartbeat"]["status"] == "unknown"
     assert result["ready_for_shutdown_review"] is False
+
+
+def sealed_runtime_fence():
+    # Literal v1 wire contract, independently supplied by the DB owner.
+    return {
+        "protocol_version": 1, "revision": 2, "admission_paused": True,
+        "generation_required": True,
+        "generation": "10000000-0000-4000-8000-000000000001",
+        "sealed_at": "2026-08-31T00:59:50+00:00",
+        "bindings": {
+            "micro_sha": "1" * 40, "web_sha": "2" * 40,
+            "rollback_micro_sha": "3" * 40, "rollback_web_sha": "4" * 40,
+        },
+    }
+
+
+def test_opt_in_fence_reads_only_control_and_does_not_authorize_nonzero_work(audit_fixture):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.count_overrides["sync_runs_running"] = Response(headers=[("Content-Range", "0-18/19")])
+    result = audit_fixture.run()
+    assert result.get("runtime_fence") == sealed_runtime_fence()
+    assert result["version"] == 2
+    assert result["ready_for_shutdown_review"] is False
+    assert result["work_counts"]["sync_runs_running"] == 19
+    requests = audit_fixture.http.requests
+    assert len(requests) == 17
+    request = requests[-1]
+    assert urlsplit(request.full_url).path == "/rest/v1/rpc/get_pjud_runtime_control"
+    assert request.get_method() == "GET" and request.data is None
+
+
+@pytest.mark.parametrize("strict,paused", [(False, False), (False, True), (True, False), (True, True)])
+def test_fence_observation_distinguishes_legacy_and_strict_without_claiming_coverage(audit_fixture, strict, paused):
+    audit_fixture.config.include_runtime_fence = True
+    if strict:
+        audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.runtime_fence["admission_paused"] = paused
+    result = audit_fixture.run()
+    assert result.get("runtime_fence") == audit_fixture.http.runtime_fence
+    assert result["version"] == 2
+    # This remains the existing zero-count advisory, NOT a deployment permission.
+    assert result["ready_for_shutdown_review"] is True
+
+
+@pytest.mark.parametrize("field,value", [
+    ("protocol_version", True), ("protocol_version", 2), ("revision", True),
+    ("revision", -1), ("revision", 9007199254740992), ("revision", 2.0),
+    ("admission_paused", "true"), ("generation_required", 1),
+    ("generation", None), ("generation", SECRET),
+    ("generation", "10000000-0000-4000-8000-00000000000A"),
+    ("sealed_at", None), ("sealed_at", "2026-08-31T00:59:50"),
+    ("sealed_at", "2026-08-31T01:00:01Z"), ("bindings", None),
+    ("bindings", {"unexpected": SECRET}), ("unknown", SECRET),
+])
+def test_malformed_fence_never_emits_partial_metadata_or_leaves_advisory_green(audit_fixture, field, value):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.runtime_fence[field] = value
+    result = audit_fixture.run()
+    assert "runtime_fence" in result and result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b"{}", b"not json", b"[" * 4097,
+    b'{"protocol_version":1,"protocol_version":1}',
+    b'{"protocol_version":NaN}',
+])
+def test_fence_requires_bounded_unambiguous_json(audit_fixture, body):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence_response = Response(body=body)
+    result = audit_fixture.run()
+    assert "runtime_fence" in result and result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+    assert audit_fixture.http.runtime_fence_response.reads == [4097]
+
+
+@pytest.mark.parametrize("response", [Response(404), Response(503, body=SECRET.encode()),
+    Response(302, headers=[("Location", "https://" + SECRET)]), RuntimeError(SECRET)])
+def test_absent_or_failed_fence_is_unknown_without_retry(audit_fixture, response):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence_response = response
+    result = audit_fixture.run()
+    assert "runtime_fence" in result and result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+    assert len(audit_fixture.http.requests) == 17
+
+
+@pytest.mark.parametrize("field", ["generation", "sealed_at", "bindings"])
+def test_legacy_fence_must_not_carry_sealed_metadata(audit_fixture, field):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence[field] = sealed_runtime_fence()[field]
+    result = audit_fixture.run()
+    assert "runtime_fence" in result and result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+
+
+@pytest.mark.parametrize("field", ["micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha"])
+@pytest.mark.parametrize("bad", [None, "A" * 40, "1" * 39, SECRET])
+def test_each_fence_binding_is_validated_before_any_projection(audit_fixture, field, bad):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.runtime_fence["bindings"][field] = bad
+    result = audit_fixture.run()
+    assert "runtime_fence" in result and result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+
+
+def test_cli_explicit_fence_observation_preserves_fixed_paths(module, monkeypatch, capsys):
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    calls = []
+
+    def observation(config, runner, opener, now):
+        calls.append(config)
+        assert config.include_runtime_fence is True
+        assert config.repo_dir == Path("/opt/legal-tech-microservices")
+        return {**module.empty_result(now), "version": 2, "runtime_fence": None}
+
+    monkeypatch.setattr(module, "audit", observation)
+    assert module.main(["--expected-sha", SHA, "--include-runtime-fence"]) == 1
+    assert len(calls) == 1
+    assert json.loads(capsys.readouterr().out)["runtime_fence"] is None
+
+
+@pytest.mark.parametrize("timestamp", [
+    "2026-08-31T00:00:00+00:99", "2026-08-31T00:00:00+01:60",
+    "2026-08-30T00:00:00-00:99", "2026-08-30T00:00:00-01:60",
+    "2026-08-31T00:00:00+24:00",
+])
+def test_fence_rejects_invalid_offsets_instead_of_python_normalization(audit_fixture, timestamp):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.runtime_fence["sealed_at"] = timestamp
+    result = audit_fixture.run()
+    assert result["runtime_fence"] is None
+    assert result["ready_for_shutdown_review"] is False
+
+
+@pytest.mark.parametrize("timestamp", [
+    "2026-08-31T00:59:50Z", "2026-08-31T00:59:50.123456+00:00",
+    "2026-08-30T21:59:50-03:00", "2026-08-31T03:59:50+03:00",
+])
+def test_fence_accepts_valid_offsets_and_subseconds(audit_fixture, timestamp):
+    audit_fixture.config.include_runtime_fence = True
+    audit_fixture.http.runtime_fence = sealed_runtime_fence()
+    audit_fixture.http.runtime_fence["sealed_at"] = timestamp
+    result = audit_fixture.run()
+    assert result["runtime_fence"]["sealed_at"] == timestamp

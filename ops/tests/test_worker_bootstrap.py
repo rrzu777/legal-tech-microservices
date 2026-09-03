@@ -270,6 +270,60 @@ def test_adoption_authenticates_first_identity_and_creates_normal_journal_withou
         drained_identity=f"{BOOT}:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923", result="intended")
 
 
+def verify_adopted(host, monkeypatch):
+    def validate_held_fd(fd, path, uid, gid, mode):
+        named = os.lstat(path)
+        opened = os.fstat(fd)
+        host.module.operator.metadata(named, uid, gid, mode)
+        host.module.operator.metadata(opened, uid, gid, mode)
+        assert (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+    monkeypatch.setattr(host.module.operator, "validate_held_fd", validate_held_fd)
+    global_fd = os.open(host.config.global_lock, os.O_RDWR | os.O_NOFOLLOW)
+    admission_fd = os.open(host.config.control_dir / "admission.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(global_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return host.module.verify_adopted(
+            host.config, host.operation, host.module.operator.identity_text(host.identity),
+            global_fd, admission_fd, host.runner,
+        )
+    finally:
+        os.close(admission_fd)
+        os.close(global_fd)
+
+
+def test_adopted_bootstrap_can_be_verified_under_controller_owned_leases(closed_worker, monkeypatch):
+    host = closed_worker
+    host.module.adopt(host.config, host.operation, host.runner)
+    assert verify_adopted(host, monkeypatch) == {
+        "operation_id": host.operation, "phase": "adopted", "result": "verified",
+    }
+    assert host.store.read_control().state == "hold"
+
+
+@pytest.mark.parametrize("fault", ["record-phase", "journal-result", "wrong-identity"])
+def test_adopted_verifier_rejects_drift_without_opening(closed_worker, fault, monkeypatch):
+    host = closed_worker
+    host.module.adopt(host.config, host.operation, host.runner)
+    if fault == "record-phase":
+        path = host.config.bootstrap_root / "record.json"
+        value = json.loads(path.read_text())
+        value["phase"] = "installed"
+        path.write_text(json.dumps(value) + "\n")
+    elif fault == "journal-result":
+        path = host.config.journal_root / f"{host.operation}.json"
+        value = json.loads(path.read_text())
+        value["result"] = "succeeded"
+        path.write_text(json.dumps(value) + "\n")
+    else:
+        host.identity = host.identity.__class__(
+            host.identity.boot_id, host.identity.pid, host.identity.start_ticks + 1, host.identity.instance_id,
+        )
+    with pytest.raises((host.module.MaintenanceError, host.module.audit.Unavailable, OSError, ValueError)):
+        verify_adopted(host, monkeypatch)
+    assert host.store.read_control().state == "hold"
+
+
 @pytest.mark.parametrize("fault", ["wrong-operation", "wrong-sha", "record-phase", "record-mode", "record-hash",
     "target-drift", "drop-drift", "journal", "draining", "old-boot", "pid-reuse", "wrong-cgroup", "wrong-mainpid", "busy", "health", "open"])
 def test_adoption_rejects_untrusted_identity_or_state_without_journal_or_release(closed_worker, fault):

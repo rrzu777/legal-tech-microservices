@@ -65,6 +65,7 @@ class Config:
     root_uid: int = 0
     worker_gid: int | None = None
     clock: Callable[[], datetime] = utc_now
+    include_runtime_fence: bool = False
 
 
 def empty_result(now):
@@ -259,9 +260,49 @@ def heartbeat_projection(opener, credentials, clock):
             "process_outside_office_hours_enabled": outside if type(outside) is bool else None}
 
 
+def runtime_fence_projection(opener, credentials, clock):
+    """Read protocol metadata only. A valid control row does not prove enforcement."""
+    request = database_request(credentials, "rpc/get_pjud_runtime_control", {}, "GET")
+    with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+        require(response.status == 200)
+        body = response.read(4097)
+        require(len(body) <= 4096)
+    received_at = clock()
+    row = json.loads(body, object_pairs_hook=unique_pairs,
+                     parse_constant=lambda _: (_ for _ in ()).throw(Unavailable()))
+    require(type(row) is dict and set(row) == {
+        "protocol_version", "revision", "admission_paused", "generation_required",
+        "generation", "sealed_at", "bindings",
+    })
+    require(type(row["protocol_version"]) is int and row["protocol_version"] == 1)
+    require(type(row["revision"]) is int and 0 <= row["revision"] <= MAX_INTEGER)
+    require(type(row["admission_paused"]) is bool and type(row["generation_required"]) is bool)
+    if not row["generation_required"]:
+        require(all(row[key] is None for key in ("generation", "sealed_at", "bindings")))
+    else:
+        generation = row["generation"]
+        require(type(generation) is str and re.fullmatch(
+            r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", generation) is not None)
+        stamp = row["sealed_at"]
+        require(type(stamp) is str and re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", stamp) is not None)
+        sealed_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        require(sealed_at.utcoffset() is not None and sealed_at <= received_at)
+        bindings = row["bindings"]
+        require(type(bindings) is dict and set(bindings) == {
+            "micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha",
+        })
+        require(all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+                    for value in bindings.values()))
+    return row
+
+
 def audit(config, runner, opener, now):
     """Observe once. Explicit Python dependencies are for isolated unit tests only."""
     result = empty_result(now)
+    if config.include_runtime_fence:
+        result.update(version=2, runtime_fence=None)
     try:
         require(re.fullmatch(r"[0-9a-f]{40}", config.expected_sha) is not None)
         repo = nonsymlink_path(config.repo_dir)
@@ -304,6 +345,11 @@ def audit(config, runner, opener, now):
             result["heartbeat"].update(heartbeat_projection(opener, credentials, config.clock))
         except Exception:
             pass
+        if config.include_runtime_fence:
+            try:
+                result["runtime_fence"] = runtime_fence_projection(opener, credentials, config.clock)
+            except Exception:
+                pass
     heartbeat = result["heartbeat"]
     result["ready_for_shutdown_review"] = (
         result["sha"] == config.expected_sha and result["tree_clean"] is True
@@ -315,6 +361,7 @@ def audit(config, runner, opener, now):
         and heartbeat["process_outside_office_hours_enabled"] is False
         and heartbeat["installed_process_outside_office_hours"] is False
         and heartbeat["installed_off_hours_validation_once"] is False
+        and (not config.include_runtime_fence or result["runtime_fence"] is not None)
     )
     return result
 
@@ -325,11 +372,12 @@ def main(argv=None):
     result = empty_result(now)
     code = 2
     # Deliberately do not use argparse errors: they echo arbitrary caller strings.
-    if (len(argv) == 2 and argv[0] == "--expected-sha" and re.fullmatch(r"[0-9a-f]{40}", argv[1])
+    include_fence = len(argv) == 3 and argv[2] == "--include-runtime-fence"
+    if ((len(argv) == 2 or include_fence) and argv[0] == "--expected-sha" and re.fullmatch(r"[0-9a-f]{40}", argv[1])
             and sys.platform == "linux" and os.geteuid() == 0):
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-            result = audit(Config(argv[1]), subprocess.run, opener, now)
+            result = audit(Config(argv[1], include_runtime_fence=include_fence), subprocess.run, opener, now)
             code = 0 if result["ready_for_shutdown_review"] else 1
         except Exception:
             code = 1

@@ -17,6 +17,7 @@ usage() {
   printf '%s\n' \
     'usage: resource-guards.sh preflight|apply --expected-sha <40-hex-sha>' \
     '       resource-guards.sh apply --expected-sha <40-hex-sha> --allow-daytime-maintenance' \
+    '       resource-guards.sh apply-adopted --expected-sha <40-hex-sha> --operation-id <exact-uuid>' \
     '       resource-guards.sh postflight' \
     '       resource-guards.sh finish --operation-id <exact-uuid>' \
     '       resource-guards.sh rollback --backup-dir <timestamped-backup>' >&2
@@ -102,6 +103,7 @@ mktemp_bin=${RG_MKTEMP_BIN:-/usr/bin/mktemp}
 jq_bin=${RG_JQ_BIN:-/usr/bin/jq}
 provision_bin=${RG_PROVISION_BIN:-$repo_dir/ops/provision.sh}
 swap_bin=${RG_SWAP_BIN:-$repo_dir/ops/swap/configure-swap.sh}
+bootstrap_bin=$repo_dir/ops/bootstrap-worker-maintenance.py
 python_bin=${RG_PYTHON_BIN:-/usr/bin/python3}
 flock_bin=${RG_FLOCK_BIN:-/usr/bin/flock}
 readlink_bin=${RG_READLINK_BIN:-/usr/bin/readlink}
@@ -371,12 +373,17 @@ case "$command_name" in
     [ -n "$expected_sha" ] && [ -z "$requested_backup" ] || usage
     [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || usage
     ;;
+  apply-adopted)
+    [ -n "$expected_sha" ] && [ -n "$requested_operation" ] && [ -z "$requested_backup" ] || usage
+    [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || usage
+    [[ "$requested_operation" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || usage
+    ;;
   postflight) [ -z "$expected_sha" ] && [ -z "$requested_backup" ] || usage ;;
   rollback) [ -z "$expected_sha" ] && [ -n "$requested_backup" ] || usage ;;
   finish) [ -n "$requested_operation" ] && [ -z "$expected_sha$requested_backup" ] || usage ;;
   *) usage ;;
 esac
-[ "$command_name" = finish ] || [ -z "$requested_operation" ] || usage
+case "$command_name" in finish|apply-adopted) ;; *) [ -z "$requested_operation" ] || usage ;; esac
 
 # shellcheck source=worker-maintenance.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/worker-maintenance.sh"
@@ -979,7 +986,11 @@ run_preflight() {
   local uid swap_state worker_activity
   check_git || { fail 'Git tree or deployed SHA is not exact'; return 1; }
   apply_maintenance_window_is_open || { fail 'outside the Santiago maintenance window'; return 1; }
-  wm_capability || { fail 'worker v1 capability or current identity is unavailable'; return 1; }
+  if [ "$command_name" = apply-adopted ]; then
+    wm_verify_current || { fail 'adopted worker hold or current identity is unavailable'; return 1; }
+  else
+    wm_capability || { fail 'worker v1 capability or current identity is unavailable'; return 1; }
+  fi
   safe_existing_path "$provision_bin" && [ -x "$provision_bin" ] \
     && safe_existing_path "$swap_bin" && [ -x "$swap_bin" ] \
     || { fail 'reviewed provision or swap executable is unsafe'; return 1; }
@@ -2249,7 +2260,7 @@ verify_monitor_migration() { # change-flag monitor-array-index
 }
 
 run_apply_steps() {
-  local uid=$1 api_path worker_path worker_dropin_path hermes_path monitor_path tracker_path
+  local uid=$1 adopted=${2:-0} api_path worker_path worker_dropin_path hermes_path monitor_path tracker_path
   local worker_source worker_dropin_source desired_worker desired_worker_dropin worker_count
   local monitor_source tracker_source before_api before_worker before_worker_dropin before_hermes before_monitor before_tracker
   local desired_monitor desired_tracker after_api after_worker after_worker_dropin after_hermes after_monitor after_tracker
@@ -2291,9 +2302,14 @@ run_apply_steps() {
     && load_and_validate_monitor_runtime || return 1
   check_git || return 1
   apply_phase=worker-admission
-  wm_operation_id=$("$wm_python" -c 'import uuid; print(uuid.uuid4())') || return 1
+  if [ "$adopted" -eq 0 ]; then
+    wm_operation_id=$("$wm_python" -c 'import uuid; print(uuid.uuid4())') || return 1
+  else
+    [ "$wm_operation_id" = "$requested_operation" ] || return 1
+  fi
   durable_replace_metadata "$backup_dir/maintenance-operation-id" "$wm_operation_id"$'\n' || return 1
-  wm_prepare || return 1
+  if [ "$adopted" -eq 0 ]; then wm_prepare || return 1
+  else wm_verify_current && maintenance_window_is_open || return 1; fi
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
     apply_maintenance_window_is_open || return 1
@@ -2404,14 +2420,14 @@ run_apply_steps() {
 }
 
 run_apply() {
-  local uid apply_phase=initial-digests
+  local adopted=${1:-0} uid apply_phase=initial-digests
   worker_restore_window_capability=0
   run_preflight || return 1
   uid=$(validate_hermes_inventory) || return 1
   build_managed_paths "$uid"
   backup_dir=''
   mutation_started=0
-  if ! run_apply_steps "$uid"; then
+  if ! run_apply_steps "$uid" "$adopted"; then
     fail "apply failed in phase: $apply_phase" || true
     if [ -n "$backup_dir" ] && [ "$mutation_started" -eq 1 ]; then automatic_rollback || true; fi
     return 1
@@ -2423,8 +2439,27 @@ run_apply() {
   printf '%s\n' "APPLY OK; backup: $backup_dir"
 }
 
+prepare_adopted_hold() {
+  local protocol_status protocol_state protocol_operation extra
+  safe_existing_path "$bootstrap_bin" || return 1
+  protocol_status=$(wm_cli status) || return 1
+  read -r protocol_state protocol_operation wm_identity extra <<< "$protocol_status"
+  [ -z "${extra:-}" ] && [ "$protocol_state" = hold ] \
+    && [ "$protocol_operation" = "$requested_operation" ] || return 1
+  wm_operation_id=$requested_operation
+  # The normal wait path calls verify-ack, which durably rewrites the journal's
+  # drained identity. Authenticate the inherited bootstrap journal first.
+  [ -n "$wm_admission_fd" ] \
+    || exec {wm_admission_fd}<"$wm_control_dir/admission.lock" || return 1
+  "$wm_flock" -n "$wm_admission_fd" 2>"$null_file" || return 1
+  "$wm_python" "$bootstrap_bin" verify-adopted --expected-sha "$expected_sha" \
+    --operation-id "$wm_operation_id" --identity "$wm_identity" \
+    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >"$null_file" || return 1
+  wm_verify_current && maintenance_window_is_open
+}
+
 case "$command_name" in
-  apply|rollback|finish)
+  apply|apply-adopted|rollback|finish)
     acquire_resource_mutation_lock || exit "$EXIT_ERROR"
     wm_global_fd=$resource_lock_fd
     ;;
@@ -2433,6 +2468,7 @@ esac
 case "$command_name" in
   preflight) run_preflight ;;
   apply) run_apply ;;
+  apply-adopted) prepare_adopted_hold && run_apply 1 ;;
   postflight) run_postflight ;;
   rollback) do_rollback "$requested_backup" 0 0 ;;
   finish)

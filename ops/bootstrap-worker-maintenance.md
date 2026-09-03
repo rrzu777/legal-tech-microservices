@@ -115,6 +115,36 @@ El reporte es una muestra secuencial, no una transacción global ni un cierre de
 admisión. Todo conteo distinto de cero o desconocido bloquea la señal. No reconciliar
 reservas, liberar claims ni iniciar trabajo para lograr un reporte verde.
 
+### Observación opcional del control de generación
+
+Una vez verificado independientemente que está instalado el contrato de lectura
+`get_pjud_runtime_control()` del protocolo1, se puede añadir
+`--include-runtime-fence` al final de la invocación del auditor. No es una opción
+del instalador. Sin ella se conserva exactamente el reporte versión1 y no se
+consulta el control nuevo.
+
+Con ella el reporte es versión2 y agrega `runtime_fence`: los siete campos
+`protocol_version`, `revision`, `admission_paused`, `generation_required`,
+`generation`, `sealed_at`, `bindings`, o `null` si no se puede validar el conjunto.
+Se realiza un solo GET autenticado a `/rest/v1/rpc/get_pjud_runtime_control`, sin
+argumentos, cuerpo, header de generación, reintentos ni llamadas de pausa/sello.
+El cuerpo máximo es4096bytes; se rechazan JSON ambiguo, campos extra, tipos
+incorrectos, generación no canónica, sello sin zona horaria/futuro y bindings
+distintos de los cuatro SHA esperados por el protocolo. La revisión es un entero
+seguro no negativo. En modo legado generación/sello/bindings deben ser null.
+Una respuesta inválida nunca se publica parcialmente. Si se pidió la observación
+y resulta desconocida, la señal advisory queda false.
+
+Los UUID de generación y SHA de bindings son metadata de versión permitida, no
+credenciales ni identificadores de causas. Los bindings son declaraciones del
+operador: el auditor **no** acredita que esos artefactos estén ejecutándose ni
+que las tablas/RPCs tengan instalados todos los controles. Tampoco un control
+válido demuestra que esté pausado: los booleanos observados se reportan tal cual.
+No se cambia el gate existente de doce conteos en cero; se conservan íntegros
+los residuos. Ni versión2 ni `ready_for_shutdown_review=true` autorizan instalar,
+reanudar, ignorar metadata de salida o aceptar143. El predicado conjunto del
+corte y su verificación de cobertura siguen siendo trabajo separado pendiente.
+
 ## Corte inicial coordinado: responsabilidad del controlador
 
 El bootstrap **no puede producir retroactivamente evidencia de drain**. No acepta
