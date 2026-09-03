@@ -46,6 +46,7 @@ def test_logging_redacts_trial_capability_from_message_and_exception(capsys):
 def _local_maintenance(monkeypatch, worker_maintenance):
     from worker import __main__ as worker_main
     from worker.maintenance_store import MaintenanceStore, ProcessIdentity
+    monkeypatch.setattr(worker_main, "WORKER_BUILD_MODE", "normal")
     monkeypatch.setattr(MaintenanceStore, "production", lambda: worker_maintenance.store)
     monkeypatch.setattr(ProcessIdentity, "current", lambda: worker_maintenance.identity)
     monkeypatch.setattr(worker_main, "WorkerMaintenance", lambda store, identity: worker_maintenance)
@@ -296,6 +297,7 @@ def _patch_entrypoint(
     monkeypatch, worker_main, *, config, scheduler, pool, metrics, backoff,
     maintenance=None,
 ):
+    monkeypatch.setattr(worker_main, "WORKER_BUILD_MODE", "normal")
     monkeypatch.setattr(worker_main, "WorkerConfig", lambda: config)
     monkeypatch.setattr(worker_main, "setup_logging", lambda *_a, **_k: None)
     monkeypatch.setattr(worker_main, "create_supabase", lambda _config: RuntimeControlDB())
