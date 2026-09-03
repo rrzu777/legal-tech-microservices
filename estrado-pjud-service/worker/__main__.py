@@ -33,6 +33,7 @@ from worker.maintenance_store import MaintenanceError, MaintenanceStore, Process
 
 logger = logging.getLogger("worker")
 _RUNTIME_REJECTED = object()
+WORKER_BUILD_MODE = "rollback_hold_only"
 
 
 class JsonFormatter(logging.Formatter):
@@ -54,6 +55,66 @@ def setup_logging(level: str, *, secrets: tuple[str, ...] = ()):
     install_secret_redaction((handler,), secrets)
     logging.root.handlers = [handler]
     logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
+async def run_rollback_hold_only(config: WorkerConfig) -> None:
+    """Remain observable and maintenance-aware without admitting PJUD work."""
+    trial_capability = getattr(config, "PJUD_IMPORT_TRIAL_CAPABILITY", None)
+    raw_trial_capability = (
+        trial_capability.get_secret_value()
+        if trial_capability is not None
+        else None
+    )
+    setup_logging(
+        config.LOG_LEVEL,
+        secrets=tuple(filter(None, (
+            config.TELEGRAM_BOT_TOKEN,
+            config.SUPABASE_SERVICE_KEY,
+            config.OJV_PROXY_URL,
+            raw_trial_capability,
+        ))),
+    )
+    logger.info("Starting rollback-only worker %s", config.WORKER_ID)
+
+    maintenance = WorkerMaintenance(
+        MaintenanceStore.production(), ProcessIdentity.current(),
+    )
+    supabase = create_supabase(config)
+    proxy_control = ProxyControl(supabase) if config.OJV_PROXY_URL else None
+    metrics = Metrics(
+        config,
+        supabase,
+        proxy_control=proxy_control,
+        maintenance=maintenance,
+        build_mode=WORKER_BUILD_MODE,
+    )
+    metrics.set_status("paused")
+    shutdown_event = asyncio.Event()
+
+    def handle_signal(sig, _frame):
+        logger.info("Received signal %s, shutting down...", signal.Signals(sig).name)
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    maintenance_task: asyncio.Task | None = None
+    try:
+        metrics.start()
+        maintenance_task = asyncio.create_task(
+            watch_maintenance(maintenance, shutdown_event),
+            name="pjud-maintenance-ack",
+        )
+        notify_ready()
+        notify_status("rollback-only hold")
+        await shutdown_event.wait()
+    finally:
+        notify_stopping()
+        logger.info("Shutting down rollback-only worker...")
+        shutdown_event.set()
+        if maintenance_task is not None:
+            await asyncio.gather(maintenance_task, return_exceptions=True)
+        await metrics.stop()
+        logger.info("Rollback-only worker stopped")
 
 
 async def process_batch(
@@ -533,6 +594,19 @@ async def process_import_trial_once(
 
 
 async def main():
+    if WORKER_BUILD_MODE not in {"normal", "rollback_hold_only"}:
+        raise RuntimeError("invalid_worker_build_mode")
+    if WORKER_BUILD_MODE == "rollback_hold_only":
+        config = WorkerConfig(
+            PJUD_OFF_HOURS_VALIDATION_ONCE=False,
+            PJUD_IMPORT_TRIAL_ONCE=False,
+            PJUD_IMPORT_TRIAL_CAPABILITY=None,
+            PJUD_PROCESS_OUTSIDE_OFFICE_HOURS=False,
+            ENABLE_PJUD_MY_CAUSES_IMPORT=False,
+            ENABLE_PJUD_MY_CAUSES_EXCEL=False,
+        )
+        await run_rollback_hold_only(config)
+        return
     config = WorkerConfig()
     validation_once = config.PJUD_OFF_HOURS_VALIDATION_ONCE is True
     process_outside_office_hours = (
