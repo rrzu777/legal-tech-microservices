@@ -55,6 +55,16 @@ def test_production_cli_has_no_path_or_test_mode_override(module):
         assert error.value.code == 2
 
 
+def test_daytime_override_is_explicit_and_boolean(module):
+    args = module.parser().parse_args([
+        "install", "--expected-sha", SHA, "--allow-daytime-maintenance",
+    ])
+    assert args.allow_daytime_maintenance is True
+    assert module.parser().parse_args([
+        "install", "--expected-sha", SHA,
+    ]).allow_daytime_maintenance is False
+
+
 @pytest.fixture
 def host(module, tmp_path):
     root = tmp_path.resolve()
@@ -218,6 +228,28 @@ def test_changed_runtime_between_reads_rejects_stale_stopped_snapshot(host):
     host.state.before_command = change
     with pytest.raises((host.module.MaintenanceError, host.module.audit.Unavailable, OSError, ValueError)): install(host)
     assert not host.config.control_dir.exists()
+    assert not host.config.bootstrap_root.exists()
+
+
+def test_explicit_daytime_override_allows_only_otherwise_safe_install(host):
+    host.config.clock = lambda: NOW.replace(hour=16)
+    assert host.module.execute(host.config, "install", None, host.runner)["result"] == "blocked"
+    assert not host.config.bootstrap_root.exists()
+
+    host.config.allow_daytime_maintenance = True
+    assert host.module.execute(host.config, "install", None, host.runner)["result"] == "succeeded"
+
+
+def test_daytime_override_does_not_bypass_exact_tree_or_stopped_services(host):
+    host.config.clock = lambda: NOW.replace(hour=16)
+    host.config.allow_daytime_maintenance = True
+    host.state.tree = " M ops/bootstrap-worker-maintenance.py\n"
+    assert host.module.execute(host.config, "install", None, host.runner)["result"] == "blocked"
+    assert not host.config.bootstrap_root.exists()
+
+    host.state.tree = ""
+    host.state.services["estrado-pjud-worker.service"]["ActiveState"] = "active"
+    assert host.module.execute(host.config, "install", None, host.runner)["result"] == "blocked"
     assert not host.config.bootstrap_root.exists()
 
 

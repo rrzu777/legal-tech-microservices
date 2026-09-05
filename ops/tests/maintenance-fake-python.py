@@ -8,6 +8,8 @@ import uuid
 if len(sys.argv) >= 2 and sys.argv[1].endswith("/bootstrap-worker-maintenance.py"):
     args = sys.argv[2:]
     root = Path(os.environ["WM_FIXTURE_ROOT"])
+    if "--allow-daytime-maintenance" in args:
+        (root / "bootstrap-daytime-flag-seen").write_text("yes\n")
     with (root / "events").open("a") as events:
         events.write("bootstrap verify-adopted\n")
     def option(name, default=""):

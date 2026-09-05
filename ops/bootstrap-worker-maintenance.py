@@ -60,9 +60,13 @@ class Config:
     worker_uid: int = 0
     worker_gid: int = 0
     clock: Callable = lambda: datetime.now(timezone.utc)
+    allow_daytime_maintenance: bool = False
 
 
 def window(config):
+    require(type(config.allow_daytime_maintenance) is bool)
+    if config.allow_daytime_maintenance:
+        return
     now = config.clock()
     require(now.utcoffset() is not None)
     hour = now.astimezone(ZoneInfo("America/Santiago")).hour
@@ -474,6 +478,7 @@ def parser():
     result.add_argument("--identity")
     result.add_argument("--global-fd", type=int)
     result.add_argument("--admission-fd", type=int)
+    result.add_argument("--allow-daytime-maintenance", action="store_true")
     return result
 
 
@@ -522,7 +527,8 @@ def main(argv=None):
                     and str(uuid.UUID(args.operation_id)) == args.operation_id and type(args.identity) is str
                     and args.global_fd is not None and args.admission_fd is not None))
         config = Config(args.expected_sha, worker_uid=pwd.getpwnam("estrado").pw_uid,
-                        worker_gid=grp.getgrnam("estrado").gr_gid)
+                        worker_gid=grp.getgrnam("estrado").gr_gid,
+                        allow_daytime_maintenance=args.allow_daytime_maintenance)
         result = execute(config, args.command, args.operation_id, identity=args.identity,
                          global_fd=args.global_fd, admission_fd=args.admission_fd)
         status = 0 if result["result"] in ("succeeded", "verified") else 1
