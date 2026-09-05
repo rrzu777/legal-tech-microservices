@@ -217,6 +217,40 @@ def test_unsafe_prerequisites_fail_before_bootstrap_write(host, fault):
     assert host.unit.read_bytes() == before
 
 
+@pytest.mark.parametrize("service,metadata", [
+    ("estrado-pjud.service", {"ExecMainCode": "2", "ExecMainStatus": "15"}),
+    ("estrado-pjud-worker.service", {
+        "ExecMainPID": "0", "ExecMainCode": "0", "ExecMainStatus": "0",
+        "ExecMainExitTimestampMonotonic": "0",
+    }),
+])
+def test_stopped_snapshot_accepts_systemd_termination_without_claiming_drain(host, service, metadata):
+    host.state.services[service].update(metadata)
+    boot, services = host.module.stopped_snapshot(host.config, host.runner)
+    assert boot == BOOT
+    assert services[service] == host.state.services[service]
+    # This is a read-only kernel predicate; business closure is a separate prerequisite.
+    assert not host.config.control_dir.exists()
+
+
+@pytest.mark.parametrize("forgotten", [False, True])
+@pytest.mark.parametrize("fault", ["active", "failed", "job", "cgroup"])
+def test_alternative_termination_metadata_does_not_allow_execution(host, forgotten, fault):
+    values = host.state.services["estrado-pjud-worker.service"]
+    values.update(ExecMainCode="2", ExecMainStatus="15")
+    if forgotten:
+        values.update(ExecMainCode="0", ExecMainStatus="0", ExecMainPID="0",
+                      ExecMainExitTimestampMonotonic="0")
+    if fault == "active": values["ActiveState"] = "active"
+    elif fault == "failed": values["Result"] = "watchdog"
+    elif fault == "job": values["Job"] = "42 start"
+    else:
+        (host.config.cgroup_root / "system.slice/estrado-pjud-worker.service/cgroup.procs").write_text("99\n")
+    with pytest.raises(host.module.MaintenanceError):
+        host.module.stopped_snapshot(host.config, host.runner)
+    assert not host.config.control_dir.exists()
+
+
 def test_changed_runtime_between_reads_rejects_stale_stopped_snapshot(host):
     reads = 0
     def change(command):

@@ -213,19 +213,29 @@ def empty_cgroups(config):
 
 
 def stopped_snapshot(config, runner):
+    """Prove absence of local execution, never successful business/RPC drain.
+
+    systemd can retain SIGTERM or discard all ExecMain metadata after unloading
+    a stopped unit. Neither observation is an exit-zero certificate. The caller
+    must independently establish closure before install, including for exit zero.
+    """
     boot = audit.bounded_read(config.proc_root / "sys/kernel/random/boot_id").strip()
     require(str(uuid.UUID(boot)) == boot)
     services = installed_files(config, runner)
     for values in services.values():
         require(all(values[key] == expected for key, expected in {
             "UnitFileState": "disabled", "ActiveState": "inactive", "SubState": "dead",
-            "Result": "success", "MainPID": "0", "ExecMainCode": "1", "ExecMainStatus": "0",
+            "Result": "success", "MainPID": "0",
             "ControlGroup": "",
         }.items()))
         require(values["Slice"] in ("system.slice", "legaltech.slice"))
-        require(re.fullmatch(r"[1-9][0-9]{0,9}", values["ExecMainPID"]) is not None)
-        require(re.fullmatch(r"[1-9][0-9]{0,19}", values["ExecMainExitTimestampMonotonic"]) is not None)
-        absent(config.proc_root / values["ExecMainPID"])
+        metadata = tuple(values[key] for key in (
+            "ExecMainCode", "ExecMainStatus", "ExecMainPID", "ExecMainExitTimestampMonotonic"))
+        if metadata != ("0", "0", "0", "0"):
+            require(metadata[:2] in (("1", "0"), ("2", "15")))
+            require(re.fullmatch(r"[1-9][0-9]{0,9}", values["ExecMainPID"]) is not None)
+            require(re.fullmatch(r"[1-9][0-9]{0,19}", values["ExecMainExitTimestampMonotonic"]) is not None)
+            absent(config.proc_root / values["ExecMainPID"])
     empty_cgroups(config)
     require(audit.bounded_read(config.proc_root / "sys/kernel/random/boot_id").strip() == boot)
     return boot, services

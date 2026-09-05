@@ -239,8 +239,14 @@ demostrar ausencia de nuevos efectos. No se admite el flag en `preflight`,
    incierta. Si falta evidencia independiente suficiente, no invocar el instalador;
    pedir el permiso acotado necesario sobre el productor/cron concreto, sin mutarlo.
 7. Comprobar ambas units `inactive/dead`, `Result=success`, `MainPID=0`,
-   `ExecMainCode=1` (CLD_EXITED), `ExecMainStatus=0`, `ExecMainPID` previo no presente,
-   timestamp monotónico de salida no cero y todos los cgroups vacíos. No borrar
+   y todos los cgroups vacíos. La metadata de salida admite tres combinaciones:
+   código1/status0, código2/status15 (SIGTERM), o los cuatro campos ExecMain
+   (código/status/PID/timestamp) exactamente cero cuando systemd descartó el registro.
+   En las dos primeras, exigir PID previo ausente y timestamp de salida positivo;
+   rechazar metadata parcialmente descartada. SIGTERM y registro descartado tienen
+   resultado de terminación desconocido. Ninguna combinación demuestra cierre de
+   negocio/RPC: sigue siendo obligatoria la evidencia independiente del paso6.
+   No borrar
    estado con `reset-failed` para aparentar una salida limpia. Un reboot invalida
    la identidad anterior y obliga a volver a auditar: no demuestra cierre limpio.
    Retirar **solo los dos overrides propios** una vez acreditada esta salida;
