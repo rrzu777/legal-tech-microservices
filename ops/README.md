@@ -144,6 +144,13 @@ backup ni rollback automático. `preflight`, `postflight`, `finish` y rollback
 manual continúan sin aceptar el flag. La admisión web/DB y el proxy deben quedar
 cerrados y verificarse por fuera antes de invocar el bootstrap.
 
+La autorización diurna se transmite a `provision.sh` ligada al UUID de la
+operación adoptada. El delegado comprueba los descriptores heredados de ambos
+locks y la identidad drenada antes de omitir su reloj. La variable interna
+`WM_DAYTIME_OPERATION_ID` no habilita una ejecución standalone; sin delegación
+completa o con otra operación falla antes de mutar. Swap conserva su descriptor
+de lock externo y no tiene una excepción horaria independiente.
+
 La identidad previa no se presupone en `legaltech.slice`: el backup captura en
 una sola lectura el PID, `Slice` efectiva y cgroup exacto de la unit instalada.
 Por eso una primera migración válida desde

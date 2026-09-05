@@ -969,6 +969,11 @@ case "$(cat "$RG_TEST_STATE/sha-mode" 2>/dev/null || true)" in
 esac
 EOF
   write_stub provision <<'EOF'
+if [ -f "$RG_TEST_STATE/delegated-maintenance-library" ]; then
+  source "$(cat "$RG_TEST_STATE/delegated-maintenance-library")"
+  wm_init || exit $?
+  wm_prepare || exit $?
+fi
 printf '%s\n' provision >> "$RG_TEST_STATE/events"
 if [ -p "$RG_TEST_STATE/hold-ready" ] && mkdir "$RG_TEST_STATE/provision-owner" 2>/dev/null; then
   printf '%s\n' ready > "$RG_TEST_STATE/hold-ready"
@@ -2777,6 +2782,7 @@ run_explicit_daytime_maintenance_regressions() {
   expect_eq 'adopted daytime hold requires explicit authorization' "$RC" 1
   expect_count 'unauthorized adopted daytime performs no provision' provision 0
 
+  printf '%s\n' "$ROOT/ops/worker-maintenance.sh" > "$STATE/delegated-maintenance-library"
   : > "$EVENTS"
   TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
     --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847 \

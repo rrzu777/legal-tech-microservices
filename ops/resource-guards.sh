@@ -2465,7 +2465,12 @@ prepare_adopted_hold() {
     bootstrap_args+=(--allow-daytime-maintenance)
   fi
   "$wm_python" "$bootstrap_bin" "${bootstrap_args[@]}" >"$null_file" || return 1
-  wm_verify_current && apply_maintenance_window_is_open
+  wm_verify_current && apply_maintenance_window_is_open || return 1
+  # Propagate only the adopted operation that has just passed authentication.
+  # wm_init rejects ambient standalone authority; children recheck both FDs.
+  if [ "$allow_daytime_maintenance" -eq 1 ]; then
+    wm_daytime_operation_id=$wm_operation_id
+  fi
 }
 
 case "$command_name" in

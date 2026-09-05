@@ -89,6 +89,38 @@ def test_global_lock_rejects_parallel_mutator_for_whole_transaction(host):
     assert not (host[0] / "mutated").exists()
 
 
+@pytest.mark.parametrize("tamper", ["none", "operation", "identity", "global-fd", "admission-fd"])
+def test_daytime_delegation_retains_real_lock_and_identity_checks(host, tamper):
+    """Authenticate in the night fixture, then delegate at a simulated daytime."""
+    ended = threading.Event()
+    def acknowledge():
+        while not ended.wait(0.005):
+            control = host[1].read_control()
+            if control.state == "hold":
+                host[1].write_ack(Ack(1, control.operation_id, BOOT, 512, 9012, INSTANCE, "quiescent", 0))
+    thread = threading.Thread(target=acknowledge)
+    thread.start()
+    modifications = {
+        "none": "true",
+        "operation": "WM_DAYTIME_OPERATION_ID=00000000-0000-4000-8000-000000000000; export WM_DAYTIME_OPERATION_ID",
+        "identity": "WM_IDENTITY=invalid; export WM_IDENTITY",
+        "global-fd": "exec {WM_GLOBAL_FD}>&-",
+        "admission-fd": "exec {WM_ADMISSION_FD}<&-",
+    }
+    try:
+        result = shell(host, f'''wm_acquire_global; wm_prepare
+            wm_daytime_operation_id=$wm_operation_id
+            printf '#!/bin/sh\\nprintf "09\\\\n"\\n' > "$WM_DATE"
+            wm_delegate bash -c '{modifications[tamper]}; source "{LIB}"; wm_init || exit $?; trap wm_close EXIT; wm_prepare || exit $?; touch "{host[0]}/mutated"'
+            ''', extra={"WM_POLL_ATTEMPTS": "20"})
+    finally:
+        ended.set()
+        thread.join()
+    assert (result.returncode == 0) == (tamper == "none"), result.stderr
+    assert (host[0] / "mutated").exists() == (tamper == "none")
+    assert host[1].read_control().state == "hold"
+
+
 @pytest.mark.parametrize("invalid", ["fifo", "mode", "owner"])
 def test_global_lock_rejects_unsafe_file_before_shell_open(host, invalid):
     lock = host[0] / "global.lock"

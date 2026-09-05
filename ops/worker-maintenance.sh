@@ -47,12 +47,18 @@ wm_init() {
   wm_operation_id=${WM_OPERATION_ID:-}
   wm_identity=${WM_IDENTITY:-}
   wm_delegated=0
+  wm_daytime_operation_id=${WM_DAYTIME_OPERATION_ID:-}
   wm_cli_root=$wm_source_root
   wm_runtime_snapshot=''
   if [ -n "$wm_global_fd$wm_admission_fd$wm_operation_id$wm_identity" ]; then
     [[ "$wm_global_fd" =~ ^[0-9]+$ ]] && [[ "$wm_admission_fd" =~ ^[0-9]+$ ]] \
       && [ -n "$wm_operation_id" ] && [ -n "$wm_identity" ] || return 2
     wm_delegated=1
+  fi
+  if [ -n "$wm_daytime_operation_id" ]; then
+    [ "$wm_delegated" -eq 1 ] \
+      && [[ "$wm_daytime_operation_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+      && [ "$wm_daytime_operation_id" = "$wm_operation_id" ] || return 2
   fi
 }
 
@@ -181,9 +187,15 @@ wm_wait() {
 
 wm_prepare() {
   if [ "$wm_delegated" -eq 1 ]; then
-    wm_window || return 1
     wm_cli status --delegated --operation-id "$wm_operation_id" --global-fd "$wm_global_fd" \
       --admission-fd "$wm_admission_fd" --identity "$wm_identity" || return 1
+    # The parent may transfer its explicit authorization only with the same
+    # authenticated operation and both continuously held lock descriptors.
+    if [ -n "${wm_daytime_operation_id:-}" ]; then
+      [ "$wm_daytime_operation_id" = "$wm_operation_id" ] || return 1
+    else
+      wm_window || return 1
+    fi
     return 0
   fi
   wm_window && wm_begin && wm_wait && wm_window
@@ -200,7 +212,8 @@ wm_verify_restarted() {
 
 wm_delegate() {
   WM_GLOBAL_FD="$wm_global_fd" WM_ADMISSION_FD="$wm_admission_fd" \
-    WM_OPERATION_ID="$wm_operation_id" WM_IDENTITY="$wm_identity" "$@"
+    WM_OPERATION_ID="$wm_operation_id" WM_IDENTITY="$wm_identity" \
+    WM_DAYTIME_OPERATION_ID="${wm_daytime_operation_id:-}" "$@"
 }
 
 wm_finish() {
