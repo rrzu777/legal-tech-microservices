@@ -342,6 +342,8 @@ shift || true
 expected_sha=''
 requested_backup=''
 requested_operation=''
+recovery_backup=''
+handoff_receipt=''
 allow_daytime_maintenance=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -353,6 +355,16 @@ while [ "$#" -gt 0 ]; do
     --backup-dir)
       [ "$#" -ge 2 ] && [ -z "$requested_backup" ] || usage
       requested_backup=$2
+      shift 2
+      ;;
+    --recovery-backup)
+      [ "$#" -ge 2 ] && [ "$command_name" = apply-adopted ] && [ -z "$recovery_backup" ] || usage
+      recovery_backup=$2
+      shift 2
+      ;;
+    --handoff-receipt)
+      [ "$#" -ge 2 ] && [ "$command_name" = apply-adopted ] && [ -z "$handoff_receipt" ] || usage
+      handoff_receipt=$2
       shift 2
       ;;
     --operation-id)
@@ -380,12 +392,18 @@ case "$command_name" in
     [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || usage
     [[ "$requested_operation" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || usage
     ;;
+  verify-rollback)
+    [ -n "$expected_sha" ] && [ -n "$requested_operation" ] && [ -n "$requested_backup" ] || usage
+    [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || usage
+    [[ "$requested_operation" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || usage
+    ;;
   postflight) [ -z "$expected_sha" ] && [ -z "$requested_backup" ] || usage ;;
   rollback) [ -z "$expected_sha" ] && [ -n "$requested_backup" ] || usage ;;
   finish) [ -n "$requested_operation" ] && [ -z "$expected_sha$requested_backup" ] || usage ;;
   *) usage ;;
 esac
-case "$command_name" in finish|apply-adopted) ;; *) [ -z "$requested_operation" ] || usage ;; esac
+case "$command_name" in finish|apply-adopted|verify-rollback) ;; *) [ -z "$requested_operation" ] || usage ;; esac
+[ -z "$handoff_receipt" ] || [ -n "$recovery_backup" ] || usage
 
 # shellcheck source=worker-maintenance.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/worker-maintenance.sh"
@@ -2024,6 +2042,34 @@ validate_swap_rollback_authority() {
   swap_state=$marker
 }
 
+verify_rollback() {
+  # No acquisition, lifecycle, writes or release: both EX descriptions belong
+  # to the authenticated bootstrap/handoff caller throughout this check.
+  local uid index unit scope enabled active
+  [ "$wm_delegated" -eq 1 ] && [ "$wm_operation_id" = "$requested_operation" ] || return 1
+  wm_cli status --delegated --operation-id "$wm_operation_id" --identity "$wm_identity" \
+    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >"$null_file" || return 1
+  backup_dir=$requested_backup
+  uid=$(validate_hermes_inventory) || return 1
+  build_managed_paths "$uid"
+  validate_backup_dir "$backup_dir" && validate_manifest && load_and_validate_changes \
+    && load_and_validate_unit_states && load_and_validate_worker_runtime \
+    && load_and_validate_monitor_runtime || return 1
+  validate_root_path "$backup_dir/maintenance-operation-id" 600 || return 1
+  [ "$(<"$backup_dir/maintenance-operation-id")" = "$requested_operation" ] || return 1
+  "$wm_python" "$wm_source_root/ops/resource-guards-rollback.py" "$backup_dir" || return 1
+  for ((index = 0; index < ${#tracked_units[@]}; index++)); do
+    unit=${tracked_units[$index]}
+    scope=${tracked_unit_scopes[$index]}
+    enabled=$(read_unit_state "$scope" is-enabled "$unit") || return 1
+    active=$(read_correlated_unit_activity "$scope" "$unit" "$enabled") || return 1
+    [ "$enabled" = "${desired_enabled_states[$index]}" ] \
+      && [ "$active" = "${desired_active_states[$index]}" ] || return 1
+  done
+  wm_cli status --delegated --operation-id "$wm_operation_id" --identity "$wm_identity" \
+    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >"$null_file" || return 1
+}
+
 do_rollback() { # backup-dir worker-restore-capability automatic-compensation
   local uid rollback_rc=0 swap_rc=0 swap_state monitor_recovery_allowed=1
   local worker_restore_capability=${2:-0} automatic_compensation=${3:-0}
@@ -2464,6 +2510,12 @@ prepare_adopted_hold() {
   if [ "$allow_daytime_maintenance" -eq 1 ]; then
     bootstrap_args+=(--allow-daytime-maintenance)
   fi
+  if [ -n "$recovery_backup" ]; then
+    bootstrap_args+=(--recovery-backup "$recovery_backup")
+  fi
+  if [ -n "$handoff_receipt" ]; then
+    bootstrap_args+=(--handoff-receipt "$handoff_receipt")
+  fi
   "$wm_python" "$bootstrap_bin" "${bootstrap_args[@]}" >"$null_file" || return 1
   wm_verify_current && apply_maintenance_window_is_open || return 1
   # Propagate only the adopted operation that has just passed authentication.
@@ -2486,6 +2538,7 @@ case "$command_name" in
   apply-adopted) prepare_adopted_hold && run_apply 1 ;;
   postflight) run_postflight ;;
   rollback) do_rollback "$requested_backup" 0 0 ;;
+  verify-rollback) verify_rollback ;;
   finish)
     # Recovery is verification/release only, never retry/restore/start/stop.
     protocol_status=$(wm_cli status) || exit 1

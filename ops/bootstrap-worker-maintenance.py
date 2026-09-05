@@ -411,7 +411,53 @@ def adopt(config, operation, runner=subprocess.run):
         return dict(operation_id=operation, phase="adopted", result="succeeded")
 
 
-def verify_adopted(config, operation, identity_text, global_fd, admission_fd, runner=subprocess.run):
+def verify_recovery_backup(config, operation, identity, global_fd, admission_fd,
+                           recovery_backup, expected_sha=None, runner=subprocess.run):
+    """Read-only recovery evidence; caller must own both leases and authenticate its tree.
+
+    expected_sha is internal: a future authenticated ops-only handoff may retain
+    an older backup. It is never exposed as an unauthenticated CLI override.
+    """
+    require(recovery_backup is not None)
+    backup = Path(recovery_backup)
+    require(backup.is_absolute() and re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", backup.name))
+    trusted_ancestors(config, backup)
+    for directory in (backup, backup.parent):
+        operator.metadata(directory.stat(), config.root_uid, config.root_gid, 0o700, True)
+    args = operator_args(config)
+    journal = operator.journal_read(args, operation)
+    initial = operator.parse_identity(journal["initial_identity"])
+    require(journal["result"] == "intended"
+            and journal["drained_identity"] == operator.identity_text(identity)
+            and initial != identity and initial.boot_id == identity.boot_id
+            and initial.pid != identity.pid)
+    absent(config.proc_root / str(initial.pid))  # PID reuse is UNKNOWN, not proof of absence.
+    bound_sha = expected_sha if expected_sha is not None else config.expected_sha
+    require(type(bound_sha) is str and re.fullmatch(r"[0-9a-f]{40}", bound_sha))
+    contents = {name: file_text(config, backup / name, 0o600) for name in
+                ("expected-sha", "maintenance-operation-id", "worker-runtime.tsv")}
+    require(contents["expected-sha"] == bound_sha + "\n"
+            and contents["maintenance-operation-id"] == operation + "\n")
+    runtime = contents["worker-runtime.tsv"].rstrip("\n").split("\t")
+    require(len(runtime) == 5 and runtime[:3] == ["estrado-pjud-worker.service", "active", str(initial.pid)]
+            and runtime[4] in ("system.slice", "legaltech.slice")
+            and runtime[3] == f"/{runtime[4]}/estrado-pjud-worker.service")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", WM_GLOBAL_FD=str(global_fd), WM_ADMISSION_FD=str(admission_fd),
+               WM_OPERATION_ID=operation, WM_IDENTITY=operator.identity_text(identity))
+    # Verification neither enters a maintenance window nor creates daytime authority.
+    env.pop("WM_DAYTIME_OPERATION_ID", None)
+    result = runner(["/bin/bash", str(Path(__file__).with_name("resource-guards.sh")), "verify-rollback",
+                     "--expected-sha", bound_sha, "--operation-id", operation,
+                     "--backup-dir", str(backup)], env=env, pass_fds=(global_fd, admission_fd),
+                    capture_output=True, text=True, timeout=30)
+    require(result.returncode == 0)
+    require(operator.journal_read(args, operation) == journal)
+    require(all(file_text(config, backup / name, 0o600) == content for name, content in contents.items()))
+    absent(config.proc_root / str(initial.pid))
+
+
+def verify_adopted(config, operation, identity_text, global_fd, admission_fd, runner=subprocess.run,
+                   recovery_backup=None, recovery_expected_sha=None, handoff_receipt=None):
     """Authenticate the adopted bootstrap while the guards controller owns both EX leases."""
     require(type(operation) is str and str(uuid.UUID(operation)) == operation)
     expected = operator.parse_identity(identity_text)
@@ -434,11 +480,22 @@ def verify_adopted(config, operation, identity_text, global_fd, admission_fd, ru
             require(acknowledgement.state == "quiescent" and acknowledgement.inflight == 0)
             journal = operator.journal_read(args, operation)
             rendered = operator.identity_text(identity)
-            require(journal["result"] == "intended" and journal["initial_identity"] == rendered
-                    and journal["drained_identity"] == rendered)
+            require(journal["result"] == "intended" and journal["drained_identity"] == rendered)
+            if handoff_receipt is not None:
+                require(recovery_backup is not None and recovery_expected_sha is None)
+                handoff = load_sibling("bootstrap_handoff_verifier", "bootstrap-worker-handoff.py")
+                receipt = handoff.verify_handoff(config, operation, rendered, Path(handoff_receipt), runner)
+                require(receipt["recovery_backup"] == str(recovery_backup))
+                recovery_expected_sha = receipt["previous_sha"]
+            if journal["initial_identity"] != rendered:
+                verify_recovery_backup(config, operation, identity, global_fd, admission_fd,
+                                       recovery_backup, recovery_expected_sha, runner)
+            else:
+                require(recovery_backup is None and recovery_expected_sha is None)
             exact_tree(config, runner)
             require(installed_files(config, runner) == first)
             require(record_read(config, operation, "adopted") == record)
+            require(operator.journal_read(args, operation) == journal)
             require(store.read_control() == control)
             operator.current_identity(args, store, identity)
             acknowledgement = store.read_ack(expected_operation_id=operation, expected_identity=identity)
@@ -488,22 +545,27 @@ def parser():
     result.add_argument("--identity")
     result.add_argument("--global-fd", type=int)
     result.add_argument("--admission-fd", type=int)
+    result.add_argument("--recovery-backup", type=Path)
+    result.add_argument("--handoff-receipt", type=Path)
     result.add_argument("--allow-daytime-maintenance", action="store_true")
     return result
 
 
-def execute(config, command, operation, runner=subprocess.run, identity=None, global_fd=None, admission_fd=None):
+def execute(config, command, operation, runner=subprocess.run, identity=None, global_fd=None, admission_fd=None,
+            recovery_backup=None, handoff_receipt=None):
     try:
         require(command in ("install", "adopt", "verify-adopted")
                 and (operation is None if command == "install" else operation is not None))
+        require(handoff_receipt is None or (command == "verify-adopted" and recovery_backup is not None))
         if command == "install":
-            require(identity is None and global_fd is None and admission_fd is None)
+            require(identity is None and global_fd is None and admission_fd is None and recovery_backup is None)
             return install(config, runner)
         if command == "adopt":
-            require(identity is None and global_fd is None and admission_fd is None)
+            require(identity is None and global_fd is None and admission_fd is None and recovery_backup is None)
             return adopt(config, operation, runner)
         require(identity is not None and global_fd is not None and admission_fd is not None)
-        return verify_adopted(config, operation, identity, global_fd, admission_fd, runner)
+        return verify_adopted(config, operation, identity, global_fd, admission_fd, runner,
+                              recovery_backup=recovery_backup, handoff_receipt=handoff_receipt)
     except Exception:
         # Report only validated finite recovery hints. Never echo OS/provider data.
         result = dict(operation_id=None, phase="validation", result="blocked")
@@ -528,6 +590,8 @@ def main(argv=None):
     try:
         require(sys.platform == "linux" and os.geteuid() == 0)
         require(re.fullmatch(r"[0-9a-f]{40}", args.expected_sha) is not None)
+        require(args.recovery_backup is None or args.command == "verify-adopted")
+        require(args.handoff_receipt is None or (args.command == "verify-adopted" and args.recovery_backup is not None))
         require((args.command == "install" and args.operation_id is None and args.identity is None
                  and args.global_fd is None and args.admission_fd is None)
                 or (args.command == "adopt" and type(args.operation_id) is str
@@ -540,7 +604,8 @@ def main(argv=None):
                         worker_gid=grp.getgrnam("estrado").gr_gid,
                         allow_daytime_maintenance=args.allow_daytime_maintenance)
         result = execute(config, args.command, args.operation_id, identity=args.identity,
-                         global_fd=args.global_fd, admission_fd=args.admission_fd)
+                         global_fd=args.global_fd, admission_fd=args.admission_fd,
+                         recovery_backup=args.recovery_backup, handoff_receipt=args.handoff_receipt)
         status = 0 if result["result"] in ("succeeded", "verified") else 1
     except Exception:
         pass

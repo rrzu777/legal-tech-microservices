@@ -336,7 +336,7 @@ def test_adoption_authenticates_first_identity_and_creates_normal_journal_withou
         drained_identity=f"{BOOT}:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923", result="intended")
 
 
-def verify_adopted(host, monkeypatch):
+def verify_adopted(host, monkeypatch, recovery_backup=None):
     def validate_held_fd(fd, path, uid, gid, mode):
         named = os.lstat(path)
         opened = os.fstat(fd)
@@ -351,11 +351,95 @@ def verify_adopted(host, monkeypatch):
         fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return host.module.verify_adopted(
             host.config, host.operation, host.module.operator.identity_text(host.identity),
-            global_fd, admission_fd, host.runner,
+            global_fd, admission_fd, host.runner, recovery_backup=recovery_backup,
         )
     finally:
         os.close(admission_fd)
         os.close(global_fd)
+
+
+@pytest.fixture
+def rolled_back_worker(closed_worker):
+    from worker.maintenance_store import Ack, ProcessIdentity
+    host = closed_worker
+    host.module.adopt(host.config, host.operation, host.runner)
+    previous = host.identity
+    process = host.config.proc_root / str(previous.pid)
+    process.rename(host.config.proc_root / "514")
+    (host.config.proc_root / "514/stat").write_text("514 (worker) " + " ".join(["S"] + ["0"] * 18 + ["9999"]))
+    host.identity = ProcessIdentity(BOOT, 514, 9999, "0d308ca4-9237-40a8-986d-a947fd895d02")
+    host.state.services["estrado-pjud-worker.service"]["MainPID"] = "514"
+    host.store.write_ack(Ack(1, host.operation, BOOT, 514, 9999,
+                            host.identity.instance_id, "quiescent", 0))
+    args = host.module.operator_args(host.config)
+    journal = host.module.operator.journal_read(args, host.operation)
+    journal["drained_identity"] = host.module.operator.identity_text(host.identity)
+    host.module.operator.journal_write(args, journal)
+    backup = host.config.repo_dir.parent / "backups" / "20260905T160000Z"
+    backup.mkdir(parents=True, mode=0o700)
+    backup.parent.chmod(0o700)
+    for name, content in {
+        "expected-sha": host.config.expected_sha + "\n",
+        "maintenance-operation-id": host.operation + "\n",
+        "worker-runtime.tsv": "estrado-pjud-worker.service\tactive\t512\t/system.slice/estrado-pjud-worker.service\tsystem.slice\n",
+    }.items():
+        (backup / name).write_text(content)
+        (backup / name).chmod(0o600)
+    original_runner = host.runner
+    host.restore_calls = []
+    def runner(command, **kwargs):
+        if command[0] == "/bin/bash":
+            host.restore_calls.append((command, kwargs))
+            return SimpleNamespace(returncode=host.restore_rc, stdout="", stderr="")
+        return original_runner(command, **kwargs)
+    host.runner = runner
+    host.backup, host.restore_rc = backup, 0
+    host.original_journal = journal.copy()
+    return host
+
+
+def test_recovery_verifies_complete_backup_without_rewriting_history(rolled_back_worker, monkeypatch):
+    host = rolled_back_worker
+    assert verify_adopted(host, monkeypatch, host.backup)["result"] == "verified"
+    assert host.restore_calls
+    command, kwargs = host.restore_calls[0]
+    assert command[2:] == ["verify-rollback", "--expected-sha", SHA,
+                           "--operation-id", host.operation, "--backup-dir", str(host.backup)]
+    assert len(kwargs["pass_fds"]) == 2
+    assert host.module.operator.journal_read(host.module.operator_args(host.config), host.operation) == host.original_journal
+    assert host.store.read_control().state == "hold"
+
+
+@pytest.mark.parametrize("fault", ["no-backup", "sha", "operation", "pid", "old-process", "restoration", "permissions"])
+def test_recovery_rejects_unproven_rollback(rolled_back_worker, monkeypatch, fault):
+    host = rolled_back_worker
+    backup = host.backup
+    if fault == "no-backup": backup = None
+    elif fault == "sha": (backup / "expected-sha").write_text("b" * 40 + "\n")
+    elif fault == "operation": (backup / "maintenance-operation-id").write_text(str(host.module.uuid.uuid4()) + "\n")
+    elif fault == "pid": (backup / "worker-runtime.tsv").write_text("estrado-pjud-worker.service\tactive\t999\t/system.slice/estrado-pjud-worker.service\tsystem.slice\n")
+    elif fault == "old-process": (host.config.proc_root / "512").mkdir()
+    elif fault == "restoration": host.restore_rc = 1
+    else: (backup / "expected-sha").chmod(0o644)
+    with pytest.raises(Exception):
+        verify_adopted(host, monkeypatch, backup)
+    assert host.store.read_control().state == "hold"
+
+
+def test_recovery_cli_accepts_exact_receipt_path(module):
+    args = module.parser().parse_args([
+        "verify-adopted", "--expected-sha", SHA, "--recovery-backup", "/backup/20260905T160000Z",
+        "--handoff-receipt", "/bootstrap/handoff.json",
+    ])
+    assert args.handoff_receipt == Path("/bootstrap/handoff.json")
+
+
+@pytest.mark.parametrize("command", ["install", "adopt"])
+def test_non_verifier_rejects_recovery_options_without_mutation(host, command):
+    result = host.module.execute(host.config, command, None, host.runner,
+                                 recovery_backup=Path("/backup/20260905T160000Z"))
+    assert result["result"] == "blocked"
+    assert not host.config.bootstrap_root.exists()
 
 
 def test_adopted_bootstrap_can_be_verified_under_controller_owned_leases(closed_worker, monkeypatch):

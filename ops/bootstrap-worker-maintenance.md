@@ -264,8 +264,9 @@ demostrar ausencia de nuevos efectos. No se admite el flag en `preflight`,
 
 La CLI es Linux/root-only; aquí se documentan sus dos operaciones de transición.
 La tercera operación, `verify-adopted`, pertenece al handoff autenticado hacia
-resource guards. La CLI no permite
-rutas, UID/GID, URLs, reloj ni modo de prueba por argumentos o entorno:
+resource guards. Sólo admite una ruta de evidencia explícita `--recovery-backup`
+para el caso de rollback descrito abajo; no admite rutas de runtime, UID/GID,
+URLs, reloj ni modo de prueba por argumentos o entorno:
 
 ```sh
 sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
@@ -273,6 +274,34 @@ sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
   install --expected-sha <sha-completo-de-40-hex-minusculas> \
   [--allow-daytime-maintenance]
 ```
+
+### Recuperación de identidad tras rollback de guards
+
+Un rollback puede reiniciar el worker bajo el mismo hold: el journal conserva
+`initial_identity` histórica y actualiza únicamente `drained_identity`. No se
+reescribe esa historia para permitir el siguiente intento. `verify-adopted`
+acepta esta situación sólo con `--recovery-backup /var/backups/legaltech-resource-guards/<timestamp>`:
+ambos EX delegados, mismo UUID de hold, ACK fresco quiescent/0, identidad actual
+igual a drained, mismo boot que initial e inexistencia del PID original (también
+rechaza reutilización del PID). El backup root-only debe vincular SHA, operación
+y PID original. Estos datos no bastan por sí solos: `verify-rollback` comprueba
+en modo sólo lectura el manifest completo de 16 rutas (contenido, ausencia,
+permisos y propietarios, incluyendo descendientes) y los estados enabled/active
+de las ocho unidades. No acepta un mensaje `ROLLBACK OK` como certificado.
+
+El controlador propaga la misma opción desde `resource-guards.sh apply-adopted
+--expected-sha <SHA> --operation-id <UUID> --recovery-backup <backup>` hasta el
+verificador; la autorización diurna sigue siendo una opción explícita separada.
+La comparación no arranca, para, restaura ni libera nada. Cualquier diferencia,
+backup ambiguo o identidad anterior aún presente mantiene el hold y bloquea.
+El caller autentica el toolkit staged exacto y conserva ambos locks durante
+toda la verificación; el verificador de backup no selecciona ni cambia checkout.
+Cambiar SHA requiere además el handoff autenticado separado, no un argumento
+libre que permita declarar como válido un backup de otra versión. Tras ese
+handoff se añade `--handoff-receipt <directorio-controlado>/handoff.json` a
+`apply-adopted`; se propaga al verificador. Sólo un receipt committed autenticado
+bajo ambos locks puede autorizar la SHA anterior del backup, conservando el
+árbol actual exacto y la comprobación fresca de la restauración completa.
 
 `install` no realiza lifecycle ni consultas de negocio. Valida el global lock
 preexistente y conserva su inode; adquiere EX sin reemplazarlo. El directorio padre

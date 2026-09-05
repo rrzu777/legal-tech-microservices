@@ -2864,6 +2864,50 @@ run_failed_monitor_restore_barriers() {
   done
 }
 
+run_recovery_verification_regressions() {
+  local backup_path operation identity fault
+  setup
+  configure_active_worker
+  : > "$STATE/postflight-fail"
+  TEST_MUTATE=all run_guard apply --expected-sha "$EXPECTED_SHA"
+  expect_eq 'recovery fixture apply fails' "$RC" 1
+  expect_contains 'recovery fixture rolls back completely' "$OUT" 'ROLLBACK OK:'
+  backup_path=$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  operation=$(cat "$STATE/maintenance-operation")
+  identity=$(cat "$STATE/maintenance-identity")
+  for fault in clean file enabled active no-delegation; do
+    case "$fault" in
+      file) printf 'drift\n' >> "$FAKE/systemd/legaltech-monitor.service" ;;
+      enabled) printf 'disabled\n' > "$STATE/user-unit-hermes-gateway.service-enabled" ;;
+      active) printf 'inactive\n' > "$STATE/user-unit-hermes-dashboard.service-active" ;;
+    esac
+    : > "$EVENTS"
+    if [ "$fault" = no-delegation ]; then
+      run_guard verify-rollback --expected-sha "$EXPECTED_SHA" --operation-id "$operation" --backup-dir "$backup_path"
+    else
+      WM_GLOBAL_FD=8 WM_ADMISSION_FD=9 WM_OPERATION_ID="$operation" WM_IDENTITY="$identity" \
+        run_guard verify-rollback --expected-sha "$EXPECTED_SHA" --operation-id "$operation" --backup-dir "$backup_path"
+    fi
+    if [ "$fault" = clean ]; then expect_eq 'complete restoration verifies' "$RC" 0
+    else expect_eq "recovery rejects $fault" "$RC" 1; fi
+    expect_count "recovery $fault performs no lifecycle" 'systemctl start ' 0
+    expect_count "recovery $fault performs no stop" 'systemctl stop ' 0
+    expect_count "recovery $fault never opens hold" 'maintenance finish' 0
+    case "$fault" in
+      file) cp "$backup_path/entries/0005" "$FAKE/systemd/legaltech-monitor.service" ;;
+      enabled) printf 'enabled\n' > "$STATE/user-unit-hermes-gateway.service-enabled" ;;
+      active) printf 'active\n' > "$STATE/user-unit-hermes-dashboard.service-active" ;;
+    esac
+  done
+}
+
+if [ "${RESOURCE_GUARDS_FOCUS:-}" = rollback-recovery-verification ]; then
+  run_recovery_verification_regressions
+  printf '\n%s ok, %s fail\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 if [ "${RESOURCE_GUARDS_FOCUS:-}" = failed-monitor-restore-barriers ]; then
   run_failed_monitor_restore_barriers
   echo "$PASS ok, $FAIL fail"
@@ -3905,6 +3949,7 @@ done
 
 run_explicit_daytime_maintenance_regressions
 run_late_window_review_regressions
+run_recovery_verification_regressions
 
 echo
 echo "$PASS ok, $FAIL fail"
