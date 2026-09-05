@@ -29,8 +29,8 @@ OVERRIDE = '[Service]\nRestart=no\nWatchdogSec=0\nSendSIGKILL=no\nTimeoutStopSec
 ENV = {'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
 ALLOW_DAYTIME_LAB = False
 # Fixture-only binding to the reviewed installer, not a production protocol.
-INSTALLER_SHA256 = '7d37c9f7eb3d4f5650c5de867321b217abc1b7e95700fccedae4c941508320ad'
-STOPPED_UNIT_STATE_LINE = 216
+INSTALLER_SHA256 = '0e46d218f140d6bc8a1535ccb9bb2ea4f2ee1e18a8eb50fc1341d00230955b8e'
+STOPPED_UNIT_STATE_LINE = 220
 PING_FILE = APP / 'logs/native-bootstrap-watchdog/latest.json'
 WATCHDOG_KEYS = ('Type', 'NotifyAccess', 'TimeoutStartUSec', 'ControlPID', 'PropagatesReloadTo',
                  'ReloadPropagatedFrom', 'TriggeredBy', 'NeedDaemonReload', 'LoadState', 'ActiveState',

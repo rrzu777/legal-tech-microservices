@@ -136,6 +136,14 @@ backup completo también se sincroniza antes de comenzar mutaciones. Si cualquie
 de esas fronteras falla, el rollout se detiene sin iniciar el efecto que dependía
 del marcador.
 
+Una intervención diurna aprobada explícitamente usa el bootstrap detenido y
+`apply-adopted --allow-daytime-maintenance`; no usa `apply` legacy. El flag solo
+omite el reloj para esa cadena adoptada: no omite SHA/árbol exactos, servicios
+detenidos antes del bootstrap, hold/ACK/locks, claims cero, fencing, health,
+backup ni rollback automático. `preflight`, `postflight`, `finish` y rollback
+manual continúan sin aceptar el flag. La admisión web/DB y el proxy deben quedar
+cerrados y verificarse por fuera antes de invocar el bootstrap.
+
 La identidad previa no se presupone en `legaltech.slice`: el backup captura en
 una sola lectura el PID, `Slice` efectiva y cgroup exacto de la unit instalada.
 Por eso una primera migración válida desde

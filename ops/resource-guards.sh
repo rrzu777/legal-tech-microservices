@@ -18,6 +18,7 @@ usage() {
     'usage: resource-guards.sh preflight|apply --expected-sha <40-hex-sha>' \
     '       resource-guards.sh apply --expected-sha <40-hex-sha> --allow-daytime-maintenance' \
     '       resource-guards.sh apply-adopted --expected-sha <40-hex-sha> --operation-id <exact-uuid>' \
+    '         [--allow-daytime-maintenance]' \
     '       resource-guards.sh postflight' \
     '       resource-guards.sh finish --operation-id <exact-uuid>' \
     '       resource-guards.sh rollback --backup-dir <timestamped-backup>' >&2
@@ -360,7 +361,8 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --allow-daytime-maintenance)
-      [ "$command_name" = apply ] && [ "$allow_daytime_maintenance" -eq 0 ] || usage
+      { [ "$command_name" = apply ] || [ "$command_name" = apply-adopted ]; } \
+        && [ "$allow_daytime_maintenance" -eq 0 ] || usage
       allow_daytime_maintenance=1
       shift
       ;;
@@ -631,7 +633,10 @@ maintenance_window_is_open() {
 }
 
 apply_maintenance_window_is_open() {
-  # Historical flag cannot bypass v1's strict stop window.
+  if [ "$command_name" = apply-adopted ] && [ "$allow_daytime_maintenance" -eq 1 ]; then
+    return 0
+  fi
+  # The historical legacy apply flag cannot bypass v1's strict stop window.
   maintenance_window_is_open
 }
 
@@ -1822,10 +1827,10 @@ restore_enabled_state() { # system|user unit enabled|disabled|static
   [ "$current" = "$desired" ]
 }
 
-worker_restoration_window_allows() { # legacy caller marker never bypasses the clock
+worker_restoration_window_allows() { # only an explicitly adopted operation can bypass the clock
   local worker_restore_capability=$1
   case "$worker_restore_capability" in 0|1) ;; *) return 1 ;; esac
-  maintenance_window_is_open
+  apply_maintenance_window_is_open
 }
 
 read_monitor_restore_activity() { # unit, captured enablement, restored-config capability
@@ -1902,7 +1907,7 @@ restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
           rc=1
         fi
       elif [ "$current" = active ]; then
-        wm_verify_current && maintenance_window_is_open \
+        wm_verify_current && apply_maintenance_window_is_open \
           && "$systemctl_bin" stop "$unit" >"$null_file" 2>&1 || rc=1
       fi
     elif { [ "$unit" = legaltech-monitor.service ] && [ "$changed_monitor" -eq 1 ]; } \
@@ -1924,7 +1929,7 @@ restore_unit_states() { # 0=no capability, 1=admitted changed-worker restore
       else
         case "$desired" in active) action=start ;; inactive) action=stop ;; esac
         if [ "$unit" = estrado-pjud-worker.service ]; then
-          wm_verify_current && maintenance_window_is_open || { rc=1; continue; }
+          wm_verify_current && apply_maintenance_window_is_open || { rc=1; continue; }
         fi
         "$systemctl_bin" "$action" "$unit" >"$null_file" 2>&1 || rc=1
       fi
@@ -2059,7 +2064,7 @@ do_rollback() { # backup-dir worker-restore-capability automatic-compensation
       [ "$(<"$backup_dir/maintenance-operation-id")" = "$protocol_operation" ] || return 1
       wm_operation_id=$protocol_operation
       wm_identity=$protocol_identity
-      wm_wait && maintenance_window_is_open || return 1
+      wm_wait && apply_maintenance_window_is_open || return 1
     elif [ "$protocol_state" = open ]; then
       wm_operation_id=$("$wm_python" -c 'import uuid; print(uuid.uuid4())') || return 1
       durable_replace_metadata "$backup_dir/maintenance-operation-id" "$wm_operation_id"$'\n' || return 1
@@ -2082,7 +2087,7 @@ do_rollback() { # backup-dir worker-restore-capability automatic-compensation
     return 1
   fi
   # Quiescing itself may cross 04:00. Do not begin restoration on stale time.
-  maintenance_window_is_open \
+  apply_maintenance_window_is_open \
     || { fail 'rollback outside the maintenance window; no files restored'; return 1; }
   case "$swap_state" in
     attempted)
@@ -2198,9 +2203,9 @@ stop_worker_for_change() {
     && [ "$effective_slice" = "$captured_worker_slice" ] \
     && worker_runtime_has_exact_identity "$active" "$old_pid" \
       "$old_control_group" "$effective_slice" || return 1
-  wm_verify_current && maintenance_window_is_open || return 1
+  wm_verify_current && apply_maintenance_window_is_open || return 1
   record_change worker-stop || return 1
-  maintenance_window_is_open || return 1
+  apply_maintenance_window_is_open || return 1
   mutation_started=1
   "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
   [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
@@ -2237,7 +2242,7 @@ quiesce_worker_for_restore() {
       # A post-start failure may have changed MainPID. Authenticate that exact
       # new ACK before stopping it; an unknown instance cannot trigger restore.
       wm_verify_current || wm_verify_restarted || return 1
-      maintenance_window_is_open || return 1
+      apply_maintenance_window_is_open || return 1
       "$systemctl_bin" stop estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
       worker_runtime_is_stopped "$pid" "$effective_slice"
@@ -2309,7 +2314,7 @@ run_apply_steps() {
   fi
   durable_replace_metadata "$backup_dir/maintenance-operation-id" "$wm_operation_id"$'\n' || return 1
   if [ "$adopted" -eq 0 ]; then wm_prepare || return 1
-  else wm_verify_current && maintenance_window_is_open || return 1; fi
+  else wm_verify_current && apply_maintenance_window_is_open || return 1; fi
   if [ "$worker_will_change" -eq 1 ] && [ "${desired_active_states[1]}" = active ]; then
     load_worker_fence_config || return 1
     apply_maintenance_window_is_open || return 1
@@ -2351,7 +2356,7 @@ run_apply_steps() {
   [ "$after_monitor" = "$desired_monitor" ] || return 1
   [ "$after_tracker" = "$desired_tracker" ] || return 1
   [ "$provision_rc" -eq 0 ] || return 1
-  maintenance_window_is_open || return 1
+  apply_maintenance_window_is_open || return 1
   restore_enabled_state system estrado-pjud.service "${desired_enabled_states[0]}" || return 1
   if [ "${swap_initial_state:-unknown}" = clean ]; then
     durable_replace_metadata "$backup_dir/swap-state" $'attempted\n' || return 1
@@ -2394,7 +2399,7 @@ run_apply_steps() {
     apply_phase=worker-runtime
     if [ "${desired_active_states[1]}" = active ]; then
       [ "$(read_unit_state system is-active estrado-pjud-worker.service)" = inactive ] || return 1
-      maintenance_window_is_open || return 1
+      apply_maintenance_window_is_open || return 1
       "$systemctl_bin" start estrado-pjud-worker.service >"$null_file" 2>&1 || return 1
       show_runtime_contract system estrado-pjud-worker.service active exact-service \
         "$WORKER_CGROUP" || return 1
@@ -2441,6 +2446,7 @@ run_apply() {
 
 prepare_adopted_hold() {
   local protocol_status protocol_state protocol_operation extra
+  local -a bootstrap_args
   safe_existing_path "$bootstrap_bin" || return 1
   protocol_status=$(wm_cli status) || return 1
   read -r protocol_state protocol_operation wm_identity extra <<< "$protocol_status"
@@ -2452,10 +2458,14 @@ prepare_adopted_hold() {
   [ -n "$wm_admission_fd" ] \
     || exec {wm_admission_fd}<"$wm_control_dir/admission.lock" || return 1
   "$wm_flock" -n "$wm_admission_fd" 2>"$null_file" || return 1
-  "$wm_python" "$bootstrap_bin" verify-adopted --expected-sha "$expected_sha" \
+  bootstrap_args=(verify-adopted --expected-sha "$expected_sha" \
     --operation-id "$wm_operation_id" --identity "$wm_identity" \
-    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd" >"$null_file" || return 1
-  wm_verify_current && maintenance_window_is_open
+    --global-fd "$wm_global_fd" --admission-fd "$wm_admission_fd")
+  if [ "$allow_daytime_maintenance" -eq 1 ]; then
+    bootstrap_args+=(--allow-daytime-maintenance)
+  fi
+  "$wm_python" "$bootstrap_bin" "${bootstrap_args[@]}" >"$null_file" || return 1
+  wm_verify_current && apply_maintenance_window_is_open
 }
 
 case "$command_name" in

@@ -162,6 +162,16 @@ de la ventana **America/Santiago 20:00–03:59**. El deadline del controlador si
 abortar el avance: nunca escalar a SIGKILL, reiterar señales ni reiniciar para
 intentar que el legacy drene.
 
+Excepción operacional acotada: una ventana diurna aprobada explícitamente puede
+usar `--allow-daytime-maintenance` únicamente en `install`, `adopt`,
+`verify-adopted` y el posterior `resource-guards.sh apply-adopted`. El flag no
+reemplaza ninguna precondición: antes de `install`, API y worker deben seguir
+`disabled`, `inactive/dead`, con salida limpia y cgroups vacíos; antes de
+`apply-adopted`, el hold, UUID, locks, identidad y ACK deben estar autenticados.
+El controlador externo además debe conservar admisión web/DB y proxy cerrados y
+demostrar ausencia de nuevos efectos. No se admite el flag en `preflight`,
+`postflight`, `finish` ni rollback manual, y nunca habilita `apply` legacy.
+
 1. Refrescar código y árbol desplegados, hora, health, units efectivas, boot ID,
    MainPID, PID Python/uvicorn, start ticks y todos sus cgroups/auxiliares. Guardar
    con permisos root-only las units, drop-ins, estado de habilitación y enlaces
@@ -246,13 +256,16 @@ intentar que el legacy drene.
 
 ## Instalador detenido y primera adopción
 
-La CLI es Linux/root-only y tiene exactamente estas dos operaciones; no permite
+La CLI es Linux/root-only; aquí se documentan sus dos operaciones de transición.
+La tercera operación, `verify-adopted`, pertenece al handoff autenticado hacia
+resource guards. La CLI no permite
 rutas, UID/GID, URLs, reloj ni modo de prueba por argumentos o entorno:
 
 ```sh
 sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
   /usr/bin/python3 /opt/legal-tech-microservices/ops/bootstrap-worker-maintenance.py \
-  install --expected-sha <sha-completo-de-40-hex-minusculas>
+  install --expected-sha <sha-completo-de-40-hex-minusculas> \
+  [--allow-daytime-maintenance]
 ```
 
 `install` no realiza lifecycle ni consultas de negocio. Valida el global lock
@@ -314,7 +327,8 @@ nunca `enable --now` ni restauración automática. Preservar disabled ante fallo
 ```sh
 sudo env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
   /usr/bin/python3 /opt/legal-tech-microservices/ops/bootstrap-worker-maintenance.py \
-  adopt --expected-sha <mismo-sha-completo> --operation-id <uuid-devuelto-por-install>
+  adopt --expected-sha <mismo-sha-completo> --operation-id <uuid-devuelto-por-install> \
+  [--allow-daytime-maintenance]
 ```
 
 `adopt` autentica record/hashes/target, hold/UUID, MainPID/boot/start ticks/cgroup,

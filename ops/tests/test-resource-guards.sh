@@ -2702,7 +2702,7 @@ run_orchestrated_swap_crash_regression() {
 }
 
 run_explicit_daytime_maintenance_regressions() {
-  local scenario backup_path command
+  local scenario backup_path command retry_path
   echo '== daytime maintenance requires explicit apply-only authorization'
   setup
   configure_active_worker
@@ -2724,6 +2724,12 @@ run_explicit_daytime_maintenance_regressions() {
   setup
   run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance --allow-daytime-maintenance
   expect_eq 'duplicate daytime authorization is rejected' "$RC" 2
+
+  setup
+  run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847 \
+    --allow-daytime-maintenance --allow-daytime-maintenance
+  expect_eq 'duplicate adopted daytime authorization is rejected' "$RC" 2
 
   setup
   configure_active_worker
@@ -2760,11 +2766,77 @@ run_explicit_daytime_maintenance_regressions() {
   setup
   configure_active_worker
   printf '%s\n' 09 > "$STATE/local-hour"
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  printf '%s\n' maintenance-safe-new > "$STATE/heartbeat-post"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847
+  expect_eq 'adopted daytime hold requires explicit authorization' "$RC" 1
+  expect_count 'unauthorized adopted daytime performs no provision' provision 0
+
+  : > "$EVENTS"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847 \
+    --allow-daytime-maintenance
+  expect_eq 'authorized adopted daytime hold applies guards' "$RC" 0
+  expect_exact_count 'authorized adopted daytime verifies bootstrap once' 'bootstrap verify-adopted' 1
+  if [ -f "$STATE/bootstrap-daytime-flag-seen" ]; then
+    ok 'authorized adopted daytime forwards authorization to bootstrap verifier'
+  else
+    bad 'authorized adopted daytime forwards authorization to bootstrap verifier'
+  fi
+
+  setup
+  configure_active_worker
+  printf '%s\n' 09 > "$STATE/local-hour"
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  printf '%s\n' maintenance-safe-new > "$STATE/heartbeat-post"
   : > "$STATE/postflight-fail"
-  TEST_MUTATE=dropin run_guard apply --expected-sha "$EXPECTED_SHA" --allow-daytime-maintenance
-  expect_eq 'daytime failure keeps apply failed' "$RC" 1
-  expect_missing 'daytime refusal never starts rollback' "$OUT" 'ROLLBACK OK'
-  expect_eq 'daytime automatic rollback leaves worker active' "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847 \
+    --allow-daytime-maintenance
+  expect_eq 'adopted daytime post-mutation failure keeps apply failed' "$RC" 1
+  expect_contains 'adopted daytime post-mutation failure completes rollback' "$OUT" 'ROLLBACK OK'
+  expect_eq 'adopted daytime automatic rollback restores worker active' \
+    "$(cat "$STATE/unit-estrado-pjud-worker.service-active")" active
+  expect_count 'adopted daytime failure mutates before compensating' provision 1
+  expect_exact_count 'adopted daytime compensation rolls swap back once' 'swap rollback' 1
+  expect_eq 'adopted daytime compensation preserves the authenticated hold' \
+    "$(cat "$STATE/maintenance-state")" hold
+  expect_count 'adopted daytime compensation emits no paid sync action' 'paid-sync' 0
+  expect_count 'adopted daytime compensation emits no session mint action' 'session-mint' 0
+
+  setup
+  configure_active_worker
+  printf '%s\n' 09 > "$STATE/local-hour"
+  printf '%s\n' hold > "$STATE/maintenance-state"
+  printf '%s\n' 64a8eb10-2d55-457f-924c-23d5a532c847 > "$STATE/maintenance-operation"
+  printf '%s\n' f784c8bd-67c3-448e-ae1c-55ac6feab947:512:9012:bf763d76-b99c-464d-80d8-bcbd9520b923 \
+    > "$STATE/maintenance-identity"
+  printf '%s\n' maintenance-safe > "$STATE/heartbeat-pre"
+  printf '%s\n' maintenance-safe-new > "$STATE/heartbeat-post"
+  : > "$STATE/postflight-fail"
+  : > "$STATE/swap-rollback-fail"
+  TEST_MUTATE=all run_guard apply-adopted --expected-sha "$EXPECTED_SHA" \
+    --operation-id 64a8eb10-2d55-457f-924c-23d5a532c847 \
+    --allow-daytime-maintenance
+  expect_eq 'adopted daytime incomplete compensation stays failed' "$RC" 1
+  retry_path=$(printf '%s\n' "$OUT" \
+    | sed -n 's/^ROLLBACK INCOMPLETO: reintente con el BACKUP_DIR validado: \(.*\)$/\1/p')
+  expect_eq 'adopted daytime incomplete compensation emits one retry authority' \
+    "$(printf '%s\n' "$retry_path" | grep -c . || true)" 1
+  expect_eq 'adopted daytime incomplete compensation retains exact backup authority' \
+    "$retry_path" "$(find "$FAKE/backups" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+  expect_missing 'adopted daytime incomplete compensation never claims success' "$OUT" 'ROLLBACK OK'
+  expect_count 'adopted daytime incomplete compensation emits no paid sync action' 'paid-sync' 0
+  expect_count 'adopted daytime incomplete compensation emits no session mint action' 'session-mint' 0
   run_rollback_worker_capability_regression --allow-daytime-maintenance
 }
 
