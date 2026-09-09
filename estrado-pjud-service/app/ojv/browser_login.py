@@ -39,6 +39,7 @@ _OFFICIAL_LANDING = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 _OFFICIAL_HOST = "oficinajudicialvirtual.pjud.cl"
 _LOGIN_TIMEOUT_S = 45.0
 _SERVICES_CLICK_TIMEOUT_S = 2.0
+_CLAVE_CLICK_TIMEOUT_S = 2.0
 _CLEANUP_TIMEOUT_S = 1.0
 _RUT_PLACEHOLDER = "Ingrese su Rut sin dígito verificador, Ej: 12345678"
 logger = logging.getLogger(__name__)
@@ -225,6 +226,23 @@ async def _open_services_menu(page: object, services: object, deadline: float) -
             raise OjvUpstreamChangedError()
         await _within_deadline(
             visible_services.evaluate("element => element.click()"), deadline,
+        )
+
+
+async def _open_clave_modal(page: object, clave: object, deadline: float) -> None:
+    """Open the credential modal without letting one Playwright click consume login."""
+    visible_clave = clave.filter(visible=True)
+    click_deadline = min(deadline, time.monotonic() + _CLAVE_CLICK_TIMEOUT_S)
+    try:
+        await _within_deadline(
+            visible_clave.click(timeout=_remaining_timeout_ms(click_deadline)),
+            click_deadline,
+        )
+    except (asyncio.TimeoutError, PlaywrightTimeoutError):
+        if not _is_trusted_official_url(page.url):
+            raise OjvUpstreamChangedError()
+        await _within_deadline(
+            visible_clave.evaluate("element => element.click()"), deadline,
         )
 
 
@@ -465,7 +483,7 @@ async def login_official_ojv(
                     failure = OjvUpstreamChangedError()
             if failure is None:
                 stage = "clave_click"
-                await _within_deadline(clave.click(timeout=_remaining_timeout_ms(deadline)), deadline)
+                await _open_clave_modal(page, clave, deadline)
                 stage = "form_visible"
                 modal = page.locator("#segunda-clave-access")
                 form = modal.locator("#fSGN")
