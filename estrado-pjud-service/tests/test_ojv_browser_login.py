@@ -276,6 +276,39 @@ async def test_official_adapter_uses_observed_ui_and_returns_owned_typed_cookies
     assert context.cdp.detached is True
 
 
+async def test_services_menu_falls_back_to_dom_click_when_playwright_click_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.ojv.browser_login as browser_login
+
+    class HungServices(_Action):
+        async def click(self, **_kwargs: object) -> None:
+            await asyncio.sleep(1)
+
+        async def evaluate(self, script: str) -> None:
+            assert script == "element => element.click()"
+            self.page.actions.append("services")
+
+    class HungServicesPage(_Page):
+        def get_by_role(self, role: str, *, name: str, exact: bool) -> _Counted:
+            if (role, name) == ("button", "Todos los servicios"):
+                return HungServices(self, "services")
+            return super().get_by_role(role, name=name, exact=exact)
+
+    page = HungServicesPage()
+    _install_fake_browser(monkeypatch, page)
+    monkeypatch.setattr(browser_login, "_LOGIN_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(browser_login, "_SERVICES_CLICK_TIMEOUT_S", 0.01, raising=False)
+
+    result = await login_official_ojv(
+        SecretStr("11.111.111-1"), SecretStr("secret"),
+        proxy_url=None, user_agent="official-test-agent",
+    )
+
+    assert result.cookies[0].name == "AUTH"
+    assert page.actions[:3] == ["services", "clave", "submit"]
+
+
 async def test_official_adapter_fails_closed_before_filling_when_entry_origin_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

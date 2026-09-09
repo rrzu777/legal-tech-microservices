@@ -38,6 +38,7 @@ _OFFICIAL_ENTRY = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
 _OFFICIAL_LANDING = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 _OFFICIAL_HOST = "oficinajudicialvirtual.pjud.cl"
 _LOGIN_TIMEOUT_S = 45.0
+_SERVICES_CLICK_TIMEOUT_S = 2.0
 _CLEANUP_TIMEOUT_S = 1.0
 _RUT_PLACEHOLDER = "Ingrese su Rut sin dígito verificador, Ej: 12345678"
 logger = logging.getLogger(__name__)
@@ -208,6 +209,23 @@ async def _wait_visible(locator: object, deadline: float) -> bool:
         return await _within_deadline(visible.count(), deadline) == 1
     except (asyncio.TimeoutError, PlaywrightTimeoutError):
         return False
+
+
+async def _open_services_menu(page: object, services: object, deadline: float) -> None:
+    """Open OJV's inline menu without letting one Playwright click consume login."""
+    visible_services = services.filter(visible=True)
+    click_deadline = min(deadline, time.monotonic() + _SERVICES_CLICK_TIMEOUT_S)
+    try:
+        await _within_deadline(
+            visible_services.click(timeout=_remaining_timeout_ms(click_deadline)),
+            click_deadline,
+        )
+    except (asyncio.TimeoutError, PlaywrightTimeoutError):
+        if not _is_trusted_official_url(page.url):
+            raise OjvUpstreamChangedError()
+        await _within_deadline(
+            visible_services.evaluate("element => element.click()"), deadline,
+        )
 
 
 @dataclass(slots=True)
@@ -440,7 +458,7 @@ async def login_official_ojv(
                     failure = OjvUpstreamChangedError()
             if failure is None:
                 stage = "services_click"
-                await _within_deadline(services.click(timeout=_remaining_timeout_ms(deadline)), deadline)
+                await _open_services_menu(page, services, deadline)
                 stage = "clave_visible"
                 clave = page.get_by_role("link", name="Clave Poder Judicial", exact=True)
                 if not await _wait_visible(clave, deadline):
