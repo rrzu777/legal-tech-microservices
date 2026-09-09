@@ -108,6 +108,7 @@ _NEXT_PAGE_RE = re.compile(r"\bpagina(?:Ant|Sig)?\(\s*(\d+)\s*,", re.IGNORECASE)
 
 
 DiscoveryStatus = Literal[
+    "session_unavailable",
     "ok",
     "credential_invalid",
     "session_expired",

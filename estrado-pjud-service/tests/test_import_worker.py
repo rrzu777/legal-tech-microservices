@@ -10,6 +10,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.familia.auth import InvalidCredentialsError
+from app.failure_kind import MintUnavailableError, PoolUnavailableError
 from app.my_causes.models import ImportCandidate
 from app.my_causes.client import DiscoveryResult
 from app.ojv.errors import (
@@ -245,6 +246,47 @@ def make_worker(
         proxy_usage=proxy_usage,
     )
     return worker, sb, pool, discovery, credential, session_factory, session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [MintUnavailableError("navigation_failed"), PoolUnavailableError("mint_exhausted")])
+async def test_session_acquisition_failure_finalizes_claim_with_credential_revision(failure):
+    worker, sb, pool, discovery, *_ = make_worker()
+    pool.acquire_familia_bundle.side_effect = failure
+    assert await worker.process_next() is True
+    finals = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"]
+    assert len(finals) == 1
+    assert finals[0]["p_claim_token"] == JOB["claim_token"]
+    assert finals[0]["p_expected_credential_updated_at"] == "2026-08-23T12:00:00.000Z"
+    assert finals[0]["p_candidates"] == []
+    assert finals[0]["p_summary"] == {
+        "status": "failed", "pages": 0, "discovered": 0,
+        "error_code": "pjud_unavailable", "error_class": "transport",
+    }
+    discovery.assert_not_awaited()
+    pool.acquire_familia_bundle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_empty_session_acquisition_releases_slot_and_finalizes_failure():
+    worker, sb, pool, discovery, *_ = make_worker()
+    pool.acquire_familia_bundle.return_value = (None, pool.slot)
+    assert await worker.process_next() is True
+    pool.release_familia_bundle.assert_awaited_once()
+    discovery.assert_not_awaited()
+    finals = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"]
+    assert len(finals) == 1
+    assert finals[0]["p_summary"]["error_code"] == "pjud_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), RuntimeError("import_job_claim_lost"), ProxyUsagePersistenceError("unsettled")])
+async def test_uncertain_or_cancelled_acquisition_does_not_finalize(failure):
+    worker, sb, pool, *_ = make_worker()
+    pool.acquire_familia_bundle.side_effect = failure
+    with pytest.raises(type(failure)):
+        await worker.process_next()
+    assert not any(name == "finalize_pjud_import_discovery" for name, _ in sb.calls)
 
 
 def make_trial_worker(
