@@ -21,6 +21,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
 
 from app.familia.auth import FamiliaAuthSession
+from app.failure_kind import MintUnavailableError, PoolUnavailableError
 from app.my_causes.client import DiscoveryResult, DiscoveryStatus, discover_my_causes
 from app.my_causes.models import ImportCandidate, Matter
 from app.ojv.errors import OjvSessionError
@@ -300,6 +301,7 @@ def _candidate_payloads(raw_candidates: list[Any]) -> CandidatePayloadBatch:
 
 
 _ERRORS: dict[str, tuple[str, str, str]] = {
+    "session_unavailable": ("failed", "pjud_unavailable", "transport"),
     "credential_invalid": ("failed", "credential_invalid", "authentication"),
     "session_expired": ("failed", "session_expired", "authentication"),
     "waf": ("failed", "ojv_blocked", "transport"),
@@ -654,7 +656,7 @@ class ImportDiscoveryWorker:
                     remint=False,
                     trial_scope=trial_scope,
                 )
-            raise RuntimeError("import_session_unavailable")
+            raise PoolUnavailableError("upstream_unavailable")
         disposition = "healthy"
         remint = True
         try:
@@ -835,9 +837,18 @@ class ImportDiscoveryWorker:
             binding_version = (
                 trial_scope.expected_credentials_updated_at.isoformat()
             )
-        return await self._discover_with_session_retry(
-            job, credential, trial_scope,
-        ), binding_version
+        try:
+            result = await self._discover_with_session_retry(
+                job, credential, trial_scope,
+            )
+        except (MintUnavailableError, PoolUnavailableError) as exc:
+            # Keep the credential revision and claim fence on the terminal RPC.
+            # Cancellation, lost claims and unsettled billing must still escape.
+            logger.warning("my_causes_session_unavailable failure_code=%s", exc.code)
+            result = DiscoveryResult(
+                candidates=[], page_count=0, status="session_unavailable",
+            )
+        return result, binding_version
 
     async def process_claimed(self, raw_job: ClaimedImportJob | dict[str, Any]) -> None:
         job = (
