@@ -653,6 +653,9 @@ async def test_schema_drift_logs_only_safe_structural_evidence(
     assert "headers=2 rows=1 max_cells=2" in log_text
     assert "known=Rol" in log_text
     assert "missing_count=8 unknown_count=1" in log_text
+    assert "html=1 head=0 body=1 scripts=0 inputs=0 selects=0 links=0" in log_text
+    assert "leading=markup json=0 text_chars=" in log_text
+    assert "markers=-" in log_text
     assert "bytes=" in log_text
     assert "content_type=text/html" in log_text
     for private_value in (
