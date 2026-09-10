@@ -15,16 +15,24 @@ class FakeBackoff:
 class ConcurrencyTrackingEngine:
     """Fake engine that records concurrency overlap and which cases ran."""
 
-    def __init__(self, delay_event: asyncio.Event | None = None):
+    def __init__(
+        self,
+        delay_event: asyncio.Event | None = None,
+        expected_concurrency: int | None = None,
+    ):
         self.current = 0
         self.max_seen = 0
         self.ran = []
         self._delay_event = delay_event
+        self._expected_concurrency = expected_concurrency
+        self.at_expected_concurrency = asyncio.Event()
 
     async def sync_case(self, case):
         self.current += 1
         self.max_seen = max(self.max_seen, self.current)
         self.ran.append(case["id"])
+        if self.current == self._expected_concurrency:
+            self.at_expected_concurrency.set()
         try:
             if self._delay_event is not None:
                 await self._delay_event.wait()
@@ -49,7 +57,7 @@ class RaisingEngine:
 @pytest.mark.asyncio
 async def test_process_batch_bounds_concurrency_to_n():
     delay_event = asyncio.Event()
-    engine = ConcurrencyTrackingEngine(delay_event=delay_event)
+    engine = ConcurrencyTrackingEngine(delay_event=delay_event, expected_concurrency=3)
     batch = [{"id": i} for i in range(6)]
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
@@ -58,11 +66,7 @@ async def test_process_batch_bounds_concurrency_to_n():
         process_batch(batch, engine, 3, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
-    # Let the semaphore-bound tasks start and block on the delay event.
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if engine.current == 3:
-            break
+    await asyncio.wait_for(engine.at_expected_concurrency.wait(), timeout=1)
 
     assert engine.current == 3
     assert engine.max_seen == 3
@@ -77,7 +81,7 @@ async def test_process_batch_bounds_concurrency_to_n():
 @pytest.mark.asyncio
 async def test_process_batch_skips_not_yet_started_on_shutdown():
     delay_event = asyncio.Event()
-    engine = ConcurrencyTrackingEngine(delay_event=delay_event)
+    engine = ConcurrencyTrackingEngine(delay_event=delay_event, expected_concurrency=2)
     batch = [{"id": i} for i in range(6)]
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
@@ -86,11 +90,7 @@ async def test_process_batch_skips_not_yet_started_on_shutdown():
         process_batch(batch, engine, 2, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
-    # Wait until the first wave (bounded by N=2) has started.
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if engine.current == 2:
-            break
+    await asyncio.wait_for(engine.at_expected_concurrency.wait(), timeout=1)
 
     assert engine.current == 2
     # Trigger shutdown before releasing the delay; already-running cases should
@@ -151,7 +151,7 @@ async def test_shutdown_drains_running_case_before_batch_release_and_skips_undis
 @pytest.mark.asyncio
 async def test_process_batch_skips_when_circuit_breaker_opens_mid_batch():
     delay_event = asyncio.Event()
-    engine = ConcurrencyTrackingEngine(delay_event=delay_event)
+    engine = ConcurrencyTrackingEngine(delay_event=delay_event, expected_concurrency=2)
     batch = [{"id": i} for i in range(6)]
     shutdown_event = asyncio.Event()
     backoff = FakeBackoff()
@@ -160,10 +160,7 @@ async def test_process_batch_skips_when_circuit_breaker_opens_mid_batch():
         process_batch(batch, engine, 2, shutdown_event, backoff, runtime_fence=legacy_runtime_fence(), processing_window=lambda: True)
     )
 
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if engine.current == 2:
-            break
+    await asyncio.wait_for(engine.at_expected_concurrency.wait(), timeout=1)
 
     assert engine.current == 2
     backoff.is_open = True
