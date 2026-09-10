@@ -111,6 +111,12 @@ class _Action(_Counted):
         if self.action == "submit":
             self.page.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 
+    async def evaluate(self, script: str) -> None:
+        assert script == "element => element.click()"
+        self.page.actions.append(self.action)
+        if self.action == "submit":
+            self.page.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
+
 
 class _Modal(_Counted):
     def __init__(self, form: _Form) -> None:
@@ -287,13 +293,17 @@ async def test_submit_does_not_wait_for_navigation_before_classifying_result(
             super().__init__()
             submit = self.form.get_by_role("button", name="Ingresar", exact=True)
 
-            async def submit_click(**kwargs: object) -> None:
+            async def submit_click(**_kwargs: object) -> None:
+                self.actions.append("playwright-submit")
+                await asyncio.sleep(1)
+
+            async def submit_evaluate(script: str) -> None:
+                assert script == "element => element.click()"
                 self.actions.append("submit")
-                if not kwargs.get("no_wait_after"):
-                    await asyncio.sleep(1)
                 self.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 
             submit.click = submit_click  # type: ignore[method-assign]
+            submit.evaluate = submit_evaluate  # type: ignore[method-assign]
             self.form.get_by_role = lambda *_args, **_kwargs: submit  # type: ignore[method-assign]
 
     monkeypatch.setattr(browser_login, "_LOGIN_TIMEOUT_S", 0.05)
@@ -307,6 +317,7 @@ async def test_submit_does_not_wait_for_navigation_before_classifying_result(
 
     assert result.cookies[0].name == "AUTH"
     assert page.actions.count("submit") == 1
+    assert "playwright-submit" not in page.actions
 
 
 async def test_services_menu_falls_back_to_dom_click_when_playwright_click_hangs(
@@ -534,10 +545,10 @@ async def test_explicit_rejection_is_credential_invalid_without_provider_excepti
             super().__init__()
             submit = self.form.get_by_role("button", name="Ingresar", exact=True)
 
-            async def reject(**_kwargs: object) -> None:
+            async def reject(_script: str) -> None:
                 self.actions.append("submit")
 
-            submit.click = reject  # type: ignore[method-assign]
+            submit.evaluate = reject  # type: ignore[method-assign]
             self.form.get_by_role = lambda *_args, **_kwargs: submit  # type: ignore[method-assign]
 
         async def wait_for_url(self, _url: str, **_kwargs: object) -> None:
@@ -815,10 +826,10 @@ async def test_post_submit_classifier_never_awaits_alert_after_deadline(
             super().__init__()
             submit = self.form.get_by_role("button", name="Ingresar", exact=True)
 
-            async def stay_put(**_kwargs: object) -> None:
+            async def stay_put(_script: str) -> None:
                 self.actions.append("submit")
 
-            submit.click = stay_put  # type: ignore[method-assign]
+            submit.evaluate = stay_put  # type: ignore[method-assign]
             self.form.get_by_role = lambda *_args, **_kwargs: submit  # type: ignore[method-assign]
 
         async def wait_for_url(self, _url: str, **_kwargs: object) -> None:
