@@ -37,7 +37,7 @@ from app.ojv.submit_diagnostics import _SubmitProbe
 _OFFICIAL_ENTRY = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
 _OFFICIAL_LANDING = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
 _OFFICIAL_HOST = "oficinajudicialvirtual.pjud.cl"
-_LOGIN_TIMEOUT_S = 45.0
+_LOGIN_TIMEOUT_S = 60.0
 _SERVICES_CLICK_TIMEOUT_S = 2.0
 _CLAVE_CLICK_TIMEOUT_S = 2.0
 _CLEANUP_TIMEOUT_S = 1.0
