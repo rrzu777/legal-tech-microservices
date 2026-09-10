@@ -7,6 +7,7 @@ identities from action links and never returns HTML, URLs, form inputs or the
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -244,6 +245,39 @@ def safe_schema_shape(html: str, matter: Matter | str) -> str:
         for body in table.find_all("tbody")
         for row in body.find_all("tr", recursive=False)
     ]
+    stripped = html.lstrip()
+    if not stripped:
+        leading = "empty"
+    elif stripped.startswith("<"):
+        leading = "markup"
+    elif stripped.startswith("{"):
+        leading = "object"
+    elif stripped.startswith("["):
+        leading = "array"
+    elif stripped.startswith(('"', "'")):
+        leading = "quoted"
+    else:
+        leading = "text"
+    try:
+        json.loads(html)
+        is_json = 1
+    except (json.JSONDecodeError, TypeError):
+        is_json = 0
+    folded = html.casefold()
+    marker_tokens = {
+        "captcha": ("captcha", "recaptcha"),
+        "empty": _EMPTY_MESSAGES,
+        "error": ("error", "problema", "intente nuevamente"),
+        "expired": ("expir", "sesión caduc", "sesion caduc"),
+        "login": ("iniciar sesión", "iniciar sesion", "rut o contraseña"),
+        "my_causes": ("mis causas", "consultamiscau"),
+    }
+    markers = sorted(
+        label
+        for label, tokens in marker_tokens.items()
+        if any(token in folded for token in tokens)
+    )
+    text_chars = len(" ".join(soup.get_text(" ", strip=True).split()))
     return " ".join(
         (
             f"expected_form={int(soup.find('form', attrs={'name': spec.form_name}) is not None)}",
@@ -257,6 +291,17 @@ def safe_schema_shape(html: str, matter: Matter | str) -> str:
             f"known={'|'.join(known) or '-'}",
             f"missing_count={len(spec.headers - header_set)}",
             f"unknown_count={len(header_set - spec.headers)}",
+            f"html={len(soup.find_all('html'))}",
+            f"head={len(soup.find_all('head'))}",
+            f"body={len(soup.find_all('body'))}",
+            f"scripts={len(soup.find_all('script'))}",
+            f"inputs={len(soup.find_all('input'))}",
+            f"selects={len(soup.find_all('select'))}",
+            f"links={len(soup.find_all('a'))}",
+            f"leading={leading}",
+            f"json={is_json}",
+            f"text_chars={text_chars}",
+            f"markers={'|'.join(markers) or '-'}",
         )
     )
 
