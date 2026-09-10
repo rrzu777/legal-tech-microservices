@@ -222,6 +222,45 @@ def _header_map(table: Tag, spec: _MatterSpec) -> tuple[list[str], dict[str, int
     return headers, {header: index for index, header in enumerate(headers)}
 
 
+def safe_schema_shape(html: str, matter: Matter | str) -> str:
+    """Return bounded structural evidence without response or row values."""
+
+    if matter not in _SPECS:
+        return "unsupported=1"
+    spec = _SPECS[cast(Matter, matter)]
+    soup = BeautifulSoup(html, "html.parser")
+    forms = soup.find_all("form")
+    tables = soup.find_all("table")
+    headers = [
+        _clean(cast(Tag, header))
+        for table in tables
+        for header in table.find_all("th")
+    ]
+    header_set = set(headers)
+    known = sorted(header_set & spec.headers)
+    row_widths = [
+        len(row.find_all("td", recursive=False))
+        for table in tables
+        for body in table.find_all("tbody")
+        for row in body.find_all("tr", recursive=False)
+    ]
+    return " ".join(
+        (
+            f"expected_form={int(soup.find('form', attrs={'name': spec.form_name}) is not None)}",
+            f"forms={len(forms)}",
+            f"tables={len(tables)}",
+            f"theads={sum(len(table.find_all('thead')) for table in tables)}",
+            f"tbodies={sum(len(table.find_all('tbody')) for table in tables)}",
+            f"headers={len(headers)}",
+            f"rows={len(row_widths)}",
+            f"max_cells={max(row_widths, default=0)}",
+            f"known={'|'.join(known) or '-'}",
+            f"missing_count={len(spec.headers - header_set)}",
+            f"unknown_count={len(header_set - spec.headers)}",
+        )
+    )
+
+
 def parse_my_causes_page(html: str, matter: Matter | str) -> list[ImportCandidate]:
     """Parse one listing page or raise ``upstream_changed`` without partial output."""
 
