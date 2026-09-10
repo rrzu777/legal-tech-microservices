@@ -27,7 +27,11 @@ from app.ojv.errors import OjvTimeoutError, SessionError
 from app.ojv.session import OjvSession, decode_ojv_html
 from app.my_causes.identity import resolve_public_import_candidate
 from app.my_causes.models import ImportCandidate, Matter
-from app.my_causes.parser import UpstreamChangedError, parse_my_causes_page
+from app.my_causes.parser import (
+    UpstreamChangedError,
+    parse_my_causes_page,
+    safe_schema_shape,
+)
 from app.parsers.search_parser import detect_blocked
 
 
@@ -338,6 +342,20 @@ async def discover_my_causes(
             try:
                 parsed = parse_my_causes_page(html, matter)
             except UpstreamChangedError:
+                raw_content_type = response.headers.get("content-type", "")
+                content_type_match = re.fullmatch(
+                    r"[a-z0-9.+-]+/[a-z0-9.+-]+",
+                    raw_content_type.split(";", 1)[0].strip().casefold(),
+                )
+                content_type = (
+                    content_type_match.group(0) if content_type_match else "unknown"
+                )
+                logger.warning(
+                    "my_causes schema_drift %s bytes=%d content_type=%s",
+                    safe_schema_shape(html, matter),
+                    len(html.encode("utf-8")),
+                    content_type,
+                )
                 return _result(collected, page_count, "upstream_changed")
             parsed = [
                 resolve_public_import_candidate(candidate, _PUBLIC_IMPORT_CATALOGS)

@@ -616,6 +616,54 @@ async def test_upstream_schema_change_is_terminal_without_retry(session_factory)
     assert calls == 1
 
 
+async def test_schema_drift_logs_only_safe_structural_evidence(
+    session_factory, caplog: pytest.LogCaptureFixture
+) -> None:
+    html = """
+        <html><body>
+          <form name="formUnexpected">
+            <table>
+              <thead><tr><th>Rol</th><th>PRIVATE HEADER</th></tr></thead>
+              <tbody><tr><td>PRIVATE-CASE-123</td><td>PRIVATE PERSON</td></tr></tbody>
+            </table>
+          </form>
+        </body></html>
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=html,
+            headers={"content-type": "text/html; charset=iso-8859-1"},
+            request=request,
+        )
+
+    session = session_factory(handler)
+    caplog.set_level(logging.WARNING, logger="app.my_causes.client")
+    result = await discover_my_causes(
+        session, ("apelaciones",), include_closed=False
+    )
+    await session.close()
+
+    assert result.status == "upstream_changed"
+    log_text = caplog.text
+    assert "my_causes schema_drift" in log_text
+    assert "expected_form=0" in log_text
+    assert "forms=1 tables=1 theads=1 tbodies=1" in log_text
+    assert "headers=2 rows=1 max_cells=2" in log_text
+    assert "known=Rol" in log_text
+    assert "missing_count=8 unknown_count=1" in log_text
+    assert "bytes=" in log_text
+    assert "content_type=text/html" in log_text
+    for private_value in (
+        "PRIVATE HEADER",
+        "PRIVATE-CASE-123",
+        "PRIVATE PERSON",
+        "formUnexpected",
+    ):
+        assert private_value not in log_text
+
+
 async def test_legacy_latin1_response_uses_shared_ojv_decoder(session_factory) -> None:
     html = page("apelaciones_page_1.html").replace("Fallada", "Impugnada")
 
