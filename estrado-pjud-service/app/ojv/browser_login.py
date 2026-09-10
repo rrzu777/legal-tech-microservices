@@ -530,10 +530,7 @@ async def login_official_ojv(
                                 stage = "submit"
                                 submit_probe.start(page, deadline)
                                 await _within_deadline(
-                                    submit.click(
-                                        timeout=_remaining_timeout_ms(deadline),
-                                        no_wait_after=True,
-                                    ),
+                                    submit.evaluate("element => element.click()"),
                                     deadline,
                                 )
                                 submitted = True

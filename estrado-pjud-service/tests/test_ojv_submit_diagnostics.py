@@ -30,12 +30,13 @@ class DiagnosticPage(_Page):
         self.on_submit = on_submit
         submit = self.form.get_by_role('button', name='Ingresar', exact=True)
 
-        async def click(**kwargs):
+        async def evaluate(script):
+            assert script == 'element => element.click()'
             self.actions.append('submit')
             if self.on_submit:
                 await self.on_submit(self)
 
-        submit.click = click
+        submit.evaluate = evaluate
         self.form.get_by_role = lambda *args, **kwargs: submit
 
     def on(self, event, callback):
