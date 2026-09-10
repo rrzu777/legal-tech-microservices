@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Callable, cast
@@ -278,6 +279,48 @@ def safe_schema_shape(html: str, matter: Matter | str) -> str:
         if any(token in folded for token in tokens)
     )
     text_chars = len(" ".join(soup.get_text(" ", strip=True).split()))
+    tag_counts = Counter(
+        tag.name for tag in soup.find_all(True) if isinstance(tag.name, str)
+    )
+    tags = ",".join(
+        f"{name}:{count}" for name, count in sorted(tag_counts.items())
+    ) or "-"
+    ui_class_pattern = re.compile(
+        r"(?:active|disabled|row|container(?:-fluid)?|pagination|"
+        r"(?:btn|panel|table|alert|card|modal|text|pull)(?:-[a-z]+)?|"
+        r"list-group(?:-item)?|col-(?:xs|sm|md|lg)-\d+)",
+        re.IGNORECASE,
+    )
+    ui_class_counts: Counter[str] = Counter()
+    for tag in soup.find_all(True):
+        raw_classes = tag.get("class", [])
+        if isinstance(raw_classes, str):
+            raw_classes = raw_classes.split()
+        if isinstance(raw_classes, list):
+            ui_class_counts.update(
+                token.casefold()
+                for token in raw_classes
+                if isinstance(token, str) and ui_class_pattern.fullmatch(token)
+            )
+    ui_classes = ",".join(
+        f"{name}:{count}" for name, count in sorted(ui_class_counts.items())
+    ) or "-"
+    action_pattern = re.compile(
+        r"(?:javascript:\s*)?(?:return\s+)?([A-Za-z_$][\w$]*)\s*\(",
+        re.IGNORECASE,
+    )
+    action_functions: set[str] = set()
+    for tag in soup.find_all(True):
+        for attribute in ("onclick", "href"):
+            raw_action = tag.get(attribute)
+            if not isinstance(raw_action, str):
+                continue
+            match = action_pattern.match(raw_action.strip())
+            if match and any(
+                token in match.group(1).casefold()
+                for token in ("causa", "detalle", "miscau", "pagina", "ver")
+            ):
+                action_functions.add(match.group(1))
     return " ".join(
         (
             f"expected_form={int(soup.find('form', attrs={'name': spec.form_name}) is not None)}",
@@ -302,6 +345,9 @@ def safe_schema_shape(html: str, matter: Matter | str) -> str:
             f"json={is_json}",
             f"text_chars={text_chars}",
             f"markers={'|'.join(markers) or '-'}",
+            f"tags={tags}",
+            f"ui_classes={ui_classes}",
+            f"action_functions={'|'.join(sorted(action_functions)) or '-'}",
         )
     )
 

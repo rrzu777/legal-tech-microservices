@@ -656,6 +656,8 @@ async def test_schema_drift_logs_only_safe_structural_evidence(
     assert "html=1 head=0 body=1 scripts=0 inputs=0 selects=0 links=0" in log_text
     assert "leading=markup json=0 text_chars=" in log_text
     assert "markers=-" in log_text
+    assert "tags=body:1,form:1,html:1,table:1,tbody:1,td:2,th:2,thead:1,tr:2" in log_text
+    assert "ui_classes=- action_functions=-" in log_text
     assert "bytes=" in log_text
     assert "content_type=text/html" in log_text
     for private_value in (
