@@ -276,6 +276,39 @@ async def test_official_adapter_uses_observed_ui_and_returns_owned_typed_cookies
     assert context.cdp.detached is True
 
 
+async def test_submit_does_not_wait_for_navigation_before_classifying_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fired OJV submit must leave time to inspect its eventual result."""
+    import app.ojv.browser_login as browser_login
+
+    class SubmitWaitPage(_Page):
+        def __init__(self) -> None:
+            super().__init__()
+            submit = self.form.get_by_role("button", name="Ingresar", exact=True)
+
+            async def submit_click(**kwargs: object) -> None:
+                self.actions.append("submit")
+                if not kwargs.get("no_wait_after"):
+                    await asyncio.sleep(1)
+                self.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
+
+            submit.click = submit_click  # type: ignore[method-assign]
+            self.form.get_by_role = lambda *_args, **_kwargs: submit  # type: ignore[method-assign]
+
+    monkeypatch.setattr(browser_login, "_LOGIN_TIMEOUT_S", 0.05)
+    page = SubmitWaitPage()
+    _install_fake_browser(monkeypatch, page)
+
+    result = await login_official_ojv(
+        SecretStr("11.111.111-1"), SecretStr("secret"),
+        proxy_url=None, user_agent="official-test-agent",
+    )
+
+    assert result.cookies[0].name == "AUTH"
+    assert page.actions.count("submit") == 1
+
+
 async def test_services_menu_falls_back_to_dom_click_when_playwright_click_hangs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
