@@ -213,6 +213,46 @@ _SPECS: dict[Matter, _MatterSpec] = {
     ),
 }
 
+_FRAGMENT_COLUMNS: dict[Matter, tuple[str, ...]] = {
+    "suprema": (
+        "", "Rol", "Caratulado", "Fecha Ingreso", "Estado Causa", "Corte",
+        "Institución",
+    ),
+    "apelaciones": (
+        "", "Rol", "Corte", "Caratulado", "Fecha Ingreso", "Estado Causa",
+        "Fecha Ubicación", "Ubicación", "Institución",
+    ),
+    "civil": (
+        "", "Rit", "Tribunal", "Caratulado", "Fecha Ingreso",
+        "Estado Cuaderno", "Cuaderno", "Institución",
+    ),
+    "laboral": (
+        "", "Rit", "Tribunal", "Caratulado", "Fecha Ingreso", "Estado Causa",
+        "Institución",
+    ),
+    "penal": (
+        "", "Rit", "Ruc", "Tribunal", "Caratulado", "Fecha Ingreso",
+        "Estado Causa", "Institución",
+    ),
+    "cobranza": (
+        "", "Rit", "Tribunal", "Caratulado", "Fecha Ingreso",
+        "Estado Procesal", "Institución",
+    ),
+    "familia": (
+        "", "Rit", "Tribunal", "Caratulado", "Fecha Ingreso",
+        "Estado Procesal", "Institución",
+    ),
+}
+_FRAGMENT_DETAIL_ACTION: dict[Matter, str] = {
+    "suprema": "detalleMisCausaSuprema",
+    "apelaciones": "detalleMisCausaApelaciones",
+    "civil": "detalleMisCausaCivil",
+    "laboral": "detalleMisCausaLaboral",
+    "penal": "detalleMisCausaPenal",
+    "cobranza": "detalleMisCausaCobranza",
+    "familia": "detalleMisCausaFamilia",
+}
+
 
 def _header_map(table: Tag, spec: _MatterSpec) -> tuple[list[str], dict[str, int]]:
     header_row = table.find("thead")
@@ -222,6 +262,58 @@ def _header_map(table: Tag, spec: _MatterSpec) -> tuple[list[str], dict[str, int
     if not headers or len(headers) != len(set(headers)) or frozenset(headers) != spec.headers:
         raise UpstreamChangedError()
     return headers, {header: index for index, header in enumerate(headers)}
+
+
+def _has_detail_action(cell: Tag, expected: str) -> bool:
+    pattern = re.compile(
+        rf"^(?:javascript:\s*)?(?:return\s+)?{re.escape(expected)}\s*\(",
+        re.IGNORECASE,
+    )
+    matches = 0
+    for tag in (cell, *cell.find_all(True)):
+        for attribute in ("onclick", "href"):
+            raw = tag.get(attribute)
+            if isinstance(raw, str) and pattern.match(raw.strip()):
+                matches += 1
+    return matches == 1
+
+
+def _fragment_rows(soup: BeautifulSoup, matter: Matter) -> tuple[list[str], list[Tag]]:
+    """Validate OJV's headerless AJAX row fragment observed in production."""
+
+    disallowed = (
+        "form", "table", "thead", "tbody", "th", "input", "select", "script",
+        "iframe",
+    )
+    if soup.find(disallowed):
+        raise UpstreamChangedError()
+    headers = list(_FRAGMENT_COLUMNS[matter])
+    rows = [cast(Tag, row) for row in soup.find_all("tr")]
+    if not rows:
+        raise UpstreamChangedError()
+    candidate_rows: list[Tag] = []
+    saw_pagination = False
+    for index, row in enumerate(rows):
+        cells = row.find_all("td", recursive=False)
+        row_text = _clean(row).casefold()
+        if len(cells) == 1 and any(message in row_text for message in _EMPTY_MESSAGES):
+            if candidate_rows or saw_pagination or len(rows) != 1:
+                raise UpstreamChangedError()
+            return headers, [row]
+        if len(cells) == 1 and row.select_one(".pagination") is not None:
+            colspan = cells[0].get("colspan")
+            if saw_pagination or index != len(rows) - 1 or str(colspan) != str(len(headers)):
+                raise UpstreamChangedError()
+            saw_pagination = True
+            continue
+        if saw_pagination or len(cells) != len(headers):
+            raise UpstreamChangedError()
+        if not _has_detail_action(cast(Tag, cells[0]), _FRAGMENT_DETAIL_ACTION[matter]):
+            raise UpstreamChangedError()
+        candidate_rows.append(row)
+    if not candidate_rows:
+        raise UpstreamChangedError()
+    return headers, candidate_rows
 
 
 def safe_schema_shape(html: str, matter: Matter | str) -> str:
@@ -361,19 +453,21 @@ def parse_my_causes_page(html: str, matter: Matter | str) -> list[ImportCandidat
     spec = _SPECS[typed_matter]
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form", attrs={"name": spec.form_name})
-    if not isinstance(form, Tag):
-        raise UpstreamChangedError()
-    table = form.find("table")
-    if not isinstance(table, Tag):
-        raise UpstreamChangedError()
-    headers, _ = _header_map(table, spec)
-    body = table.find("tbody")
-    if not isinstance(body, Tag):
-        raise UpstreamChangedError()
+    if isinstance(form, Tag):
+        table = form.find("table")
+        if not isinstance(table, Tag):
+            raise UpstreamChangedError()
+        headers, _ = _header_map(table, spec)
+        body = table.find("tbody")
+        if not isinstance(body, Tag):
+            raise UpstreamChangedError()
+        rows = [cast(Tag, row) for row in body.find_all("tr", recursive=False)]
+    else:
+        headers, rows = _fragment_rows(soup, typed_matter)
 
     parsed: list[ImportCandidate] = []
     saw_empty_state = False
-    for row in body.find_all("tr", recursive=False):
+    for row in rows:
         cells = row.find_all("td", recursive=False)
         row_text = _clean(row).lower()
         if len(cells) == 1 and any(message in row_text for message in _EMPTY_MESSAGES):

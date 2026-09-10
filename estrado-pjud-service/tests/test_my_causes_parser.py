@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 from pydantic import ValidationError
 
 from app.my_causes.models import ImportCandidate
@@ -16,6 +17,22 @@ FIXTURES = Path(__file__).parent / "fixtures" / "my_causes"
 
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def appeals_row_fragment() -> str:
+    """Synthetic equivalent of the headerless AJAX fragment observed in OJV."""
+    soup = BeautifulSoup(fixture("apelaciones_page_1.html"), "html.parser")
+    row = soup.select_one("tbody > tr")
+    pagination = soup.select_one(".pagination")
+    assert row is not None and pagination is not None
+    detail = row.select_one("td:first-child a")
+    assert detail is not None
+    detail["href"] = "javascript:detalleMisCausaApelaciones(1,2,3)"
+    pagination_link = pagination.select_one("a")
+    assert pagination_link is not None
+    pagination_link.attrs.pop("data-page", None)
+    pagination_link["onclick"] = "pagina(2,15)"
+    return f'{row}<tr><td colspan="9"><nav>{pagination}</nav></td></tr>'
 
 
 @pytest.mark.parametrize(
@@ -117,6 +134,34 @@ def test_apelaciones_missing_libro_is_valid_and_needs_later_enrichment() -> None
     assert candidate.libro is None
     assert candidate.court_code is None
     assert candidate.court_label == "C.A. de Santiago"
+
+
+def test_parses_observed_headerless_appeals_ajax_row_fragment() -> None:
+    candidate = parse_my_causes_page(appeals_row_fragment(), "apelaciones")[0]
+
+    assert candidate.case_number == "4490-2025"
+    assert candidate.court_label == "C.A. de Santiago"
+    assert candidate.caption == "PERSONA C / SERVICIO D"
+    assert candidate.filed_at == date(2025, 11, 21)
+    assert candidate.upstream_status == "Fallada"
+
+
+def test_headerless_fragment_requires_the_matter_specific_detail_action() -> None:
+    changed = appeals_row_fragment().replace(
+        "detalleMisCausaApelaciones", "detalleMisCausaCivil", 1
+    )
+
+    with pytest.raises(UpstreamChangedError):
+        parse_my_causes_page(changed, "apelaciones")
+
+
+def test_headerless_fragment_rejects_a_malformed_candidate_row() -> None:
+    changed = appeals_row_fragment().replace(
+        "<td>Institución ignorada</td>", "", 1
+    )
+
+    with pytest.raises(UpstreamChangedError):
+        parse_my_causes_page(changed, "apelaciones")
 
 
 def test_penal_prefers_rit_when_row_also_exposes_ruc_and_uses_ruc_as_fallback() -> None:
