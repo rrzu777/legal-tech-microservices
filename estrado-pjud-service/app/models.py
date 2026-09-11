@@ -95,10 +95,12 @@ def _validate_v2_search_contract(
         if search_mode not in {"appeals_resource", "first_instance"}:
             raise ValueError("v2 apelaciones requires a valid search_mode")
         if search_mode == "appeals_resource":
-            if libro is None:
-                raise ValueError("appeals_resource requires libro")
-            if tribunal is not None or allow_broad:
-                raise ValueError("appeals_resource does not accept tribunal or allow_broad")
+            if tribunal is not None:
+                raise ValueError("appeals_resource does not accept tribunal")
+            if libro is None and not allow_broad:
+                raise ValueError("appeals_resource requires libro unless allow_broad is true")
+            if libro is not None and allow_broad:
+                raise ValueError("broad appeals_resource does not accept libro")
         else:
             if libro is not None:
                 raise ValueError("first_instance does not accept libro")

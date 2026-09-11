@@ -181,6 +181,27 @@ def test_appeals_resource_matches_its_official_book_prefix_without_rewriting_dis
     assert response.matches[0].rol == "Protección-4490-2025"
 
 
+def test_broad_appeals_resource_matches_any_proven_book_for_the_exact_number_year():
+    request = SearchRequest(
+        contract_version=2,
+        case_type="rol",
+        case_number="10563-2023",
+        competencia="apelaciones",
+        corte=30,
+        search_mode="appeals_resource",
+        allow_broad=True,
+    )
+    candidate = _candidate(
+        1, rol="Protección-10563-2023", corte_code=30, libro_code="34"
+    )
+
+    response = build_search_response([candidate], request)
+
+    assert response.status == "found"
+    assert response.match_count == 1
+    assert response.matches[0].libro_code == "34"
+
+
 def test_appeals_ranking_uses_resolved_court_and_official_book_code():
     request = SearchRequest(
         contract_version=2,

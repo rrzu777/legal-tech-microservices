@@ -83,7 +83,8 @@ def matches_requested_context(
         if req.search_mode == "appeals_resource":
             return (
                 candidate.tribunal_code is None
-                and candidate.libro_code == req.libro
+                and candidate.libro_code is not None
+                and (req.allow_broad or candidate.libro_code == req.libro)
             )
         return (
             candidate.tribunal_code is not None
@@ -125,6 +126,13 @@ def matches_requested_identifier(candidate_identifier: str, req: SearchRequest) 
         )
     if req.competencia != "apelaciones" or req.search_mode != "appeals_resource":
         return False
+
+    if req.allow_broad and req.libro is None:
+        return (
+            len(candidate_parts) >= 3
+            and len(requested_parts) == 2
+            and candidate_parts[-2:] == requested_parts
+        )
 
     expected_book = resolve_libro(req.competencia, "", req.libro)
     return (

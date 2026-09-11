@@ -107,6 +107,18 @@ class TestCanonicalSearchRequestV2:
         )
         assert direct.tribunal is None
 
+        broad_resource = SearchRequest(
+            contract_version=2,
+            case_type="rol",
+            case_number="10563-2023",
+            competencia="apelaciones",
+            corte=30,
+            search_mode="appeals_resource",
+            allow_broad=True,
+        )
+        assert broad_resource.libro is None
+        assert broad_resource.allow_broad is True
+
         origin = SearchRequest(
             contract_version=2,
             case_type="rol",
@@ -157,6 +169,17 @@ class TestCanonicalSearchRequestV2:
                 corte=90,
                 libro="31",
                 search_mode="first_instance",
+            )
+        with pytest.raises(ValidationError):
+            SearchRequest(
+                contract_version=2,
+                case_type="rol",
+                case_number="340-2025",
+                competencia="apelaciones",
+                corte=90,
+                libro="31",
+                search_mode="appeals_resource",
+                allow_broad=True,
             )
 
     @pytest.mark.parametrize("search_mode,tribunal", [

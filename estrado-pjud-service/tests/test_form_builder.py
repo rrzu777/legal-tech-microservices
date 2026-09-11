@@ -170,3 +170,17 @@ class TestBuildSearchFormData:
         )
         assert form["conTipoBusApe"] == "0"
         assert form["conTipoCausa"] == "PENAL"
+
+    def test_broad_appeals_resource_submits_an_empty_book_filter(self):
+        form = build_search_form_data(
+            competencia="apelaciones",
+            case_type="rol",
+            case_number="10563-2023",
+            corte=30,
+            libro=None,
+            search_mode="appeals_resource",
+            allow_broad=True,
+        )
+
+        assert form["conTipoBusApe"] == "0"
+        assert form["conTipoCausa"] == ""
