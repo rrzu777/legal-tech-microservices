@@ -86,6 +86,16 @@ def _enrich_v2_candidates(
                     raise CanonicalCatalogResolutionError(
                         "appeal court or book is unresolved"
                     )
+                if req.allow_broad:
+                    if anno is None or catalog_service.resolve_loaded_book(
+                        req.competencia,
+                        match.libro_code,
+                        anno,
+                        corte=court_code,
+                    ) is None:
+                        raise CanonicalCatalogResolutionError(
+                            "broad appeal book is outside the loaded court/year slice"
+                        )
                 match.corte_code = court_code
                 match.tribunal_code = None
             return

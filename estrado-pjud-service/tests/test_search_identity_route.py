@@ -90,6 +90,14 @@ def _snapshot(*, duplicate_civil_label: bool = False):
         "fetched_at": generated,
         "options": [{"code": "400", "label": "1º Juzgado Civil de San Miguel"}],
     }
+    for court in (90, 91):
+        books[f"apelaciones:{court}:2025"] = {
+            "fetched_at": generated,
+            "options": [
+                {"code": "34", "label": "Protección"},
+                {"code": "35", "label": "Amparo"},
+            ],
+        }
     return {
         "generated_at": generated,
         "courts": {
@@ -288,6 +296,116 @@ def test_appeals_first_instance_broad_keeps_court_and_resolves_tribunal(client):
     assert body["matches"][0]["corte_code"] == 90
     assert body["matches"][0]["tribunal_code"] == 321
     assert body["matches"][0]["libro_code"] is None
+
+
+def test_broad_appeals_resource_resolves_one_official_book(client):
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "search_mode": "appeals_resource",
+            "allow_broad": True,
+            "max_matches": 100,
+        },
+        [
+            _raw_match(
+                "jwt-protection", "Protección-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago", libro="Protección", libro_code="34",
+            )
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "found"
+    assert body["match_count"] == 1
+    assert body["matches"][0]["corte_code"] == 90
+    assert body["matches"][0]["tribunal_code"] is None
+    assert body["matches"][0]["libro_code"] == "34"
+
+
+def test_broad_appeals_resource_preserves_book_ambiguity(client):
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "search_mode": "appeals_resource",
+            "allow_broad": True,
+            "max_matches": 100,
+        },
+        [
+            _raw_match(
+                "jwt-protection", "Protección-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago", libro="Protección", libro_code="34",
+            ),
+            _raw_match(
+                "jwt-amparo", "Amparo-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago", libro="Amparo", libro_code="35",
+            ),
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "needs_disambiguation"
+    assert body["match_count"] == 2
+    assert {match["libro_code"] for match in body["matches"]} == {"34", "35"}
+
+
+def test_broad_appeals_resource_fails_closed_without_an_official_book(client):
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "search_mode": "appeals_resource",
+            "allow_broad": True,
+        },
+        [
+            _raw_match(
+                "jwt-unknown", "Etiqueta nueva-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago",
+            )
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "upstream_changed"
+    assert body["matches"] == []
+
+
+def test_broad_appeals_resource_rejects_a_book_outside_the_loaded_slice(client):
+    response, _session_mock, _pool_mock = _post(
+        client,
+        {
+            "contract_version": 2,
+            "case_type": "rol",
+            "case_number": "4490-2025",
+            "competencia": "apelaciones",
+            "corte": 90,
+            "search_mode": "appeals_resource",
+            "allow_broad": True,
+        },
+        [
+            _raw_match(
+                "jwt-unknown", "Libro Nuevo-4490-2025", "Corte de Apelaciones",
+                corte="C.A. de Santiago", libro="Libro Nuevo", libro_code="99",
+            )
+        ],
+    )
+
+    body = response.json()
+    assert body["status"] == "upstream_changed"
+    assert body["matches"] == []
 
 
 def test_appeals_first_instance_rejects_incoherent_displayed_court_pair(client):
