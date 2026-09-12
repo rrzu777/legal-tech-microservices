@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 
 class Metrics:
-    def __init__(self, config: WorkerConfig, supabase, pool=None, proxy_control=None, maintenance=None):
+    def __init__(
+        self, config: WorkerConfig, supabase, pool=None, proxy_control=None,
+        maintenance=None, *, build_mode: str = "normal",
+    ):
         self._config = config
         self._sb = supabase
         # El pool es opcional para no romper a quien construya Metrics sin el,
@@ -19,6 +22,7 @@ class Metrics:
         self._pool = pool
         self._proxy_control = proxy_control
         self._maintenance = maintenance
+        self._build_mode = build_mode
         self.initialization_started = False
         self.current_status = "starting"
         self.cases_synced_total: int = 0
@@ -116,6 +120,7 @@ class Metrics:
                 self._pool.effective_pool_size if self._pool else self._config.POOL_SIZE
             ),
             "metadata": {
+                "worker_build_mode": self._build_mode,
                 "maintenance": proof,
                 "mint_attempts": attempts,
                 "mint_failures": failures,
