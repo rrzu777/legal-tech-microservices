@@ -11,7 +11,16 @@ logger = logging.getLogger(__name__)
 
 
 class Metrics:
-    def __init__(self, config: WorkerConfig, supabase, pool=None, proxy_control=None, maintenance=None):
+    def __init__(
+        self,
+        config: WorkerConfig,
+        supabase,
+        pool=None,
+        proxy_control=None,
+        maintenance=None,
+        *,
+        imports_enabled: bool = False,
+    ):
         self._config = config
         self._sb = supabase
         # El pool es opcional para no romper a quien construya Metrics sin el,
@@ -19,6 +28,7 @@ class Metrics:
         self._pool = pool
         self._proxy_control = proxy_control
         self._maintenance = maintenance
+        self._imports_enabled = imports_enabled is True
         self.initialization_started = False
         self.current_status = "starting"
         self.cases_synced_total: int = 0
@@ -152,6 +162,10 @@ class Metrics:
                 ),
                 "process_outside_office_hours_enabled": (
                     self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
+                ),
+                "imports_enabled": self._imports_enabled,
+                "import_worker_mode": (
+                    "normal" if self._imports_enabled else "disabled"
                 ),
             },
         }

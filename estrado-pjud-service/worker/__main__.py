@@ -289,8 +289,19 @@ def bind_import_task_lifetime(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Wake the main worker if its independent import loop stops."""
-    def wake_main(_completed: asyncio.Task) -> None:
+    def wake_main(completed: asyncio.Task) -> None:
         if not shutdown_event.is_set():
+            if completed.cancelled():
+                logger.error("PJUD import discovery task was cancelled unexpectedly")
+            else:
+                error = completed.exception()
+                if error is None:
+                    logger.error("PJUD import discovery task exited unexpectedly")
+                else:
+                    logger.error(
+                        "PJUD import discovery task failed (error_class=%s)",
+                        type(error).__name__,
+                    )
             shutdown_event.set()
 
     task.add_done_callback(wake_main)
@@ -609,7 +620,14 @@ async def main():
     )
     scheduler = Scheduler(config, supabase)
     notifier = Notifier(supabase)
-    metrics = Metrics(config, supabase, pool=pool, proxy_control=proxy_control, maintenance=maintenance)
+    metrics = Metrics(
+        config,
+        supabase,
+        pool=pool,
+        proxy_control=proxy_control,
+        maintenance=maintenance,
+        imports_enabled=imports_enabled,
+    )
     backoff = CircuitBreaker(
         failure_threshold=5,
         pause_seconds=600,      # 10 min on errors

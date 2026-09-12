@@ -104,6 +104,100 @@ async def test_minter_cleanup_survives_parent_cancellation(worker_maintenance, m
 
 
 @pytest.mark.asyncio
+async def test_minter_detaches_cdp_before_closing_browser(worker_maintenance, monkeypatch):
+    """Browser close invalidates CDP in real Playwright; cleanup order is safety-critical."""
+    from tests.test_minter import _playwright_factory
+    from app.minter import CookieMinter
+
+    context, browser, factory = _playwright_factory()
+
+    async def detach():
+        if browser.closed:
+            raise RuntimeError("browser closed before CDP detach")
+        context.cdp.detached = True
+
+    context.cdp.detach = detach
+    monkeypatch.setattr("app.minter.async_playwright", factory)
+
+    result = await worker_maintenance.run(
+        CookieMinter("https://example.invalid").mint,
+    )
+
+    assert result.user_agent == "Mozilla/5.0 Test UA"
+    assert context.cdp.detached is True
+    assert browser.closed is True
+    assert worker_maintenance.uncertain is False
+
+
+@pytest.mark.asyncio
+async def test_clean_startup_mint_keeps_import_discovery_admitted(
+    worker_maintenance,
+    monkeypatch,
+):
+    from tests.test_minter import _playwright_factory
+    from app.minter import CookieMinter
+    from worker.__main__ import run_import_discovery_loop
+
+    _context, _browser, factory = _playwright_factory()
+    monkeypatch.setattr("app.minter.async_playwright", factory)
+    await worker_maintenance.run(CookieMinter("https://example.invalid").mint)
+
+    shutdown = asyncio.Event()
+
+    async def discover_once():
+        shutdown.set()
+        return False
+
+    engine = SimpleNamespace(process_import_job=AsyncMock(side_effect=discover_once))
+    await run_import_discovery_loop(
+        engine,
+        SimpleNamespace(record_error=MagicMock()),
+        shutdown,
+        runtime_fence=legacy_runtime_fence(),
+        poll_interval=0.001,
+        maintenance=worker_maintenance,
+    )
+
+    engine.process_import_job.assert_awaited_once()
+    assert worker_maintenance.uncertain is False
+
+
+@pytest.mark.asyncio
+async def test_real_cdp_detach_failure_closes_admission_and_requests_recycle(
+    worker_maintenance,
+    monkeypatch,
+):
+    from tests.test_minter import _playwright_factory
+    from app.minter import CookieMinter
+    from worker.__main__ import run_import_discovery_loop
+
+    _context, browser, factory = _playwright_factory()
+
+    async def fail_detach():
+        raise RuntimeError("synthetic CDP transport failure")
+
+    _context.cdp.detach = fail_detach
+    monkeypatch.setattr("app.minter.async_playwright", factory)
+    await worker_maintenance.run(CookieMinter("https://example.invalid").mint)
+
+    shutdown = asyncio.Event()
+    engine = SimpleNamespace(process_import_job=AsyncMock())
+    await run_import_discovery_loop(
+        engine,
+        SimpleNamespace(record_error=MagicMock()),
+        shutdown,
+        runtime_fence=legacy_runtime_fence(),
+        poll_interval=0.001,
+        maintenance=worker_maintenance,
+    )
+
+    assert browser.closed is True
+    assert worker_maintenance.uncertain is True
+    assert shutdown.is_set()
+    engine.process_import_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_minter_one_cleanup_error_does_not_abandon_other_cleanup(worker_maintenance, monkeypatch):
     from tests.test_minter import _playwright_factory
     from app.minter import CookieMinter
@@ -386,7 +480,7 @@ async def test_import_failure_requests_process_restart_when_maintenance_is_uncer
 
 
 @pytest.mark.asyncio
-async def test_import_task_exit_wakes_the_main_worker():
+async def test_import_task_exit_wakes_the_main_worker(caplog):
     from worker.__main__ import bind_import_task_lifetime
 
     shutdown = asyncio.Event()
@@ -397,6 +491,42 @@ async def test_import_task_exit_wakes_the_main_worker():
     await asyncio.sleep(0)
 
     assert shutdown.is_set()
+    assert "PJUD import discovery task exited unexpectedly" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_import_task_failure_logs_only_error_class_and_wakes_main(caplog):
+    from worker.__main__ import bind_import_task_lifetime
+
+    async def fail():
+        raise RuntimeError("sensitive failure detail")
+
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(fail())
+    bind_import_task_lifetime(task, shutdown)
+
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert shutdown.is_set()
+    assert "error_class=RuntimeError" in caplog.text
+    assert "sensitive failure detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_expected_import_task_cancellation_stays_quiet(caplog):
+    from worker.__main__ import bind_import_task_lifetime
+
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(asyncio.Event().wait())
+    bind_import_task_lifetime(task, shutdown)
+    shutdown.set()
+    task.cancel()
+
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert "PJUD import discovery task" not in caplog.text
 
 
 @pytest.mark.asyncio
