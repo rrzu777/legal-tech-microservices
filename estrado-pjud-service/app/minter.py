@@ -86,6 +86,12 @@ class CookieMinter:
                 mark_uncertain()
             logger.warning("pjud_mint_cdp_cleanup_unavailable")
 
+    async def _close_mint_resources(self, cdp_session, browser) -> None:
+        """Detach CDP while its browser transport is still valid, then close it."""
+        if cdp_session is not None:
+            await self._detach_cdp_session(cdp_session)
+        await self._close_playwright_resource(browser, "browser")
+
     async def _create_cdp_meter(self, context, page):
         session = None
         try:
@@ -188,19 +194,14 @@ class CookieMinter:
                     await self._fence_cdp_callbacks(cdp_session)
                 finally:
                     admitted = has_active_operation()
-                    cleanup = [self._close_playwright_resource(browser, "browser")]
-                    if cdp_session is not None:
-                        cleanup.append(self._detach_cdp_session(cdp_session))
-                    completed = asyncio.gather(*cleanup, return_exceptions=admitted)
+                    completed = asyncio.create_task(
+                        self._close_mint_resources(cdp_session, browser),
+                    )
                     if not admitted:
                         await completed
                     else:
                         try:
-                            results = await track_auxiliary(completed)
-                            for result in results:
-                                if isinstance(result, BaseException):
-                                    mark_uncertain()
-                                    raise result
+                            await track_auxiliary(completed)
                         except asyncio.CancelledError:
                             mark_uncertain()
                             # Keep the Playwright driver alive until its bounded

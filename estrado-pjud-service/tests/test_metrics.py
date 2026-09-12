@@ -73,13 +73,25 @@ class TestWorkerMetrics:
     """B2 — el heartbeat mentia: reportaba pool_size=1 con 3 slots corriendo y
     mezclaba errores de infra con errores de causa en un solo numero."""
 
-    def _make(self, pool=None):
+    def _make(
+        self,
+        pool=None,
+        *,
+        imports_enabled=False,
+        import_worker_mode="disabled",
+    ):
         from unittest.mock import MagicMock
         from worker.metrics import Metrics
         config = MagicMock()
         config.WORKER_ID = "vps-worker-1"
         config.POOL_SIZE = 1
-        return Metrics(config, MagicMock(), pool=pool)
+        return Metrics(
+            config,
+            MagicMock(),
+            pool=pool,
+            imports_enabled=imports_enabled,
+            import_worker_mode=import_worker_mode,
+        )
 
     def _fake_pool(self, size=3, attempts=0, failures=0):
         from unittest.mock import MagicMock
@@ -98,6 +110,30 @@ class TestWorkerMetrics:
     def test_sin_pool_cae_al_config(self):
         m = self._make(pool=None)
         assert m.heartbeat_payload("running")["pool_size"] == 1
+
+    def test_publica_capacidad_efectiva_de_importacion(self):
+        enabled = self._make(
+            pool=self._fake_pool(size=3),
+            imports_enabled=True,
+            import_worker_mode="normal",
+        ).heartbeat_payload("running")
+        disabled = self._make(
+            pool=self._fake_pool(size=3),
+            imports_enabled=False,
+        ).heartbeat_payload("running")
+
+        assert enabled["metadata"]["imports_enabled"] is True
+        assert enabled["metadata"]["import_worker_mode"] == "normal"
+        assert disabled["metadata"]["imports_enabled"] is False
+        assert disabled["metadata"]["import_worker_mode"] == "disabled"
+
+        trial = self._make(
+            pool=self._fake_pool(size=3),
+            imports_enabled=False,
+            import_worker_mode="trial",
+        ).heartbeat_payload("running")
+        assert trial["metadata"]["imports_enabled"] is False
+        assert trial["metadata"]["import_worker_mode"] == "trial"
 
     def test_separa_errores_de_infra_y_de_causa(self):
         m = self._make(pool=self._fake_pool())
