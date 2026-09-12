@@ -284,6 +284,18 @@ async def safe_process_import_job(engine, metrics) -> bool:
         return False
 
 
+def bind_import_task_lifetime(
+    task: asyncio.Task,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Wake the main worker if its independent import loop stops."""
+    def wake_main(_completed: asyncio.Task) -> None:
+        if not shutdown_event.is_set():
+            shutdown_event.set()
+
+    task.add_done_callback(wake_main)
+
+
 async def run_import_discovery_loop(
     engine,
     metrics,
@@ -307,6 +319,9 @@ async def run_import_discovery_loop(
                 )
             except MaintenanceError:
                 processed = False
+            if maintenance is not None and maintenance.uncertain:
+                shutdown_event.set()
+                return
             if processed:
                 continue
         await wait_before_retry(shutdown_event, poll_interval, validation_once=False)
@@ -740,6 +755,7 @@ async def main():
                 ),
                 name="pjud-import-discovery",
             )
+            bind_import_task_lifetime(import_task, shutdown_event)
             logger.info(
                 "Import discovery loop enabled with one reserved budget; public capacity=%d",
                 session_capacity - 1,

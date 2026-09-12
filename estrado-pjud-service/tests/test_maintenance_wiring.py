@@ -356,6 +356,50 @@ async def test_import_hold_during_claim_owns_finalize_and_capacity_release(worke
 
 
 @pytest.mark.asyncio
+async def test_import_failure_requests_process_restart_when_maintenance_is_uncertain(
+    worker_maintenance,
+):
+    from worker.__main__ import run_import_discovery_loop
+
+    shutdown = asyncio.Event()
+    engine = SimpleNamespace(
+        process_import_job=AsyncMock(
+            side_effect=RuntimeError("synthetic import failure"),
+        ),
+    )
+    metrics = SimpleNamespace(record_error=MagicMock())
+
+    await asyncio.wait_for(
+        run_import_discovery_loop(
+            engine,
+            metrics,
+            shutdown,
+            runtime_fence=legacy_runtime_fence(),
+            poll_interval=0.001,
+            maintenance=worker_maintenance,
+        ),
+        1,
+    )
+
+    assert worker_maintenance.uncertain
+    assert shutdown.is_set()
+
+
+@pytest.mark.asyncio
+async def test_import_task_exit_wakes_the_main_worker():
+    from worker.__main__ import bind_import_task_lifetime
+
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(asyncio.sleep(0))
+    bind_import_task_lifetime(task, shutdown)
+
+    await task
+    await asyncio.sleep(0)
+
+    assert shutdown.is_set()
+
+
+@pytest.mark.asyncio
 async def test_process_batch_parent_cancellation_joins_case_cleanup(worker_maintenance):
     from worker.__main__ import process_batch
     worker = worker_maintenance
