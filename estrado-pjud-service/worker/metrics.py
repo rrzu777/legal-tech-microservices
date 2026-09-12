@@ -20,7 +20,12 @@ class Metrics:
         maintenance=None,
         *,
         imports_enabled: bool = False,
+        import_worker_mode: str = "disabled",
     ):
+        if import_worker_mode not in {"normal", "trial", "disabled"}:
+            raise ValueError("invalid import worker mode")
+        if (imports_enabled is True) != (import_worker_mode == "normal"):
+            raise ValueError("inconsistent import worker capability")
         self._config = config
         self._sb = supabase
         # El pool es opcional para no romper a quien construya Metrics sin el,
@@ -29,6 +34,7 @@ class Metrics:
         self._proxy_control = proxy_control
         self._maintenance = maintenance
         self._imports_enabled = imports_enabled is True
+        self._import_worker_mode = import_worker_mode
         self.initialization_started = False
         self.current_status = "starting"
         self.cases_synced_total: int = 0
@@ -164,9 +170,7 @@ class Metrics:
                     self._config.PJUD_PROCESS_OUTSIDE_OFFICE_HOURS is True
                 ),
                 "imports_enabled": self._imports_enabled,
-                "import_worker_mode": (
-                    "normal" if self._imports_enabled else "disabled"
-                ),
+                "import_worker_mode": self._import_worker_mode,
             },
         }
 

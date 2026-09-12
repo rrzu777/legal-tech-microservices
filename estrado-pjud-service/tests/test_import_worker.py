@@ -1716,6 +1716,16 @@ def test_import_budget_is_not_reserved_while_import_flag_is_disabled():
     assert public_sync_concurrency(1, imports_enabled=False) == 1
 
 
+def test_normal_import_capability_excludes_one_shot_and_trial_workers():
+    from worker.__main__ import normal_imports_enabled
+
+    assert normal_imports_enabled(True, 3, validation_once=False, import_trial_once=False)
+    assert not normal_imports_enabled(True, 3, validation_once=True, import_trial_once=False)
+    assert not normal_imports_enabled(True, 3, validation_once=False, import_trial_once=True)
+    assert not normal_imports_enabled(False, 3, validation_once=False, import_trial_once=False)
+    assert not normal_imports_enabled(True, 1, validation_once=False, import_trial_once=False)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_url", ["https://app.test", "https://app.test/", "https://app.test///"])
 async def test_import_credential_url_has_one_path_separator(monkeypatch, base_url):

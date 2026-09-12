@@ -369,6 +369,22 @@ def public_sync_concurrency(session_capacity: int, *, imports_enabled: bool) -> 
     return max(1, session_capacity - (1 if imports_enabled else 0))
 
 
+def normal_imports_enabled(
+    configured: bool,
+    session_capacity: int,
+    *,
+    validation_once: bool,
+    import_trial_once: bool,
+) -> bool:
+    """Describe a durable normal consumer, never a finite validation process."""
+    return (
+        configured is True
+        and session_capacity >= 2
+        and not validation_once
+        and not import_trial_once
+    )
+
+
 async def safe_reconcile_stale_runs(scheduler, metrics, backoff) -> bool:
     """Run bounded maintenance fail-closed before any traffic gate or claim."""
     try:
@@ -580,10 +596,14 @@ async def main():
     session_capacity = (
         config.OJV_PROXY_POOL_SIZE if config.OJV_PROXY_URL else config.POOL_SIZE
     )
-    imports_enabled = (
-        config.ENABLE_PJUD_MY_CAUSES_IMPORT is True
-        and session_capacity >= 2
-        and not validation_once
+    imports_enabled = normal_imports_enabled(
+        config.ENABLE_PJUD_MY_CAUSES_IMPORT,
+        session_capacity,
+        validation_once=validation_once,
+        import_trial_once=import_trial_once,
+    )
+    import_worker_mode = (
+        "trial" if import_trial_once else "normal" if imports_enabled else "disabled"
     )
     trial_capability = getattr(config, "PJUD_IMPORT_TRIAL_CAPABILITY", None)
     raw_trial_capability = (
@@ -627,6 +647,7 @@ async def main():
         proxy_control=proxy_control,
         maintenance=maintenance,
         imports_enabled=imports_enabled,
+        import_worker_mode=import_worker_mode,
     )
     backoff = CircuitBreaker(
         failure_threshold=5,

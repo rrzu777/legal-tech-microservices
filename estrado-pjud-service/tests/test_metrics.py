@@ -73,7 +73,13 @@ class TestWorkerMetrics:
     """B2 — el heartbeat mentia: reportaba pool_size=1 con 3 slots corriendo y
     mezclaba errores de infra con errores de causa en un solo numero."""
 
-    def _make(self, pool=None, *, imports_enabled=False):
+    def _make(
+        self,
+        pool=None,
+        *,
+        imports_enabled=False,
+        import_worker_mode="disabled",
+    ):
         from unittest.mock import MagicMock
         from worker.metrics import Metrics
         config = MagicMock()
@@ -84,6 +90,7 @@ class TestWorkerMetrics:
             MagicMock(),
             pool=pool,
             imports_enabled=imports_enabled,
+            import_worker_mode=import_worker_mode,
         )
 
     def _fake_pool(self, size=3, attempts=0, failures=0):
@@ -108,6 +115,7 @@ class TestWorkerMetrics:
         enabled = self._make(
             pool=self._fake_pool(size=3),
             imports_enabled=True,
+            import_worker_mode="normal",
         ).heartbeat_payload("running")
         disabled = self._make(
             pool=self._fake_pool(size=3),
@@ -118,6 +126,14 @@ class TestWorkerMetrics:
         assert enabled["metadata"]["import_worker_mode"] == "normal"
         assert disabled["metadata"]["imports_enabled"] is False
         assert disabled["metadata"]["import_worker_mode"] == "disabled"
+
+        trial = self._make(
+            pool=self._fake_pool(size=3),
+            imports_enabled=False,
+            import_worker_mode="trial",
+        ).heartbeat_payload("running")
+        assert trial["metadata"]["imports_enabled"] is False
+        assert trial["metadata"]["import_worker_mode"] == "trial"
 
     def test_separa_errores_de_infra_y_de_causa(self):
         m = self._make(pool=self._fake_pool())
