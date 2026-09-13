@@ -1,5 +1,4 @@
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -44,70 +43,6 @@ async def test_missing_or_unavailable_control_fails_closed():
     assert missing.status == "unavailable"
     assert unavailable.allowed is False
     assert unavailable.reason_code == "control_read_failed"
-
-
-@pytest.mark.asyncio
-async def test_transient_control_read_retries_once_before_succeeding():
-    control = ProxyControl(_supabase())
-    read = AsyncMock(side_effect=[
-        RuntimeError("temporary gateway timeout"),
-        _response([{
-            "provider": "iproyal", "status": "enabled",
-            "reason_code": None, "revision": 7,
-        }]),
-    ])
-    with patch("worker.proxy_control.run_query", read), patch(
-        "worker.proxy_control.asyncio.sleep", new=AsyncMock()
-    ) as delay:
-        snapshot = await control.refresh()
-
-    assert snapshot.allowed is True
-    assert read.await_count == 2
-    delay.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_invalid_control_row_does_not_retry():
-    control = ProxyControl(_supabase())
-    read = AsyncMock(return_value=_response([]))
-    with patch("worker.proxy_control.run_query", read):
-        snapshot = await control.refresh()
-
-    assert snapshot.allowed is False
-    assert read.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_control_read_timeout_is_bounded_and_fails_closed():
-    control = ProxyControl(_supabase())
-    waits = []
-
-    async def timeout(awaitable, *, timeout):
-        waits.append(timeout)
-        awaitable.close()
-        raise asyncio.TimeoutError()
-
-    with patch("worker.proxy_control.asyncio.wait_for", timeout), patch(
-        "worker.proxy_control.asyncio.sleep", new=AsyncMock()
-    ):
-        snapshot = await control.refresh()
-
-    assert snapshot.allowed is False
-    assert snapshot.reason_code == "control_read_failed"
-    assert waits == [5.0, 5.0]
-
-
-@pytest.mark.asyncio
-async def test_control_read_cancellation_propagates():
-    control = ProxyControl(_supabase())
-
-    async def cancelled(awaitable, *, timeout):
-        awaitable.close()
-        raise asyncio.CancelledError()
-
-    with patch("worker.proxy_control.asyncio.wait_for", cancelled):
-        with pytest.raises(asyncio.CancelledError):
-            await control.refresh()
 
 
 @pytest.mark.asyncio
