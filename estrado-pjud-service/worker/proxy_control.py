@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from worker.config import run_query
 
 logger = logging.getLogger(__name__)
+_CONTROL_READ_ATTEMPTS = 2
+_CONTROL_RETRY_DELAY_S = 0.1
 
 
 @dataclass(frozen=True)
@@ -50,13 +52,25 @@ class ProxyControl:
             return await self._refresh_unlocked()
 
     async def _refresh_unlocked(self) -> ProxyControlSnapshot:
+        attempts = 0
         try:
-            response = await run_query(
-                self._sb.from_("pjud_proxy_control")
-                .select("provider,status,reason_code,revision")
-                .eq("provider", self._provider)
-                .limit(1)
-            )
+            response = None
+            for attempts in range(1, _CONTROL_READ_ATTEMPTS + 1):
+                try:
+                    response = await asyncio.wait_for(
+                        run_query(
+                            self._sb.from_("pjud_proxy_control")
+                            .select("provider,status,reason_code,revision")
+                            .eq("provider", self._provider)
+                            .limit(1)
+                        ),
+                        timeout=5.0,
+                    )
+                    break
+                except Exception:
+                    if attempts == _CONTROL_READ_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(_CONTROL_RETRY_DELAY_S)
             rows = response.data if isinstance(response.data, list) else []
             if len(rows) != 1:
                 raise LookupError("proxy control row missing")
@@ -94,7 +108,7 @@ class ProxyControl:
                 source="database",
             )
         except Exception:
-            logger.exception("Proxy control read failed")
+            logger.error("Proxy control read failed after %d attempt(s)", attempts)
             self._snapshot = ProxyControlSnapshot(
                 allowed=False,
                 status="unavailable",

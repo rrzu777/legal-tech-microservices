@@ -1216,11 +1216,11 @@ async def test_invalid_login_is_terminal_and_never_calls_listing_discovery():
     [
         (SessionExpiredError(), "session_expired", 2, "replace_before_reuse"),
         (OjvWafError(), "ojv_blocked", 1, "replace_before_reuse"),
-        (OjvTimeoutError(), "pjud_timeout", 1, "replace_before_reuse"),
-        (OjvUpstreamChangedError(), "upstream_changed", 1, "healthy"),
+        (OjvTimeoutError(), "pjud_timeout", 2, "replace_before_reuse"),
+        (OjvUpstreamChangedError(), "upstream_changed", 2, "healthy"),
     ],
 )
-async def test_login_uses_closed_taxonomy_and_only_expired_session_retries(
+async def test_login_uses_closed_taxonomy_and_only_transient_session_failures_retry(
     error, error_code, expected_sessions, expected_disposition
 ):
     session = FakeSession(login_error=error)
@@ -1243,6 +1243,23 @@ async def test_login_uses_closed_taxonomy_and_only_expired_session_retries(
         if name == "finalize_pjud_import_discovery"
     ][0]
     assert final["p_summary"]["error_code"] == error_code
+
+
+@pytest.mark.asyncio
+async def test_partial_listing_failure_is_not_replayed_after_provider_output():
+    result = DiscoveryResult(
+        candidates=[candidate()],
+        page_count=1,
+        status="upstream_changed",
+    )
+    worker, _sb, _pool, discover, _credential, session_factory, _ = make_worker(
+        discovery=AsyncMock(return_value=result)
+    )
+
+    assert await worker.process_next() is True
+
+    assert session_factory.call_count == 1
+    discover.assert_awaited_once()
 
 
 @pytest.mark.asyncio
