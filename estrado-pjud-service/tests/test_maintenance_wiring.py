@@ -480,6 +480,37 @@ async def test_import_failure_requests_process_restart_when_maintenance_is_uncer
 
 
 @pytest.mark.asyncio
+async def test_import_claim_unavailable_keeps_maintenance_admission_safe(
+    worker_maintenance,
+):
+    from worker.__main__ import run_import_discovery_loop
+    from worker.import_jobs import ImportClaimUnavailable
+
+    shutdown = asyncio.Event()
+
+    async def process_import_job():
+        shutdown.set()
+        raise ImportClaimUnavailable()
+
+    metrics = SimpleNamespace(record_error=MagicMock())
+    await asyncio.wait_for(
+        run_import_discovery_loop(
+            SimpleNamespace(process_import_job=process_import_job),
+            metrics,
+            shutdown,
+            runtime_fence=legacy_runtime_fence(),
+            poll_interval=0.001,
+            maintenance=worker_maintenance,
+        ),
+        1,
+    )
+
+    assert worker_maintenance.uncertain is False
+    assert worker_maintenance.inflight == 0
+    metrics.record_error.assert_called_once_with("infra")
+
+
+@pytest.mark.asyncio
 async def test_import_task_exit_wakes_the_main_worker(caplog):
     from worker.__main__ import bind_import_task_lifetime
 
