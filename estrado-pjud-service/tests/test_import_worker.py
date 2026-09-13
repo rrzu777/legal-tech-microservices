@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from pydantic import SecretStr
+from postgrest.exceptions import APIError
 
 from app.familia.auth import InvalidCredentialsError
 from app.failure_kind import MintUnavailableError, PoolUnavailableError
@@ -21,7 +22,7 @@ from app.ojv.errors import (
 )
 from app.proxy_billing import ProxyBillingExhaustedError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
-from worker.import_jobs import ImportDiscoveryWorker
+from worker.import_jobs import ImportClaimUnavailable, ImportDiscoveryWorker
 from worker.trial_scope import TrialScope
 
 
@@ -219,7 +220,7 @@ def trial_scope() -> TrialScope:
 
 def make_worker(
     *, claim=JOB, discovery=None, credential=None, session=None, concurrency=1,
-    proxy_usage=None,
+    proxy_usage=None, clock=None,
 ):
     sb = FakeSupabase(claim)
     pool = FakePool()
@@ -233,6 +234,7 @@ def make_worker(
     session = session or FakeSession()
     session_factory = MagicMock(return_value=session)
     proxy_usage = proxy_usage or FakeProxyUsage()
+    kwargs = {} if clock is None else {"clock": clock}
     worker = ImportDiscoveryWorker(
         supabase=sb,
         pool=pool,
@@ -244,6 +246,7 @@ def make_worker(
         lease_seconds=30,
         renewal_interval_seconds=0.001,
         proxy_usage=proxy_usage,
+        **kwargs,
     )
     return worker, sb, pool, discovery, credential, session_factory, session
 
@@ -1142,6 +1145,79 @@ async def test_replace_during_listing_is_rejected_by_atomic_finalize():
     final = [payload for name, payload in sb.calls if name == "finalize_pjud_import_discovery"]
     assert len(final) == 1
     assert final[0]["p_expected_credential_updated_at"] == "2026-08-23T12:00:00.000Z"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    APIError({
+        "code": "504", "message": "Gateway Timeout",
+        "details": "upstream detail must stay private", "hint": None,
+    }),
+    httpx.ReadTimeout("upstream detail must stay private"),
+])
+async def test_ambiguous_claim_failure_defers_reclaim_for_the_full_lease(failure):
+    now = [100.0]
+    worker, sb, pool, discover, credential, *_ = make_worker(
+        claim=failure,
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(ImportClaimUnavailable):
+        await worker.process_next()
+    now[0] = 129.999
+    assert await worker.process_next() is False
+    now[0] = 130.0
+    sb.claim = {"status": "empty"}
+    assert await worker.process_next() is False
+
+    credential.assert_not_awaited()
+    discover.assert_not_awaited()
+    pool.acquire_familia_bundle.assert_not_awaited()
+    assert [name for name, _ in sb.calls] == [
+        "claim_pjud_import_job", "claim_pjud_import_job",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_claim_failure_does_not_poison_maintenance(
+    worker_maintenance, caplog,
+):
+    from worker.__main__ import safe_process_import_job
+
+    failure = APIError({
+        "code": "504",
+        "message": "Gateway Timeout",
+        "details": "upstream detail must stay private",
+        "hint": None,
+    })
+    worker, *_ = make_worker(claim=failure)
+    engine = SimpleNamespace(process_import_job=worker.process_next)
+    metrics = SimpleNamespace(record_error=MagicMock())
+
+    assert await worker_maintenance.run(
+        lambda: safe_process_import_job(engine, metrics),
+    ) is False
+
+    assert worker_maintenance.uncertain is False
+    assert worker_maintenance.inflight == 0
+    metrics.record_error.assert_called_once_with("infra")
+    assert "upstream detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_non_gateway_claim_api_error_remains_fatal():
+    failure = APIError({
+        "code": "42501",
+        "message": "permission denied",
+        "details": None,
+        "hint": None,
+    })
+    worker, sb, *_ = make_worker(claim=failure)
+
+    with pytest.raises(APIError):
+        await worker.process_next()
+
+    assert [name for name, _ in sb.calls] == ["claim_pjud_import_job"]
 
 
 @pytest.mark.asyncio

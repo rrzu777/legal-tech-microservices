@@ -15,9 +15,11 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from time import monotonic
 from typing import Any, TypeVar, cast
 
 import httpx
+from postgrest.exceptions import APIError
 from pydantic import BaseModel, ConfigDict, SecretStr, UUID4
 
 from app.familia.auth import FamiliaAuthSession
@@ -36,6 +38,42 @@ from worker.trial_scope import TrialScope
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+
+
+class ImportClaimUnavailable(Exception):
+    """The claim response is unknown; no provider work may begin."""
+
+
+@dataclass(frozen=True)
+class _ClaimQueryOutcome:
+    response: Any | None = None
+    error_class: str | None = None
+
+
+def _is_ambiguous_claim_api_error(error: APIError) -> bool:
+    code = str(error.code or "")
+    return len(code) == 3 and code.isdigit() and 500 <= int(code) <= 599
+
+
+class _ClaimQuery:
+    """Convert known HTTP failures to data before maintenance tracks the future."""
+
+    def __init__(self, query) -> None:
+        self._query = query
+        self.request = getattr(query, "request", None)
+
+    def execute(self) -> _ClaimQueryOutcome:
+        try:
+            # This adapter itself is submitted through run_query, preserving the
+            # canonical per-session executor and maintenance tracking.
+            return _ClaimQueryOutcome(response=getattr(self._query, "execute")())
+        except APIError as exc:
+            if not _is_ambiguous_claim_api_error(exc):
+                raise
+            return _ClaimQueryOutcome(error_class=type(exc).__name__)
+        except httpx.TransportError as exc:
+            return _ClaimQueryOutcome(error_class=type(exc).__name__)
+
 
 _MAX_CANDIDATES = 1_000
 _MAX_CANDIDATE_BYTES = 4_096
@@ -360,6 +398,7 @@ class ImportDiscoveryWorker:
         enabled: bool = True,
         lane_budget: OjvLaneBudget | None = None,
         proxy_usage: ProxyUsageTracker | None = None,
+        clock: Callable[[], float] = monotonic,
     ):
         if concurrency < 1:
             raise ValueError("import_concurrency_must_be_positive")
@@ -384,6 +423,8 @@ class ImportDiscoveryWorker:
             else max(5.0, lease_seconds / 3)
         )
         self._enabled = enabled
+        self._clock = clock
+        self._claim_retry_not_before = 0.0
 
     async def _rpc(self, name: str, payload: dict[str, Any]) -> Any:
         response = await run_query(self._sb.rpc(name, payload))
@@ -478,13 +519,26 @@ class ImportDiscoveryWorker:
         raise RuntimeError("pjud_trial_discovery_finalize_unconfirmed")
 
     async def _claim(self) -> ClaimedImportJob | None:
-        data = await self._rpc(
+        if self._clock() < self._claim_retry_not_before:
+            return None
+        query = self._sb.rpc(
             "claim_pjud_import_job",
             {
                 "p_worker_id": self._worker_id,
                 "p_lease_seconds": self._lease_seconds,
             },
         )
+        outcome = await run_query(_ClaimQuery(query))
+        if outcome.error_class is not None:
+            # A gateway/transport failure may have committed the atomic claim.
+            # Wait until that possible lease expires before claiming another row.
+            self._claim_retry_not_before = self._clock() + self._lease_seconds
+            raise ImportClaimUnavailable() from None
+        response = outcome.response
+        error = getattr(response, "error", None)
+        if error:
+            raise RuntimeError("claim_pjud_import_job_failed")
+        data = getattr(response, "data", None)
         if not isinstance(data, dict) or data.get("status") == "empty":
             return None
         try:
