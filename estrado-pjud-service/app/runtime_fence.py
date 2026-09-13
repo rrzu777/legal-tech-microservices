@@ -16,6 +16,8 @@ _UUID4 = re.compile(
 )
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})")
 _BINDINGS = {"micro_sha", "web_sha", "rollback_micro_sha", "rollback_web_sha"}
+_CONTROL_READ_ATTEMPTS = 2
+_CONTROL_RETRY_DELAY_S = 0.1
 
 
 def validate_runtime_generation(value: str | None) -> str | None:
@@ -87,14 +89,24 @@ class RuntimeFence:
         return self._generation
 
     async def snapshot(self) -> PjudRuntimeControl:
+        if self._supabase is None:
+            raise PjudRuntimeError()
+        response = None
+        for attempt in range(_CONTROL_READ_ATTEMPTS):
+            try:
+                query = self._supabase.rpc("get_pjud_runtime_control", {})
+                response = await asyncio.wait_for(
+                    execute_supabase_query(query),
+                    timeout=5.0,
+                )
+                break
+            except Exception:
+                # Only transport/query failures are replayed. A successful but
+                # malformed control is parsed once below and still fails closed.
+                if attempt + 1 == _CONTROL_READ_ATTEMPTS:
+                    raise PjudRuntimeError() from None
+                await asyncio.sleep(_CONTROL_RETRY_DELAY_S)
         try:
-            if self._supabase is None:
-                raise PjudRuntimeError()
-            query = self._supabase.rpc("get_pjud_runtime_control", {})
-            response = await asyncio.wait_for(
-                execute_supabase_query(query),
-                timeout=5.0,
-            )
             return PjudRuntimeControl.parse(response.data)
         except Exception:
             # No response bodies, headers or secrets cross the observation boundary.

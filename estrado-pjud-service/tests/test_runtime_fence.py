@@ -138,6 +138,36 @@ async def test_unavailable_rpc_and_missing_client_are_finite():
 
 
 @pytest.mark.asyncio
+async def test_transient_runtime_read_retries_once_before_succeeding(monkeypatch):
+    import app.runtime_fence as module
+    execute = AsyncMock(side_effect=[
+        RuntimeError("temporary gateway timeout"),
+        SimpleNamespace(data=runtime_control(generation=GENERATION_A)),
+    ])
+    delay = AsyncMock()
+    monkeypatch.setattr(module, "execute_supabase_query", execute)
+    monkeypatch.setattr(module.asyncio, "sleep", delay)
+
+    snapshot = await RuntimeFence(RuntimeControlDB(), GENERATION_A).snapshot()
+
+    assert snapshot.generation == GENERATION_A
+    assert execute.await_count == 2
+    delay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalid_runtime_control_does_not_retry(monkeypatch):
+    import app.runtime_fence as module
+    execute = AsyncMock(return_value=SimpleNamespace(data={"bad": "control"}))
+    monkeypatch.setattr(module, "execute_supabase_query", execute)
+
+    with pytest.raises(PjudRuntimeError, match="^pjud_runtime_unavailable$"):
+        await RuntimeFence(RuntimeControlDB(), GENERATION_A).snapshot()
+
+    assert execute.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_rpc_wait_is_bounded_and_cancellation_propagates(monkeypatch):
     import app.runtime_fence as module
     waits = []
@@ -148,7 +178,7 @@ async def test_rpc_wait_is_bounded_and_cancellation_propagates(monkeypatch):
     monkeypatch.setattr(module.asyncio, "wait_for", timeout)
     with pytest.raises(PjudRuntimeError, match="^pjud_runtime_unavailable$"):
         await RuntimeFence(RuntimeControlDB(), None).require()
-    assert waits == [5.0]
+    assert waits == [5.0, 5.0]
     async def cancelled(awaitable, *, timeout):
         awaitable.close()
         raise asyncio.CancelledError()

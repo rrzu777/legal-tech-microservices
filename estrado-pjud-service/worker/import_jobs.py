@@ -759,7 +759,11 @@ class ImportDiscoveryWorker:
         trial_scope: TrialScope | None = None,
     ) -> DiscoveryResult:
         result = await self._discover_once(job, credential, 1, trial_scope)
-        if result.status != "session_expired":
+        if (
+            result.status not in {"session_expired", "timeout", "upstream_changed"}
+            or result.page_count != 0
+            or result.candidates
+        ):
             return result
         return await self._discover_once(job, credential, 2, trial_scope)
 
