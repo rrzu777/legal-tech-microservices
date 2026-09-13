@@ -31,10 +31,42 @@ SUDO_BIN="${WD_SUDO:-sudo}"
 # es la misma enfermedad que el resto del archivo viene a curar: una consulta que
 # falla se leía como "no hay nada mal". Los dos call sites distinguen los dos casos.
 cnt() {
-  local cr
-  cr=$(curl -s -m 20 -I "$API/$1" "${AUTH[@]}" -H "Prefer: count=exact" -H "Range: 0-0" 2>/dev/null \
-        | tr -d '\r' | grep -i '^content-range:' | sed -E 's#.*/([0-9]+|\*)$#\1#')
-  echo "$cr"
+  local attempt headers curl_rc status cr last_class="invalid_response"
+  local count_curl="${WD_COUNT_CURL:-curl}" retry_delay="${WD_COUNT_RETRY_DELAY:-1}"
+  case "$retry_delay" in ''|*[!0-9]*) retry_delay=1 ;; esac
+  for attempt in 1 2 3; do
+    headers=$("$count_curl" -sS -m 7 -I "$API/$1" "${AUTH[@]}" \
+      -H "Prefer: count=exact" -H "Range: 0-0" 2>/dev/null)
+    curl_rc=$?
+    if [ "$curl_rc" -ne 0 ]; then
+      last_class="transport"
+    else
+      status=$(printf '%s\n' "$headers" | tr -d '\r' | awk '/^HTTP\// { code=$2 } END { print code }')
+      cr=$(printf '%s\n' "$headers" | tr -d '\r' | awk '
+        tolower($1) == "content-range:" {
+          count = split($0, parts, "/")
+          if (parts[count] ~ /^[0-9]+$/) value = parts[count]
+        }
+        END { print value }
+      ')
+      if [[ "$status" =~ ^2[0-9][0-9]$ ]] && [[ "$cr" =~ ^[0-9]+$ ]]; then
+        echo "$cr"
+        return 0
+      fi
+      if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+        last_class="invalid_response"
+      elif [[ "$status" =~ ^(408|425|429|5[0-9][0-9])$ ]] || [ -z "$status" ]; then
+        last_class="${status:+http_$status}"
+        last_class="${last_class:-invalid_response}"
+      else
+        last_class="http_$status"
+        break
+      fi
+    fi
+    [ "$attempt" -eq 3 ] || sleep "$((retry_delay * attempt))"
+  done
+  echo "estrado-watchdog count read failed class=$last_class attempts=$attempt" >&2
+  echo ""
 }
 
 # Devuelve 0 (hay que alertar) si el conteo llega al umbral. Si el conteo no se pudo

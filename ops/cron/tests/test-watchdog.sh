@@ -99,6 +99,9 @@ run() {
     "WD_JOURNAL_FILE=${WD_JOURNAL_FILE:-$default_journal}"
     "WD_SYSTEMCTL=${WD_SYSTEMCTL:-$default_systemctl}"
     "WD_SUDO=${WD_SUDO:-$default_sudo}"
+    "WD_COUNT_CURL=${WD_COUNT_CURL:-curl}"
+    "WD_COUNT_ATTEMPTS=${WD_COUNT_ATTEMPTS:-}"
+    "WD_COUNT_RETRY_DELAY=${WD_COUNT_RETRY_DELAY:-0}"
     "WD_NOW_EPOCH=${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}"
     "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}")
   [ "$use_proxy_seam" = "1" ] && run_env+=("WD_PROXY_CONTROL_JSON=$proxy_control_json")
@@ -696,6 +699,35 @@ if grep -qF "$FAKE_ID" "$CAIDO/estrado-wd-suspended"; then
 else
   echo "  FAIL NO borra el estado de 'ya avisado' — el archivo quedó sin el ID previo"; FAIL=$((FAIL+1))
 fi
+
+echo "== conteo Supabase tolera un fallo transitorio =="
+COUNT_ATTEMPTS="$TMP/count-attempts"
+: > "$COUNT_ATTEMPTS"
+cat > "$TMP/count-recovers" <<'EOF'
+#!/bin/bash
+printf 'x\n' >> "$WD_COUNT_ATTEMPTS"
+if [ "$(wc -l < "$WD_COUNT_ATTEMPTS")" -eq 1 ]; then
+  printf 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+  exit 0
+fi
+printf 'HTTP/2 200\r\ncontent-range: */0\r\n\r\n'
+EOF
+chmod +x "$TMP/count-recovers"
+OUT=$(WD_COUNT_CURL="$TMP/count-recovers" WD_COUNT_ATTEMPTS="$COUNT_ATTEMPTS" run "$BASE" "$SANO")
+expect_missing "un blip recuperado no alerta count-fail" "$OUT" "count-fail:blocked"
+expect_equals "reintenta una vez y usa el conteo válido" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "2"
+
+echo "== conteo Supabase alerta sólo tras agotar retries =="
+: > "$COUNT_ATTEMPTS"
+cat > "$TMP/count-down" <<'EOF'
+#!/bin/bash
+printf 'x\n' >> "$WD_COUNT_ATTEMPTS"
+exit 28
+EOF
+chmod +x "$TMP/count-down"
+OUT=$(WD_COUNT_CURL="$TMP/count-down" WD_COUNT_ATTEMPTS="$COUNT_ATTEMPTS" run "$BASE" "$SANO")
+expect_contains "agotamiento mantiene el chequeo sin datos" "$OUT" "count-fail:blocked"
+expect_equals "agota exactamente tres intentos" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "3"
 
 echo "== chequeo 10: crontab drift =="
 cat > "$TMP/ct-snap" <<'EOF'
