@@ -22,7 +22,7 @@ from app.ojv.errors import (
 )
 from app.proxy_billing import ProxyBillingExhaustedError
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
-from worker.import_jobs import ImportClaimUnavailable, ImportDiscoveryWorker
+from worker.import_jobs import ImportDiscoveryWorker
 from worker.trial_scope import TrialScope
 
 
@@ -220,7 +220,7 @@ def trial_scope() -> TrialScope:
 
 def make_worker(
     *, claim=JOB, discovery=None, credential=None, session=None, concurrency=1,
-    proxy_usage=None, clock=None,
+    proxy_usage=None, clock=None, record_infra_error=None,
 ):
     sb = FakeSupabase(claim)
     pool = FakePool()
@@ -234,7 +234,11 @@ def make_worker(
     session = session or FakeSession()
     session_factory = MagicMock(return_value=session)
     proxy_usage = proxy_usage or FakeProxyUsage()
-    kwargs = {} if clock is None else {"clock": clock}
+    kwargs = {}
+    if clock is not None:
+        kwargs["clock"] = clock
+    if record_infra_error is not None:
+        kwargs["record_infra_error"] = record_infra_error
     worker = ImportDiscoveryWorker(
         supabase=sb,
         pool=pool,
@@ -1162,8 +1166,7 @@ async def test_ambiguous_claim_failure_defers_reclaim_for_the_full_lease(failure
         clock=lambda: now[0],
     )
 
-    with pytest.raises(ImportClaimUnavailable):
-        await worker.process_next()
+    assert await worker.process_next() is False
     now[0] = 129.999
     assert await worker.process_next() is False
     now[0] = 130.0
@@ -1190,7 +1193,11 @@ async def test_ambiguous_claim_failure_does_not_poison_maintenance(
         "details": "upstream detail must stay private",
         "hint": None,
     })
-    worker, *_ = make_worker(claim=failure)
+    record_infra_error = MagicMock()
+    worker, *_ = make_worker(
+        claim=failure,
+        record_infra_error=record_infra_error,
+    )
     engine = SimpleNamespace(process_import_job=worker.process_next)
     metrics = SimpleNamespace(record_error=MagicMock())
 
@@ -1200,7 +1207,9 @@ async def test_ambiguous_claim_failure_does_not_poison_maintenance(
 
     assert worker_maintenance.uncertain is False
     assert worker_maintenance.inflight == 0
-    metrics.record_error.assert_called_once_with("infra")
+    metrics.record_error.assert_not_called()
+    record_infra_error.assert_called_once_with()
+    assert "PJUD import claim unavailable; retry deferred" in caplog.text
     assert "upstream detail" not in caplog.text
 
 
