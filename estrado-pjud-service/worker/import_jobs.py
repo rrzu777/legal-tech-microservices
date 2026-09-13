@@ -40,10 +40,6 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
-class ImportClaimUnavailable(Exception):
-    """The claim response is unknown; no provider work may begin."""
-
-
 @dataclass(frozen=True)
 class _ClaimQueryOutcome:
     response: Any | None = None
@@ -399,6 +395,7 @@ class ImportDiscoveryWorker:
         lane_budget: OjvLaneBudget | None = None,
         proxy_usage: ProxyUsageTracker | None = None,
         clock: Callable[[], float] = monotonic,
+        record_infra_error: Callable[[], None] = lambda: None,
     ):
         if concurrency < 1:
             raise ValueError("import_concurrency_must_be_positive")
@@ -424,6 +421,7 @@ class ImportDiscoveryWorker:
         )
         self._enabled = enabled
         self._clock = clock
+        self._record_infra_error = record_infra_error
         self._claim_retry_not_before = 0.0
 
     async def _rpc(self, name: str, payload: dict[str, Any]) -> Any:
@@ -533,7 +531,12 @@ class ImportDiscoveryWorker:
             # A gateway/transport failure may have committed the atomic claim.
             # Wait until that possible lease expires before claiming another row.
             self._claim_retry_not_before = self._clock() + self._lease_seconds
-            raise ImportClaimUnavailable() from None
+            self._record_infra_error()
+            logger.error(
+                "PJUD import claim unavailable; retry deferred (error_class=%s)",
+                outcome.error_class,
+            )
+            return None
         response = outcome.response
         error = getattr(response, "error", None)
         if error:

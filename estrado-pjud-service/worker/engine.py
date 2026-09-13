@@ -751,6 +751,7 @@ class SyncEngine:
             enabled=imports_enabled,
             lane_budget=self._work_budgets.discovery,
             proxy_usage=self._proxy_usage,
+            record_infra_error=lambda: self._metrics.record_error("infra"),
         )
         self._r2 = None
         if config.R2_ENABLED and config.R2_ACCESS_KEY_ID:

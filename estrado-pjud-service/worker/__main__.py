@@ -21,7 +21,7 @@ from worker.scheduler import (
     is_scheduled_processing_window,
 )
 from worker.engine import SyncEngine
-from worker.import_jobs import ImportClaimUnavailable, TrialImportOutcome
+from worker.import_jobs import TrialImportOutcome
 from worker.notifier import Notifier
 from worker.metrics import Metrics
 from worker.backoff import CircuitBreaker
@@ -266,10 +266,6 @@ async def safe_process_import_job(engine, metrics) -> bool:
     """Poll one discovery job without coupling failures to public case sync."""
     try:
         return await engine.process_import_job()
-    except ImportClaimUnavailable:
-        logger.error("PJUD import claim unavailable; retry deferred")
-        metrics.record_error("infra")
-        return False
     except Exception as exc:
         if has_active_operation():
             mark_uncertain()
