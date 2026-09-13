@@ -101,6 +101,7 @@ run() {
     "WD_SUDO=${WD_SUDO:-$default_sudo}"
     "WD_COUNT_CURL=${WD_COUNT_CURL:-curl}"
     "WD_COUNT_ATTEMPTS=${WD_COUNT_ATTEMPTS:-}"
+    "WD_COUNT_STATUS=${WD_COUNT_STATUS:-}"
     "WD_COUNT_RETRY_DELAY=${WD_COUNT_RETRY_DELAY:-0}"
     "WD_NOW_EPOCH=${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}"
     "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}")
@@ -728,6 +729,32 @@ chmod +x "$TMP/count-down"
 OUT=$(WD_COUNT_CURL="$TMP/count-down" WD_COUNT_ATTEMPTS="$COUNT_ATTEMPTS" run "$BASE" "$SANO")
 expect_contains "agotamiento mantiene el chequeo sin datos" "$OUT" "count-fail:blocked"
 expect_equals "agota exactamente tres intentos" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "3"
+
+echo "== conteo Supabase reintenta los status HTTP transitorios =="
+cat > "$TMP/count-status-recovers" <<'EOF'
+#!/bin/bash
+printf 'x\n' >> "$WD_COUNT_ATTEMPTS"
+if [ "$(wc -l < "$WD_COUNT_ATTEMPTS")" -eq 1 ]; then
+  printf 'HTTP/2 %s\r\n\r\n' "$WD_COUNT_STATUS"
+else
+  printf 'HTTP/2 200\r\ncontent-range: */0\r\n\r\n'
+fi
+EOF
+chmod +x "$TMP/count-status-recovers"
+for STATUS in 408 425 429 503; do
+  : > "$COUNT_ATTEMPTS"
+  OUT=$(WD_COUNT_CURL="$TMP/count-status-recovers" WD_COUNT_ATTEMPTS="$COUNT_ATTEMPTS" \
+    WD_COUNT_STATUS="$STATUS" run "$BASE" "$SANO")
+  expect_missing "HTTP $STATUS se recupera sin count-fail" "$OUT" "count-fail:blocked"
+  expect_equals "HTTP $STATUS hace dos intentos" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "2"
+done
+
+echo "== conteo Supabase no reintenta un 4xx permanente =="
+: > "$COUNT_ATTEMPTS"
+OUT=$(WD_COUNT_CURL="$TMP/count-status-recovers" WD_COUNT_ATTEMPTS="$COUNT_ATTEMPTS" \
+  WD_COUNT_STATUS=401 run "$BASE" "$SANO")
+expect_contains "HTTP 401 mantiene el chequeo sin datos" "$OUT" "count-fail:blocked"
+expect_equals "HTTP 401 corta tras un intento" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "1"
 
 echo "== chequeo 10: crontab drift =="
 cat > "$TMP/ct-snap" <<'EOF'
