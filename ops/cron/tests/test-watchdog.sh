@@ -8,6 +8,10 @@
 # Sale 0 si pasa todo. Nunca escribe fuera de un mktemp -d.
 set -uo pipefail
 
+# Also cover direct bash invocations below, not only the run() helper. Fixtures
+# must never enter the host journal; the sink test opts in to its local capture.
+export WD_LOGGER=/bin/true
+
 WD="${1:-/tmp/estrado-watchdog.sh}"
 LIVE_SMOKE="${WD_LIVE:-0}"
 LIVE_ENV="${WD_ENV:-/opt/legal-tech-microservices/estrado-pjud-service/.env}"
@@ -135,6 +139,9 @@ expect_equals() { # <nombre> <actual> <esperado>
     echo "  FAIL $1 — esperaba: $3"; echo "       salida: ${2:-<vacía>}"; FAIL=$((FAIL+1))
   fi
 }
+
+expect_equals "subprocesos directos heredan logger inerte" \
+  "$(bash -c 'printf "%s" "${WD_LOGGER:-}"')" "/bin/true"
 
 # El snapshot es el contrato que el chequeo 10 normaliza y compara contra root.
 # Desde el checkout se lee el archivo hermano; en el VPS (donde este test se
