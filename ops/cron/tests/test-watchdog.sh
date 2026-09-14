@@ -103,10 +103,13 @@ run() {
     "WD_COUNT_ATTEMPTS=${WD_COUNT_ATTEMPTS:-}"
     "WD_COUNT_STATUS=${WD_COUNT_STATUS:-}"
     "WD_COUNT_RETRY_DELAY=${WD_COUNT_RETRY_DELAY:-0}"
+    "WD_CASES_CURL=${WD_CASES_CURL:-curl}"
+    "WD_CASES_RETRY_DELAY=0"
+    "WD_LOGGER=${WD_LOGGER:-/bin/true}"
     "WD_NOW_EPOCH=${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}"
     "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}")
   [ "$use_proxy_seam" = "1" ] && run_env+=("WD_PROXY_CONTROL_JSON=$proxy_control_json")
-  "${run_env[@]}" bash "$WD" 2>/dev/null
+  "${run_env[@]}" bash "$WD" 2>"${WD_TEST_DIAGNOSTICS:-/dev/null}"
 }
 
 expect_contains() { # <nombre> <salida> <texto esperado>
@@ -755,6 +758,70 @@ OUT=$(WD_COUNT_CURL="$TMP/count-status-recovers" WD_COUNT_ATTEMPTS="$COUNT_ATTEM
   WD_COUNT_STATUS=401 run "$BASE" "$SANO")
 expect_contains "HTTP 401 mantiene el chequeo sin datos" "$OUT" "count-fail:blocked"
 expect_equals "HTTP 401 corta tras un intento" "$(wc -l < "$COUNT_ATTEMPTS" | tr -d ' ')" "1"
+
+echo "== listas Supabase: retry acotado, diagnostico y estado durable =="
+cat > "$TMP/cases-response" <<'EOF'
+#!/bin/bash
+if [[ "$*" != *"tracking_status=eq.suspended"* ]]; then
+  printf '[]\n200\n0.010'
+  exit 0
+fi
+printf 'x\n' >> "$WD_CASES_ATTEMPTS"
+if [ "$WD_CASES_MODE" = recover ] && [ "$(wc -l < "$WD_CASES_ATTEMPTS")" -gt 1 ]; then
+  printf '[]\n200\n0.010'
+elif [ "$WD_CASES_MODE" = malformed ]; then
+  printf '[{"id":null,"case_number":"SECRET"}]\n200\n0.011'
+elif [ "$WD_CASES_MODE" = multiple ]; then
+  printf 'null\n[]\n200\n0.011'
+else
+  printf '{"message":"SECRET error body"}\n%s\n0.012' "$WD_CASES_STATUS"
+fi
+EOF
+chmod +x "$TMP/cases-response"
+export WD_CASES_ATTEMPTS="$TMP/cases-attempts" WD_CASES_MODE=recover WD_CASES_STATUS=504
+for STATUS in 504 429 200; do
+  : > "$WD_CASES_ATTEMPTS"
+  WD_CASES_STATUS="$STATUS"
+  OUT=$(WD_CASES_CURL="$TMP/cases-response" WD_TEST_DIAGNOSTICS="$TMP/cases-log" run "$BASE" "$SANO")
+  expect_missing "HTTP $STATUS recuperado no alerta por lista" "$OUT" "cases-query-fail:suspended"
+  expect_equals "HTTP $STATUS recupera con un retry" "$(wc -l < "$WD_CASES_ATTEMPTS" | tr -d ' ')" "2"
+  expect_contains "queda evidencia de la recuperacion" "$(<"$TMP/cases-log")" '"recovered":true'
+  expect_missing "no filtra el cuerpo" "$(<"$TMP/cases-log")" SECRET
+done
+for WD_CASES_MODE in down malformed multiple; do
+  export WD_CASES_MODE
+  WD_CASES_STATUS=504
+  : > "$WD_CASES_ATTEMPTS"
+  WDS=$(mktemp -d "$TMP/cases-state-XXXXXX")
+  printf '%s\n' "$FAKE_ID" > "$WDS/estrado-wd-suspended"
+  OUT=$(WD_CASES_CURL="$TMP/cases-response" run "$BASE" "$SANO")
+  expect_contains "agotado $WD_CASES_MODE alerta" "$OUT" "cases-query-fail:suspended"
+  expect_equals "agotado $WD_CASES_MODE preserva estado" "$(<"$WDS/estrado-wd-suspended")" "$FAKE_ID"
+  expect_equals "agotado $WD_CASES_MODE termina en tres intentos" "$(wc -l < "$WD_CASES_ATTEMPTS" | tr -d ' ')" "3"
+  expect_missing "agotado no filtra el cuerpo" "$OUT" SECRET
+  unset WDS
+done
+export WD_CASES_MODE=down WD_CASES_STATUS=401
+: > "$WD_CASES_ATTEMPTS"
+OUT=$(WD_CASES_CURL="$TMP/cases-response" run "$BASE" "$SANO")
+expect_equals "401 no se reintenta" "$(wc -l < "$WD_CASES_ATTEMPTS" | tr -d ' ')" "1"
+expect_contains "alerta informa HTTP exacto" "$OUT" "http_401"
+cat > "$TMP/capture-logger" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WD_CAPTURE_LOG"
+EOF
+chmod +x "$TMP/capture-logger"
+export WD_CAPTURE_LOG="$TMP/journal-events" WD_CASES_MODE=recover WD_CASES_STATUS=504
+: > "$WD_CASES_ATTEMPTS"
+OUT=$(WD_CASES_CURL="$TMP/cases-response" WD_LOGGER="$TMP/capture-logger" run "$BASE" "$SANO")
+expect_contains "telemetria llega al journal aunque cron descarte stderr" "$(<"$WD_CAPTURE_LOG")" '"recovered":true'
+expect_contains "journal usa tag estable" "$(<"$WD_CAPTURE_LOG")" '-t estrado-watchdog --'
+expect_missing "journal no filtra payloads" "$(<"$WD_CAPTURE_LOG")" SECRET
+: > "$WD_CASES_ATTEMPTS"
+OUT=$(WD_CASES_CURL="$TMP/cases-response" WD_LOGGER=/bin/false run "$BASE" "$SANO")
+expect_missing "logger fallido no altera lectura recuperada" "$OUT" "cases-query-fail:suspended"
+unset WD_CAPTURE_LOG
+unset WD_CASES_ATTEMPTS WD_CASES_MODE WD_CASES_STATUS
 
 echo "== chequeo 10: crontab drift =="
 cat > "$TMP/ct-snap" <<'EOF'
