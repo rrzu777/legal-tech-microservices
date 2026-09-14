@@ -1230,6 +1230,32 @@ async def test_non_gateway_claim_api_error_remains_fatal():
 
 
 @pytest.mark.asyncio
+async def test_claim_outage_logs_safe_http_duration_and_escalates_only_persistent_failure(caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="worker.import_jobs")
+    now = [100.0]
+    failure = APIError({"code": "504", "message": "SECRET body", "details": "SECRET", "hint": None})
+    worker, sb, *_ = make_worker(claim=failure, clock=lambda: now[0])
+    for _ in range(3):
+        assert await worker.process_next() is False
+        now[0] += 30.0
+    failures = [r for r in caplog.records if "retry deferred" in r.message]
+    assert [r.levelno for r in failures] == [logging.WARNING, logging.WARNING, logging.ERROR]
+    assert all("http_status=504" in r.message for r in failures)
+    assert all("duration_ms=" in r.message for r in failures)
+    sb.claim = {"status": "empty"}
+    assert await worker.process_next() is False
+    assert "PJUD import claim recovered" in caplog.text
+    assert "consecutive_failures=3" in caplog.text
+    assert "SECRET" not in caplog.text
+    caplog.clear()
+    sb.claim = failure
+    now[0] += 30.0
+    assert await worker.process_next() is False
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_empty_claim_is_a_noop_without_credential_or_pjud_traffic():
     worker, sb, pool, discover, credential, *_ = make_worker(claim={"status": "empty"})
 

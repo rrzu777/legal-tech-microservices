@@ -73,8 +73,62 @@ cnt() {
 # obtener, alerta por su cuenta y devuelve 1: lo que no puede pasar es que una consulta
 # fallida se lea como "no hay nada mal". El mensaje de la anomalía se queda en el call
 # site, que es donde se entiende qué se estaba contando.
-sin_datos() { # <tag> <qué se consultaba>
-  add "No pude consultar $2 en Supabase: la respuesta no es una lista. Este chequeo queda sin datos; el estado de 'ya avisado' no se toca." "cases-query-fail:$1"
+sin_datos() { # <tag> <qué se consultaba> <diagnóstico cerrado del lector>
+  add "No pude consultar $2 en Supabase ($3). Este chequeo queda sin datos; el estado de 'ya avisado' no se toca." "cases-query-fail:$1"
+}
+
+# GET-only: safely retry transient failures without publishing response bodies,
+# credentials or case identifiers. stdout is either a validated list or a closed
+# diagnostic; callers must check the exit code before updating deduplication.
+read_cases() { # <stable check slug> <filter>
+  local attempt raw json http seconds duration curl_rc class retry recovered event
+  local read_curl="${WD_CASES_CURL:-curl}" retry_delay="${WD_CASES_RETRY_DELAY:-1}"
+  case "$retry_delay" in ''|*[!0-9]*) retry_delay=1 ;; esac
+  for attempt in 1 2 3; do
+    raw=$("$read_curl" -sS -m 7 "$API/cases?select=id,case_number&$2" "${AUTH[@]}" \
+      -w '\n%{http_code}\n%{time_total}' 2>/dev/null)
+    curl_rc=$?
+    seconds=${raw##*$'\n'}
+    json=${raw%$'\n'*}
+    http=${json##*$'\n'}
+    json=${json%$'\n'*}
+    [[ "$http" =~ ^[1-5][0-9][0-9]$ ]] || http=0
+    duration=null
+    if [[ "$seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      duration=$(awk -v seconds="$seconds" 'BEGIN { printf "%.0f", seconds * 1000 }')
+    fi
+    class=invalid_response
+    retry=false
+    recovered=false
+    if [ "$curl_rc" -ne 0 ]; then
+      class=transport
+      retry=true
+    elif [[ "$http" =~ ^2[0-9][0-9]$ ]]; then
+      if printf '%s' "$json" | jq -se 'length == 1 and (.[0] | type == "array" and all(.[];
+          type == "object" and (.id | type == "string" and length > 0)
+          and (.case_number | type == "string")))' >/dev/null 2>&1; then
+        class=ok
+        [ "$attempt" -eq 1 ] || recovered=true
+      else
+        retry=true
+      fi
+    else
+      class="http_$http"
+      if [[ "$http" =~ ^(408|425|429|5[0-9][0-9])$ ]] || [ "$http" = 0 ]; then retry=true; fi
+    fi
+    [ "$attempt" -lt 3 ] || retry=false
+    event=$(printf '{"event":"watchdog_cases_read","check":"%s","attempt":%d,"http_status":%s,"duration_ms":%s,"outcome":"%s","will_retry":%s,"recovered":%s}' \
+      "$1" "$attempt" "$http" "$duration" "$class" "$retry" "$recovered")
+    printf '%s\n' "$event" >&2
+    # Cron discards stderr. Keep safe, bounded events in the rotated system
+    # journal too; telemetry failure must never change the read/dedup result.
+    "${WD_LOGGER:-logger}" -t estrado-watchdog -- "$event" 2>/dev/null || true
+    if [ "$class" = ok ]; then printf '%s' "$json"; return 0; fi
+    [ "$retry" = true ] || break
+    sleep "$((retry_delay * attempt))"
+  done
+  printf 'class=%s attempts=%d' "$class" "$attempt"
+  return 1
 }
 
 conteo_supera() { # <valor de cnt> <umbral> <tag> <qué se contaba>
@@ -301,7 +355,10 @@ read_proxy_control() {
 # los umbrales sin inundar el canal.
 nuevas_causas() { # <slug de estado> <filtro postgrest sobre cases>
   local json ids nuevos nums
-  json=$(curl -s -m 20 "$API/cases?select=id,case_number&$2" "${AUTH[@]}" 2>/dev/null || true)
+  if ! json=$(read_cases "$1" "$2"); then
+    printf '%s' "$json"
+    return 1
+  fi
   # Un curl que falla y un `[]` legítimo dejan `ids` vacío exactamente igual, y esa
   # confusión cuesta dos veces: la corrida no alerta (razonable, no sabemos nada) pero
   # ADEMÁS reescribe el estado en vacío, borrando la memoria de lo ya avisado. La
@@ -370,7 +427,7 @@ if SUSP=$(nuevas_causas suspended "tracking_status=eq.suspended"); then
   sig_keyed suspended
   [ -n "${SUSP// }" ] && add "Causa(s) con monitoreo SUSPENDIDO: ${SUSP}. Es terminal: no se reintenta sola, hay que reactivarla a mano desde la ficha de la causa." ""
 else
-  sin_datos suspended "las causas suspendidas"
+  sin_datos suspended "las causas suspendidas" "$SUSP"
 fi
 
 # De `>= 3` a una sola causa. Los tres motivos, con los números del 2026-08-01:
@@ -391,7 +448,7 @@ if ERR=$(nuevas_causas track-err "tracking_status=eq.error"); then
   sig_keyed track-err
   [ -n "${ERR// }" ] && add "Causa(s) con tracking_status=error: ${ERR}. Revisar last_sync_error en la ficha." ""
 else
-  sin_datos track-err "las causas en error"
+  sin_datos track-err "las causas en error" "$ERR"
 fi
 
 # `blocked` se queda en 3, y esto es lo contrario de (a): acá el umbral alto está

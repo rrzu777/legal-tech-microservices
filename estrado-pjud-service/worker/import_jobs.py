@@ -44,6 +44,7 @@ _T = TypeVar("_T")
 class _ClaimQueryOutcome:
     response: Any | None = None
     error_class: str | None = None
+    http_status: int | None = None
 
 
 def _is_ambiguous_claim_api_error(error: APIError) -> bool:
@@ -66,7 +67,7 @@ class _ClaimQuery:
         except APIError as exc:
             if not _is_ambiguous_claim_api_error(exc):
                 raise
-            return _ClaimQueryOutcome(error_class=type(exc).__name__)
+            return _ClaimQueryOutcome(error_class=type(exc).__name__, http_status=int(exc.code))
         except httpx.TransportError as exc:
             return _ClaimQueryOutcome(error_class=type(exc).__name__)
 
@@ -423,6 +424,7 @@ class ImportDiscoveryWorker:
         self._clock = clock
         self._record_infra_error = record_infra_error
         self._claim_retry_not_before = 0.0
+        self._claim_consecutive_failures = 0
 
     async def _rpc(self, name: str, payload: dict[str, Any]) -> Any:
         response = await run_query(self._sb.rpc(name, payload))
@@ -526,15 +528,21 @@ class ImportDiscoveryWorker:
                 "p_lease_seconds": self._lease_seconds,
             },
         )
+        started = monotonic()
         outcome = await run_query(_ClaimQuery(query))
+        duration_ms = round((monotonic() - started) * 1000)
         if outcome.error_class is not None:
             # A gateway/transport failure may have committed the atomic claim.
             # Wait until that possible lease expires before claiming another row.
             self._claim_retry_not_before = self._clock() + self._lease_seconds
+            self._claim_consecutive_failures += 1
             self._record_infra_error()
-            logger.error(
-                "PJUD import claim unavailable; retry deferred (error_class=%s)",
-                outcome.error_class,
+            logger.log(
+                logging.ERROR if self._claim_consecutive_failures >= 3 else logging.WARNING,
+                "PJUD import claim unavailable; retry deferred "
+                "(error_class=%s http_status=%s duration_ms=%d consecutive_failures=%d defer_seconds=%d)",
+                outcome.error_class, outcome.http_status, duration_ms,
+                self._claim_consecutive_failures, self._lease_seconds,
             )
             return None
         response = outcome.response
@@ -542,7 +550,10 @@ class ImportDiscoveryWorker:
         if error:
             raise RuntimeError("claim_pjud_import_job_failed")
         data = getattr(response, "data", None)
-        if not isinstance(data, dict) or data.get("status") == "empty":
+        if not isinstance(data, dict):
+            return None
+        if data.get("status") == "empty":
+            self._record_claim_recovery(duration_ms)
             return None
         try:
             job = ClaimedImportJob.model_validate(data)
@@ -550,7 +561,16 @@ class ImportDiscoveryWorker:
             raise RuntimeError("invalid_import_job_claim_contract") from exc
         if job.status != "acquired":
             raise RuntimeError("invalid_import_job_claim_status")
+        self._record_claim_recovery(duration_ms)
         return job
+
+    def _record_claim_recovery(self, duration_ms: int) -> None:
+        if self._claim_consecutive_failures:
+            logger.info(
+                "PJUD import claim recovered (consecutive_failures=%d duration_ms=%d)",
+                self._claim_consecutive_failures, duration_ms,
+            )
+            self._claim_consecutive_failures = 0
 
     async def _claim_trial(
         self,
