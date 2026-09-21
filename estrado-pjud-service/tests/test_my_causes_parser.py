@@ -35,6 +35,41 @@ def appeals_row_fragment() -> str:
     return f'{row}<tr><td colspan="9"><nav>{pagination}</nav></td></tr>'
 
 
+def civil_row_fragment() -> str:
+    """Synthetic Civil rows using the reviewed eight-column AJAX contract."""
+    soup = BeautifulSoup(fixture("civil_page_1.html"), "html.parser")
+    rows = soup.select("tbody > tr")
+    for row in rows:
+        cell = row.select_one("td")
+        assert cell is not None
+        cell.clear()
+        detail = soup.new_tag("a", href="javascript:detalleMisCausaCivil(1,2,3)")
+        detail.string = "Ver"
+        cell.append(detail)
+    return "".join(str(row) for row in rows) + (
+        '<tr><td colspan="8"><ul class="pagination">'
+        '<li><a onclick="pagina(2,15)">2</a></li></ul></td></tr>'
+    )
+
+
+def test_civil_headerless_fragment_deduplicates_cuadernos_without_guessing_book() -> None:
+    candidates = parse_my_causes_page(civil_row_fragment(), "civil")
+    assert [(item.case_number, item.tribunal_label, item.libro) for item in candidates] == [
+        ("C-1234-2024", "2º Juzgado Civil", None),
+        ("C-1234-2024", "3º Juzgado Civil", None),
+    ]
+
+
+@pytest.mark.parametrize("invalid", [
+    lambda html: html.replace("detalleMisCausaCivil", "detalleMisCausaLaboral", 1),
+    lambda html: html.replace("<td>Ignorar</td>", "", 1),
+    lambda html: html.replace('colspan="8"', 'colspan="9"'),
+])
+def test_civil_headerless_fragment_rejects_wrong_action_or_columns(invalid) -> None:
+    with pytest.raises(UpstreamChangedError):
+        parse_my_causes_page(invalid(civil_row_fragment()), "civil")
+
+
 @pytest.mark.parametrize(
     ("matter", "filename", "case_type", "case_number", "filed_at"),
     [

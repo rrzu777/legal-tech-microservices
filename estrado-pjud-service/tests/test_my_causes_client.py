@@ -150,6 +150,37 @@ async def test_include_closed_submits_each_explicit_observed_status_value(
     assert seen_payloads[0].get_list(status_key) == all_values
 
 
+async def test_civil_cuaderno_repeated_on_next_page_does_not_hide_new_causes(session_factory) -> None:
+    seen_pages: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_page = httpx.QueryParams(request.content.decode()).get("pagina")
+        seen_pages.append(requested_page)
+        if requested_page is None:
+            html = page("civil_page_1.html", next_page=2)
+        else:
+            assert requested_page == "2"
+            # Same cause in another cuaderno, plus a new cause at another court.
+            html = page("civil_page_1.html").replace("Principal", "Incidente")
+            html = html.replace("2º Juzgado Civil", "2º   Juzgado Civil")
+            html = html.replace("3º Juzgado Civil", "4º Juzgado Civil")
+        return httpx.Response(200, text=html, request=request)
+
+    session = session_factory(handler)
+    try:
+        result = await discover_my_causes(session, ("civil",), include_closed=True)
+    finally:
+        await session.close()
+
+    assert result.status == "ok"
+    assert seen_pages == [None, "2"]
+    assert [(item.case_number, item.tribunal_label, item.libro) for item in result.candidates] == [
+        ("C-1234-2024", "2º Juzgado Civil", "C"),
+        ("C-1234-2024", "3º Juzgado Civil", "C"),
+        ("C-1234-2024", "4º Juzgado Civil", "C"),
+    ]
+
+
 async def test_include_closed_keeps_terminal_appeals_candidate(session_factory) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
