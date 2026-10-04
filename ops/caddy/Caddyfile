@@ -2,8 +2,8 @@
 # Espejo de /etc/caddy/Caddyfile — lo instala ops/provision.sh, que recarga
 # caddy solo si esto cambió. Editar acá, nunca en /etc directo.
 #
-# El único vhost es el subdominio: un scanner que llega por IP pelada o con
-# otro Host no matchea ningún site y Caddy le corta la conexión sin que el
+# Los vhosts son subdominios explícitos: un scanner que llega por IP pelada o
+# con otro Host no matchea ningún site y Caddy le corta la conexión sin que el
 # request toque Python. Hoy TODO el tráfico externo del puerto 8000 son
 # probes de scanners (medido 14 días de journal: cero hits legítimos, y dos
 # de esos probes sacaron 500 de /api/v1/search).
@@ -17,4 +17,11 @@
 # Cutover completo (quién hace qué y en qué orden): ops/caddy/README.md.
 estrado.juristrack.cl {
 	reverse_proxy 127.0.0.1:8000
+}
+
+# App Assist remains disabled until its signed app/runtime gates, session
+# revocation and pilot allowlist are configured. This vhost only provides TLS
+# and loopback proxying; authorization stays in the runtime.
+assistant.api.agendita.cl {
+	reverse_proxy 127.0.0.1:18080
 }

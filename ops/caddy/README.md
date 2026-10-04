@@ -22,7 +22,20 @@ cifrada.
 ## Piezas
 
 - `ops/caddy/Caddyfile` — espejo de `/etc/caddy/Caddyfile`; lo instala
-  `ops/provision.sh` (recarga caddy solo si cambió).
+  `ops/caddy/install.sh`, invocado por `ops/provision.sh` (recarga caddy solo
+  si cambió y revierte el archivo si la recarga/arranque falla).
+- Para un cambio exclusivo del proxy se puede copiar el checkout versionado y
+  ejecutar sólo `ops/caddy/install.sh` con sus cuatro argumentos (fuente,
+  destino, binario `caddy`, binario `systemctl`); no hace falta correr el
+  provisionador completo, que también administra units y monitoreo.
+- La prueba local del helper es `ops/tests/test-caddy-install.sh`; cubre
+  validación del candidato, idempotencia, locks, symlinks y rollback de
+  reload/start. La validación real del Caddyfile debe ejecutarse con la misma
+  versión de Caddy instalada en el VPS.
+- `assistant.api.agendita.cl` sólo termina TLS y reenvía a
+  `127.0.0.1:18080`. Requiere DNS/certificado y la autorización firmada del
+  runtime; mientras los gates de App Assist estén apagados no habilita el
+  asistente.
 - El paquete es el de Ubuntu 24.04 (`apt-get install caddy`): se actualiza
   con los updates normales del sistema. provision.sh avisa si falta.
 - El watchdog no cambia: su health check le pega a `127.0.0.1:8000` directo,

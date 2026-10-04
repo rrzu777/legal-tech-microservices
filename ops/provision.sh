@@ -61,6 +61,7 @@ main() {
   local chmod_bin="${PROV_CHMOD_BIN:-chmod}"
   local caddyfile_src="$repo_dir/ops/caddy/Caddyfile"
   local caddyfile_dest="${PROV_CADDYFILE_DEST:-/etc/caddy/Caddyfile}"
+  local caddy_install="$repo_dir/ops/caddy/install.sh"
   local enable_pjud_worker="${PROV_ENABLE_PJUD_WORKER:-0}"
   local skip_caddy="${PROV_SKIP_CADDY:-0}"
   local src="$repo_dir/ops/systemd"
@@ -77,7 +78,7 @@ main() {
   case "$skip_caddy" in 0|1) ;; *) echo "ABORTA: PROV_SKIP_CADDY debe ser 0 o 1." >&2; exit 1 ;; esac
 
   if [ ! -d "$src" ] || [ ! -r "$repo_dir/ops/env.inventory" ] \
-    || { [ "$skip_caddy" = 0 ] && [ ! -r "$caddyfile_src" ]; } || [ ! -r "$template_src" ] \
+    || { [ "$skip_caddy" = 0 ] && { [ ! -r "$caddyfile_src" ] || [ ! -x "$caddy_install" ]; }; } || [ ! -r "$template_src" ] \
     || [ ! -r "$logrotate_src" ] || [ ! -r "$monitoring_src/monitor.py" ] \
     || [ ! -r "$monitoring_src/resource-tracker.py" ] \
     || [ ! -r "$monitoring_src/alert_policy.py" ] \
@@ -374,25 +375,10 @@ main() {
   if [ "$skip_caddy" = 0 ] && ! command -v "$caddy_bin" >/dev/null 2>&1; then
     echo "FALTA caddy (apt-get install caddy) — sin él la API queda sin TLS delante." >&2
     rc=1
-  elif [ "$skip_caddy" = 0 ] && ! cmp -s "$caddyfile_src" "$caddyfile_dest"; then
-    # Validar ANTES de instalar. Sin esto, un Caddyfile roto llegaba a /etc y
-    # un `reload || restart` ciego hacía lo peor posible: el reload gracioso
-    # de Caddy rechaza el config inválido y SIGUE sirviendo el viejo (diseño,
-    # zero-downtime), y el restart de "fallback" mataba ese proceso sano
-    # contra el mismo archivo roto — Caddy caído por decisión nuestra.
-    if ! "$caddy_bin" validate --config "$caddyfile_src" --adapter caddyfile >/dev/null 2>&1; then
-      echo "INVÁLIDO: $caddyfile_src no pasa \`caddy validate\` — no se toca $caddyfile_dest." >&2
+  elif [ "$skip_caddy" = 0 ]; then
+    echo "==> instala Caddyfile"
+    if ! "$caddy_install" "$caddyfile_src" "$caddyfile_dest" "$caddy_bin" "$systemctl_bin"; then
       rc=1
-    else
-      echo "==> instala Caddyfile"
-      mkdir -p "$(dirname "$caddyfile_dest")"
-      install -m 644 "$caddyfile_src" "$caddyfile_dest"
-      # reload solo tiene sentido con la unit andando; parada, se levanta.
-      if "$systemctl_bin" is-active --quiet caddy; then
-        "$systemctl_bin" reload caddy
-      else
-        "$systemctl_bin" start caddy
-      fi
     fi
   fi
 
