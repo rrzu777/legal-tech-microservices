@@ -67,6 +67,7 @@ async def process_batch(
     shutdown_grace_seconds: float = 30.0,
     *,
     runtime_fence: RuntimeFence | None,
+    proxy_snapshot: ProxyControlSnapshot | None = None,
 ) -> None:
     """Process a batch of cases concurrently, bounded to `concurrency` in-flight
     at a time (matches the number of residential IP slots in the pool).
@@ -88,7 +89,9 @@ async def process_batch(
             if not processing_window():
                 return
             if proxy_control is not None:
-                snapshot = await refresh_proxy_gate(proxy_control, backoff)
+                snapshot = proxy_snapshot
+                if snapshot is None:
+                    snapshot = await refresh_proxy_gate(proxy_control, backoff)
                 if not snapshot.allowed:
                     return
             if shutdown_event.is_set() or backoff.is_open:
@@ -457,6 +460,7 @@ async def initialize_worker_attempt(
     pool, scheduler, metrics, backoff, proxy_control, config, *,
     validation_once: bool, process_outside_office_hours: bool, imports_enabled: bool,
     runtime_fence: RuntimeFence | None,
+    proxy_snapshot: ProxyControlSnapshot,
 ) -> str:
     """One bounded startup operation; idle/retry waits belong outside admission."""
     # Only reached after admission. A forbidden initializer must not refresh
@@ -464,10 +468,7 @@ async def initialize_worker_attempt(
     if not await runtime_admitted(runtime_fence, metrics):
         return "runtime_rejected"
     metrics.initialization_started = True
-    if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
-        return "reconcile_unavailable"
-    snapshot = await refresh_proxy_gate(proxy_control, backoff)
-    if not snapshot.allowed:
+    if not proxy_snapshot.allowed:
         return "paused"
     prewarm = can_initialize_paid_pool(
         validation_once=validation_once,
@@ -497,20 +498,22 @@ async def initialize_worker_attempt(
     return "ready" if initialized else "mint_failed"
 
 
-async def reconcile_and_refresh(
-    scheduler, metrics, backoff, proxy_control, runtime_fence: RuntimeFence | None,
+async def reconcile_before_proxy_gate(
+    scheduler, metrics, backoff, runtime_fence: RuntimeFence | None,
 ):
+    """Reconcile under admission, leaving the read-only proxy gate outside it."""
     if not await runtime_admitted(runtime_fence, metrics):
         return _RUNTIME_REJECTED
     if not await safe_reconcile_stale_runs(scheduler, metrics, backoff):
         return None
-    return await refresh_proxy_gate(proxy_control, backoff)
+    return True
 
 
 async def claim_process_release_batch(
     scheduler, metrics, backoff, engine, concurrency, shutdown_event, *,
     runtime_fence: RuntimeFence | None,
     proxy_control=None, processing_window=is_scheduled_processing_window,
+    proxy_snapshot: ProxyControlSnapshot | None = None,
 ):
     """The caller admits before claim and retains ownership through release."""
     if not await runtime_admitted(runtime_fence, metrics):
@@ -526,6 +529,7 @@ async def claim_process_release_batch(
         batch, engine, concurrency, shutdown_event, backoff,
         runtime_fence=runtime_fence,
         proxy_control=proxy_control, processing_window=processing_window,
+        proxy_snapshot=proxy_snapshot,
     )
     await scheduler.release_batch(release_claims)
     return batch
@@ -552,13 +556,16 @@ async def import_trial_runtime_error(
 
 
 async def initialize_import_trial_attempt(
-    pool, proxy_control, backoff, runtime_fence: RuntimeFence | None,
+    pool, runtime_fence: RuntimeFence | None,
+    proxy_snapshot: ProxyControlSnapshot,
 ) -> Exception | None:
-    """One admitted, finite import-only initialization attempt."""
-    if error := await import_trial_runtime_error(runtime_fence):
-        return error
-    snapshot = await refresh_proxy_gate(proxy_control, backoff)
-    if not snapshot.allowed:
+    """One admitted, finite import-only initialization attempt.
+
+    The caller validates the runtime before the read-only proxy gate. Recheck
+    immediately before pool initialization so that read and effect remain
+    separately fenced without admitting the gate read itself.
+    """
+    if not proxy_snapshot.allowed:
         return RuntimeError("pjud_import_trial_proxy_denied")
     if error := await import_trial_runtime_error(runtime_fence):
         return error
@@ -677,8 +684,16 @@ async def main():
         while not shutdown_event.is_set() and not initialized:
             if import_trial_once:
                 trial_error = await maintenance.run(
+                    lambda: import_trial_runtime_error(runtime_fence)
+                )
+                if trial_error is not None:
+                    raise trial_error
+                trial_snapshot = await refresh_proxy_gate(proxy_control, backoff)
+                if not trial_snapshot.allowed:
+                    raise RuntimeError("pjud_import_trial_proxy_denied")
+                trial_error = await maintenance.run(
                     lambda: initialize_import_trial_attempt(
-                        pool, proxy_control, backoff, runtime_fence,
+                        pool, runtime_fence, trial_snapshot,
                     )
                 )
                 if trial_error is not None:
@@ -687,12 +702,8 @@ async def main():
                 break
 
             try:
-                outcome = await maintenance.run(lambda: initialize_worker_attempt(
-                    pool, scheduler, metrics, backoff, proxy_control, config,
-                    validation_once=validation_once,
-                    process_outside_office_hours=process_outside_office_hours,
-                    imports_enabled=imports_enabled,
-                    runtime_fence=runtime_fence,
+                reconciled = await maintenance.run(lambda: reconcile_before_proxy_gate(
+                    scheduler, metrics, backoff, runtime_fence,
                 ))
             except MaintenanceError:
                 metrics.set_status("paused")
@@ -700,6 +711,33 @@ async def main():
                 # A held one-shot must also remain alive and acknowledge hold.
                 await wait_before_retry(shutdown_event, 1, validation_once=False)
                 continue
+            if reconciled is _RUNTIME_REJECTED:
+                if not await wait_before_retry(
+                    shutdown_event, 30, validation_once=validation_once,
+                ):
+                    return
+                continue
+            if reconciled is None:
+                outcome = "reconcile_unavailable"
+            else:
+                # This read-only gate must not become an auxiliary of the
+                # admitted operation: a transient 504 pauses traffic but does
+                # not poison the worker's maintenance lease.
+                startup_snapshot = await refresh_proxy_gate(proxy_control, backoff)
+                try:
+                    outcome = await maintenance.run(lambda: initialize_worker_attempt(
+                        pool, scheduler, metrics, backoff, proxy_control, config,
+                        validation_once=validation_once,
+                        process_outside_office_hours=process_outside_office_hours,
+                        imports_enabled=imports_enabled,
+                        runtime_fence=runtime_fence,
+                        proxy_snapshot=startup_snapshot,
+                    ))
+                except MaintenanceError:
+                    metrics.set_status("paused")
+                    notify_status("maintenance admission closed")
+                    await wait_before_retry(shutdown_event, 1, validation_once=False)
+                    continue
             if outcome == "ready":
                 initialized = True
                 break
@@ -809,21 +847,21 @@ async def main():
 
         while not shutdown_event.is_set():
             try:
-                snapshot = await maintenance.run(lambda: reconcile_and_refresh(
-                    scheduler, metrics, backoff, proxy_control, runtime_fence,
+                reconciled = await maintenance.run(lambda: reconcile_before_proxy_gate(
+                    scheduler, metrics, backoff, runtime_fence,
                 ))
             except MaintenanceError:
                 metrics.set_status("paused")
                 notify_status("maintenance admission closed")
                 await wait_before_retry(shutdown_event, 1, validation_once=False)
                 continue
-            if snapshot is _RUNTIME_REJECTED:
+            if reconciled is _RUNTIME_REJECTED:
                 if not await wait_before_retry(
                     shutdown_event, 30, validation_once=validation_once,
                 ):
                     return
                 continue
-            if snapshot is None:
+            if reconciled is None:
                 metrics.set_status("backoff")
                 notify_status("sync-run reconciliation unavailable; traffic blocked")
                 if not await wait_before_retry(
@@ -831,6 +869,10 @@ async def main():
                 ):
                     return
                 continue
+
+            # Keep the read-only proxy gate outside the admitted operation. A
+            # gateway timeout must pause traffic, not make the lease uncertain.
+            snapshot = await refresh_proxy_gate(proxy_control, backoff)
 
             if not snapshot.allowed:
                 metrics.set_status("paused")
@@ -882,6 +924,7 @@ async def main():
                     scheduler, metrics, backoff, engine, concurrency, shutdown_event,
                     runtime_fence=runtime_fence,
                     proxy_control=proxy_control,
+                    proxy_snapshot=snapshot,
                     processing_window=lambda: is_processing_allowed(
                         validation_once=validation_once,
                         process_outside_office_hours=process_outside_office_hours,
