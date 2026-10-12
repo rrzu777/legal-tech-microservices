@@ -25,3 +25,10 @@ estrado.juristrack.cl {
 assistant.api.agendita.cl {
 	reverse_proxy 127.0.0.1:18080
 }
+
+# JurisTrack has its own App Assist instance and loopback port. TLS does not
+# enable the assistant; its runtime admission and signed authorization gates
+# remain controlled by the separate JurisTrack configuration.
+assistant.juristrack.cl {
+	reverse_proxy 127.0.0.1:8081
+}
