@@ -101,6 +101,37 @@ en cada deploy y un unit adelantado corta producción en el próximo deploy.
 
 ## Rollback
 
+### Instancia App Assist de JurisTrack
+
+El vhost `assistant.juristrack.cl` apunta exclusivamente a `127.0.0.1:8081`,
+la instancia propia de JurisTrack. Su registro A debe apuntar a
+`207.180.198.177` en modo DNS only. Este bloque no habilita el asistente:
+mantener sus flags apagados hasta comprobar HTTPS, revocación, conocimiento
+aprobado del release web y evaluación del modelo con presupuesto propio.
+
+Preparar primero el registro DNS, validar el Caddyfile fuente con
+`caddy validate --config ops/caddy/Caddyfile --adapter caddyfile` y aplicar
+sólo el espejo Caddy mediante el helper validado `ops/caddy/install.sh`;
+no ejecutar el provisionamiento general para este vhost. Desde el checkout
+aprobado, el comando exclusivo del proxy es:
+
+```bash
+sudo bash ops/caddy/install.sh ops/caddy/Caddyfile /etc/caddy/Caddyfile /usr/bin/caddy /usr/bin/systemctl
+```
+
+Editar primero el archivo fuente del repositorio y conservar su backup;
+instalar el espejo validado con modo0644 y recargar la unit activa.
+Comprobar `https://assistant.juristrack.cl/healthz`
+con validación TLS normal; durante preparación debe devolver `enabled:false`.
+El helper recarga Caddy conservando el proceso activo; no requiere reiniciar PJUD,
+su worker ni Agendita. No ejecutar un deploy general para este cambio de TLS.
+
+Para retirar sólo este vhost, eliminar su bloque del archivo fuente,
+validar y reinstalar el espejo con recarga graciosa. Conservar los bloques de
+Estrado y Agendita. Una falla de reload no justifica un restart automático.
+
+### Cutover de Estrado
+
 - Antes del paso 6: no hay nada que revertir — uvicorn sigue expuesto como
   siempre y Vercel puede volver a la URL vieja con solo revertir la env var.
 - Después del paso 6: revertir el unit a `--host 0.0.0.0`, `systemctl
