@@ -2257,6 +2257,117 @@ class TestHelperFunctions:
             "Segunda": "C-1234-2024:Principal:5#3",
         }
 
+    def test_apelaciones_reuses_protection_prefix_historical_key(self):
+        from worker.engine import _prepare_pjud_movements
+
+        movement = {
+            "folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+            "tramite": "Resolución", "descripcion": "Acoge", "etapa": "", "foja": 3,
+        }
+        case = _make_case(case_number="4490-2025", matter="apelaciones")
+        prepared = _prepare_pjud_movements(
+            case, [movement], log_undated=False,
+            existing_movements=[{
+                "external_movement_key": "PROTECCIÓN-4490-2025:Principal:20",
+                "raw_payload": movement,
+            }],
+        )
+        assert prepared[0][1] == "PROTECCIÓN-4490-2025:Principal:20"
+
+    @pytest.mark.parametrize("historical", [
+        "4490-2025:Principal:20",
+        "PROTECCION-4490-2025:Principal:20",
+    ])
+    def test_prefixed_current_case_reuses_plain_or_same_accent_key(self, historical):
+        from worker.engine import _prepare_pjud_movements
+
+        movement = {
+            "folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+            "tramite": "Resolución", "descripcion": "Acoge", "etapa": "", "foja": 3,
+        }
+        prepared = _prepare_pjud_movements(
+            _make_case(case_number="PROTECCIÓN-4490-2025", matter="apelaciones"),
+            [movement], log_undated=False,
+            existing_movements=[{"external_movement_key": historical, "raw_payload": movement}],
+        )
+        assert prepared[0][1] == historical
+
+    def test_alias_suffixes_are_ranked_numerically(self):
+        from worker.engine import _external_key_rank
+
+        base = "4490-2025:Principal:20"
+        assert _external_key_rank(f"{base}#10", base) == 10
+        assert _external_key_rank(f"{base}#2", base) == 2
+        assert _external_key_rank("PROTECCION-4490-2025:Principal:20", base) == 1
+        assert _external_key_rank(base, base) == 0
+        assert _external_key_rank("PROTECCION-4490-2025:Principal:20#2", base) == 2
+        assert _external_key_rank("PROTECCION-4490-2025:Principal:20#10", base) == 10
+
+    def test_alias_key_selection_is_independent_of_database_order(self):
+        from worker.engine import _prepare_pjud_movements
+
+        raw = {"folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+               "tramite": "Resolución", "descripcion": "Acoge", "etapa": "", "foja": 3}
+        case = _make_case(case_number="4490-2025", matter="apelaciones")
+        canonical = "4490-2025:Principal:20"
+        keys = ["PROTECCION-4490-2025:Principal:20#10", "PROTECCION-4490-2025:Principal:20#2", canonical]
+        for order in (keys, list(reversed(keys))):
+            prepared = _prepare_pjud_movements(case, [raw], log_undated=False,
+                existing_movements=[{"external_movement_key": key, "raw_payload": raw} for key in order])
+            assert prepared[0][1] == canonical
+        prepared = _prepare_pjud_movements(case, [raw], log_undated=False,
+            existing_movements=[{"external_movement_key": key, "raw_payload": raw} for key in keys[:2]])
+        assert prepared[0][1] == keys[1]
+
+    def test_apelaciones_does_not_merge_changed_identity(self):
+        from worker.engine import _prepare_pjud_movements
+
+        old = {
+            "folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+            "tramite": "Resolución", "descripcion": "Antigua", "etapa": "", "foja": 3,
+        }
+        current = {**old, "descripcion": "Nueva"}
+        prepared = _prepare_pjud_movements(
+            _make_case(case_number="4490-2025", matter="apelaciones"), [current],
+            log_undated=False, existing_movements=[{
+                "external_movement_key": "PROTECCION-4490-2025:Principal:20",
+                "raw_payload": old,
+            }],
+        )
+        assert prepared[0][1] == "4490-2025:Principal:20"
+
+    def test_civil_does_not_use_appellate_alias(self):
+        from worker.engine import _prepare_pjud_movements
+
+        movement = {
+            "folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+            "tramite": "Resolución", "descripcion": "Acoge", "etapa": "", "foja": 3,
+        }
+        prepared = _prepare_pjud_movements(
+            _make_case(case_number="4490-2025", matter="civil"), [movement],
+            log_undated=False, existing_movements=[{
+                "external_movement_key": "PROTECCION-4490-2025:Principal:20",
+                "raw_payload": movement,
+            }],
+        )
+        assert prepared[0][1] == "4490-2025:Principal:20"
+
+    def test_appellate_alias_replay_is_stable(self):
+        from worker.engine import _prepare_pjud_movements
+
+        movement = {
+            "folio": 20, "cuaderno": "Principal", "fecha": "2025-10-01",
+            "tramite": "Resolución", "descripcion": "Acoge", "etapa": "", "foja": 3,
+        }
+        case = _make_case(case_number="4490-2025", matter="apelaciones")
+        existing = [{
+            "external_movement_key": "PROTECCION-4490-2025:Principal:20",
+            "raw_payload": movement,
+        }]
+        first = _prepare_pjud_movements(case, [movement], log_undated=False, existing_movements=existing)
+        second = _prepare_pjud_movements(case, [movement], log_undated=False, existing_movements=existing)
+        assert first == second
+
     def test_logical_duplicates_merge_document_metadata_conservatively(self):
         from worker.engine import _prepare_pjud_movements
 
