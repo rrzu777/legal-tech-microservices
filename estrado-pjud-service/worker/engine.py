@@ -33,11 +33,18 @@ from app.familia.auth import FamiliaAuthSession, FamiliaBlockedError, InvalidCre
 from app.familia.parser import parse_familia_results
 from app.ojv.errors import OjvSessionError
 from app.ojv.budget import OjvWorkBudgets
-from app.matching import is_definitive_not_found, matches_requested_candidate, rank_matches
+from app.matching import (
+    is_definitive_not_found,
+    matches_requested_context,
+    matches_requested_identifier,
+    rank_matches,
+)
 from app.models import CandidateMatch, SearchRequest
 from app.parsers.anexo_parser import parse_anexo_list
 from app.parsers.form_builder import build_search_form_data
-from app.parsers.normalizer import parse_case_identifier, competencia_path
+from app.parsers.normalizer import (
+    parse_case_identifier, competencia_path, VALID_LIBROS, PENAL_LIBRO_CODE_MAP,
+)
 from app.parsers.search_parser import parse_search_results, detect_blocked
 from app.parsers.detail_parser import parse_detail
 from app.proxy_billing import ProxyBillingExhaustedError, is_proxy_billing_error
@@ -146,6 +153,7 @@ _SYNC_RUN_ERROR_CODES = frozenset({
 _SYNC_RUN_EXACT_ERROR_TOKENS = {
     "invalid identifier": "invalid_identifier",
     "invalid_identity": "invalid_identifier",
+    "detail_identity_mismatch": "upstream_changed",
     "unsupported matter": "unsupported_matter",
     "auth_type no soportado": "unsupported_matter",
     "not found in ojv": "case_not_found",
@@ -577,13 +585,6 @@ def _canonical_search_request(case: dict, competencia: str) -> SearchRequest | N
         return None
 
 
-def _matches_known_context(candidate: CandidateMatch, request: SearchRequest) -> bool:
-    """Known v2 context requires complete, matching official codes."""
-    tribunal_matches = request.tribunal is None or candidate.tribunal_code == request.tribunal
-    corte_matches = request.corte is None or candidate.corte_code == request.corte
-    return tribunal_matches and corte_matches
-
-
 def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMatch | None:
     """Return one exact official candidate, never an arbitrary result row."""
     candidates = _dedupe_candidates([CandidateMatch.model_validate(match) for match in matches])
@@ -591,8 +592,7 @@ def _confirmed_match(matches: list[dict], request: SearchRequest) -> CandidateMa
     exact = [
         candidate
         for candidate in ranked.matches
-        if matches_requested_candidate(candidate, request)
-        and _matches_known_context(candidate, request)
+        if matches_requested_context(candidate, request)
     ]
     return exact[0] if len(exact) == 1 else None
 
@@ -613,6 +613,74 @@ def _dedupe_candidates(candidates: list[CandidateMatch]) -> list[CandidateMatch]
             seen.add(identity)
             unique.append(candidate)
     return unique
+
+
+def _detail_matches_confirmed_identity(
+    detail: dict, candidate: CandidateMatch, request: SearchRequest,
+    catalog: CatalogService | None = None,
+) -> bool:
+    """Compare detail identity before publishing any case data.
+
+    In appellate search rows ``tribunal`` describes the current location. The
+    actual court is ``corte``; detail presents it as ``metadata.tribunal``.
+    Book fields may contain either an official code/label or the complete ROL.
+    """
+    metadata = detail.get("metadata") or {}
+    if hasattr(metadata, "model_dump"):
+        metadata = metadata.model_dump()
+    detail_rol = str(metadata.get("rol") or "").strip()
+    if request.case_type == "ruc":
+        if normalize_catalog_label(str(metadata.get("ruc") or "")) != normalize_catalog_label(request.case_number):
+            return False
+        if detail_rol and normalize_catalog_label(detail_rol) != normalize_catalog_label(candidate.rol):
+            return False
+    elif request.competencia == "suprema":
+        # Suprema displays e.g. "Civil / 5869 - 2026", while its search uses
+        # 5869-2026. The resource prefix is not an Appeals book identifier.
+        try:
+            parsed = parse_case_identifier(re.sub(r"\s+", "", detail_rol).replace("/", "-"))
+            expected = parse_case_identifier(request.case_number)
+        except ValueError:
+            return False
+        if (parsed["numero"], parsed["anno"]) != (expected["numero"], expected["anno"]):
+            return False
+    elif not detail_rol or not matches_requested_identifier(detail_rol, request):
+        return False
+
+    def same_court(label: str, expected_label: str) -> bool:
+        if normalize_catalog_label(label) == normalize_catalog_label(expected_label):
+            return True
+        if catalog is None or request.corte is None:
+            return False
+        actual_code = catalog.resolve_loaded_court(label)
+        expected_code = catalog.resolve_loaded_court(expected_label)
+        return actual_code is not None and actual_code == expected_code == request.corte
+
+    detail_tribunal = str(metadata.get("tribunal") or "").strip()
+    detail_corte = str(metadata.get("corte") or "").strip()
+    appellate_resource = request.competencia == "apelaciones" and request.search_mode == "appeals_resource"
+    expected_tribunal = candidate.corte if appellate_resource else candidate.tribunal
+    if detail_tribunal and (
+        not expected_tribunal
+        or not (same_court(detail_tribunal, expected_tribunal) if appellate_resource
+                else normalize_catalog_label(detail_tribunal) == normalize_catalog_label(expected_tribunal))
+    ):
+        return False
+    if detail_corte and (not candidate.corte or not same_court(detail_corte, candidate.corte)):
+        return False
+    for field, expected_code in (("corte_code", candidate.corte_code), ("tribunal_code", candidate.tribunal_code)):
+        for value in (metadata.get(field), detail.get(field)):
+            if value not in (None, "") and (expected_code is None or str(value) != str(expected_code)):
+                return False
+    if request.competencia != "suprema":
+        allowed_books = {normalize_catalog_label(value) for value in (candidate.libro_code, candidate.libro) if value}
+        for value in (metadata.get("libro"), detail.get("libro"), metadata.get("libro_code"), detail.get("libro_code")):
+            if value in (None, ""):
+                continue
+            value = str(value).strip()
+            if normalize_catalog_label(value) not in allowed_books and not matches_requested_identifier(value, request):
+                return False
+    return True
 
 
 def _dedupe_movement_keys(keys: list[str]) -> list[str]:
@@ -798,16 +866,49 @@ class SyncEngine:
         resolved_labels = {}
         enriched: list[dict] = []
         for match in matches:
+            if request.competencia == "apelaciones" and request.search_mode == "appeals_resource":
+                # Appeals resources identify their official court in corte.
+                # tribunal is often a display/location label, not a court
+                # catalog identity, and must never infer the court.
+                corte_label = str(match.get("corte", ""))
+                if corte_label not in resolved_labels:
+                    resolved_labels[corte_label] = (
+                        self._catalog_service.resolve_loaded_court(corte_label)
+                        if corte_label
+                        else None
+                    )
+                enriched.append({
+                    **match,
+                    "tribunal_code": None,
+                    "corte_code": resolved_labels[corte_label],
+                })
+                continue
             label = str(match.get("tribunal", ""))
             if label not in resolved_labels:
                 resolved_labels[label] = self._catalog_service.resolve_loaded_tribunal(
                     request.competencia, label, corte=request.corte,
                 )
             identity = resolved_labels[label]
+            book_code = match.get("libro_code")
+            if book_code is None and request.case_type != "ruc":
+                # The official ROL is positive book evidence; the submitted
+                # request alone is not (OJV can return other books).
+                try:
+                    prefix = parse_case_identifier(str(match.get("rol") or ""))["tipo"]
+                except ValueError:
+                    prefix = ""
+                if prefix in VALID_LIBROS.get(request.competencia, set()):
+                    book_code = prefix
+                elif request.competencia == "penal":
+                    book_code = next((code for code, label in PENAL_LIBRO_CODE_MAP.items()
+                                      if prefix == label), None)
+                    if prefix == "O":
+                        book_code = "1"
             enriched.append({
                 **match,
                 "tribunal_code": identity.tribunal_code if identity else None,
                 "corte_code": identity.court_code if identity else None,
+                "libro_code": book_code,
             })
         return enriched
 
@@ -1116,17 +1217,56 @@ class SyncEngine:
                 return {"success": False, "new_movements": 0}
 
             # Canonical rows must correlate the fresh same-session search result
-            # to one official identifier. Legacy rows preserve v1's historical
-            # first-row behavior until their identity is backfilled.
+            # to one official identifier. Legacy appeal rows with persisted
+            # court/book identity use the same strict selector.
             confirmed_match = None
-            if canonical_request is not None:
-                candidates = await self._enrich_candidates(search_result["matches"], canonical_request)
-                confirmed_match = _confirmed_match(candidates, canonical_request)
-                if canonical_request.allow_broad and (
+            selection_request = canonical_request
+            if (
+                selection_request is None
+                and competencia == "apelaciones"
+                and case.get("court_code") is not None
+                and case.get("libro")
+            ):
+                try:
+                    legacy_parts = parse_case_identifier(case["case_number"])
+                    selection_request = SearchRequest(
+                        contract_version=2,
+                        competencia=competencia,
+                        case_type="rol",
+                        case_number=f"{legacy_parts['numero']}-{legacy_parts['anno']}",
+                        corte=case.get("court_code"),
+                        tribunal=None,
+                        libro=case.get("libro"),
+                        search_mode="appeals_resource",
+                        allow_broad=False,
+                    )
+                except ValueError:
+                    await self._finish_run(
+                        sync_run_id, started_at, "needs_confirmation", 0,
+                    )
+                    await self._handle_transient(
+                        case, "needs_confirmation", "Identidad legacy de apelaciones incompleta",
+                    )
+                    return {
+                        "success": False,
+                        "new_movements": 0,
+                        "status": "needs_confirmation",
+                    }
+            if selection_request is None and competencia == "apelaciones":
+                await self._publish_resolution_candidates(
+                    case, search_result["matches"],
+                    search_result.get("match_count", len(search_result["matches"])),
+                )
+                await self._finish_run(sync_run_id, started_at, "needs_confirmation", 0)
+                return {"success": False, "new_movements": 0, "status": "needs_confirmation"}
+            if selection_request is not None:
+                candidates = await self._enrich_candidates(search_result["matches"], selection_request)
+                confirmed_match = _confirmed_match(candidates, selection_request)
+                if selection_request.allow_broad and (
                     confirmed_match is None
                     or confirmed_match.tribunal_code is None
                     or (
-                        canonical_request.competencia != "apelaciones"
+                        selection_request.competencia != "apelaciones"
                         and confirmed_match.corte_code is None
                     )
                 ):
@@ -1137,11 +1277,11 @@ class SyncEngine:
                         candidates,
                         search_result.get("match_count", len(candidates)),
                     )
-                    await self._finish_run(sync_run_id, started_at, "success", 0)
-                    self._backoff.record_success()
-                    self._metrics.record_sync()
+                    await self._finish_run(
+                        sync_run_id, started_at, "needs_confirmation", 0,
+                    )
                     return {
-                        "success": True,
+                        "success": False,
                         "new_movements": 0,
                         "status": "needs_confirmation",
                     }
@@ -1192,6 +1332,20 @@ class SyncEngine:
                 await self._handle_parse_suspect(case, competencia)
                 self._metrics.record_error("infra")
                 return {"success": False, "new_movements": 0}
+
+            if confirmed_match is not None and selection_request is not None and not _detail_matches_confirmed_identity(
+                detail, confirmed_match, selection_request, self._catalog_service,
+            ):
+                await self._finish_run(
+                    sync_run_id, started_at, "error", 0, "detail_identity_mismatch",
+                )
+                await self._handle_transient(case, "detail_identity_mismatch", "PJUD detail identity mismatch")
+                self._metrics.record_error("resolution")
+                return {
+                    "success": False,
+                    "new_movements": 0,
+                    "status": "detail_identity_mismatch",
+                }
 
             identity_update = None
             if (
