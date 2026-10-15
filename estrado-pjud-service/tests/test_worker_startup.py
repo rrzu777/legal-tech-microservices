@@ -130,6 +130,44 @@ async def test_startup_hold_keeps_real_heartbeat_watchdog_and_resumes(monkeypatc
         await asyncio.gather(running, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_proxy_control_read_runs_outside_maintenance_lease(monkeypatch, worker_maintenance):
+    """A read-only gate outage must pause traffic without poisoning admission."""
+    from worker import __main__ as worker_main
+    from worker.maintenance import has_active_operation
+    from worker.proxy_control import ProxyControlSnapshot
+
+    config = _entrypoint_config(validation_once=True)
+    scheduler = AsyncMock()
+    pool = MagicMock(initialize=AsyncMock(), close_all=AsyncMock())
+    metrics = MagicMock(stop=AsyncMock())
+    backoff = MagicMock(is_open=False)
+    _patch_entrypoint(
+        monkeypatch, worker_main, config=config, scheduler=scheduler,
+        pool=pool, metrics=metrics, backoff=backoff,
+        maintenance=worker_maintenance,
+    )
+    observed_admission = []
+
+    async def read_gate(*_args):
+        observed_admission.append(has_active_operation())
+        return ProxyControlSnapshot(
+            allowed=False,
+            status="unavailable",
+            reason_code="control_read_failed",
+            revision=18,
+            source="local",
+        )
+
+    monkeypatch.setattr(worker_main, "refresh_proxy_gate", read_gate)
+
+    await worker_main.main()
+
+    assert observed_admission == [False]
+    assert worker_maintenance.uncertain is False
+    pool.initialize.assert_not_awaited()
+
+
 def _entrypoint_config(*, validation_once=False):
     config = MagicMock()
     config.PJUD_RUNTIME_GENERATION = None
@@ -227,7 +265,7 @@ def _patch_import_trial_entrypoint(
     )
     monkeypatch.setattr(worker_main, "RuntimeFence", lambda *_a, **_k: runtime_fence)
     async def read_proxy_gate(*_args):
-        assert has_active_operation()
+        assert not has_active_operation()
         return ProxyControlSnapshot(
             allowed=proxy_allowed,
             status="enabled" if proxy_allowed else "paused",
@@ -694,7 +732,7 @@ async def test_manual_import_off_hours_and_scheduled_reopening(monkeypatch, warm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["startup_reconcile", "proxy_refresh", "contract", "initialize",
+@pytest.mark.parametrize("boundary", ["startup_reconcile", "contract", "initialize",
                                       "recurrent_reconcile", "batch_claim", "batch_release"])
 async def test_main_holds_complete_operation_at_each_effect_boundary(monkeypatch, worker_maintenance, boundary):
     from worker import __main__ as worker_main
@@ -725,7 +763,8 @@ async def test_main_holds_complete_operation_at_each_effect_boundary(monkeypatch
     async def reconcile():
         await phase("startup_reconcile" if not phases else "recurrent_reconcile")
     async def proxy(*args):
-        await phase("proxy_refresh")
+        assert not has_active_operation(), "proxy gate read must be outside admission"
+        phases.append("proxy_refresh")
         return ProxyControlSnapshot(True, "enabled", None, 1, "database")
     async def contract():
         await phase("contract")
