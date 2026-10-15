@@ -69,6 +69,27 @@ cnt() {
   echo ""
 }
 
+read_watchdog_backlog() {
+  local json response http_status
+  if [ "${WD_BACKLOG_JSON+x}" = x ]; then
+    json="$WD_BACKLOG_JSON"
+    http_status="${WD_BACKLOG_HTTP_STATUS:-200}"
+  else
+    response=$(curl -sS -m 20 -X POST "$API/rpc/get_pjud_watchdog_backlog" \
+      "${AUTH[@]}" -H 'Content-Type: application/json' -d '{}' -w $'\n%{http_code}' 2>/dev/null || true)
+    http_status="${response##*$'\n'}"
+    json="${response%$'\n'*}"
+  fi
+  [[ "$http_status" =~ ^2[0-9][0-9]$ ]] || return 1
+  if ! printf '%s' "$json" | jq -e 'type == "object" and (.admission_paused|type == "boolean") and (.overdue_eligible_count|type == "number" and floor == . and . >= 0 and . <= 2147483647) and (.overdue_retained_count|type == "number" and floor == . and . >= 0 and . <= 2147483647) and (.checked_at|type == "string" and length > 0)' >/dev/null 2>&1; then
+    return 1
+  fi
+  WATCHDOG_ADMISSION_PAUSED=$(printf '%s' "$json" | jq -r '.admission_paused')
+  WATCHDOG_STUCK=$(printf '%s' "$json" | jq -r '.overdue_eligible_count')
+  WATCHDOG_RETAINED=$(printf '%s' "$json" | jq -r '.overdue_retained_count')
+  return 0
+}
+
 # Devuelve 0 (hay que alertar) si el conteo llega al umbral. Si el conteo no se pudo
 # obtener, alerta por su cuenta y devuelve 1: lo que no puede pasar es que una consulta
 # fallida se lea como "no hay nada mal". El mensaje de la anomalía se queda en el call
@@ -605,9 +626,6 @@ fi
 #    Se mira `next_sync_at` vencido y no "N horas sin sincronizar" porque la cadencia es
 #    por prioridad (_compute_next_sync_at): un umbral fijo daría falsos positivos en las
 #    causas de cadencia diaria. Las 2h son margen para un scheduler unos minutos atrasado.
-STUCK_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 7200))" +%Y-%m-%dT%H:%M:%S)
-STUCK_LEASE_CUTOFF=$(date -u -d "@$((WATCHDOG_NOW_EPOCH - 14400))" +%Y-%m-%dT%H:%M:%S)
-STUCK_FILTER="cases?select=id&tracking_status=eq.active&source_system=eq.pjud_ojv&next_sync_at=lt.$STUCK_CUTOFF&and=(or(sync_priority.is.null,sync_priority.lte.3),or(sync_blocked_until.is.null,sync_blocked_until.lt.$NOW),or(sync_worker_id.is.null,sync_claimed_at.is.null,sync_claimed_at.lt.$STUCK_LEASE_CUTOFF))"
 if stuck_window_open; then
   read_proxy_control
   PROXY_CONTROL_STATE=$?
@@ -615,18 +633,42 @@ if stuck_window_open; then
     0)
       # Recuperación: permite que una recaída de control sea una alerta nueva.
       nuevas_claves proxy-control-root "" >/dev/null
-      if [ "${DRY_RUN:-0}" = "1" ]; then
-        STUCK="${WD_STUCK_COUNT:-$(cnt "$STUCK_FILTER")}" # dry-run seam
+      if ! read_watchdog_backlog; then
+        add "No pude consultar el backlog PJUD agregado; este chequeo queda sin datos y no atribuye el atraso al scheduler." "watchdog-backlog-unavailable"
+        STUCK=""
+        RETAINED=""
+        WATCHDOG_ADMISSION_PAUSED="unknown"
       else
-        STUCK=$(cnt "$STUCK_FILTER")
+        STUCK="$WATCHDOG_STUCK"
+        RETAINED="$WATCHDOG_RETAINED"
       fi
-      if [[ "$STUCK" =~ ^[0-9]+$ ]] && conteo_supera "$STUCK" 1 stuck "las causas atascadas"; then
+      if [ -n "${RETAINED:-}" ] && [ "$RETAINED" -gt 0 ] 2>/dev/null; then
+        RETAINED_NEW=$(nuevas_claves retained "$RETAINED")
+        sig_keyed retained
+        [ -n "${RETAINED_NEW// }" ] && add "${RETAINED} causa(s) activa(s) con corridas antiguas retenidas; resolver esos claims antes de reanudar su sincronización. El atraso no se atribuye al scheduler." ""
+      elif [ -n "${RETAINED:-}" ]; then
+        nuevas_claves retained "" >/dev/null
+        sig_keyed retained
+      fi
+      if [ "$WATCHDOG_ADMISSION_PAUSED" = true ]; then
+        # The read succeeded: maintenance defers otherwise eligible work.
+        # Reopen the incident after resume even if its count stays identical.
+        nuevas_claves stuck "" >/dev/null
+        if [[ "$STUCK" =~ ^[0-9]+$ ]] && [ "$STUCK" -gt 0 ]; then
+          PAUSED_NEW=$(nuevas_claves admission-paused-backlog "$STUCK")
+          sig_keyed admission-paused-backlog
+          [ -n "${PAUSED_NEW// }" ] && add "${STUCK} causa(s) con sincronización diferida: la admisión PJUD está pausada; el atraso no se atribuye al scheduler." ""
+        else
+          nuevas_claves admission-paused-backlog "" >/dev/null
+        fi
+      elif [[ "$STUCK" =~ ^[0-9]+$ ]] && conteo_supera "$STUCK" 1 stuck "las causas atascadas"; then
+        nuevas_claves admission-paused-backlog "" >/dev/null
         STUCK_NEW=$(nuevas_claves stuck "${STUCK}")
         if [ -n "${STUCK_NEW// }" ]; then
           # La deduplicación vive en el estado keyed. No agregar una etiqueta a
           # SIG evita que un backlog nuevo altere el cooldown de incidentes ajenos
           # dentro de la misma corrida; la transición de conteo ya es el evento.
-          add "${STUCK} causa(s) activa(s) con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." ""
+          add "${STUCK} causa(s) activa(s) elegibles con next_sync_at vencido hace más de 2h — el scheduler no las está tomando." ""
         fi
       else
         # A cero (o sin datos) también se reescribe el estado sólo cuando el
@@ -635,6 +677,7 @@ if stuck_window_open; then
         # evidencia anterior.
         if [[ "$STUCK" =~ ^[0-9]+$ ]]; then
           nuevas_claves stuck "" >/dev/null
+          nuevas_claves admission-paused-backlog "" >/dev/null
         fi
       fi
       ;;

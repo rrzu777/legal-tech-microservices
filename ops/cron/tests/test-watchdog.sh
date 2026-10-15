@@ -70,7 +70,7 @@ EOF
 # sola vez y necesitan que el estado sobreviva entre corridas.
 run() {
   local st="${WDS:-$(mktemp -d "$TMP/run-XXXXXX")}" proxy_control_json use_proxy_seam=0
-  local default_env default_systemctl default_sudo default_journal
+  local default_env default_systemctl default_sudo default_journal backlog_json use_backlog_seam=0
   local -a run_env
   if [ "${WD_LIVE:-0}" = "1" ]; then
     default_env=/opt/legal-tech-microservices/estrado-pjud-service/.env
@@ -89,6 +89,13 @@ run() {
   elif [ "${WD_LIVE:-0}" != "1" ]; then
     proxy_control_json='[{"status":"enabled","reason_code":null}]'
     use_proxy_seam=1
+  fi
+  if [ "${WD_BACKLOG_JSON+x}" = x ]; then
+    backlog_json="$WD_BACKLOG_JSON"
+    use_backlog_seam=1
+  elif [ "${WD_LIVE:-0}" != 1 ]; then
+    printf -v backlog_json '{"admission_paused":false,"overdue_eligible_count":%s,"overdue_retained_count":0,"checked_at":"2026-08-10T14:00:00Z"}' "${WD_STUCK_COUNT:-39}"
+    use_backlog_seam=1
   fi
   run_env=(env
     "DRY_RUN=1"
@@ -111,8 +118,10 @@ run() {
     "WD_CASES_RETRY_DELAY=0"
     "WD_LOGGER=${WD_LOGGER:-/bin/true}"
     "WD_NOW_EPOCH=${WD_NOW_EPOCH:-$(date -u -d '2026-08-10T14:00:00Z' +%s)}"
-    "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}")
+    "WD_STUCK_COUNT=${WD_STUCK_COUNT:-39}"
+    "WD_BACKLOG_HTTP_STATUS=${WD_BACKLOG_HTTP_STATUS:-200}")
   [ "$use_proxy_seam" = "1" ] && run_env+=("WD_PROXY_CONTROL_JSON=$proxy_control_json")
+  [ "$use_backlog_seam" = "1" ] && run_env+=("WD_BACKLOG_JSON=$backlog_json")
   "${run_env[@]}" bash "$WD" 2>"${WD_TEST_DIAGNOSTICS:-/dev/null}"
 }
 
@@ -493,18 +502,40 @@ expect_equals "control incierto fuera de ventana conserva la causa deduplicada" 
 unset WDS
 
 echo "== chequeo 8: consulta sólo causas elegibles =="
-STUCK_BLOCK=$(awk '/^# 8\. Causas atascadas/{inside=1} /^# 9\. La API/{inside=0} inside' "$WD")
-for literal in \
-  'source_system=eq.pjud_ojv' \
-  'tracking_status=eq.active' \
-  'sync_priority.is.null' \
-  'sync_priority.lte.3' \
-  'sync_blocked_until.is.null' \
-  'sync_blocked_until.lt.' \
-  'sync_worker_id.is.null' \
-  'sync_claimed_at.is.null' \
-  'sync_claimed_at.lt.'; do
-  expect_contains "el filtro stuck incluye $literal" "$STUCK_BLOCK" "$literal"
+OUT=$(WD_BACKLOG_JSON='{"admission_paused":false,"overdue_eligible_count":2,"overdue_retained_count":8,"checked_at":"2026-08-10T14:00:00Z"}' run "$BASE")
+expect_contains "backlog retenido se reporta" "$OUT" "8 causa(s) activa(s) con corridas antiguas retenidas"
+expect_contains "backlog elegible no se oculta" "$OUT" "2 causa(s) activa(s) elegibles con next_sync_at vencido"
+expect_contains "retención no oculta scheduler atrasado" "$OUT" "el scheduler no las está tomando"
+OUT=$(WD_BACKLOG_JSON='{"admission_paused":true,"overdue_eligible_count":2,"overdue_retained_count":0,"checked_at":"2026-08-10T14:00:00Z"}' run "$BASE")
+expect_contains "pausa explica el atraso" "$OUT" "admisión PJUD está pausada"
+expect_missing "pausa no acusa scheduler" "$OUT" "el scheduler no las está tomando"
+OUT=$(WD_BACKLOG_HTTP_STATUS=500 WD_BACKLOG_JSON='{"admission_paused":false,"overdue_eligible_count":2,"overdue_retained_count":0,"checked_at":"2026-08-10T14:00:00Z"}' run "$BASE")
+expect_contains "HTTP 500 queda sin datos" "$OUT" "No pude consultar el backlog PJUD agregado"
+expect_missing "HTTP 500 no inventa backlog" "$OUT" "2 causa(s) activa(s) con next_sync_at"
+
+echo "== chequeo 8: fallos conservan estado y pausa reabre el incidente =="
+WDS=$(mktemp -d "$TMP/backlog-state-XXXXXX")
+BACKLOG_MIX='{"admission_paused":false,"overdue_eligible_count":2,"overdue_retained_count":8,"checked_at":"2026-08-10T14:00:00Z"}'
+OUT=$(WD_BACKLOG_JSON="$BACKLOG_MIX" run "$BASE")
+STUCK_BEFORE=$(cksum "$WDS/estrado-wd-stuck")
+RETAINED_BEFORE=$(cksum "$WDS/estrado-wd-retained")
+OUT=$(WD_BACKLOG_JSON='invalid secret body' run "$BASE")
+expect_contains "contrato inválido alerta sin datos" "$OUT" "No pude consultar el backlog PJUD agregado"
+expect_missing "error no expone el cuerpo" "$OUT" 'invalid secret body'
+expect_equals "error conserva dedup elegible" "$(cksum "$WDS/estrado-wd-stuck")" "$STUCK_BEFORE"
+expect_equals "error conserva dedup retenido" "$(cksum "$WDS/estrado-wd-retained")" "$RETAINED_BEFORE"
+OUT=$(WD_BACKLOG_JSON="$BACKLOG_MIX" run "$BASE")
+expect_missing "recuperar lectura no duplica retenidas" "$OUT" 'corridas antiguas retenidas'
+OUT=$(WD_BACKLOG_JSON='{"admission_paused":true,"overdue_eligible_count":2,"overdue_retained_count":8,"checked_at":"2026-08-10T14:00:00Z"}' run "$BASE")
+expect_missing "pausa con retenidas no acusa scheduler" "$OUT" 'el scheduler no las está tomando'
+OUT=$(WD_BACKLOG_JSON="$BACKLOG_MIX" run "$BASE")
+expect_contains "reasumir mismo backlog reabre incidente" "$OUT" 'el scheduler no las está tomando'
+unset WDS
+
+echo "== chequeo 8: números JSON deben caber en la aritmética de Bash =="
+for BAD_COUNT in 1e100 -1 0.5 '"2"'; do
+  OUT=$(WD_BACKLOG_JSON="{\"admission_paused\":false,\"overdue_eligible_count\":$BAD_COUNT,\"overdue_retained_count\":0,\"checked_at\":\"2026-08-10T14:00:00Z\"}" run "$BASE")
+  expect_contains "conteo no soportado $BAD_COUNT queda sin datos" "$OUT" 'No pude consultar el backlog PJUD agregado'
 done
 
 echo "== chequeo 8: el lease activo queda fuera del request =="
@@ -515,6 +546,7 @@ printf '%s\n' \
   'case " $* " in' \
   '  *" -I "*) printf "HTTP/1.1 200 OK\\r\\nContent-Range: 0-0/0\\r\\n\\r\\n" ;;' \
   "  *\"pjud_proxy_control?\"*) printf '[{\"status\":\"enabled\",\"reason_code\":null}]' ;;" \
+  '  *"get_pjud_watchdog_backlog"*) printf "{\\"admission_paused\\":false,\\"overdue_eligible_count\\":0,\\"overdue_retained_count\\":0,\\"checked_at\\":\\"2026-08-10T14:00:00Z\\"}\\n200" ;;' \
   '  *) printf "[]" ;;' \
   'esac' > "$TMP/curl-bin/curl"
 chmod +x "$TMP/curl-bin/curl"
@@ -531,11 +563,11 @@ run_with_captured_queries() { # <epoch>
 STUCK_QUERY_LOG="$TMP/stuck-query.log"
 : > "$STUCK_QUERY_LOG"
 OUT=$(WD_CURL_LOG="$STUCK_QUERY_LOG" run_with_captured_queries "$(date -u -d '2026-08-10T14:00:00Z' +%s)")
-expect_contains "consulta abierta excluye lease activo" "$(<"$STUCK_QUERY_LOG")" \
-  'or(sync_worker_id.is.null,sync_claimed_at.is.null,sync_claimed_at.lt.2026-08-10T10:00:00)'
+expect_contains "consulta de backlog usa RPC" "$(<"$STUCK_QUERY_LOG")" \
+  '/rpc/get_pjud_watchdog_backlog'
 : > "$STUCK_QUERY_LOG"
 OUT=$(WD_CURL_LOG="$STUCK_QUERY_LOG" run_with_captured_queries "$(date -u -d '2026-08-08T14:00:00Z' +%s)")
-expect_missing "fuera de horario no consulta casos stuck" "$(<"$STUCK_QUERY_LOG")" 'next_sync_at=lt.'
+expect_missing "fuera de horario no consulta backlog" "$(<"$STUCK_QUERY_LOG")" '/rpc/get_pjud_watchdog_backlog'
 
 echo "== smoke WD_LIVE: consulta control real, no el seam unitario =="
 if [ "$LIVE_SMOKE" = "1" ]; then
@@ -602,14 +634,14 @@ if WD_DATE_LOG="$EPOCH_DATE_LOG" run_leading_zero_epoch 010; then
 else
   echo "  FAIL 010 se acepta como epoch decimal"; FAIL=$((FAIL+1))
 fi
-expect_contains "010 resta dos horas desde 10 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @-7190"
+expect_contains "010 normaliza el reloj a 10 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @10"
 : > "$EPOCH_DATE_LOG"
 if WD_DATE_LOG="$EPOCH_DATE_LOG" run_leading_zero_epoch 08; then
   echo "  ok   08 se acepta como epoch decimal"; PASS=$((PASS+1))
 else
   echo "  FAIL 08 se acepta como epoch decimal"; FAIL=$((FAIL+1))
 fi
-expect_contains "08 resta dos horas desde 8 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @-7192"
+expect_contains "08 normaliza el reloj a 8 decimal" "$(<"$EPOCH_DATE_LOG")" "-d @8"
 
 DEFAULT_STATE_DIR=$(mktemp -d "$TMP/default-state-XXXXXX")
 printf 'no tocar\n' > "$DEFAULT_STATE_DIR/estrado-wd-state"
