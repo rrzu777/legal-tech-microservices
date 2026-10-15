@@ -388,7 +388,12 @@ def _is_movement_key_for_base(key: str, base_key: str) -> bool:
 
 
 def _external_key_rank(key: str, base_key: str) -> int:
-    return 1 if key == base_key else int(key[len(base_key) + 1:])
+    if key == base_key:
+        return 0
+    # All callers first validate the current or historical base. Parse the
+    # suffix independently of that base so alias#2 and alias#10 keep their rank.
+    suffix = re.search(r"#([0-9]+)$", key)
+    return int(suffix.group(1)) if suffix else 1
 
 
 def _build_movement_external_key(case_number: str, movement: dict) -> str:
@@ -411,6 +416,34 @@ def _build_movement_external_key(case_number: str, movement: dict) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return f"pjud:null-folio:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _movement_external_key_bases(case: dict, movement: dict) -> tuple[str, ...]:
+    """Return current plus narrowly-scoped historical key bases.
+
+    OJV appellate roles were historically stored both as ``PROTECCIÓN-4490-2025``
+    and ``4490-2025``.  Only apelaciones may use that alias, and only when the
+    case has the exact same number/year.  Other matters must retain strict key
+    identity because the same role can exist in different books/competencias.
+    """
+    current = _build_movement_external_key(case["case_number"], movement)
+    if movement.get("folio") is None or case.get("matter") != "apelaciones":
+        return (current,)
+
+    case_number = _normalize_movement_identity_part(case.get("case_number"))
+    match = re.fullmatch(r"(?:(?:PROTECCI[ÓO]N)[- ]*)?(\d+)-(\d{4})", case_number, re.IGNORECASE)
+    if not match:
+        return (current,)
+    plain = f"{match.group(1)}-{match.group(2)}"
+    aliases = [case_number]
+    if case_number.casefold() == plain.casefold():
+        aliases.extend((f"PROTECCIÓN-{plain}", f"PROTECCION-{plain}"))
+    else:
+        aliases.extend((plain, f"PROTECCIÓN-{plain}", f"PROTECCION-{plain}"))
+    return tuple(dict.fromkeys((current, *(
+        _build_external_movement_key(alias, movement.get("cuaderno", ""), movement.get("folio"))
+        for alias in aliases
+    ))))
 
 
 def _copy_movement(movement: dict) -> dict:
@@ -473,7 +506,7 @@ def _prepare_pjud_movements(
             skipped_count += 1
             continue
 
-        base_key = _build_movement_external_key(case["case_number"], movement)
+        base_key = _movement_external_key_bases(case, movement)[0]
         identity = _movement_identity(movement)
         group = groups.setdefault(base_key, {})
         existing = group.get(identity)
@@ -499,12 +532,16 @@ def _prepare_pjud_movements(
         raw_payload = existing.get("raw_payload")
         if not external_key or not isinstance(raw_payload, dict):
             continue
-        base_key = _build_movement_external_key(case["case_number"], raw_payload)
-        if not _is_movement_key_for_base(external_key, base_key):
+        bases = _movement_external_key_bases(case, raw_payload)
+        matching_base = next((base for base in bases if _is_movement_key_for_base(external_key, base)), None)
+        if matching_base is None:
             continue
-        identity_key = (base_key, _movement_identity(raw_payload))
+        # Rehome only an exact historical alias to the current base.  The
+        # complete movement identity below still has to match (folio, date,
+        # cuaderno, tramite, descripcion, etapa and foja).
+        identity_key = (_movement_external_key_bases(case, raw_payload)[0], _movement_identity(raw_payload))
         existing_keys_by_identity.setdefault(identity_key, []).append(external_key)
-        reserved_keys_by_base.setdefault(base_key, set()).add(external_key)
+        reserved_keys_by_base.setdefault(matching_base, set()).add(external_key)
 
     prepared: list[tuple[dict, str]] = []
     for base_key, group in groups.items():
@@ -517,7 +554,7 @@ def _prepare_pjud_movements(
                 key
                 for key in sorted(
                     existing_keys_by_identity.get(identity_key, []),
-                    key=lambda value: _external_key_rank(value, base_key),
+                    key=lambda value: (_external_key_rank(value, base_key), value),
                 )
                 if key not in assigned_keys
             ), None)
