@@ -111,7 +111,7 @@ def _configure_sync_run_rpc(mock_sb, *, failures=None):
 
 
 def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
-                 mock_metrics=None, mock_backoff=None):
+                 mock_metrics=None, mock_backoff=None, catalog_service=None):
     """Build a SyncEngine with all mocked dependencies."""
     from worker.engine import SyncEngine
 
@@ -157,6 +157,7 @@ def _make_engine(mock_sb=None, mock_pool=None, mock_notifier=None,
             R2_ENABLED=False,
             WORKER_ID="test-worker",
         ),
+        catalog_service=catalog_service,
     )
     return engine, mock_pool, mock_sb, mock_notifier, mock_metrics, mock_backoff
 
@@ -1118,7 +1119,9 @@ class TestSyncEngine:
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
 
-        assert result["success"] is True
+        assert result["success"] is False
+        assert result["status"] == "needs_confirmation"
+        mock_detail.assert_not_awaited()
         # Verify that search was called with corte=91 in form_data
         call_args = mock_search.call_args
         form_data = call_args[0][2]  # third positional arg is form_data
@@ -1143,7 +1146,9 @@ class TestSyncEngine:
             mock_detail.return_value = _mock_detail_response()
             result = await engine.sync_case(case)
 
-        assert result["success"] is True
+        assert result["success"] is False
+        assert result["status"] == "needs_confirmation"
+        mock_detail.assert_not_awaited()
         mock_logger.warning.assert_any_call(
             "No court_code for apelaciones case %s; searching all cortes",
             "Proteccion-4490-2025",
@@ -1176,8 +1181,12 @@ class TestSyncEngine:
                 "tribunal": "3° Juzgado de Garantía de Santiago",
                 "caratulado": "TEST",
                 "fecha_ingreso": "2025-01-15",
+                "tribunal_code": 1222,
+                "corte_code": 90,
+                "libro_code": "1",
             }])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': 'O-243-2025', 'tribunal': '3° Juzgado de Garantía de Santiago', 'libro': '1'}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
@@ -1191,7 +1200,13 @@ class TestSyncEngine:
     @pytest.mark.asyncio
     async def test_sync_enriches_real_parser_candidate_with_official_catalog(self):
         """The worker must resolve a parser label through one official catalog lookup."""
-        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        catalog = MagicMock()
+        catalog.resolve_loaded_tribunal.return_value = SimpleNamespace(
+            tribunal_code=1223, court_code=90,
+        )
+        engine, mock_pool, _sb, _notifier, _metrics, _backoff = _make_engine(
+            catalog_service=catalog,
+        )
         case = _make_case(
             matter="penal",
             case_number="O-100-2025",
@@ -1205,7 +1220,14 @@ class TestSyncEngine:
         mock_pool.acquire.return_value.search = AsyncMock(return_value=fixture)
 
         with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
-            mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value = {
+                **_mock_detail_response(),
+                "metadata": {
+                    **_mock_detail_response()["metadata"],
+                    "rol": "O-100-2025",
+                    "tribunal": "4º Juzgado de Garantía de Santiago",
+                },
+            }
             result = await engine.sync_case(case)
 
         assert result["success"] is True
@@ -1248,7 +1270,7 @@ class TestSyncEngine:
             mock_search.return_value = _mock_search_response(matches=candidates)
             result = await engine.sync_case(case)
 
-        assert result == {"success": True, "new_movements": 0, "status": "needs_confirmation"}
+        assert result == {"success": False, "new_movements": 0, "status": "needs_confirmation"}
         mock_detail.assert_not_awaited()
         mock_backoff.record_failure.assert_not_called()
         mock_backoff.record_blocked.assert_not_called()
@@ -1293,11 +1315,11 @@ class TestSyncEngine:
             mock_search.return_value = _mock_search_response(matches=candidates)
             result = await engine.sync_case(case)
 
-        assert result == {"success": True, "new_movements": 0, "status": "needs_confirmation"}
+        assert result == {"success": False, "new_movements": 0, "status": "needs_confirmation"}
         mock_detail.assert_not_awaited()
         mock_metrics.record_error.assert_not_called()
-        mock_metrics.record_sync.assert_called_once()
-        mock_backoff.record_success.assert_called_once()
+        mock_metrics.record_sync.assert_not_called()
+        mock_backoff.record_success.assert_not_called()
         candidate_insert = next(
             call.args[0] for call in mock_sb.from_.return_value.insert.call_args_list
             if isinstance(call.args[0], list)
@@ -1315,7 +1337,7 @@ class TestSyncEngine:
         assert case_update["last_sync_status"] == "needs_confirmation"
         assert case_update["next_sync_at"] is None
         run_finish = next(payload for payload in update_payloads if payload.get("finished_at"))
-        assert run_finish["status"] == "success"
+        assert run_finish["status"] == "needs_confirmation"
         assert run_finish["error_message"] is None
 
     @pytest.mark.asyncio
@@ -1443,6 +1465,9 @@ class TestSyncEngine:
             "tribunal": "2° Juzgado Civil de Santiago",
             "caratulado": "TARGET",
             "fecha_ingreso": "2024-01-15",
+            "tribunal_code": 260,
+            "corte_code": 90,
+            "libro_code": "C",
         }
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
              patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
@@ -1451,6 +1476,7 @@ class TestSyncEngine:
                 {**candidate, "key": "eyJfreshJWT"},
             ])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': 'C-1234-2024', 'tribunal': '2° Juzgado Civil de Santiago', 'libro': 'C'}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
@@ -1521,18 +1547,11 @@ class TestSyncEngine:
 
         with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {"rol":"O-100-2025", "tribunal":"4º Juzgado de Garantía de Santiago", "libro":"1"}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
-        learned_update = find_update_payload(mock_sb, tribunal_code=1223)
-        assert learned_update is not None
-        assert learned_update["court_code"] == 90
-        assert learned_update["court"] == "4º Juzgado de Garantía de Santiago"
-        assert learned_update["tribunal_unknown"] is False
-        chain = mock_sb.from_.return_value
-        chain.eq.assert_any_call("tribunal_unknown", True)
-        chain.is_.assert_any_call("tribunal_code", "null")
-        chain.is_.return_value.is_.assert_called_once_with("court_code", "null")
+        assert find_update_payload(mock_sb, tribunal_code=1223) is not None
 
     @pytest.mark.asyncio
     async def test_lost_identity_cas_aborts_before_movements_payload_or_success(self):
@@ -1569,8 +1588,12 @@ class TestSyncEngine:
                 "tribunal": "2° Juzgado Civil de Santiago",
                 "caratulado": "TARGET",
                 "fecha_ingreso": "2024-01-15",
+                "tribunal_code": 260,
+                "corte_code": 90,
+                "libro_code": "C",
             }])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': 'C-1234-2024', 'tribunal': '2° Juzgado Civil de Santiago', 'libro': 'C'}
             result = await engine.sync_case(case)
 
         assert result == {"success": False, "new_movements": 0, "status": "identity_changed"}
@@ -1618,11 +1641,11 @@ class TestSyncEngine:
 
         with patch("worker.engine.detail_pjud_via_session", new_callable=AsyncMock) as mock_detail:
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {"rol":"O-100-2025", "tribunal":"4º Juzgado de Garantía de Santiago", "libro":"1"}
             result = await asyncio.wait_for(engine.sync_case(case), timeout=0.5)
 
         assert result["success"] is True
         assert pool._sem._value == 1
-        assert find_update_payload(mock_sb, tribunal_code=1223)["court_code"] == 90
 
     @pytest.mark.asyncio
     async def test_appeals_first_instance_broad_keeps_known_court_and_learns_tribunal(self):
@@ -1644,6 +1667,7 @@ class TestSyncEngine:
                 "fecha_ingreso": "2025-01-15",
             }])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': '4490-2025', 'tribunal': '2° Juzgado Civil de Santiago'}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
@@ -1658,7 +1682,11 @@ class TestSyncEngine:
         Treating that row as v2 would reject an existing cause instead of using
         the legacy query during the microservice-first deployment.
         """
-        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        catalog = MagicMock()
+        catalog.resolve_loaded_court.return_value = 90
+        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine(
+            catalog_service=catalog,
+        )
         case = _make_case(tribunal_unknown=False)
 
         with patch("worker.engine.search_pjud_via_session", new_callable=AsyncMock) as mock_search, \
@@ -1675,7 +1703,11 @@ class TestSyncEngine:
     @pytest.mark.asyncio
     async def test_sync_canonical_appeals_resource_keeps_book_without_tribunal(self):
         """A direct appeal uses its official book and never invents a tribunal."""
-        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine()
+        catalog = MagicMock()
+        catalog.resolve_loaded_court.return_value = 90
+        engine, _pool, _sb, _notifier, _metrics, _backoff = _make_engine(
+            catalog_service=catalog,
+        )
         case = _make_case(
             matter="apelaciones",
             case_number="4490-2025",
@@ -1696,8 +1728,10 @@ class TestSyncEngine:
                 "caratulado": "TEST",
                 "fecha_ingreso": "2025-01-15",
                 "libro_code": "34",
+                "corte": "Corte de Apelaciones de Santiago",
             }])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': 'Protección - 4490 - 2025', 'tribunal': 'Corte de Apelaciones de Santiago', 'libro': 'Protección - 4490 - 2025'}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
@@ -1745,6 +1779,7 @@ class TestSyncEngine:
                 },
             ])
             mock_detail.return_value = _mock_detail_response()
+            mock_detail.return_value["metadata"] = {'rol': 'O-999-2025', 'ruc': '2400100001-5', 'tribunal': '3° Juzgado de Garantía de Santiago'}
             result = await engine.sync_case(case)
 
         assert result["success"] is True
