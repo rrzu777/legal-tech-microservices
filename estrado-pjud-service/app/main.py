@@ -20,7 +20,7 @@ from app.proxy_cost_handler import proxy_cost_control_exception_handler
 from app.request_id import LOG_FORMAT, RequestIdFilter, RequestIdMiddleware
 from app.usage_context import PjudUsageContextMiddleware
 from app.catalogs import CatalogService
-from app.routes import health, search, detail, familia
+from app.routes import health, search, detail, familia, my_causes
 from app.ojv.budget import OjvLaneBudget
 from app.session_pool import APISessionPool
 from supabase import ClientOptions, create_client
@@ -34,7 +34,9 @@ class PrivateSyncHttpMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path", "").rstrip("/") != "/api/v1/familia/sync":
+        if scope["type"] != "http" or scope.get("path", "").rstrip("/") not in {
+            "/api/v1/familia/sync", "/api/v1/my-causes/resolve-private",
+        }:
             await self.app(scope, receive, send)
             return
         started = False
@@ -194,6 +196,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router, dependencies=[Depends(_require_runtime_http)])
     app.include_router(detail.router, dependencies=[Depends(_require_runtime_http)])
     app.include_router(familia.router, dependencies=[Depends(_require_runtime_http)])
+    app.include_router(my_causes.router, dependencies=[Depends(_require_runtime_http)])
     return app
 
 

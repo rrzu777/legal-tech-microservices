@@ -289,6 +289,21 @@ class CatalogService:
         matches = [option for option in options if option["code"] == book_code]
         return dict(matches[0]) if len(matches) == 1 else None
 
+    def resolve_loaded_book_label(
+        self, competencia: str, book_label: str, anno: int, *, corte: int,
+    ) -> dict[str, str] | None:
+        """Resolve a displayed authenticated book against the exact loaded slice."""
+        snapshot_key = f"{competencia}:{corte}:{anno}"
+        books = self._snapshot.get("books")
+        record = books.get(snapshot_key) if isinstance(books, dict) else None
+        options = _snapshot_options(record.get("options")) if isinstance(record, dict) else []
+        cached = self._cache.get(f"books:{snapshot_key}")
+        if cached is not None:
+            options = cached.options
+        label = normalize_catalog_label(book_label)
+        matches = [option for option in options if normalize_catalog_label(option["label"]) == label]
+        return dict(matches[0]) if len(matches) == 1 else None
+
     def resolve_loaded_book_hint(
         self, competencia: str, book_code: str, anno: int,
     ) -> str | None:

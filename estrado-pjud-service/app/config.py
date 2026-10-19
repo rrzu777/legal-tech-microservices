@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     API_KEY: str
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_KEY: str = ""
+    VERCEL_APP_URL: str = ""
+    INTERNAL_CREDENTIALS_API_KEY: str = ""
     PJUD_RUNTIME_GENERATION: str | None = None
     OJV_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
     RATE_LIMIT_MS: int = 2500
