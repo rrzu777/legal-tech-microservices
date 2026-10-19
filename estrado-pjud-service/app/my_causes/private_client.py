@@ -142,7 +142,9 @@ def _table_rows(soup: BeautifulSoup, aliases: dict[str, set[str]], required: set
 def parse_authenticated_detail(html: str, selected: ImportCandidate, catalogs: CatalogService) -> tuple[ImportCandidate, PenalBookSafeDetail]:
     soup = BeautifulSoup(html, "html.parser")
     metadata = _parse_metadata(soup)
-    identifier = metadata.get("rol", "").strip()
+    # Private modals render e.g. "Protección - 1234 - 2023". Only
+    # whitespace around literal separators is presentation, never digit content.
+    identifier = re.sub(r"\s*-\s*", "-", metadata.get("rol", "").strip())
     if not identifier or not re.fullmatch(r"(?:.+-)?" + re.escape(selected.case_number), identifier, re.I):
         raise AuthenticatedImportError("private_identifier_mismatch")
     if selected.matter == "civil" and identifier.upper() != selected.case_number.upper():

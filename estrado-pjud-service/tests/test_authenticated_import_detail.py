@@ -126,3 +126,15 @@ async def test_session_affinity_filtered_listing_and_private_modal(monkeypatch, 
     assert len(calls) == 3 and len(scopes) == 6
     assert all("consultaUnificada" not in str(r.url) for r in calls)
     assert resolved.caption == CAPTION and len(detail.movements) == len(detail.litigantes) == 1
+
+
+@pytest.mark.parametrize("matter", ["civil", "apelaciones"])
+@pytest.mark.parametrize("separator", [" - ", "\u00a0-\n"])
+def test_private_identifier_separator_whitespace(matter, separator):
+    original = "Proteccion-1-2023" if matter == "apelaciones" else "C-1-2023"
+    html = modal(matter).replace(original, original.replace("-", separator))
+    resolved, detail = parse_authenticated_detail(html, candidate(matter), Catalog())
+    assert resolved.case_number == candidate(matter).case_number
+    assert detail.movements and detail.litigantes
+    with pytest.raises(AuthenticatedImportError, match="private_identifier_mismatch"):
+        parse_authenticated_detail(html.replace("2023", "2024"), candidate(matter), Catalog())
