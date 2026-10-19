@@ -112,8 +112,10 @@ async def test_session_affinity_filtered_listing_and_private_modal(monkeypatch, 
             return httpx.Response(200, text=source(matter))
         data = parse_qs(request.content.decode())
         if "/modal/" in request.url.path:
+            assert request.extensions["timeout"]["read"] == (60.0 if matter == "civil" else 30.0)
             assert data == {"dtaCausa": [ACTION], "token": [CSRF]}
             return httpx.Response(200, text=modal(matter))
+        assert request.extensions["timeout"]["read"] == 30.0
         assert data[f"rolMisCau{'Ape' if matter == 'apelaciones' else 'Civ'}"] == ["1"]
         assert data[f"anhoMisCau{'Ape' if matter == 'apelaciones' else 'Civ'}"] == ["2023"]
         return httpx.Response(200, text=listing(matter))

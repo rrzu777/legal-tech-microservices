@@ -38,3 +38,7 @@ la custodia de esta autorización pertenece al job de importación.
 Un rollback del consumidor conserva el esquema aditivo. Las filas autenticadas
 mantienen su procedencia ante escrituras públicas posteriores. No afirmar que un
 HTTP 200, un claim completo o un build prueban el resultado judicial completo.
+
+El modal privado Civil dispone de 60 s por request (el resto conserva 30 s).
+La ruta completa queda acotada a 160 s; el consumidor usa 165 s y el runner
+VPS conserva su límite de 180 s, con margen para la publicación y el cierre.

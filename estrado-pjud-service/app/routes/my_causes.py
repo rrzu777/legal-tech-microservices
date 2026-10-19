@@ -76,7 +76,7 @@ async def authenticated_import_detail(
 ) -> AuthenticatedImportResponse:
     error_code = "upstream_changed"
     try:
-        async with asyncio.timeout(110):
+        async with asyncio.timeout(160):
             async with request.app.state.private_resolution_budget.slot():
                 return await resolve_import(req, request.app.state)
     except PjudRuntimeError:
