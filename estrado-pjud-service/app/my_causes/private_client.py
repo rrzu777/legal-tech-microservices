@@ -7,6 +7,7 @@ Capabilities live only in this operation and never enter ImportCandidate.
 from __future__ import annotations
 
 import re
+import logging
 import unicodedata
 from collections.abc import Callable
 from typing import AsyncContextManager
@@ -34,6 +35,7 @@ _DETAIL = {
     "apelaciones": ("detalleMisCausaApelaciones", "/misCausas/apelaciones/modal/misCausasApelaciones.php"),
 }
 RequestScope = Callable[[str, str], AsyncContextManager[None]]
+logger = logging.getLogger(__name__)
 
 
 def _fold(value: str) -> str:
@@ -138,6 +140,22 @@ def _table_rows(soup: BeautifulSoup, aliases: dict[str, set[str]], required: set
     if len(found) != 1:
         raise AuthenticatedImportError("private_evidence_incomplete")
     return found[0]
+
+
+def _safe_table_shape(html: str) -> list[dict[str, object]]:
+    """Return only structural parser diagnostics; never emit cell text."""
+    soup = BeautifulSoup(html, "html.parser")
+    shape: list[dict[str, object]] = []
+    for table in soup.find_all("table", limit=32):
+        headers = [_header(th.get_text(" ", strip=True)) for th in table.find_all("th")]
+        recognized = sorted({key for aliases in (_MOVEMENT_HEADERS, _PARTY_HEADERS)
+                             for key, names in aliases.items() if any(header in names for header in headers)})
+        body = table.find("tbody")
+        rows = body.find_all("tr", recursive=False) if body else []
+        shape.append({"headers": len(headers), "rows": len(rows), "body": body is not None,
+                      "widths": sorted({len(row.find_all("td", recursive=False)) for row in rows})[:16],
+                      "recognized": recognized})
+    return shape
 
 
 def parse_authenticated_detail(html: str, selected: ImportCandidate, catalogs: CatalogService) -> tuple[ImportCandidate, PenalBookSafeDetail]:
@@ -262,7 +280,15 @@ async def resolve_authenticated_detail(session: OjvSession, expected: ImportCand
         for index, (selected, action) in enumerate(actions):
             async with scope("detail", f"detail:{index}"):
                 html = await _private_modal(session, expected.matter, action, csrf)
-            current, parsed = parse_authenticated_detail(html, selected, catalogs)
+            try:
+                current, parsed = parse_authenticated_detail(html, selected, catalogs)
+            except AuthenticatedImportError as error:
+                trace = error.__traceback__
+                while trace is not None and trace.tb_next is not None:
+                    trace = trace.tb_next
+                logger.warning("authenticated_detail_parse_failed code=%s matter=%s parser_line=%d tables=%s",
+                               error.code, expected.matter, trace.tb_lineno if trace is not None else 0, _safe_table_shape(html))
+                raise
             if verified is not None and current != verified:
                 raise AuthenticatedImportError("private_ambiguous")
             verified, detail = current, parsed

@@ -11,7 +11,7 @@ from pydantic import SecretStr
 
 from app.my_causes.models import ImportCandidate
 from app.my_causes.private_client import (
-    BASE, _selected_actions, _session_token, parse_authenticated_detail,
+    BASE, _selected_actions, _session_token, _safe_table_shape, parse_authenticated_detail,
     resolve_authenticated_detail,
 )
 from app.my_causes.private_models import AuthenticatedImportError
@@ -21,6 +21,13 @@ from app.ojv.session import OjvSession
 CSRF = "a" * 32
 ACTION = "fictional.synthetic.action"
 CAPTION = "Parte Uno / Parte Dos"
+
+
+def test_parser_diagnostics_are_structural_only():
+    html = '<table><thead><tr><th>Nombre</th></tr></thead><tbody><tr><td>SECRET NAME</td></tr></tbody></table>'
+    shape = _safe_table_shape(html)
+    assert shape == [{"headers": 1, "rows": 1, "body": True, "widths": [1], "recognized": ["nombre"]}]
+    assert "SECRET NAME" not in repr(shape)
 
 
 class Catalog:
