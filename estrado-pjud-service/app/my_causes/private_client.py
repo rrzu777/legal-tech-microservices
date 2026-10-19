@@ -10,6 +10,7 @@ import re
 import unicodedata
 from collections.abc import Callable
 from typing import AsyncContextManager
+from urllib.parse import urlencode
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -207,6 +208,21 @@ def parse_authenticated_detail(html: str, selected: ImportCandidate, catalogs: C
     return selected, PenalBookSafeDetail(metadata=CaseMetadata(**metadata), movements=movements, litigantes=parties, libro=selected.libro)
 
 
+async def _private_modal(session: OjvSession, matter: str, action: SecretStr, csrf: SecretStr) -> str:
+    # Civil's private endpoint can exceed the shared session's 30 s default.
+    # Keep this override local to the authenticated modal, inside its stage fence.
+    await session._wait()
+    encoded = urlencode([("dtaCausa", action.get_secret_value()), ("token", csrf.get_secret_value())])
+    try:
+        response = await session._post(
+            BASE + _DETAIL[matter][1], content=encoded, headers=_AJAX_HEADERS,
+            timeout=httpx.Timeout(60.0 if matter == "civil" else 30.0),
+        )
+        return _accepted_html(response)
+    finally:
+        encoded = ""
+
+
 async def resolve_authenticated_detail(session: OjvSession, expected: ImportCandidate, scope: RequestScope) -> tuple[ImportCandidate, PenalBookSafeDetail]:
     if expected.matter not in _DETAIL:
         raise AuthenticatedImportError("private_identifier_mismatch")
@@ -245,7 +261,7 @@ async def resolve_authenticated_detail(session: OjvSession, expected: ImportCand
     try:
         for index, (selected, action) in enumerate(actions):
             async with scope("detail", f"detail:{index}"):
-                html = _accepted_html(await session.post_form(BASE + _DETAIL[expected.matter][1], [("dtaCausa", action.get_secret_value()), ("token", csrf.get_secret_value())], headers=_AJAX_HEADERS))
+                html = await _private_modal(session, expected.matter, action, csrf)
             current, parsed = parse_authenticated_detail(html, selected, catalogs)
             if verified is not None and current != verified:
                 raise AuthenticatedImportError("private_ambiguous")
