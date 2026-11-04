@@ -1738,7 +1738,7 @@ class TestSyncEngine:
         form = mock_search.call_args.args[2]
         assert form["conCorte"] == "90"
         assert form["conTribunal"] == "0"
-        assert form["conTipoCausa"] == "PROTECCION"
+        assert form["conTipoCausa"] == "34"
         assert form["conTipoBusApe"] == "0"
 
     @pytest.mark.asyncio
