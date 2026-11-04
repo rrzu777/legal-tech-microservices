@@ -104,30 +104,32 @@ class TestBuildSearchFormData:
             )
         assert "not in known values" not in caplog.text
 
-    def test_apelaciones_numeric_libro_maps_to_pjud_text_value(self):
+    @pytest.mark.parametrize("libro", ["34", "Protección", None])
+    def test_apelaciones_uses_numeric_protection_book(self, libro):
         form = build_search_form_data(
             competencia="apelaciones",
             tipo="PROTECCION",
             numero="7661",
             anno="2026",
             corte=46,
-            libro="34",
+            libro=libro,
         )
 
-        assert form["conTipoCausa"] == "PROTECCION"
+        assert form["conTipoCausa"] == "34"
         assert form["conCorte"] == "46"
 
-    def test_apelaciones_laboral_uses_live_pjud_composite_book_value(self):
+    @pytest.mark.parametrize("libro", ["30", "LABORAL - COBRANZA", "LABORAL"])
+    def test_apelaciones_laboral_uses_numeric_book(self, libro):
         form = build_search_form_data(
             competencia="apelaciones",
             case_type="rol",
             case_number="833-2025",
             corte=46,
-            libro="30",
+            libro=libro,
             search_mode="appeals_resource",
         )
 
-        assert form["conTipoCausa"] == "LABORAL - COBRANZA"
+        assert form["conTipoCausa"] == "30"
 
     def test_penal_ruc_populates_real_pjud_fields(self):
         form = build_search_form_data(
@@ -169,7 +171,7 @@ class TestBuildSearchFormData:
             search_mode="appeals_resource",
         )
         assert form["conTipoBusApe"] == "0"
-        assert form["conTipoCausa"] == "PENAL"
+        assert form["conTipoCausa"] == "31"
 
     def test_broad_appeals_resource_submits_an_empty_book_filter(self):
         form = build_search_form_data(

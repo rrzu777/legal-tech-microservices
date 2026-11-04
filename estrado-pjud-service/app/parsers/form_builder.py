@@ -1,8 +1,10 @@
 """Build OJV search form data — shared between API routes and worker engine."""
 
 import logging
+import unicodedata
 
 from app.parsers.normalizer import (
+    APELACIONES_LIBRO_CODE_MAP,
     VALID_LIBROS,
     competencia_code,
     parse_search_identifier,
@@ -10,6 +12,11 @@ from app.parsers.normalizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+_APPEALS_BOOK_CODE_BY_LABEL = {
+    label: code for code, label in APELACIONES_LIBRO_CODE_MAP.items()
+}
+_APPEALS_BOOK_CODE_BY_LABEL["LABORAL"] = "30"
 
 
 def build_search_form_data(
@@ -40,7 +47,14 @@ def build_search_form_data(
         numero = numero or ""
         anno = anno or ""
 
-    effective_libro = resolve_libro(competencia, tipo, libro)
+    if competencia == "apelaciones":
+        # OJV's resource form submits the numeric option value. Resolve older
+        # stored labels too, without changing the labels used for matching.
+        book = (libro or tipo or "").strip()
+        label = unicodedata.normalize("NFKD", book).encode("ascii", "ignore").decode().upper()
+        effective_libro = _APPEALS_BOOK_CODE_BY_LABEL.get(label, book)
+    else:
+        effective_libro = resolve_libro(competencia, tipo, libro)
 
     # Soft validation: warn if libro is not in known set
     if libro and competencia in VALID_LIBROS and libro not in VALID_LIBROS[competencia]:
