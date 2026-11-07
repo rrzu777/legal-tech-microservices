@@ -7,6 +7,7 @@ import httpx
 from pydantic import SecretStr
 
 from app.config import Settings
+from app.internal_url import is_secure_internal_base_url
 from app.my_causes.models import ImportCandidate
 from app.my_causes.private_models import AuthenticatedImportError, AuthenticatedImportRequest
 from app.runtime_fence import runtime_generation_headers
@@ -52,7 +53,8 @@ async def fetch_import_credential(
     req: AuthenticatedImportRequest, settings: Settings,
 ) -> tuple[SecretStr, SecretStr]:
     """Decrypt only through the web's existing candidate-claim boundary."""
-    if not settings.VERCEL_APP_URL.startswith("https://") or not settings.INTERNAL_CREDENTIALS_API_KEY:
+    # Mismo predicado que el camino del sync programado (app/internal_url.py).
+    if not is_secure_internal_base_url(settings.VERCEL_APP_URL) or not settings.INTERNAL_CREDENTIALS_API_KEY:
         raise AuthenticatedImportError("private_fence_unavailable")
     credential = None
     response = None

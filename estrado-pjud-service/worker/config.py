@@ -9,6 +9,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
+from app.internal_url import OptionalHttpsUrl
 from app.proxy import sticky_lifetime_seconds
 from app.runtime_fence import validate_runtime_generation
 from app.supabase_executor import submit_supabase_query
@@ -148,7 +149,7 @@ class WorkerConfig(BaseSettings):
     R2_ENABLED: bool = False
 
     # Familia credential decryption (calls Vercel internal endpoint)
-    VERCEL_APP_URL: str = ""
+    VERCEL_APP_URL: OptionalHttpsUrl = ""
     INTERNAL_CREDENTIALS_API_KEY: str = ""
 
     # Ops alerting (Telegram)

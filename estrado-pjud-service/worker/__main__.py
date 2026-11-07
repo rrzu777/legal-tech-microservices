@@ -10,7 +10,7 @@ from app.alerting import send_ops_alert
 from app.bandwidth import METER
 from app.proxy_billing import is_proxy_billing_error
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
-from app.logging_redaction import install_secret_redaction
+from app.logging_redaction import install_secret_redaction, secret_values
 from app.runtime_fence import PjudRuntimeError, RuntimeFence
 from worker.config import WorkerConfig, validate_import_trial_mode
 from worker.supabase_client import create_supabase, create_trial_supabase
@@ -611,19 +611,8 @@ async def main():
         if trial_capability is not None
         else None
     )
-    setup_logging(
-        config.LOG_LEVEL,
-        secrets=tuple(filter(None, (
-            # Es la llave del endpoint que devuelve la contraseña PJUD en claro
-            # y es `str`, no `SecretStr`: sin esto un traceback que arrastre la
-            # config la escribe al journal.
-            config.INTERNAL_CREDENTIALS_API_KEY,
-            config.TELEGRAM_BOT_TOKEN,
-            config.SUPABASE_SERVICE_KEY,
-            config.OJV_PROXY_URL,
-            raw_trial_capability,
-        ))),
-    )
+    # Misma fuente de verdad que la API: ver SECRET_CONFIG_FIELDS.
+    setup_logging(config.LOG_LEVEL, secrets=secret_values(config, raw_trial_capability))
     logger.info("Starting worker %s (pool_size=%d)", config.WORKER_ID, config.POOL_SIZE)
 
     # Mandatory local protocol; no environment switch or legacy-open fallback.

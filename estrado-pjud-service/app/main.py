@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 from app.config import get_settings
 from app.auth import _require_runtime_http
 from app.runtime_fence import RuntimeFence, runtime_generation_headers
-from app.logging_redaction import install_secret_redaction
+from app.logging_redaction import install_secret_redaction, secret_values
 from app.rate_limit import limiter
 from app.proxy_cost import ProxyBudgetExceededError, ProxyUsagePersistenceError
 from app.proxy_cost_handler import proxy_cost_control_exception_handler
@@ -162,21 +162,10 @@ def create_app() -> FastAPI:
     # método/host/endpoint y rid, pero el valor configurado nunca llega al
     # journal. El helper es idempotente porque create_app se llama más de una
     # vez en tests y en algunos servidores.
-    # API_KEY e INTERNAL_CREDENTIALS_API_KEY faltaban acá, y son las dos llaves
-    # que más importan: una abre todo el servicio y la otra el endpoint que
-    # entrega contraseñas PJUD descifradas. Al estar declaradas como `str` y no
-    # `SecretStr`, cualquier repr(settings) o traceback que arrastre la config
-    # las escribía en claro al journal, que está menos protegido que el .env.
-    install_secret_redaction(
-        root_handlers,
-        tuple(filter(None, (
-            settings.API_KEY,
-            settings.INTERNAL_CREDENTIALS_API_KEY,
-            settings.TELEGRAM_BOT_TOKEN,
-            settings.SUPABASE_SERVICE_KEY,
-            settings.OJV_PROXY_URL,
-        ))),
-    )
+    # La membresía de "qué es secreto" vive en SECRET_CONFIG_FIELDS, una sola
+    # vez para la API y el worker: API_KEY e INTERNAL_CREDENTIALS_API_KEY
+    # faltaban en las DOS tuplas escritas a mano que había antes.
+    install_secret_redaction(root_handlers, secret_values(settings))
 
     # /docs, /redoc y /openapi.json los monta FastAPI por su cuenta y NO les
     # aplica las `dependencies` de los include_router de abajo, así que estaban

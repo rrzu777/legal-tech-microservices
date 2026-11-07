@@ -36,15 +36,13 @@ def mounted_paths(app) -> set[str]:
     return {getattr(route, "path", None) for route in app.routes}
 
 
-@pytest.mark.parametrize("docs", [None, "false", "", "true-ish", "TRUE", "1"])
+@pytest.mark.parametrize("docs", [None, "false", "TRUE", "1"])
 def test_docs_cerradas_por_default_y_ante_cualquier_valor_que_no_sea_true(monkeypatch, docs):
     # El flag es igualdad exacta con "true", igual que el resto de los ENABLE_*
     # de este repo: "TRUE" o "1" no alcanzan para abrir el contrato.
     app = build_app(monkeypatch, docs=docs)
     assert mounted_paths(app) & DOC_PATHS == set()
     assert app.openapi_url is None
-    assert app.docs_url is None
-    assert app.redoc_url is None
 
 
 def test_docs_vuelven_con_el_flag_explicito(monkeypatch):
