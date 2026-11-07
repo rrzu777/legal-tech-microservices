@@ -23,10 +23,18 @@ class Settings(BaseSettings):
     PRIVATE_RESOLUTION_CONCURRENCY: int = 1
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
     ENABLE_PJUD_PRIVATE_FAMILIA: str = "false"
+    # Apagado por default: /docs, /redoc y /openapi.json publican el contrato
+    # completo del servicio privado de credenciales y FastAPI los sirve SIN las
+    # dependencies de include_router. Encender solo en desarrollo local.
+    ENABLE_API_DOCS: str = "false"
 
     @property
     def private_familia_enabled(self) -> bool:
         return self.ENABLE_PJUD_PRIVATE_FAMILIA == "true"
+
+    @property
+    def api_docs_enabled(self) -> bool:
+        return self.ENABLE_API_DOCS == "true"
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""

@@ -158,3 +158,48 @@ def test_worker_redacta_parametro_pjud_con_escapes_y_conserva_json(monkeypatch):
     assert payload["msg"] == (
         "HTTP Request: GET https://pjud.example/doc?dtaDoc=[REDACTED]&modo=publico"
     )
+
+
+API_KEY_VALUE = "api-key-7f3a9c2e-never-in-the-journal"
+INTERNAL_KEY_VALUE = "internal-credentials-key-4b8d1e-never-in-the-journal"
+
+
+def test_api_redacta_las_dos_llaves_de_autenticacion(monkeypatch):
+    """Las dos API keys del servicio también se redactan.
+
+    Faltaban en la tupla de `install_secret_redaction`, que solo llevaba
+    Telegram, la service key de Supabase y la URL del proxy. API_KEY abre todo
+    el servicio e INTERNAL_CREDENTIALS_API_KEY abre el endpoint que devuelve
+    contraseñas PJUD descifradas; las dos están declaradas como `str` y no
+    `SecretStr`, así que cualquier repr(settings) o traceback que arrastre la
+    config las escribía en claro al journal, que está menos protegido que el
+    .env.
+    """
+    monkeypatch.setenv("API_KEY", API_KEY_VALUE)
+    monkeypatch.setenv("INTERNAL_CREDENTIALS_API_KEY", INTERNAL_KEY_VALUE)
+    get_settings.cache_clear()
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root = logging.getLogger()
+    old_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    try:
+        from app.main import create_app
+
+        create_app()
+        logging.getLogger("app.test").info(
+            "settings dump: api=%s internal=%s", API_KEY_VALUE, INTERNAL_KEY_VALUE,
+        )
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+        get_settings.cache_clear()
+
+    output = stream.getvalue()
+    assert API_KEY_VALUE not in output
+    assert INTERNAL_KEY_VALUE not in output
+    # Y la línea sigue siendo legible: se redacta el valor, no el log entero.
+    assert "settings dump: api=[REDACTED] internal=[REDACTED]" in output

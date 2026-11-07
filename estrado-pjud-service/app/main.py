@@ -162,19 +162,35 @@ def create_app() -> FastAPI:
     # método/host/endpoint y rid, pero el valor configurado nunca llega al
     # journal. El helper es idempotente porque create_app se llama más de una
     # vez en tests y en algunos servidores.
+    # API_KEY e INTERNAL_CREDENTIALS_API_KEY faltaban acá, y son las dos llaves
+    # que más importan: una abre todo el servicio y la otra el endpoint que
+    # entrega contraseñas PJUD descifradas. Al estar declaradas como `str` y no
+    # `SecretStr`, cualquier repr(settings) o traceback que arrastre la config
+    # las escribía en claro al journal, que está menos protegido que el .env.
     install_secret_redaction(
         root_handlers,
         tuple(filter(None, (
+            settings.API_KEY,
+            settings.INTERNAL_CREDENTIALS_API_KEY,
             settings.TELEGRAM_BOT_TOKEN,
             settings.SUPABASE_SERVICE_KEY,
             settings.OJV_PROXY_URL,
         ))),
     )
 
+    # /docs, /redoc y /openapi.json los monta FastAPI por su cuenta y NO les
+    # aplica las `dependencies` de los include_router de abajo, así que estaban
+    # abiertos publicando cada endpoint, cada schema y los nombres de las
+    # cabeceras X-JurisTrack-*. Con el puerto 8000 todavía expuesto a internet
+    # (ver ops/caddy/Caddyfile) eso es reconocimiento gratis del servicio
+    # privado. Ningún test ni código del repo los consume.
+    docs_enabled = settings.api_docs_enabled
     app = FastAPI(
         title="estrado-pjud-service",
         version="0.1.0",
-        docs_url="/docs",
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
         lifespan=lifespan,
     )
     app.add_exception_handler(

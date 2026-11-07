@@ -614,6 +614,10 @@ async def main():
     setup_logging(
         config.LOG_LEVEL,
         secrets=tuple(filter(None, (
+            # Es la llave del endpoint que devuelve la contraseña PJUD en claro
+            # y es `str`, no `SecretStr`: sin esto un traceback que arrastre la
+            # config la escribe al journal.
+            config.INTERNAL_CREDENTIALS_API_KEY,
             config.TELEGRAM_BOT_TOKEN,
             config.SUPABASE_SERVICE_KEY,
             config.OJV_PROXY_URL,

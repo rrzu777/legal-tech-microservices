@@ -161,3 +161,32 @@ async def test_malformed_snapshot_is_infrastructure(monkeypatch, snapshot):
     client = mod.SyncCredentialClient(None, SimpleNamespace(VERCEL_APP_URL="https://app.test", INTERNAL_CREDENTIALS_API_KEY="k"))
     with pytest.raises(mod.SyncCredentialInfrastructureError):
         await client.decrypt(mod.SyncCredentialClaim.model_validate(CLAIM))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "http://app.test", "http://127.0.0.1:3000", "http://localhost:3000",
+    "HTTPS://app.test", "//app.test", "app.test",
+])
+async def test_credential_channel_requires_tls_and_never_connects(monkeypatch, url):
+    """El canal que trae la contraseña PJUD en claro exige https://.
+
+    app/my_causes/private_fence.py ya exigía TLS para el camino de importación;
+    este, que es el del sync programado, solo pedía "string no vacío". Las dos
+    funciones piden la MISMA credencial descifrada al mismo endpoint interno, y
+    un .env del VPS con http:// mandaba la clave del Poder Judicial de un
+    abogado sin cifrar sin que nada lo notara.
+
+    Se afirma también que NO se abre el cliente: fallar después de conectar
+    sería tarde. `HTTPS://` en mayúsculas queda fuera a propósito — la
+    comparación es exacta, no normaliza.
+    """
+    mod = boundary()
+    constructed = []
+    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **kw: constructed.append(kw))
+    client = mod.SyncCredentialClient(
+        None, SimpleNamespace(VERCEL_APP_URL=url, INTERNAL_CREDENTIALS_API_KEY="k"),
+    )
+    with pytest.raises(mod.SyncCredentialInfrastructureError, match="^infra_unavailable$"):
+        await client.decrypt(mod.SyncCredentialClaim.model_validate(CLAIM))
+    assert constructed == []

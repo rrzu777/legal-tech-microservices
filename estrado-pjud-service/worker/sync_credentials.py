@@ -118,6 +118,15 @@ class SyncCredentialClient:
             key = getattr(self._config, "INTERNAL_CREDENTIALS_API_KEY", None)
             if not isinstance(url, str) or not url or not isinstance(key, str) or not key:
                 raise SyncCredentialInfrastructureError()
+            # Misma valla que app/my_causes/private_fence.py:55 para el camino de
+            # importación. Las dos funciones piden la MISMA contraseña PJUD
+            # descifrada al mismo endpoint interno y hasta acá tenían dos
+            # criterios de transporte distintos: una exigía TLS y esta solo
+            # "string no vacío". Un .env del VPS con http:// mandaba la clave
+            # del Poder Judicial de un abogado en claro y nada lo notaba.
+            # Falla como infra: el sync degrada y no se le carga a la causa.
+            if not url.startswith("https://"):
+                raise SyncCredentialInfrastructureError()
             body = claim.rpc_context()
             if version is not None:
                 body["credential_version"] = version
