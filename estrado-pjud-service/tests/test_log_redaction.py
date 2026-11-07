@@ -7,6 +7,8 @@ import logging
 import httpx
 import pytest
 
+from types import SimpleNamespace
+
 from app.config import get_settings
 from app.request_id import LOG_FORMAT, request_id_var
 
@@ -15,9 +17,11 @@ BOT_TOKEN = "123456789:FAKE-telegram-token-for-redaction-test"
 SAFE_URL = "https://api.telegram.org/bot[REDACTED]/sendMessage"
 
 
-def _api_log_output(monkeypatch, msg, args=()) -> str:
+def _api_log_output(monkeypatch, msg, args=(), *, env=None, logger="httpx") -> str:
     monkeypatch.setenv("API_KEY", "test-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", BOT_TOKEN)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
     get_settings.cache_clear()
 
     stream = io.StringIO()
@@ -32,7 +36,7 @@ def _api_log_output(monkeypatch, msg, args=()) -> str:
         from app.main import create_app
 
         create_app()
-        logging.getLogger("httpx").info(msg, *args)
+        logging.getLogger(logger).info(msg, *args)
     finally:
         request_id_var.reset(token)
         root.removeHandler(handler)
@@ -158,3 +162,95 @@ def test_worker_redacta_parametro_pjud_con_escapes_y_conserva_json(monkeypatch):
     assert payload["msg"] == (
         "HTTP Request: GET https://pjud.example/doc?dtaDoc=[REDACTED]&modo=publico"
     )
+
+
+API_KEY_VALUE = "api-key-7f3a9c2e-never-in-the-journal"
+INTERNAL_KEY_VALUE = "internal-credentials-key-4b8d1e-never-in-the-journal"
+CAPABILITY_VALUE = "c" * 64
+
+
+def test_api_redacta_las_dos_llaves_de_autenticacion(monkeypatch):
+    """Las dos API keys del servicio también se redactan.
+
+    Faltaban en la tupla de secretos, que solo llevaba Telegram, la service key
+    de Supabase y la URL del proxy. API_KEY abre todo el servicio e
+    INTERNAL_CREDENTIALS_API_KEY abre el endpoint que devuelve contraseñas PJUD
+    descifradas; las dos son `str` y no `SecretStr`, así que cualquier
+    repr(settings) o traceback que arrastre la config las escribía en claro al
+    journal, que está menos protegido que el .env.
+    """
+    output = _api_log_output(
+        monkeypatch,
+        "settings dump: api=%s internal=%s",
+        (API_KEY_VALUE, INTERNAL_KEY_VALUE),
+        env={"API_KEY": API_KEY_VALUE, "INTERNAL_CREDENTIALS_API_KEY": INTERNAL_KEY_VALUE},
+        logger="app.test",
+    )
+    assert API_KEY_VALUE not in output
+    assert INTERNAL_KEY_VALUE not in output
+    # La línea sigue siendo legible y conserva el rid: se redacta el valor, no
+    # el log entero.
+    assert "settings dump: api=[REDACTED] internal=[REDACTED]" in output
+    assert "rid-redaction-123" in output
+
+
+def test_worker_redacta_la_llave_del_canal_de_credenciales(monkeypatch):
+    """El worker es el proceso que PIDE la contraseña descifrada.
+
+    La cobertura anterior tocaba solo el lado API, así que la lista del worker
+    podía perder una llave con la suite verde. Ahora las dos leen
+    SECRET_CONFIG_FIELDS, y esto lo afirma end-to-end por su propio handler.
+    """
+    from app.logging_redaction import secret_values
+    from worker.__main__ import setup_logging
+
+    config = SimpleNamespace(
+        INTERNAL_CREDENTIALS_API_KEY=INTERNAL_KEY_VALUE,
+        SUPABASE_SERVICE_KEY="",
+        TELEGRAM_BOT_TOKEN=BOT_TOKEN,
+        OJV_PROXY_URL=None,
+    )
+
+    stream = io.StringIO()
+    monkeypatch.setattr("worker.__main__.sys.stdout", stream)
+    root = logging.getLogger()
+    old_handlers = root.handlers[:]
+    old_level = root.level
+    try:
+        setup_logging("INFO", secrets=secret_values(config))
+        logging.getLogger("app.test").info("claim a %s", INTERNAL_KEY_VALUE)
+    finally:
+        root.handlers = old_handlers
+        root.setLevel(old_level)
+
+    payload = json.loads(stream.getvalue())
+    assert INTERNAL_KEY_VALUE not in payload["msg"]
+    assert payload["msg"] == "claim a [REDACTED]"
+
+
+def test_secret_values_desenvuelve_secretstr_y_tolera_campos_ausentes():
+    """Dos trampas que harían que la redacción fallara pareciendo funcionar.
+
+    Si un campo pasa a `SecretStr` y nadie desenvuelve, lo que se redacta es la
+    máscara y el secreto real sigue saliendo en claro. Y WorkerConfig no declara
+    API_KEY: una lista por nombre tiene que absorber esa asimetría en vez de
+    bifurcarse en dos listas, que es como se perdieron las llaves.
+    """
+    from pydantic import SecretStr
+
+    from app.logging_redaction import SECRET_CONFIG_FIELDS, secret_values
+
+    assert "API_KEY" in SECRET_CONFIG_FIELDS
+    assert "INTERNAL_CREDENTIALS_API_KEY" in SECRET_CONFIG_FIELDS
+
+    values = secret_values(
+        SimpleNamespace(
+            INTERNAL_CREDENTIALS_API_KEY=SecretStr(INTERNAL_KEY_VALUE),
+            TELEGRAM_BOT_TOKEN="",
+            OJV_PROXY_URL=None,
+        ),
+        CAPABILITY_VALUE,
+        None,
+    )
+    assert values == (INTERNAL_KEY_VALUE, CAPABILITY_VALUE)
+    assert "**********" not in values

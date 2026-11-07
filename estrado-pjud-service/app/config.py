@@ -4,6 +4,7 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 from app.cookie_store import DEFAULT_COOKIE_STORE_PATH, validate_cookie_store_path
+from app.internal_url import OptionalHttpsUrl
 from app.proxy import sticky_lifetime_seconds
 from app.runtime_fence import validate_runtime_generation
 
@@ -12,7 +13,7 @@ class Settings(BaseSettings):
     API_KEY: str
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_KEY: str = ""
-    VERCEL_APP_URL: str = ""
+    VERCEL_APP_URL: OptionalHttpsUrl = ""
     INTERNAL_CREDENTIALS_API_KEY: str = ""
     PJUD_RUNTIME_GENERATION: str | None = None
     OJV_BASE_URL: str = "https://oficinajudicialvirtual.pjud.cl"
@@ -23,10 +24,16 @@ class Settings(BaseSettings):
     PRIVATE_RESOLUTION_CONCURRENCY: int = 1
     COOKIE_STORE_PATH: str = DEFAULT_COOKIE_STORE_PATH
     ENABLE_PJUD_PRIVATE_FAMILIA: str = "false"
+    # Apagado por default; el porqué está donde se aplica, en app/main.py.
+    ENABLE_API_DOCS: str = "false"
 
     @property
     def private_familia_enabled(self) -> bool:
         return self.ENABLE_PJUD_PRIVATE_FAMILIA == "true"
+
+    @property
+    def api_docs_enabled(self) -> bool:
+        return self.ENABLE_API_DOCS == "true"
 
     # Telegram alerts
     TELEGRAM_BOT_TOKEN: str = ""

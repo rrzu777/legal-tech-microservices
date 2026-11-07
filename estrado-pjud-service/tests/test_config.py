@@ -108,3 +108,48 @@ def test_telegram_config_defaults(monkeypatch):
     assert settings.TELEGRAM_CHAT_ID == ""
     assert settings.TELEGRAM_BLOCKED_RATE_THRESHOLD == 0.3
     assert settings.TELEGRAM_COOLDOWN_S == 300
+
+
+# --- Canal interno de credenciales: TLS exigido en la config, no solo por request ---
+#
+# Las dos configs comparten el tipo porque las dos alimentan llamadas al MISMO
+# endpoint interno que devuelve la contraseña PJUD en claro. Dejar el chequeo
+# solo en el punto de uso lo degradaba a `infra_unavailable`, el mismo balde que
+# una caída del PJUD: un error de configuración nuestro disfrazado de outage del
+# Poder Judicial. El porqué completo está en app/internal_url.py.
+
+REQUIRED_CONFIG_FIELDS = {
+    "API_KEY": "synthetic",
+    "WORKER_ID": "synthetic",
+    "SUPABASE_URL": "https://fixture.supabase.co",
+    "SUPABASE_SERVICE_KEY": "synthetic",
+}
+
+
+@pytest.mark.parametrize("config_name", ["app.config:Settings", "worker.config:WorkerConfig"])
+@pytest.mark.parametrize("url", [
+    "http://app.test",
+    "http://127.0.0.1:3000",
+    "HTTPS://app.test",
+    "//app.test",
+    "app.test",
+    "ftp://app.test",
+])
+def test_vercel_app_url_sin_tls_no_arranca(config_name, url):
+    module_name, attribute = config_name.split(":")
+    import importlib
+    config_class = getattr(importlib.import_module(module_name), attribute)
+    with pytest.raises(ValueError, match="internal_base_url_requires_https"):
+        config_class(**REQUIRED_CONFIG_FIELDS, VERCEL_APP_URL=url, _env_file=None)
+
+
+@pytest.mark.parametrize("config_name", ["app.config:Settings", "worker.config:WorkerConfig"])
+@pytest.mark.parametrize("url", ["", "https://app.test", "https://juristrack.cl/"])
+def test_vercel_app_url_vacio_o_con_tls_es_valido(config_name, url):
+    # Vacío tiene que seguir siendo válido: es el estado de un despliegue que no
+    # usa el canal privado, y hacerlo obligatorio rompería ese arranque.
+    module_name, attribute = config_name.split(":")
+    import importlib
+    config_class = getattr(importlib.import_module(module_name), attribute)
+    config = config_class(**REQUIRED_CONFIG_FIELDS, VERCEL_APP_URL=url, _env_file=None)
+    assert config.VERCEL_APP_URL == url

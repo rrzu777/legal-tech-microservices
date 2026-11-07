@@ -12,6 +12,47 @@ _PJUD_DOWNLOAD_TOKEN_PATTERN = re.compile(
 )
 
 
+#: Campos de config cuyo VALOR nunca puede llegar al journal. FUENTE ÚNICA: la
+#: API y el worker leían esta membresía de dos tuplas escritas a mano, y así
+#: fue como API_KEY e INTERNAL_CREDENTIALS_API_KEY quedaron afuera de las dos
+#: durante meses. Ninguna de las dos listas se comparaba con la otra, y la
+#: cobertura de tests tocaba solo una, así que la del worker podía perder una
+#: llave con la suite verde.
+#:
+#: `getattr` absorbe la asimetría real entre las dos configs: WorkerConfig no
+#: declara API_KEY. Agregar un nombre acá lo cubre en los dos procesos.
+SECRET_CONFIG_FIELDS: tuple[str, ...] = (
+    "API_KEY",
+    "INTERNAL_CREDENTIALS_API_KEY",
+    "SUPABASE_SERVICE_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "OJV_PROXY_URL",
+)
+
+
+def secret_values(config: object, *extra: str | None) -> tuple[str, ...]:
+    """Valores a redactar de una config, más los que el llamador agregue.
+
+    Desenvuelve ``SecretStr`` por duck-typing y no importando pydantic: si
+    alguien pasa un campo a ``SecretStr`` sin tocar esto, lo que se redactaría
+    es la máscara ``'**********'`` y el secreto real seguiría saliendo en claro
+    — un fallo que se ve idéntico a funcionar.
+
+    ``extra`` existe para valores que no son atributos de la config, como la
+    capability del import de prueba, que el worker ya desenvuelve por su cuenta.
+    """
+    values: list[str] = []
+    for name in SECRET_CONFIG_FIELDS:
+        value = getattr(config, name, None)
+        reveal = getattr(value, "get_secret_value", None)
+        if callable(reveal):
+            value = reveal()
+        if isinstance(value, str) and value:
+            values.append(value)
+    values.extend(value for value in extra if value)
+    return tuple(values)
+
+
 def _usable_secrets(values: Iterable[str]) -> tuple[str, ...]:
     # Más largo primero evita que secretos con un prefijo común dejen visible
     # el sufijo. Los vacíos no pueden entrar: ``text.replace("", ...)``
