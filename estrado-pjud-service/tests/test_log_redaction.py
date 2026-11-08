@@ -204,13 +204,12 @@ def test_handler_del_worker_redacta_lo_que_secret_values_entrega(monkeypatch):
     `wm_contract_paths`, `ops/deploy.sh` lo congela, y el cambio viaja en una
     operación autorizada aparte (ver tests/test_config.py).
 
-    Mientras eso no se despliegue, el worker sigue redactando su lista vieja
-    —Telegram, service key de Supabase, URL del proxy y la capability— y por lo
-    tanto **no** redacta INTERNAL_CREDENTIALS_API_KEY, que es la llave con la que
-    ese mismo proceso pide la contraseña PJUD descifrada. No se arregla acá a
-    propósito: un test no puede tapar un archivo congelado, y escribir el nombre
-    de este test como si ya estuviera cableado es cómo se perdieron las llaves la
-    primera vez.
+    El worker igual queda cubierto, pero por otro camino: `install_secret_redaction`
+    le SUMA `ambient_secret_values()` a lo que declare el llamador, así que el
+    `main()` congelado redacta las dos llaves sin saberlo. Eso lo prueba
+    `test_el_worker_congelado_redacta_las_llaves_del_entorno_sin_declararlas`,
+    que es end-to-end por el punto de instalación real. Este test se queda con
+    su alcance honesto: handler y `secret_values`, nada más.
     """
     from app.logging_redaction import secret_values
     from worker.__main__ import setup_logging
@@ -265,3 +264,137 @@ def test_secret_values_desenvuelve_secretstr_y_tolera_campos_ausentes():
     )
     assert values == (INTERNAL_KEY_VALUE, CAPABILITY_VALUE)
     assert "**********" not in values
+
+
+# --- El worker congelado: cubierto por el entorno, no por su propia lista ---
+#
+# `worker/__main__.py` es uno de los 17 archivos de `wm_contract_paths` que
+# `ops/deploy.sh` congela byte a byte, así que su lista de secretos no se puede
+# editar y no incluye API_KEY ni INTERNAL_CREDENTIALS_API_KEY. Estos tests
+# afirman el CABLEADO real: entran por `worker.__main__.setup_logging`, que es
+# el punto de instalación de producción, y NO le pasan los secretos.
+
+AMBIENT_API_KEY = "ambient-api-key-" + "a" * 48
+AMBIENT_INTERNAL_KEY = "ambient-internal-key-" + "b" * 43
+
+
+def _worker_log_output(monkeypatch, msg, args=(), *, secrets=(), logger="app.test") -> str:
+    """Loguea por el setup_logging REAL del worker y devuelve lo que escribió."""
+    from worker.__main__ import setup_logging
+
+    stream = io.StringIO()
+    monkeypatch.setattr("worker.__main__.sys.stdout", stream)
+    root = logging.getLogger()
+    old_handlers = root.handlers[:]
+    old_level = root.level
+    try:
+        setup_logging("INFO", secrets=secrets)
+        logging.getLogger(logger).info(msg, *args)
+    finally:
+        root.handlers = old_handlers
+        root.setLevel(old_level)
+    return stream.getvalue()
+
+
+def test_el_worker_congelado_redacta_las_llaves_del_entorno_sin_declararlas(monkeypatch):
+    """La que importa: `secrets=()` y aun así las dos llaves no salen.
+
+    Si alguien saca el `+ ambient_secret_values()` de `install_secret_redaction`,
+    este test cae. Verificado por mutación, no por lectura.
+    """
+    monkeypatch.setenv("API_KEY", AMBIENT_API_KEY)
+    monkeypatch.setenv("INTERNAL_CREDENTIALS_API_KEY", AMBIENT_INTERNAL_KEY)
+
+    output = _worker_log_output(
+        monkeypatch,
+        "pidiendo credencial: api=%s internal=%s",
+        (AMBIENT_API_KEY, AMBIENT_INTERNAL_KEY),
+        secrets=(),
+    )
+
+    assert AMBIENT_API_KEY not in output
+    assert AMBIENT_INTERNAL_KEY not in output
+    payload = json.loads(output)
+    # Se redacta el VALOR, no la línea: el log sigue sirviendo para diagnosticar.
+    assert payload["msg"] == "pidiendo credencial: api=[REDACTED] internal=[REDACTED]"
+
+
+def test_lo_ambiental_se_suma_a_lo_declarado_y_no_lo_reemplaza(monkeypatch):
+    """Las dos fuentes conviven.
+
+    El worker pasa la capability del import de prueba por `secrets`, que no es
+    un campo de config y por lo tanto el entorno no la tiene. Si una fuente
+    reemplazara a la otra, una de las dos quedaría en claro.
+    """
+    capability = "capability-" + "c" * 53
+    monkeypatch.setenv("INTERNAL_CREDENTIALS_API_KEY", AMBIENT_INTERNAL_KEY)
+
+    output = _worker_log_output(
+        monkeypatch,
+        "cap=%s internal=%s",
+        (capability, AMBIENT_INTERNAL_KEY),
+        secrets=(capability,),
+    )
+
+    assert capability not in output
+    assert AMBIENT_INTERNAL_KEY not in output
+
+
+def test_lo_ambiental_corto_no_entra_y_no_mancha_el_log(monkeypatch):
+    """El piso existe para no corromper logs ajenos.
+
+    Un valor corto en el entorno —los de test lo son— no puede convertir cada
+    aparición de esa subcadena en [REDACTED]. La lista EXPLÍCITA no tiene piso:
+    ahí el llamador ya afirmó que es secreto.
+    """
+    from app.logging_redaction import AMBIENT_SECRET_MIN_LENGTH
+
+    corto = "test-key"
+    assert len(corto) < AMBIENT_SECRET_MIN_LENGTH
+    monkeypatch.setenv("API_KEY", corto)
+
+    output = _worker_log_output(monkeypatch, "valor %s", (corto,), secrets=())
+    assert corto in output, "un valor corto del entorno no debe redactarse"
+
+    # Pero declarado explícitamente sí, sin importar el largo.
+    output = _worker_log_output(monkeypatch, "valor %s", (corto,), secrets=(corto,))
+    assert corto not in output
+
+
+def test_el_piso_ambiental_no_puede_subir_hasta_tapar_un_secreto_real():
+    """Impide que el umbral suba hasta donde empiece a saltear secretos reales.
+
+    Medido el 8-nov en `/proc/<MainPID>/environ` del worker en producción, los
+    cinco valores miden 64, 64, 219, 46 y 71. Si alguien sube el piso por encima
+    del más corto, el escaneo deja de cubrir ese secreto EN SILENCIO — un
+    fail-open que se ve idéntico a funcionar. 46 es el piso medido; se deja la
+    mitad de margen.
+    """
+    from app.logging_redaction import AMBIENT_SECRET_MIN_LENGTH
+
+    LARGO_REAL_MAS_CORTO_MEDIDO = 46
+    assert AMBIENT_SECRET_MIN_LENGTH <= LARGO_REAL_MAS_CORTO_MEDIDO // 2
+    # Y que no baje tanto que empiece a redactar subcadenas comunes.
+    assert AMBIENT_SECRET_MIN_LENGTH >= 12
+
+
+def test_ambient_secret_values_cubre_cada_nombre_de_la_fuente_unica():
+    """Que el escaneo no se olvide de un nombre que alguien agregue a la tupla.
+
+    Si mañana entra un sexto campo a SECRET_CONFIG_FIELDS, este test lo exige
+    cubierto sin que nadie tenga que acordarse de tocar el escaneo.
+    """
+    from app.logging_redaction import (
+        AMBIENT_SECRET_MIN_LENGTH,
+        SECRET_CONFIG_FIELDS,
+        ambient_secret_values,
+    )
+
+    environ = {name: name.lower() + "-" + "z" * AMBIENT_SECRET_MIN_LENGTH
+               for name in SECRET_CONFIG_FIELDS}
+    environ["RUIDO_QUE_NO_ES_SECRETO"] = "w" * 80
+
+    values = ambient_secret_values(environ)
+
+    assert set(values) == set(environ[name] for name in SECRET_CONFIG_FIELDS)
+    assert environ["RUIDO_QUE_NO_ES_SECRETO"] not in values
