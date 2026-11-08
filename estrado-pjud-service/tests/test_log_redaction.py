@@ -194,12 +194,23 @@ def test_api_redacta_las_dos_llaves_de_autenticacion(monkeypatch):
     assert "rid-redaction-123" in output
 
 
-def test_worker_redacta_la_llave_del_canal_de_credenciales(monkeypatch):
-    """El worker es el proceso que PIDE la contraseña descifrada.
+def test_handler_del_worker_redacta_lo_que_secret_values_entrega(monkeypatch):
+    """Afirma el handler del worker, NO el cableado de su `main()`.
 
-    La cobertura anterior tocaba solo el lado API, así que la lista del worker
-    podía perder una llave con la suite verde. Ahora las dos leen
-    SECRET_CONFIG_FIELDS, y esto lo afirma end-to-end por su propio handler.
+    Este test le pasa los secretos a mano, así que prueba dos cosas: que
+    `secret_values` incluye la llave del canal de credenciales, y que el handler
+    del worker redacta lo que recibe. Lo que NO prueba es que `worker/__main__.py`
+    llame a `secret_values`, y hoy no lo llama: ese archivo es uno de los 17 de
+    `wm_contract_paths`, `ops/deploy.sh` lo congela, y el cambio viaja en una
+    operación autorizada aparte (ver tests/test_config.py).
+
+    Mientras eso no se despliegue, el worker sigue redactando su lista vieja
+    —Telegram, service key de Supabase, URL del proxy y la capability— y por lo
+    tanto **no** redacta INTERNAL_CREDENTIALS_API_KEY, que es la llave con la que
+    ese mismo proceso pide la contraseña PJUD descifrada. No se arregla acá a
+    propósito: un test no puede tapar un archivo congelado, y escribir el nombre
+    de este test como si ya estuviera cableado es cómo se perdieron las llaves la
+    primera vez.
     """
     from app.logging_redaction import secret_values
     from worker.__main__ import setup_logging
