@@ -117,6 +117,21 @@ def test_telegram_config_defaults(monkeypatch):
 # solo en el punto de uso lo degradaba a `infra_unavailable`, el mismo balde que
 # una caída del PJUD: un error de configuración nuestro disfrazado de outage del
 # Poder Judicial. El porqué completo está en app/internal_url.py.
+#
+# `worker.config:WorkerConfig` NO está en la lista de abajo, y no es un olvido:
+# ese archivo es uno de los 17 de `wm_contract_paths` en ops/worker-maintenance.sh.
+# `ops/deploy.sh` compara sus bytes contra la revisión entrante y aborta si
+# difieren, y el bootstrap que instalaría otro contrato está documentado como no
+# implementado (ops/worker-maintenance.md). Así que el fail-fast de arranque del
+# worker viaja en una operación autorizada aparte.
+#
+# Esto NO deja el canal del worker sin protección ni sin cobertura: el rechazo
+# real está en el punto de uso, en worker/sync_credentials.py, y lo afirma
+# test_sync_credentials.py. Lo diferido es que falle al arrancar en vez de al
+# primer pedido. Cuando ese contrato se despliegue, agregar
+# "worker.config:WorkerConfig" acá y borrar este párrafo.
+
+TLS_CHECKED_CONFIGS = ["app.config:Settings"]
 
 REQUIRED_CONFIG_FIELDS = {
     "API_KEY": "synthetic",
@@ -126,7 +141,7 @@ REQUIRED_CONFIG_FIELDS = {
 }
 
 
-@pytest.mark.parametrize("config_name", ["app.config:Settings", "worker.config:WorkerConfig"])
+@pytest.mark.parametrize("config_name", TLS_CHECKED_CONFIGS)
 @pytest.mark.parametrize("url", [
     "http://app.test",
     "http://127.0.0.1:3000",
@@ -143,7 +158,7 @@ def test_vercel_app_url_sin_tls_no_arranca(config_name, url):
         config_class(**REQUIRED_CONFIG_FIELDS, VERCEL_APP_URL=url, _env_file=None)
 
 
-@pytest.mark.parametrize("config_name", ["app.config:Settings", "worker.config:WorkerConfig"])
+@pytest.mark.parametrize("config_name", TLS_CHECKED_CONFIGS)
 @pytest.mark.parametrize("url", ["", "https://app.test", "https://juristrack.cl/"])
 def test_vercel_app_url_vacio_o_con_tls_es_valido(config_name, url):
     # Vacío tiene que seguir siendo válido: es el estado de un despliegue que no
